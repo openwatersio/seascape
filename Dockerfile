@@ -25,7 +25,7 @@ RUN apt-get update && apt-get install -y \
   && rm -rf /var/lib/apt/lists/*
 
 # Install rio-rgbify for Terrain-RGB encoding.
-RUN python3 -m venv /opt/rio-venv \
+RUN python3 -m venv --system-site-packages /opt/rio-venv \
   && /opt/rio-venv/bin/pip install --no-cache-dir rio-rgbify
 ENV PATH="/opt/rio-venv/bin:$PATH"
 

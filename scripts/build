@@ -62,7 +62,7 @@ else
     -n "GEBCO Bathymetric Contours" \
     -A '<a href="https://www.gebco.net">GEBCO</a>' \
     -N "Bathymetric contour lines derived from the GEBCO grid." \
-    -Z 0 -z "${MAX_ZOOM}" -P \
+    -Z 0 -z "${MAX_ZOOM}" -P -q \
     -y depth_m -y depth_abs_m \
     -j '{
       "*": [
