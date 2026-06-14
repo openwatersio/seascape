@@ -26,8 +26,10 @@ else
   if [[ -f "${GEBCO_ZIP}" ]]; then
     log "ZIP already downloaded, extracting..."
   else
-    log "Downloading GEBCO grid (this is ~7.5 GB)..."
-    curl -L -o "${GEBCO_ZIP}" "${GEBCO_URL}"
+    log "Downloading GEBCO grid (~4.2 GB)..."
+    # CEDA can stall mid-transfer; retry and resume (-C -) instead of failing.
+    curl -L --fail --retry 5 --retry-all-errors --retry-delay 15 \
+      --connect-timeout 30 -C - -o "${GEBCO_ZIP}" "${GEBCO_URL}"
   fi
 
   log "Extracting GeoTIFF from archive..."

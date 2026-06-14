@@ -22,6 +22,28 @@ env:
   IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
+  # Download the GEBCO zip once and warm the cache, so terrain and contour don't
+  # both pull ~4.2 GB in parallel (which raced and timed out). Runs alongside the
+  # image build; sources config.sh so the URL logic isn't duplicated here.
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache GEBCO source
+        uses: actions/cache@v4
+        with:
+          path: data/gebco_${{ env.GEBCO_YEAR }}.zip
+          key: gebco-${{ env.GEBCO_YEAR }}
+      - name: Download GEBCO source
+        run: |
+          source scripts/config.sh
+          if [[ -f "${GEBCO_ZIP}" ]]; then
+            echo "Already cached: ${GEBCO_ZIP}"
+          else
+            curl -L --fail --retry 5 --retry-all-errors --retry-delay 15 \
+              --connect-timeout 30 -C - -o "${GEBCO_ZIP}" "${GEBCO_URL}"
+          fi
+
   # Build the toolchain image once and push to GHCR. buildx GHA cache means it
   # only recompiles (tippecanoe etc.) when the Dockerfile changes.
   image:
@@ -48,7 +70,7 @@ jobs:
   # terrain and contour run as separate parallel jobs (own runner = full disk
   # each), so global builds fit without sharing the multi-GB DEM between them.
   tiles:
-    needs: image
+    needs: [image, prepare]
     runs-on: ubuntu-latest
     permissions:
       contents: read
