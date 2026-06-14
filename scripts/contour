@@ -23,14 +23,7 @@ SKIP_CHAIKIN="${SKIP_CHAIKIN:-}"
 log "Input DEM: ${INPUT_TIF}"
 
 # ─── Step 1: Slope-selective DEM smoothing (optional, default on) ────────────
-# smooth-dem uses ImageMagick, which can't open the full-grid global raster
-# (86400x43200 exceeds its width/height/memory limits), so skip it when global.
-# Chaikin geometry smoothing (Step 3) still runs.
 DEM="${INPUT_TIF}"
-if [[ -z "${BBOX}" && -z "${SKIP_SLOPE_SMOOTH}" ]]; then
-  log "Global build: skipping slope-smoothing (ImageMagick can't handle the full grid)."
-  SKIP_SLOPE_SMOOTH=1
-fi
 if [[ -z "${SKIP_SLOPE_SMOOTH}" ]]; then
   SMOOTHED="${OUTPUT_FGB%.fgb}_smoothed.tif"
   if cached "${SMOOTHED}"; then

@@ -10,6 +10,8 @@ RUN apt-get update && apt-get install -y \
     gdal-bin \
     python3-gdal \
     python3-numpy \
+    python3-scipy \
+    python3-rasterio \
     python3-pip \
     python3-venv \
     bc \
@@ -21,7 +23,6 @@ RUN apt-get update && apt-get install -y \
     libsqlite3-dev \
     zlib1g-dev \
     git \
-    imagemagick \
   && rm -rf /var/lib/apt/lists/*
 
 # Install rio-rgbify for Terrain-RGB encoding.

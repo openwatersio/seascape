@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""Out-of-core Gaussian blur for large single-band rasters.
+
+Drop-in replacement for ImageMagick `convert -blur RADIUSxSIGMA`, but streams
+the raster in windows padded with a halo so memory stays bounded regardless of
+total size — it scales to the full global GEBCO grid (86400x43200), which
+ImageMagick can't open. CRS/geotransform are preserved.
+
+Usage:
+  blur input.tif output.tif RADIUSxSIGMA [--window N]
+
+  RADIUSxSIGMA  ImageMagick-style blur, e.g. "20x35". Sigma is the Gaussian
+                std dev in pixels; radius caps the kernel (0 = auto, ~3*sigma).
+"""
+import argparse
+import numpy as np
+import rasterio
+from rasterio.windows import Window
+from scipy.ndimage import gaussian_filter
+
+
+def parse_blur(spec):
+    if "x" in spec:
+        r, s = spec.split("x", 1)
+        return float(r), float(s)
+    return 0.0, float(spec)
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("input")
+    p.add_argument("output")
+    p.add_argument("blur", help="RADIUSxSIGMA, e.g. 20x35")
+    p.add_argument("--window", type=int, default=4096)
+    args = p.parse_args()
+
+    radius, sigma = parse_blur(args.blur)
+    if radius > 0:
+        truncate = radius / sigma          # match ImageMagick's truncated kernel
+        halo = int(np.ceil(radius))
+    else:
+        truncate = 4.0
+        halo = int(np.ceil(truncate * sigma))
+
+    with rasterio.open(args.input) as src:
+        profile = src.profile.copy()
+        profile.update(count=1)
+        out_dtype = src.dtypes[0]
+        W, H = src.width, src.height
+
+        with rasterio.open(args.output, "w", **profile) as dst:
+            for row0 in range(0, H, args.window):
+                for col0 in range(0, W, args.window):
+                    h = min(args.window, H - row0)
+                    w = min(args.window, W - col0)
+                    # Read the interior window plus a halo from neighbors so the
+                    # blur is seamless; clamp the read to the raster bounds.
+                    r0, c0 = max(0, row0 - halo), max(0, col0 - halo)
+                    r1, c1 = min(H, row0 + h + halo), min(W, col0 + w + halo)
+                    data = src.read(
+                        1, window=Window(c0, r0, c1 - c0, r1 - r0)
+                    ).astype("float32")
+                    blurred = gaussian_filter(
+                        data, sigma=sigma, truncate=truncate, mode="nearest"
+                    )
+                    # Strip the halo back off before writing.
+                    ir, ic = row0 - r0, col0 - c0
+                    interior = blurred[ir:ir + h, ic:ic + w]
+                    dst.write(
+                        interior.astype(out_dtype), 1,
+                        window=Window(col0, row0, w, h),
+                    )
+
+
+if __name__ == "__main__":
+    main()
