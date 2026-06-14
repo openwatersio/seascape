@@ -20,6 +20,12 @@ env:
   BBOX: ${{ github.event.inputs.bbox || '' }}
   MAX_ZOOM: ${{ github.event.inputs.max_zoom || '9' }}
   IMAGE: ghcr.io/${{ github.repository }}
+  # CEDA firewalls cloud-runner IPs, so CI pulls the source zip from our own R2
+  # mirror instead (GEBCO is public domain). Seed it once with:
+  #   curl -L -o gebco_2026_geotiff.zip "<CEDA url from scripts/config.sh>"
+  #   aws s3 cp gebco_2026_geotiff.zip s3://<bucket>/source/ --endpoint-url <r2>
+  # Keep the year here in sync with GEBCO_YEAR. Local dev still uses CEDA.
+  GEBCO_URL: https://tiles.openwaters.io/source/gebco_2026_geotiff.zip
 
 jobs:
   # Download the GEBCO zip once and warm the cache, so terrain and contour don't
@@ -104,13 +110,13 @@ jobs:
       - name: Build ${{ matrix.step }} tiles
         run: |
           docker run --rm \
-            -e BBOX="${BBOX}" -e MAX_ZOOM="${MAX_ZOOM}" -e GEBCO_YEAR="${GEBCO_YEAR}" \
+            -e BBOX="${BBOX}" -e MAX_ZOOM="${MAX_ZOOM}" -e GEBCO_YEAR="${GEBCO_YEAR}" -e GEBCO_URL="${GEBCO_URL}" \
             -v "${{ github.workspace }}/data:/app/data" \
             -v "${{ github.workspace }}/work:/app/work" \
             -v "${{ github.workspace }}/output:/app/output" \
             "${IMAGE}:${{ github.sha }}" download
           docker run --rm \
-            -e BBOX="${BBOX}" -e MAX_ZOOM="${MAX_ZOOM}" -e GEBCO_YEAR="${GEBCO_YEAR}" \
+            -e BBOX="${BBOX}" -e MAX_ZOOM="${MAX_ZOOM}" -e GEBCO_YEAR="${GEBCO_YEAR}" -e GEBCO_URL="${GEBCO_URL}" \
             -v "${{ github.workspace }}/data:/app/data" \
             -v "${{ github.workspace }}/work:/app/work" \
             -v "${{ github.workspace }}/output:/app/output" \
