@@ -206,6 +206,17 @@ jobs:
     permissions: { contents: read, packages: read }
     steps:
       - uses: actions/checkout@v6
+      # Merge assembles the whole tileset on one runner (unlike the small cells),
+      # so reclaim disk here.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
