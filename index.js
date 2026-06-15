@@ -33,7 +33,7 @@ const style = {
       type: "raster-dem",
       url: terrainUrl,
       tileSize: 512,
-      maxzoom: 9,
+      // maxzoom auto-detected from the PMTiles header so regional high-res bands render where present
       encoding: "mapbox",
       bounds: BBOX,
       attribution: "&copy; <a href='https://www.gebco.net'>GEBCO</a>",
@@ -119,9 +119,12 @@ const style = {
           "step",
           ["to-number", ["get", "depth_abs_m"]],
           0.6, // < 50m
-          50, 0.8,
-          200, 1.0,
-          1000, 1.2,
+          50,
+          0.8,
+          200,
+          1.0,
+          1000,
+          1.2,
         ],
       },
     },
@@ -130,11 +133,7 @@ const style = {
       type: "symbol",
       source: "contours",
       "source-layer": "contours",
-      filter: [
-        "==",
-        ["%", ["to-number", ["get", "depth_abs_m"]], 10],
-        0,
-      ],
+      filter: ["==", ["%", ["to-number", ["get", "depth_abs_m"]], 10], 0],
       minzoom: 8,
       layout: {
         "symbol-placement": "line",

@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Normalize one regional source (by id) for the priority mosaic:
+# fetch → reproject to EPSG:4326 → apply a constant datum offset → write
+# work/<id>_norm.tif. scripts/mosaic stacks these on the GEBCO base.
+#
+# Usage: ./scripts/ingest <source-id>
+#
+# Reads the source row from scripts/sources.conf:
+#   id | url | datum_offset_m | priority | bbox | max_zoom
+
+source "$(dirname "$0")/config.sh"
+check_deps gdalwarp gdal_calc.py curl
+
+id="${1:?Usage: ingest <source-id>}"
+row="$(sources_rows | awk -F'|' -v id="$id" '$1==id{print; exit}')"
+[[ -n "${row}" ]] || { log "ERROR: source '${id}' not found in ${SOURCES_CONF}"; exit 1; }
+IFS='|' read -r _ url offset _priority bbox _maxzoom <<< "${row}"
+
+NORM="${WORK_DIR}/${id}_norm.tif"
+if cached "${NORM}"; then
+  log "Normalized source exists: ${NORM}"
+  echo "${NORM}"; exit 0
+fi
+
+# ─── Fetch ───────────────────────────────────────────────────────────────────
+if [[ "${url}" == http*://* ]]; then
+  SRC="${DATA_DIR}/${id}.${url##*.}"
+  if cached "${SRC}"; then
+    log "Source already downloaded: ${SRC}"
+  else
+    log "Downloading ${id} from ${url}..."
+    curl -L --fail --retry 5 --retry-all-errors --retry-delay 15 \
+      --connect-timeout 30 -C - -o "${SRC}" "${url}"
+  fi
+else
+  SRC="${url}"   # local path
+fi
+
+# ─── Reproject + clip to the source bbox ─────────────────────────────────────
+IFS=',' read -r W S E N <<< "${bbox}"
+WARP="${WORK_DIR}/${id}_warp.tif"
+rm -f "${WARP}"
+log "Reprojecting ${id} to EPSG:4326 over ${bbox}..."
+# -ot Float32 keeps types uniform across sources so gdalbuildvrt can mosaic them.
+# Source nodata propagates to the output so the base shows through any gaps.
+gdalwarp -t_srs EPSG:4326 -te "${W}" "${S}" "${E}" "${N}" \
+  -r bilinear -ot Float32 -overwrite "${SRC}" "${WARP}" >&2
+
+# ─── Apply constant datum offset ─────────────────────────────────────────────
+# ponytail: a single offset to ~MSL, not full VDatum. Revisit in Phase 3 if seams show.
+if [[ -z "${offset}" || "${offset}" == "0" ]]; then
+  mv "${WARP}" "${NORM}"
+else
+  log "Applying datum offset ${offset} m..."
+  gdal_calc.py -A "${WARP}" --calc "A+(${offset})" --outfile "${NORM}" --overwrite --quiet
+  rm -f "${WARP}"
+fi
+
+log "Normalized: ${NORM}"
+echo "${NORM}"

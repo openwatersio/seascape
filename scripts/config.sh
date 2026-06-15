@@ -52,11 +52,28 @@ THREADS="${THREADS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo
 # so z9 is the real resolution ceiling. MapLibre overzooms past it for display.
 MAX_ZOOM="${MAX_ZOOM:-9}"
 
+# Minimum tile zoom. The global base band uses 0; regional high-res bands set
+# this (e.g. 10) so their tiles don't collide with the base — see scripts/build.
+MIN_ZOOM="${MIN_ZOOM:-0}"
+
+# ─── Multi-source priority mosaic ────────────────────────────────────────────
+# Regional high-res sources layered on top of the GEBCO base. See sources.conf.
+SOURCES_CONF="${SOURCES_CONF:-${PROJECT_DIR}/scripts/sources.conf}"
+MOSAIC_VRT="${WORK_DIR}/mosaic.vrt"
+
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 log() { echo "[$(date '+%H:%M:%S')] $*" >&2; }
 
 # Returns 0 (true) if the file exists and FORCE is not set.
 cached() { [[ -z "${FORCE}" && -e "$1" ]]; }
+
+# Print active sources.conf rows (comments/blanks stripped, whitespace around the
+# pipe field separators trimmed) so consumers can `IFS='|' read` them directly.
+sources_rows() {
+  [[ -f "${SOURCES_CONF}" ]] || return 0
+  grep -vE '^[[:space:]]*(#|$)' "${SOURCES_CONF}" \
+    | sed -E 's/[[:space:]]*\|[[:space:]]*/|/g; s/^[[:space:]]+//; s/[[:space:]]+$//'
+}
 
 check_deps() {
   local missing=()

@@ -1,44 +1,94 @@
 #!/usr/bin/env bash
-# Run the full GEBCO → tile pipeline.
+# Run the full bathymetry → tile pipeline.
+#
+# Builds a priority mosaic: GEBCO owns the global base (z0–MAX_ZOOM) and each
+# region in scripts/sources.conf owns z(MAX_ZOOM+1)+ within its bbox, merged into
+# one terrain + one contour tileset. See MOSAIC-PLAN.md.
 #
 # Usage:
 #   ./scripts/build                        # full global
-#   BBOX="-85,20,-70,35" ./scripts/build   # Bahamas (regional extract)
+#   BBOX="-85,20,-70,35" ./scripts/build   # regional extract
 #
-# Environment variables:
-#   BBOX        Bounding box "west,south,east,north" (empty = global)
-#   MAX_ZOOM    Maximum contour tile zoom level (default: 9)
-#   THREADS     Parallel processing threads (default: nproc)
-#   FORCE       Set to 1 to rebuild all cached files
+# Env: BBOX, MAX_ZOOM, TERRAIN_MAX_ZOOM, THREADS, FORCE
 
 set -euo pipefail
-
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "${SCRIPT_DIR}/config.sh"
-
 SUFFIX="${BBOX:+_${BBOX}}"
 
 echo "╔══════════════════════════════════════════════════════════╗"
-echo "║  GEBCO → Tiles Pipeline                                 ║"
+echo "║  Bathymetry → Tiles Pipeline                             ║"
 echo "╚══════════════════════════════════════════════════════════╝"
-echo ""
 
-# Step 1: Download & clip (global if BBOX is empty).
-echo "── Step 1: Download GEBCO data ─────────────────────────────"
-INPUT_TIF=$("${SCRIPT_DIR}/download")
-echo ""
+# ── Step 1: base DEM (GEBCO) ─────────────────────────────────────────────────
+echo "── Step 1: Download base DEM ───────────────────────────────"
+INPUT_TIF="$("${SCRIPT_DIR}/download")"
 
-# Step 2: Terrain-RGB tiles. Each step is self-contained and writes its own
-# PMTiles to output/ — the CI workflow runs terrain and contour as separate jobs.
-echo "── Step 2: Build Terrain-RGB tiles ───────────────────────────"
-"${SCRIPT_DIR}/terrain" "${INPUT_TIF}"
-echo ""
+# ── No regional sources → original single-source build ───────────────────────
+mapfile -t SOURCES < <(sources_rows)
+if [[ ${#SOURCES[@]} -eq 0 ]]; then
+  echo "── Step 2: Terrain-RGB tiles ───────────────────────────────"
+  "${SCRIPT_DIR}/terrain" "${INPUT_TIF}"
+  echo "── Step 3: Contour tiles ───────────────────────────────────"
+  "${SCRIPT_DIR}/contour" "${INPUT_TIF}"
+  echo "═══ Pipeline complete ═══"
+  log "  Terrain:  ${OUTPUT_DIR}/terrain${SUFFIX}.pmtiles"
+  log "  Contours: ${OUTPUT_DIR}/contours${SUFFIX}.pmtiles"
+  exit 0
+fi
 
-# Step 3: Contour vector tiles.
-echo "── Step 3: Generate contour tiles ────────────────────────────"
-"${SCRIPT_DIR}/contour" "${INPUT_TIF}"
+# ── Multi-source priority mosaic ─────────────────────────────────────────────
+echo "── Step 2: Ingest ${#SOURCES[@]} regional source(s) ────────────────────"
+for row in "${SOURCES[@]}"; do
+  IFS='|' read -r id _ <<< "${row}"
+  "${SCRIPT_DIR}/ingest" "${id}"
+done
+MOSAIC="$("${SCRIPT_DIR}/mosaic")"
 
-echo ""
+REGION_MIN_Z=$(( MAX_ZOOM + 1 ))   # base owns 0..MAX_ZOOM; regions start above it
+
+# ── Step 3: base bands over the global base DEM (z0..MAX_ZOOM) ────────────────
+echo "── Step 3: Base tiles (z0–${MAX_ZOOM}) ──────────────────────────────"
+MIN_ZOOM=0 OUT_MBTILES="${WORK_DIR}/terrain_base.mbtiles" \
+  "${SCRIPT_DIR}/terrain" "${INPUT_TIF}"
+MIN_ZOOM=0 OUT_MBTILES="${WORK_DIR}/contours_base.mbtiles" \
+  "${SCRIPT_DIR}/contour" "${INPUT_TIF}"
+TERRAIN_BANDS=("${WORK_DIR}/terrain_base.mbtiles")
+CONTOUR_BANDS=("${WORK_DIR}/contours_base.mbtiles")
+
+# ── Step 4: regional bands (z${REGION_MIN_Z}+) clipped to each bbox ──────────
+echo "── Step 4: Regional tiles (z${REGION_MIN_Z}+) ───────────────────────────"
+for row in "${SOURCES[@]}"; do
+  IFS='|' read -r id _url _off _pri bbox mz <<< "${row}"
+  IFS=',' read -r W S E N <<< "${bbox}"
+
+  # Materialize the prioritized region from the mosaic (CUDEM etc. on top, GEBCO
+  # filling gaps) as a real GeoTIFF so terrain/contour run on it unchanged.
+  clip="${WORK_DIR}/${id}_clip.tif"
+  if ! cached "${clip}"; then
+    log "Clipping mosaic to ${id} (${bbox})..."
+    gdal_translate -projwin "${W}" "${N}" "${E}" "${S}" "${MOSAIC}" "${clip}" >&2
+  fi
+
+  MIN_ZOOM="${REGION_MIN_Z}" TERRAIN_MAX_ZOOM="${mz}" \
+    OUT_MBTILES="${WORK_DIR}/terrain_${id}.mbtiles" "${SCRIPT_DIR}/terrain" "${clip}"
+  MIN_ZOOM="${REGION_MIN_Z}" MAX_ZOOM="${mz}" \
+    OUT_MBTILES="${WORK_DIR}/contours_${id}.mbtiles" "${SCRIPT_DIR}/contour" "${clip}"
+
+  TERRAIN_BANDS+=("${WORK_DIR}/terrain_${id}.mbtiles")
+  CONTOUR_BANDS+=("${WORK_DIR}/contours_${id}.mbtiles")
+done
+
+# ── Step 5: merge bands → one terrain + one contour tileset ──────────────────
+echo "── Step 5: Merge bands ─────────────────────────────────────"
+"${SCRIPT_DIR}/merge-tiles" "${WORK_DIR}/terrain_all.mbtiles" "${TERRAIN_BANDS[@]}"
+rm -f "${OUTPUT_DIR}/terrain${SUFFIX}.pmtiles"
+pmtiles convert "${WORK_DIR}/terrain_all.mbtiles" "${OUTPUT_DIR}/terrain${SUFFIX}.pmtiles" >&2
+
+# Vector contours merge with tile-join (handles MVT/metadata correctly).
+rm -f "${OUTPUT_DIR}/contours${SUFFIX}.pmtiles"
+tile-join -f -o "${OUTPUT_DIR}/contours${SUFFIX}.pmtiles" "${CONTOUR_BANDS[@]}" >&2
+
 echo "═══ Pipeline complete ═══"
-log "  Terrain: ${OUTPUT_DIR}/terrain${SUFFIX}.pmtiles"
+log "  Terrain:  ${OUTPUT_DIR}/terrain${SUFFIX}.pmtiles"
 log "  Contours: ${OUTPUT_DIR}/contours${SUFFIX}.pmtiles"

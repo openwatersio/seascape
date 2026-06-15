@@ -12,7 +12,9 @@ check_deps gdal_contour ogr2ogr tippecanoe
 
 SCRIPT_DIR="$(dirname "$0")"
 resolve_input_dem "${1:-}"
-OUTPUT_FGB="${WORK_DIR}/contours_enriched${SUFFIX}.fgb"
+# Name intermediates after the input so base and regional bands (same SUFFIX)
+# don't clobber each other's cache.
+OUTPUT_FGB="${WORK_DIR}/$(basename "${INPUT_TIF%.*}")_enriched.fgb"
 
 # Set SKIP_SLOPE_SMOOTH=1 to skip slope-selective DEM smoothing before contouring.
 # Smoothing blurs flat areas (ocean floor) while preserving detail in steep
@@ -90,11 +92,13 @@ rm -f "${CONTOURS_RAW}" "${CONTOURS_SMOOTH}"
 [[ -n "${SKIP_SLOPE_SMOOTH}" ]] || rm -f "${SMOOTHED}"
 
 # ─── Step 5: Tile to PMTiles ─────────────────────────────────────────────────
-CONTOUR_PMTILES="${OUTPUT_DIR}/contours${SUFFIX}.pmtiles"
+# In banded mode (OUT_MBTILES set) tippecanoe writes an MBTiles band; build
+# tile-joins the bands into the final PMTiles.
+CONTOUR_PMTILES="${OUT_MBTILES:-${OUTPUT_DIR}/contours${SUFFIX}.pmtiles}"
 if cached "${CONTOUR_PMTILES}"; then
   log "Contour tiles already exist: ${CONTOUR_PMTILES}"
 else
-  log "Building contour vector tiles (z0–${MAX_ZOOM})..."
+  log "Building contour vector tiles (z${MIN_ZOOM}–${MAX_ZOOM})..."
   tippecanoe \
     -o "${CONTOUR_PMTILES}" \
     -f \
@@ -102,7 +106,7 @@ else
     -n "GEBCO Bathymetric Contours" \
     -A '<a href="https://www.gebco.net">GEBCO</a>' \
     -N "Bathymetric contour lines derived from the GEBCO grid." \
-    -Z 0 -z "${MAX_ZOOM}" -P -q \
+    -Z "${MIN_ZOOM}" -z "${MAX_ZOOM}" -P -q \
     -y depth_m -y depth_abs_m \
     -j '{
       "*": [

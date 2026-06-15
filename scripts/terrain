@@ -27,7 +27,9 @@ resolve_input_dem "${1:-}"
 # Remove NoData metadata — rio-rgbify encodes NoData pixels as valid elevation
 # values, producing artifacts. Work on a copy to avoid modifying the original.
 # rio-rgbify resamples the source per-tile at each zoom, so no upsample needed.
-PREPARED="${WORK_DIR}/gebco_prepared${SUFFIX}.tif"
+# Name the prepared DEM after the input so base and regional bands (which share
+# the same SUFFIX) don't clobber each other's cache.
+PREPARED="${WORK_DIR}/$(basename "${INPUT_TIF%.*}")_prepared.tif"
 
 if cached "${PREPARED}"; then
   log "Prepared DEM already exists: ${PREPARED}"
@@ -43,18 +45,20 @@ fi
 # rio-rgbify reads the source DEM at each zoom level, resamples with bilinear
 # interpolation, reprojects to Web Mercator, then encodes to RGB per-tile.
 # This produces correct elevation values at every zoom — no encoding artifacts.
-TERRAIN_MBTILES="${WORK_DIR}/terrain-rgb${BBOX:+_${BBOX}}.mbtiles"
+# When OUT_MBTILES is set (regional/banded build), write there and skip the
+# PMTiles conversion — scripts/build merges the bands and converts once.
+TERRAIN_MBTILES="${OUT_MBTILES:-${WORK_DIR}/terrain-rgb${BBOX:+_${BBOX}}.mbtiles}"
 
 if cached "${TERRAIN_MBTILES}"; then
   log "Terrain-RGB MBTiles already exists: ${TERRAIN_MBTILES}"
 else
   rm -f "${TERRAIN_MBTILES}"
-  log "Building Terrain-RGB tiles (zoom 0–${TERRAIN_MAX_ZOOM})..."
+  log "Building Terrain-RGB tiles (zoom ${MIN_ZOOM}–${TERRAIN_MAX_ZOOM})..."
   PYTHONWARNINGS="ignore::UserWarning,ignore::FutureWarning" \
   rio rgbify \
     -b -10000 \
     -i 0.1 \
-    --min-z 0 \
+    --min-z "${MIN_ZOOM}" \
     --max-z "${TERRAIN_MAX_ZOOM}" \
     --format png \
     -j "${THREADS}" \
@@ -64,6 +68,13 @@ else
 fi
 
 # ─── Convert to PMTiles ──────────────────────────────────────────────────────
+# In banded mode (OUT_MBTILES set) the MBTiles is the deliverable; build merges
+# the bands and converts to PMTiles once.
+if [[ -n "${OUT_MBTILES:-}" ]]; then
+  log "Terrain-RGB band complete: ${TERRAIN_MBTILES} (zoom ${MIN_ZOOM}–${TERRAIN_MAX_ZOOM})"
+  exit 0
+fi
+
 TERRAIN_PMTILES="${OUTPUT_DIR}/terrain${BBOX:+_${BBOX}}.pmtiles"
 
 if cached "${TERRAIN_PMTILES}"; then
