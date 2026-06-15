@@ -12,7 +12,7 @@ SCRIPT_DIR="$(dirname "$0")"
 source "${SCRIPT_DIR}/config.sh"
 
 STEP="${1:?usage: lowzoom <terrain|contour>}"
-SPLIT_ZOOM="${SPLIT_ZOOM:-8}"
+SPLIT_ZOOM="${SPLIT_ZOOM:-5}"
 TOPZ=$(( SPLIT_ZOOM - 1 ))
 
 # Global DEM (BBOX unset → full ±85°). download skips the unzip when the
@@ -27,13 +27,14 @@ case "${STEP}" in
       "${SCRIPT_DIR}/terrain" "${DEM}"
     ;;
   contour)
-    # Hardcoded for SPLIT_ZOOM=8. -tr 0.01 ≈ z7 pixel (~0.011°); the
-    # level subset is everything the tippecanoe filter shows at z≤7 (≤ -50m).
-    # If SPLIT_ZOOM changes, retune both against the filter in scripts/contour.
+    # Tuned for SPLIT_ZOOM=5 (lowzoom owns z0–4). -tr 0.08 ≈ z4 pixel (~0.088°);
+    # the levels are all the tippecanoe filter shows at z≤4 (≤ -1000m). Chaikin
+    # corner-smoothing is invisible at these zooms, so skip it. If SPLIT_ZOOM
+    # changes, retune -tr and the levels against the filter in scripts/contour.
     LOWDEM="${WORK_DIR}/gebco_lowzoom.tif"
-    gdalwarp -tr 0.01 0.01 -r bilinear -overwrite "${DEM}" "${LOWDEM}" >&2
-    MIN_ZOOM=0 MAX_ZOOM="${TOPZ}" SKIP_SLOPE_SMOOTH=1 \
-      CONTOUR_LEVELS="-10000 -8000 -6000 -5000 -4000 -3000 -2000 -1500 -1000 -500 -200 -150 -100 -75 -50" \
+    gdalwarp -tr 0.08 0.08 -r bilinear -overwrite "${DEM}" "${LOWDEM}" >&2
+    MIN_ZOOM=0 MAX_ZOOM="${TOPZ}" SKIP_SLOPE_SMOOTH=1 SKIP_CHAIKIN=1 \
+      CONTOUR_LEVELS="-10000 -8000 -6000 -5000 -4000 -3000 -2000 -1500 -1000" \
       OUT_MBTILES="${WORK_DIR}/contour_lowzoom.mbtiles" \
       "${SCRIPT_DIR}/contour" "${LOWDEM}"
     ;;

@@ -17,11 +17,11 @@ on:
       shard_cols:
         description: "Shard grid columns (must divide 2**split_zoom)"
         required: false
-        default: "4"
+        default: "8"
       shard_rows:
         description: "Shard grid rows (must divide 2**split_zoom)"
         required: false
-        default: "4"
+        default: "8"
 
 env:
   GEBCO_YEAR: "2026"
@@ -29,9 +29,9 @@ env:
   MAX_ZOOM: ${{ github.event.inputs.max_zoom || '9' }}
   # Sharding: cells own SPLIT_ZOOM..MAX_ZOOM within their bbox; a global low-zoom
   # job owns 0..SPLIT_ZOOM-1. See SCALING.md.
-  SPLIT_ZOOM: "8"
-  SHARD_COLS: ${{ github.event.inputs.shard_cols || '4' }}
-  SHARD_ROWS: ${{ github.event.inputs.shard_rows || '4' }}
+  SPLIT_ZOOM: "5"
+  SHARD_COLS: ${{ github.event.inputs.shard_cols || '8' }}
+  SHARD_ROWS: ${{ github.event.inputs.shard_rows || '8' }}
   IMAGE: ghcr.io/${{ github.repository }}
   # CEDA firewalls cloud-runner IPs, so CI pulls the source zip from our own R2
   # mirror instead (GEBCO is public domain). Seed it once with:
