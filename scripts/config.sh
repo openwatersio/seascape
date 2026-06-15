@@ -33,7 +33,9 @@ BBOX="${BBOX:-}"
 # ─── Contour levels ──────────────────────────────────────────────────────────
 # Non-uniform: fine intervals for shallow water, coarse for deep.
 # Must be in increasing order (most negative first) for gdal_contour -fl.
-CONTOUR_LEVELS="-10000 -8000 -6000 -5000 -4000 -3000 -2000 -1500 -1000 -500 -200 -150 -100 -75 -50 -45 -40 -35 -30 -25 -20 -15 -14 -13 -12 -11 -10 -9 -8 -7 -6 -5 -4 -3 -2 -1"
+# Overridable so the sharded low-zoom band can pass only the deep levels that
+# render at z≤7 (see SCALING.md / the tippecanoe filter in scripts/contour).
+CONTOUR_LEVELS="${CONTOUR_LEVELS:--10000 -8000 -6000 -5000 -4000 -3000 -2000 -1500 -1000 -500 -200 -150 -100 -75 -50 -45 -40 -35 -30 -25 -20 -15 -14 -13 -12 -11 -10 -9 -8 -7 -6 -5 -4 -3 -2 -1}"
 
 # ─── Terrain RGB ──────────────────────────────────────────────────────────────
 # GEBCO is 15 arc-second (~450m at equator). Zoom 9 ≈ 305m/pixel — a good

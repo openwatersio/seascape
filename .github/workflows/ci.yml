@@ -14,11 +14,24 @@ on:
         description: "Maximum contour tile zoom level"
         required: false
         default: "9"
+      shard_cols:
+        description: "Shard grid columns (must divide 2**split_zoom)"
+        required: false
+        default: "4"
+      shard_rows:
+        description: "Shard grid rows (must divide 2**split_zoom)"
+        required: false
+        default: "4"
 
 env:
   GEBCO_YEAR: "2026"
   BBOX: ${{ github.event.inputs.bbox || '' }}
   MAX_ZOOM: ${{ github.event.inputs.max_zoom || '9' }}
+  # Sharding: cells own SPLIT_ZOOM..MAX_ZOOM within their bbox; a global low-zoom
+  # job owns 0..SPLIT_ZOOM-1. See SCALING.md.
+  SPLIT_ZOOM: "8"
+  SHARD_COLS: ${{ github.event.inputs.shard_cols || '4' }}
+  SHARD_ROWS: ${{ github.event.inputs.shard_rows || '4' }}
   IMAGE: ghcr.io/${{ github.repository }}
   # CEDA firewalls cloud-runner IPs, so CI pulls the source zip from our own R2
   # mirror instead (GEBCO is public domain). Seed it once with:
@@ -73,64 +86,146 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # terrain and contour run as separate parallel jobs (own runner = full disk
-  # each), so global builds fit without sharing the multi-GB DEM between them.
-  tiles:
+  # Compute the tile-aligned shard grid → JSON matrix for the cell jobs.
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      cells: ${{ steps.gen.outputs.cells }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: gen
+        run: echo "cells=$(python3 scripts/shard-cells "${SHARD_COLS}" "${SHARD_ROWS}" "${SPLIT_ZOOM}")" >> "$GITHUB_OUTPUT"
+
+  # High-zoom detail, sharded geographically: each cell builds z(SPLIT_ZOOM)–MAX_ZOOM
+  # terrain + contour for its bbox. Tiles are disjoint across cells (tile-aligned),
+  # so the merge is a plain union. Cells beyond ~20 just queue.
+  cells:
+    needs: [image, prepare, plan]
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: read }
+    strategy:
+      fail-fast: false
+      matrix:
+        cell: ${{ fromJSON(needs.plan.outputs.cells) }}
+        step: [terrain, contour]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with: { tool-cache: true, android: true, dotnet: true, haskell: true, large-packages: true, swap-storage: true }
+      - name: Cache GEBCO source
+        uses: actions/cache@v4
+        with:
+          path: data/gebco_${{ env.GEBCO_YEAR }}.zip
+          key: gebco-${{ env.GEBCO_YEAR }}
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build ${{ matrix.step }} ${{ matrix.cell.id }} (z${{ env.SPLIT_ZOOM }}–${{ env.MAX_ZOOM }})
+        run: |
+          set -euo pipefail
+          OUT="/app/work/${{ matrix.step }}_${{ matrix.cell.id }}.mbtiles"
+          run() { docker run --rm \
+            -e BBOX="${{ matrix.cell.bbox }}" -e GEBCO_YEAR -e GEBCO_URL \
+            -e MIN_ZOOM="${SPLIT_ZOOM}" -e MAX_ZOOM -e TERRAIN_MAX_ZOOM="${MAX_ZOOM}" -e OUT_MBTILES="$OUT" \
+            -v "${{ github.workspace }}/data:/app/data" -v "${{ github.workspace }}/work:/app/work" \
+            "${IMAGE}:${{ github.sha }}" "$@"; }
+          run download
+          run ${{ matrix.step }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: band-${{ matrix.step }}-${{ matrix.cell.id }}
+          path: work/${{ matrix.step }}_${{ matrix.cell.id }}.mbtiles
+          if-no-files-found: error
+
+  # Low zoom can't be sharded (a z0 tile spans the globe). Terrain is cheap from
+  # the full DEM. Contour would regenerate every feature, so it runs on a
+  # downsampled DEM with only the deep levels that render at z<SPLIT_ZOOM.
+  lowzoom:
     needs: [image, prepare]
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: read
+    permissions: { contents: read, packages: read }
     strategy:
       fail-fast: false
       matrix:
         step: [terrain, contour]
     steps:
       - uses: actions/checkout@v6
-
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: true
-
-      # Cache the downloaded GEBCO zip (~4.2 GB) keyed by year so re-runs skip
-      # the curl. The download step re-extracts + clips from it each run.
+        with: { tool-cache: true, android: true, dotnet: true, haskell: true, large-packages: true, swap-storage: true }
       - name: Cache GEBCO source
         uses: actions/cache@v4
         with:
           path: data/gebco_${{ env.GEBCO_YEAR }}.zip
           key: gebco-${{ env.GEBCO_YEAR }}
-
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build ${{ matrix.step }} tiles
+      - name: Build ${{ matrix.step }} low-zoom band (z0 to SPLIT_ZOOM-1)
         run: |
-          docker run --rm \
-            -e BBOX="${BBOX}" -e MAX_ZOOM="${MAX_ZOOM}" -e GEBCO_YEAR="${GEBCO_YEAR}" -e GEBCO_URL="${GEBCO_URL}" \
-            -v "${{ github.workspace }}/data:/app/data" \
-            -v "${{ github.workspace }}/work:/app/work" \
-            -v "${{ github.workspace }}/output:/app/output" \
-            "${IMAGE}:${{ github.sha }}" download
-          docker run --rm \
-            -e BBOX="${BBOX}" -e MAX_ZOOM="${MAX_ZOOM}" -e GEBCO_YEAR="${GEBCO_YEAR}" -e GEBCO_URL="${GEBCO_URL}" \
-            -v "${{ github.workspace }}/data:/app/data" \
-            -v "${{ github.workspace }}/work:/app/work" \
-            -v "${{ github.workspace }}/output:/app/output" \
-            "${IMAGE}:${{ github.sha }}" ${{ matrix.step }}
-
-      - name: Upload ${{ matrix.step }} artifact
-        uses: actions/upload-artifact@v4
+          set -euo pipefail
+          TOPZ=$(( SPLIT_ZOOM - 1 ))
+          dk() { docker run --rm -e GEBCO_YEAR -e GEBCO_URL \
+            -v "${{ github.workspace }}/data:/app/data" -v "${{ github.workspace }}/work:/app/work" \
+            "${IMAGE}:${{ github.sha }}" "$@"; }
+          dk download   # global DEM → /app/work/gebco_clipped.tif
+          if [ "${{ matrix.step }}" = contour ]; then
+            # Downsample to ~z7 pixel size (~0.011°) so gdal_contour stays small,
+            # and keep only levels that render at z≤TOPZ (deeper than -50m).
+            dk gdalwarp -tr 0.01 0.01 -r bilinear -overwrite /app/work/gebco_clipped.tif /app/work/gebco_lowzoom.tif
+            docker run --rm \
+              -e MIN_ZOOM=0 -e MAX_ZOOM="$TOPZ" -e SKIP_SLOPE_SMOOTH=1 \
+              -e CONTOUR_LEVELS="-10000 -8000 -6000 -5000 -4000 -3000 -2000 -1500 -1000 -500 -200 -150 -100 -75 -50" \
+              -e OUT_MBTILES=/app/work/contour_lowzoom.mbtiles \
+              -v "${{ github.workspace }}/data:/app/data" -v "${{ github.workspace }}/work:/app/work" \
+              "${IMAGE}:${{ github.sha }}" contour /app/work/gebco_lowzoom.tif
+          else
+            docker run --rm \
+              -e MIN_ZOOM=0 -e TERRAIN_MAX_ZOOM="$TOPZ" -e OUT_MBTILES=/app/work/terrain_lowzoom.mbtiles \
+              -v "${{ github.workspace }}/data:/app/data" -v "${{ github.workspace }}/work:/app/work" \
+              "${IMAGE}:${{ github.sha }}" terrain
+          fi
+      - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.step }}
+          name: band-${{ matrix.step }}-lowzoom
+          path: work/${{ matrix.step }}_lowzoom.mbtiles
+          if-no-files-found: error
+
+  # Union all bands (low-zoom + cells) into one tileset per layer, then PMTiles.
+  merge:
+    needs: [cells, lowzoom]
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: read }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v4
+        with: { path: bands, pattern: band-*, merge-multiple: true }
+      - name: Merge bands → PMTiles
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          dk() { docker run --rm \
+            -v "${{ github.workspace }}/bands:/app/bands" -v "${{ github.workspace }}/output:/app/output" \
+            "${IMAGE}:${{ github.sha }}" "$@"; }
+          # Terrain is raster (real `tiles` table) → sqlite union, then PMTiles.
+          dk bash -c "merge-tiles /app/output/terrain.mbtiles /app/bands/terrain_*.mbtiles"
+          dk pmtiles convert /app/output/terrain.mbtiles /app/output/terrain.pmtiles
+          # Contour is vector: tippecanoe MBTiles expose `tiles` as a VIEW (can't be
+          # indexed), so tile-join unions the bands — straight to PMTiles.
+          dk bash -c "tile-join -f -o /app/output/contours.pmtiles /app/bands/contour_*.mbtiles"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tiles
           path: output/*.pmtiles
           if-no-files-found: error
 
@@ -158,13 +253,13 @@ jobs:
   # Push the tiles to Cloudflare R2 (served at tiles.openwaters.io).
   publish-r2:
     if: github.event_name == 'release'
-    needs: tiles
+    needs: merge
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
+          name: tiles
           path: artifacts
-          merge-multiple: true
       - name: Upload tiles to R2
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
