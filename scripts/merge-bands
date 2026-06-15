@@ -18,9 +18,17 @@ mkdir -p "${OUT}"
 
 log "Merging terrain bands (sqlite union)..."
 "${SCRIPT_DIR}/merge-tiles" "${OUT}/terrain.mbtiles" "${BANDS}"/terrain_*.mbtiles >/dev/null
-pmtiles convert "${OUT}/terrain.mbtiles" "${OUT}/terrain.pmtiles" >&2
+# Free the bands before the pmtiles tempfile grows — otherwise bands + merged
+# mbtiles + tempfile coexist and fill the disk.
+rm -f "${BANDS}"/terrain_*.mbtiles
+# --tmpdir on the output filesystem so convert *renames* its tempfile into place
+# instead of copying it (a cross-filesystem /tmp → output copy means input +
+# tempfile + copy ≈ 3× the tileset, which overflows the runner).
+pmtiles convert --tmpdir "${OUT}" "${OUT}/terrain.mbtiles" "${OUT}/terrain.pmtiles" >&2
+rm -f "${OUT}/terrain.mbtiles"
 
 log "Merging contour bands (tile-join)..."
 tile-join -f -o "${OUT}/contours.pmtiles" "${BANDS}"/contour_*.mbtiles >&2
+rm -f "${BANDS}"/contour_*.mbtiles
 
 log "Merged: ${OUT}/terrain.pmtiles, ${OUT}/contours.pmtiles"
