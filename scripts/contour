@@ -132,6 +132,7 @@ else
     -A '<a href="https://www.gebco.net">GEBCO</a>' \
     -N "Bathymetric contour lines derived from the GEBCO grid." \
     -Z "${MIN_ZOOM}" -z "${MAX_ZOOM}" -P -q \
+    --drop-densest-as-needed \
     -y depth_m -y depth_abs_m \
     -j '{
       "*": [
