@@ -1,0 +1,21 @@
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+main = "src/index.ts"
+name = "bathymetry-tiles"
+
+# R2 bucket holding the published bundles: planet.pmtiles, <source>.pmtiles,
+# contours.pmtiles, manifest.json. `wrangler dev` backs this with a LOCAL sim —
+# populate it from pipelines/store/bundle via `npm run seed` (see seed.sh).
+[[r2_buckets]]
+binding = "TILES"
+bucket_name = "openwaters-tiles"
+
+[vars]
+# Key prefix within the bucket (e.g. "bathymetry/" in production); "" = root.
+TILES_PREFIX = ""
+
+# jSquash WebP codecs are imported as WebAssembly modules.
+[[rules]]
+fallthrough = true
+globs = ["**/*.wasm"]
+type = "CompiledWasm"

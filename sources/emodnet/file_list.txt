@@ -1,0 +1,3 @@
+# EMODnet 2024 ERDDAP griddap. source_download fetches only the fetch_bbox NetCDF
+# subset (the full grid is ~136 GB).
+https://erddap.emodnet.eu/erddap/griddap/bathymetry_2024

@@ -1,0 +1,9 @@
+# NOAA CUDEM — NY/NJ harbor. Run from pipelines/:  just ../sources/cudem_ne/
+# Read from public S3 via /vsis3/, clipped to fetch_bbox. No datum transform.
+[no-cd]
+default:
+    uv run python source_download_s3.py cudem_ne --bbox -74.2,40.45,-73.85,40.75
+    uv run python source_normalize.py cudem_ne --crs EPSG:4269
+    uv run python source_bounds.py cudem_ne
+    uv run python source_polygonize.py cudem_ne 8
+    uv run python source_create_tarball.py cudem_ne

@@ -1,61 +1,34 @@
 FROM ubuntu:24.04
 
 LABEL org.opencontainers.image.source="https://github.com/openwatersio/gebco-tiles"
-LABEL org.opencontainers.image.description="GEBCO bathymetry to vector tile pipeline"
+LABEL org.opencontainers.image.description="Bathymetry → tile pipeline)"
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# GDAL (with Python bindings for terrain-rgb encoding), jq, and build deps.
-RUN apt-get update && apt-get install -y \
+# GDAL CLI (invoked as a subprocess by the pipeline) + build deps for tippecanoe.
+RUN apt-get update && apt-get install -y --no-install-recommends \
     gdal-bin \
-    python3-gdal \
-    python3-numpy \
-    python3-pip \
-    python3-venv \
-    bc \
-    jq \
-    curl \
-    unzip \
-    sqlite3 \
-    build-essential \
-    libsqlite3-dev \
-    zlib1g-dev \
-    git \
+    ca-certificates curl git \
+    build-essential libsqlite3-dev zlib1g-dev \
   && rm -rf /var/lib/apt/lists/*
 
-# Install rio-rgbify (Terrain-RGB encoding) + scipy (scripts/blur) into a venv.
-# rio-rgbify pulls in NumPy 2.x and rasterio, so scipy must come from pip too —
-# the apt python3-scipy is built for NumPy 1.x and crashes under 2.x. rasterio
-# from pip also provides the `rio` CLI, so do NOT apt-install python3-rasterio
-# (system-site-packages would satisfy the dep and pip would skip it → no `rio`).
-# scripts/blur runs this venv python (first on PATH): numpy/scipy/rasterio from
-# pip here, gdal from system-site-packages.
-RUN python3 -m venv --system-site-packages /opt/rio-venv \
-  && /opt/rio-venv/bin/pip install --no-cache-dir rio-rgbify scipy
-ENV PATH="/opt/rio-venv/bin:$PATH"
-
-# Install tippecanoe (Felt fork).
+# tippecanoe + tile-join (Felt fork) — contour vector tiles.
 RUN git clone --depth 1 https://github.com/felt/tippecanoe.git /tmp/tippecanoe \
-  && cd /tmp/tippecanoe \
-  && make -j$(nproc) \
-  && make install \
-  && rm -rf /tmp/tippecanoe
+  && cd /tmp/tippecanoe && make -j"$(nproc)" && make install && rm -rf /tmp/tippecanoe
 
-# Install pmtiles CLI.
-RUN ARCH=$(dpkg --print-architecture) \
-  && case "${ARCH}" in amd64) ARCH=x86_64;; arm64) ;; *) echo "Unsupported arch: ${ARCH}" && exit 1;; esac \
-  && VERSION=$(curl -sL -o /dev/null -w '%{url_effective}' https://github.com/protomaps/go-pmtiles/releases/latest | grep -oE '[^/]+$') \
-  && curl -L -o /tmp/go-pmtiles.tar.gz \
-    "https://github.com/protomaps/go-pmtiles/releases/download/${VERSION}/go-pmtiles_${VERSION#v}_Linux_${ARCH}.tar.gz" \
-  && tar -xzf /tmp/go-pmtiles.tar.gz -C /usr/local/bin pmtiles \
-  && chmod +x /usr/local/bin/pmtiles \
-  && rm /tmp/go-pmtiles.tar.gz
+# just (task runner) + uv (Python env manager) — the pipeline's two entrypoints.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh \
+      | bash -s -- --to /usr/local/bin
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
 
+# The Python engine (rasterio/scipy/pmtiles/geopandas/… from wheels; GDAL stays CLI).
 WORKDIR /app
-COPY scripts/ /app/scripts/
-RUN chmod +x /app/scripts/*
-ENV PATH="/app/scripts:$PATH"
+COPY pipelines/ /app/pipelines/
+COPY sources/ /app/sources/
+COPY Justfile /app/Justfile
+RUN cd pipelines && uv sync --frozen
+ENV PATH="/app/pipelines/.venv/bin:${PATH}"
 
-# No ENTRYPOINT: run a specific step, e.g. `docker run img build` (full pipeline),
-# or `docker run img terrain` / `docker run img contour` for individual artifacts.
-CMD ["build"]
+# Recipes run from /app; the Justfile redirects into pipelines/ itself. e.g.
+# `docker run img just planet` (set BBOX=… for a region) or `… just source <id>`.
+CMD ["just", "--list"]

@@ -1,0 +1,5 @@
+# Danmarks Dybdemodel 50 m — single GeoTIFF via the public SDFI weblink (the
+# api.dataforsyningen.dk WCS gateway needs a token; the Atom-feed download does
+# not). EPSG:3034, stored as positive-down depth → negate. The & query-string
+# chars are why source_download uses requests, not a shell.
+https://ftp.sdfe.dk/main.html?download&weblink=b4324b6389898704fd8ec7484882dbf3&subfolder=2024&realfilename=ddm%5F50m%2Edybde%2Etiff

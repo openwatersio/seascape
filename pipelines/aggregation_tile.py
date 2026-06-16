@@ -1,0 +1,70 @@
+"""Cut one aggregation tile's merged DEM into single-zoom Terrarium PMTiles.
+
+Vendored from mapterhorn (BSD-3). child_z is derived from the de-buffered raster
+width; each 512x512 window is Terrarium-encoded via utils.save_terrarium_tile
+(our encode.py — conservative per-zoom quantization) and packed into one
+single-zoom PMTiles in the z7-sharded store/pmtiles.
+"""
+
+import json
+import math
+import os
+from glob import glob
+
+import mercantile
+import rasterio
+
+import utils
+
+NODATA = -9999
+
+
+def create_tile(i, j, tiff_filepath, out_filepath, buffer_pixels):
+    col_start = i * 512 + buffer_pixels
+    row_start = j * 512 + buffer_pixels
+    window = rasterio.windows.Window(col_off=col_start, row_off=row_start, width=512, height=512)
+    with rasterio.open(tiff_filepath) as src:
+        subdata = src.read(1, window=window, out_shape=(512, 512))
+    subdata[subdata == NODATA] = 0
+    utils.save_terrarium_tile(subdata, out_filepath)
+
+
+def create_tiles(tmp_folder, aggregation_tile, tiff_filepath, buffer_pixels):
+    with rasterio.open(tiff_filepath) as src:
+        assert src.block_shapes[0] == (512, 512)
+        horizontal_block_count = (src.width - 2 * buffer_pixels) / 512
+        assert math.floor(horizontal_block_count) == horizontal_block_count
+        child_z = aggregation_tile.z + int(math.log2(horizontal_block_count))
+    span = 2 ** (child_z - aggregation_tile.z)
+    x_min = aggregation_tile.x * span
+    y_min = aggregation_tile.y * span
+    for i, x in enumerate(range(x_min, x_min + span)):
+        for j, y in enumerate(range(y_min, y_min + span)):
+            create_tile(i, j, tiff_filepath, f"{tmp_folder}/{child_z}-{x}-{y}.webp", buffer_pixels)
+
+
+def main(filepath):
+    aggregation_id, filename = filepath.split("/")[-2:]
+    z, x, y, child_z = (int(a) for a in filename.replace("-aggregation.csv", "").split("-"))
+    tmp_folder = f"store/aggregation/{aggregation_id}/{z}-{x}-{y}-{child_z}-tmp"
+
+    if os.path.isfile(f"{tmp_folder}/pmtiles-done"):
+        print(f"tiling {filename} already done...")
+        return
+    if not os.path.isfile(f"{tmp_folder}/merge-done"):
+        print("merge not done yet...")
+        return
+
+    with open(f"{tmp_folder}/reprojection.json") as f:
+        buffer_pixels = json.load(f)["buffer_pixels"]
+
+    num_tiffs = len(glob(f"{tmp_folder}/*.tiff"))
+    tiff_filepath = f"{tmp_folder}/{num_tiffs - 1}-3857.tiff"
+
+    aggregation_tile = mercantile.Tile(x=x, y=y, z=z)
+    out_folder = utils.get_pmtiles_folder(x, y, z)
+    utils.create_folder(out_folder)
+    out_filepath = f"{out_folder}/{z}-{x}-{y}-{child_z}.pmtiles"
+    create_tiles(tmp_folder, aggregation_tile, tiff_filepath, buffer_pixels)
+    utils.create_archive(tmp_folder, out_filepath)
+    utils.run_command(f"touch {tmp_folder}/pmtiles-done")

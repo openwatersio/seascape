@@ -1,0 +1,9 @@
+# NOAA CUDEM — Puget Sound. Run from pipelines/:  just ../sources/cudem_puget/
+# Read from public S3 via /vsis3/, clipped to fetch_bbox. No datum transform.
+[no-cd]
+default:
+    uv run python source_download_s3.py cudem_puget --bbox -122.55,47.4,-122.2,47.8
+    uv run python source_normalize.py cudem_puget --crs EPSG:4269
+    uv run python source_bounds.py cudem_puget
+    uv run python source_polygonize.py cudem_puget 8
+    uv run python source_create_tarball.py cudem_puget

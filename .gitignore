@@ -2,6 +2,10 @@ data/
 work/
 output/
 dist/
+# pipeline stages + bundle output all write under pipelines/store/
+pipelines/store/
 .venv/
 node_modules
 .envrc
+__pycache__
+.playwright-mcp

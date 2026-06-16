@@ -1,5 +1,19 @@
 name: Build
 
+# Build pipeline (see CONTRIBUTING.md / the port plan):
+#   image → sources (per-source matrix) → plan (cover + diff) → aggregate
+#   (sharded fan-out) → bundle → publish/worker/pages.
+#
+# State lives in R2 under a single persistent prefix `store/` (the consolidated
+# pipelines/store dir) so rebuilds are incremental: `plan` diffs the new covering
+# against the previous one and only the changed aggregation tiles get rebuilt;
+# clean tiles' pmtiles/contours are reused straight from the store. Final bundles
+# land in build/<sha>/ and are promoted to bathymetry/<year>/ on release.
+#
+# The heavy build runs on the default branch, releases, and manual dispatch only
+# (a shared incremental store shouldn't be mutated from every feature branch); any
+# branch can trigger a build via workflow_dispatch (optionally with a BBOX).
+
 on:
   push:
   release:
@@ -7,81 +21,38 @@ on:
   workflow_dispatch:
     inputs:
       bbox:
-        description: 'Bounding box "west,south,east,north" (empty = full global)'
+        description: 'Bounding box "W,S,E,N" (empty = full global)'
         required: false
         default: ""
-      max_zoom:
-        description: "Maximum contour tile zoom level"
+      shards:
+        description: "Aggregate matrix shards (<= 256)"
         required: false
-        default: "9"
-      shard_cols:
-        description: "Shard grid columns (must divide 2**split_zoom)"
-        required: false
-        default: "8"
-      shard_rows:
-        description: "Shard grid rows (must divide 2**split_zoom)"
-        required: false
-        default: "8"
+        default: "24"
 
 env:
-  GEBCO_YEAR: "2026"
-  BBOX: ${{ github.event.inputs.bbox || '' }}
-  MAX_ZOOM: ${{ github.event.inputs.max_zoom || '9' }}
-  # Sharding: cells own SPLIT_ZOOM..MAX_ZOOM within their bbox; a global low-zoom
-  # job owns 0..SPLIT_ZOOM-1. See SCALING.md.
-  SPLIT_ZOOM: "5"
-  SHARD_COLS: ${{ github.event.inputs.shard_cols || '8' }}
-  SHARD_ROWS: ${{ github.event.inputs.shard_rows || '8' }}
   IMAGE: ghcr.io/${{ github.repository }}
-  # CEDA firewalls cloud-runner IPs, so CI pulls the source zip from our own R2
-  # mirror instead (GEBCO is public domain). Seed it once with:
-  #   curl -L -o gebco_2026_geotiff.zip "<CEDA url from scripts/config.sh>"
-  #   aws s3 cp gebco_2026_geotiff.zip s3://<bucket>/source/ --endpoint-url <r2>
-  # Keep the year here in sync with GEBCO_YEAR. Local dev still uses CEDA.
-  GEBCO_URL: https://tiles.openwaters.io/source/gebco_2026_geotiff.zip
+  GEBCO_YEAR: "2026"
+  # Bucket the serving Worker reads from (its R2 binding in worker/wrangler.toml).
+  R2_BUCKET: openwaters-tiles
+  AGG_SHARDS: ${{ github.event.inputs.shards || '24' }}
+  BBOX: ${{ github.event.inputs.bbox || '' }}
+  # R2 via the S3 API (aws-cli v2 honours AWS_ENDPOINT_URL).
+  AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  AWS_DEFAULT_REGION: auto
+  AWS_ENDPOINT_URL: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
 
-# Supersede in-progress runs on the same branch when a new push lands — but
-# never cancel a release publish mid-flight.
+# Supersede in-progress runs on the same branch — but never cancel a release.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name != 'release' }}
 
 jobs:
-  # Download + extract the GEBCO grid once and cache the *extracted* tifs/VRT
-  # (not just the zip), so the ~30 shard jobs each skip the unzip+VRT and only
-  # clip their bbox. On a cache hit this whole job is a no-op.
-  prepare:
-    needs: image
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: read
-    steps:
-      - uses: actions/checkout@v6
-      - name: Cache extracted GEBCO grid
-        id: grid-cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            data/gebco_${{ env.GEBCO_YEAR }}*.tif
-            data/gebco_${{ env.GEBCO_YEAR }}.vrt
-          key: gebco-grid-${{ env.GEBCO_YEAR }}
-      - uses: ./.github/actions/ghcr-login
-        if: steps.grid-cache.outputs.cache-hit != 'true'
-      - name: Extract GEBCO grid
-        if: steps.grid-cache.outputs.cache-hit != 'true'
-        run: |
-          docker run --rm -e GEBCO_YEAR -e GEBCO_URL \
-            -v "${{ github.workspace }}/data:/app/data" -v "${{ github.workspace }}/work:/app/work" \
-            "${IMAGE}:${{ github.sha }}" download
-
-  # Build the toolchain image once and push to GHCR. buildx GHA cache means it
-  # only recompiles (tippecanoe etc.) when the Dockerfile changes.
+  # Build + push the toolchain image. buildx GHA cache → only recompiles when the
+  # Dockerfile changes.
   image:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
+    permissions: { contents: read, packages: write }
     steps:
       - uses: actions/checkout@v6
       - uses: docker/setup-buildx-action@v3
@@ -94,164 +65,158 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # Compute the tile-aligned shard grid → JSON matrix for the cell jobs.
-  plan:
+  # Offline self-checks (synthetic data, no network/R2) on every push — fast
+  # validation that the image toolchain produces correct results.
+  check:
+    needs: image
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: read }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/ghcr-login
+      - name: Engine + source self-checks
+        run: |
+          docker run --rm "$IMAGE:${{ github.sha }}" just test-sources
+          docker run --rm "$IMAGE:${{ github.sha }}" just test-engine
+
+  # ─── Build (default branch / release / dispatch) ───────────────────────────
+  # Enumerate the sources (one dir per source) into a matrix.
+  discover:
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     outputs:
-      cells: ${{ steps.gen.outputs.cells }}
+      sources: ${{ steps.l.outputs.sources }}
     steps:
       - uses: actions/checkout@v6
-      - id: gen
-        run: echo "cells=$(scripts/shard-cells "${SHARD_COLS}" "${SHARD_ROWS}" "${SPLIT_ZOOM}")" >> "$GITHUB_OUTPUT"
+      - id: l
+        run: echo "sources=$(ls -1 sources | jq -R -s -c 'split("\n")|map(select(length>0))')" >> "$GITHUB_OUTPUT"
 
-  # High-zoom detail, sharded geographically: each cell builds z(SPLIT_ZOOM)–MAX_ZOOM
-  # terrain + contour for its bbox. Tiles are disjoint across cells (tile-aligned),
-  # so the merge is a plain union. Cells beyond ~20 just queue.
-  cells:
-    needs: [image, prepare, plan]
+  # Prepare each source (fetch → datum → normalize → bounds → polygon → tarball)
+  # and push its store/source/<id> to R2. One source failing doesn't sink the rest
+  # (the covering simply omits it). Cache skips re-fetching unchanged sources.
+  sources:
+    needs: [image, discover]
     runs-on: ubuntu-latest
     permissions: { contents: read, packages: read }
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
-        cell: ${{ fromJSON(needs.plan.outputs.cells) }}
-        step: [terrain, contour]
+        source: ${{ fromJSON(needs.discover.outputs.sources) }}
     steps:
       - uses: actions/checkout@v6
-      # Ocean-heavy contour shards stage large intermediate FlatGeobufs; reclaim
-      # disk for them. Terrain cells are small and skip this.
+      - uses: ./.github/actions/ghcr-login
+      # GEBCO's 4 GB zip + extract needs headroom.
       - name: Free disk space
-        if: matrix.step == 'contour'
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: true
-      - name: Cache extracted GEBCO grid
+        if: matrix.source == 'gebco'
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with: { tool-cache: true, android: true, dotnet: true, haskell: true, large-packages: true, swap-storage: true }
+      - name: Cache prepared source
         uses: actions/cache@v4
         with:
-          path: |
-            data/gebco_${{ env.GEBCO_YEAR }}*.tif
-            data/gebco_${{ env.GEBCO_YEAR }}.vrt
-          key: gebco-grid-${{ env.GEBCO_YEAR }}
-      - uses: ./.github/actions/ghcr-login
-      - name: Build ${{ matrix.step }} ${{ matrix.cell.id }} (z${{ env.SPLIT_ZOOM }}–${{ env.MAX_ZOOM }})
+          path: store/source/${{ matrix.source }}
+          key: source-${{ matrix.source }}-${{ hashFiles(format('sources/{0}/**', matrix.source)) }}
+      - name: Prepare ${{ matrix.source }}
         run: |
-          set -euo pipefail
-          OUT="/app/work/${{ matrix.step }}_${{ matrix.cell.id }}.mbtiles"
-          run() { docker run --rm \
-            -e BBOX="${{ matrix.cell.bbox }}" -e GEBCO_YEAR -e GEBCO_URL \
-            -e MIN_ZOOM="${SPLIT_ZOOM}" -e MAX_ZOOM -e TERRAIN_MAX_ZOOM="${MAX_ZOOM}" -e OUT_MBTILES="$OUT" \
-            -v "${{ github.workspace }}/data:/app/data" -v "${{ github.workspace }}/work:/app/work" \
-            "${IMAGE}:${{ github.sha }}" "$@"; }
-          run download
-          run ${{ matrix.step }}
-      - name: Upload band to R2 build
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
-        run: |
-          BAND="work/${{ matrix.step }}_${{ matrix.cell.id }}.mbtiles"
-          # All-land contour shards produce no band — nothing to upload.
-          if [ ! -f "$BAND" ]; then echo "No band produced; skipping upload."; exit 0; fi
-          aws s3 cp "$BAND" \
-            "s3://${{ secrets.R2_BUCKET }}/build/${{ github.sha }}/bands/${{ matrix.step }}_${{ matrix.cell.id }}.mbtiles" \
-            --endpoint-url "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
-
-  # Low zoom can't be sharded (a z0 tile spans the globe). Terrain is cheap from
-  # the full DEM. Contour would regenerate every feature, so it runs on a
-  # downsampled DEM with only the deep levels that render at z<SPLIT_ZOOM.
-  lowzoom:
-    needs: [image, prepare]
-    runs-on: ubuntu-latest
-    permissions: { contents: read, packages: read }
-    strategy:
-      fail-fast: true
-      matrix:
-        step: [terrain, contour]
-    steps:
-      - uses: actions/checkout@v6
-      - name: Cache extracted GEBCO grid
-        uses: actions/cache@v4
-        with:
-          path: |
-            data/gebco_${{ env.GEBCO_YEAR }}*.tif
-            data/gebco_${{ env.GEBCO_YEAR }}.vrt
-          key: gebco-grid-${{ env.GEBCO_YEAR }}
-      - uses: ./.github/actions/ghcr-login
-      - name: Build ${{ matrix.step }} low-zoom band
-        run: |
-          docker run --rm -e GEBCO_YEAR -e GEBCO_URL -e SPLIT_ZOOM \
-            -v "${{ github.workspace }}/data:/app/data" -v "${{ github.workspace }}/work:/app/work" \
-            "${IMAGE}:${{ github.sha }}" lowzoom ${{ matrix.step }}
-      - name: Upload band to R2 build
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
-        run: |
-          aws s3 cp "work/${{ matrix.step }}_lowzoom.mbtiles" \
-            "s3://${{ secrets.R2_BUCKET }}/build/${{ github.sha }}/bands/${{ matrix.step }}_lowzoom.mbtiles" \
-            --endpoint-url "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
-
-  # Union all bands (low-zoom + cells) into one tileset per layer, then PMTiles.
-  merge:
-    needs: [cells, lowzoom]
-    runs-on: ubuntu-latest
-    permissions: { contents: read, packages: read }
-    steps:
-      - uses: actions/checkout@v6
-      # Merge assembles the whole tileset on one runner (unlike the small cells),
-      # so reclaim disk here.
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: true
-      - uses: ./.github/actions/ghcr-login
-      - name: Fetch bands from R2 build
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
-        run: |
-          mkdir -p bands
-          aws s3 sync "s3://${{ secrets.R2_BUCKET }}/build/${{ github.sha }}/bands/" bands/ \
-            --endpoint-url "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
-      - name: Merge bands → PMTiles
-        run: |
-          mkdir -p output
+          mkdir -p store
           docker run --rm \
-            -v "${{ github.workspace }}/bands:/app/bands" -v "${{ github.workspace }}/output:/app/output" \
-            "${IMAGE}:${{ github.sha }}" merge-bands /app/bands /app/output
-      # Final PMTiles stay in R2 keyed by commit, so publish is a server-side copy.
-      - name: Upload PMTiles to R2 build
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
+            -v "$PWD/store:/app/pipelines/store" \
+            "$IMAGE:${{ github.sha }}" just source ${{ matrix.source }}
+      - name: Push source to R2
+        run: aws s3 sync "store/source/${{ matrix.source }}" "s3://$R2_BUCKET/store/source/${{ matrix.source }}" --delete
+
+  # Cover the planet into aggregation tiles, diff against the previous covering,
+  # and emit the shard matrix sized to the dirty count.
+  plan:
+    needs: [image, sources]
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: read }
+    outputs:
+      shards: ${{ steps.m.outputs.shards }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/ghcr-login
+      - name: Pull bounds + previous covering from R2
         run: |
-          aws s3 cp output/ "s3://${{ secrets.R2_BUCKET }}/build/${{ github.sha }}/" \
-            --recursive --exclude '*' --include '*.pmtiles' \
-            --content-type application/octet-stream \
-            --endpoint-url "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
-      - name: Clean up bands (keep PMTiles for publish)
-        if: always()
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
+          mkdir -p store/source store/aggregation
+          # Covering only needs each source's bounds.csv (not the full DEM)…
+          aws s3 sync "s3://$R2_BUCKET/store/source" store/source --exclude '*' --include '*/bounds.csv'
+          # …plus the prior covering(s) so the dirty-diff has something to compare to.
+          aws s3 sync "s3://$R2_BUCKET/store/aggregation" store/aggregation
+      - name: Cover
+        run: docker run --rm -e BBOX -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just cover
+      - name: Push covering to R2
+        run: aws s3 sync store/aggregation "s3://$R2_BUCKET/store/aggregation"
+      - id: m
+        name: Emit shard matrix
         run: |
-          aws s3 rm "s3://${{ secrets.R2_BUCKET }}/build/${{ github.sha }}/bands/" --recursive \
-            --endpoint-url "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+          SHARDS=$(docker run --rm -v "$PWD/store:/app/pipelines/store" \
+            "$IMAGE:${{ github.sha }}" just shard-matrix "$AGG_SHARDS" | tail -n1)
+          echo "shards=$SHARDS" >> "$GITHUB_OUTPUT"
+
+  # Reproject → merge → tile → contour for one strided slice of the dirty tiles.
+  # Shards re-derive the same sorted dirty list and never overlap, so each pushes
+  # disjoint tile keys back to the store.
+  aggregate:
+    needs: [image, sources, plan]
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: read }
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/ghcr-login
+      # Dense-coast contour shards stage large FlatGeobufs.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with: { tool-cache: true, android: true, dotnet: true, haskell: true, large-packages: true, swap-storage: true }
+      - name: Pull sources + covering from R2
+        run: |
+          mkdir -p store/source store/aggregation store/pmtiles store/contour
+          aws s3 sync "s3://$R2_BUCKET/store/source" store/source
+          aws s3 sync "s3://$R2_BUCKET/store/aggregation" store/aggregation
+      - name: Aggregate shard ${{ matrix.shard.i }}/${{ matrix.shard.n }}
+        run: |
+          docker run --rm -v "$PWD/store:/app/pipelines/store" \
+            "$IMAGE:${{ github.sha }}" just aggregate ${{ matrix.shard.i }} ${{ matrix.shard.n }}
+      - name: Push tiles + contours + done-markers to R2
+        run: |
+          aws s3 sync store/pmtiles "s3://$R2_BUCKET/store/pmtiles"
+          aws s3 sync store/contour "s3://$R2_BUCKET/store/contour"
+          aws s3 sync store/aggregation "s3://$R2_BUCKET/store/aggregation"
+
+  # Single-runner finish: overview pyramid → planet + per-source overlays +
+  # contours + manifest. Runs even if aggregate had nothing to do (clean rebuild).
+  bundle:
+    needs: aggregate
+    if: ${{ !cancelled() && needs.aggregate.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: read }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/ghcr-login
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with: { tool-cache: true, android: true, dotnet: true, haskell: true, large-packages: true, swap-storage: true }
+      - name: Pull store from R2
+        run: |
+          mkdir -p store
+          aws s3 sync "s3://$R2_BUCKET/store/aggregation" store/aggregation
+          aws s3 sync "s3://$R2_BUCKET/store/pmtiles" store/pmtiles
+          aws s3 sync "s3://$R2_BUCKET/store/contour" store/contour
+      - name: Downsample + bundle
+        run: docker run --rm -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just combine
+      - name: Push pyramid + bundles to R2
+        run: |
+          # Overview tiles + downsampling done-markers feed the next incremental run.
+          aws s3 sync store/pmtiles "s3://$R2_BUCKET/store/pmtiles"
+          aws s3 sync store/aggregation "s3://$R2_BUCKET/store/aggregation"
+          # Final artifacts keyed by commit; release promotes them in place.
+          aws s3 cp store/bundle "s3://$R2_BUCKET/build/${{ github.sha }}/" \
+            --recursive --exclude '*' --include '*.pmtiles' --content-type application/octet-stream
+          aws s3 cp store/bundle/manifest.json "s3://$R2_BUCKET/build/${{ github.sha }}/manifest.json" \
+            --content-type application/json
 
   # The viewer references tiles by URL at runtime, so it builds independently.
   web:
@@ -259,54 +224,58 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-      - name: Build web app
+        with: { node-version: 22, cache: npm }
+      - name: Build viewer
         env:
-          # Released viewer loads tiles from R2; otherwise relative (local dev).
-          TILES_BASE: ${{ github.event_name == 'release' && format('https://tiles.openwaters.io/gebco/{0}', env.GEBCO_YEAR) || '' }}
+          # Released viewer points at the Worker (tiles.openwaters.io); otherwise
+          # the local default (localhost:8787).
+          VITE_TILES_BASE: ${{ github.event_name == 'release' && 'https://tiles.openwaters.io' || '' }}
         run: |
           npm ci
           npm run build
       - uses: actions/upload-pages-artifact@v4
-        with:
-          path: dist
+        with: { path: dist }
 
   # ─── Publish (releases only) ───────────────────────────────────────────────
-  # Push the tiles to Cloudflare R2 (served at tiles.openwaters.io).
+  # Promote this commit's bundles to the served year prefix (server-side copy).
   publish-r2:
     if: github.event_name == 'release'
-    needs: merge
+    needs: bundle
     runs-on: ubuntu-latest
     steps:
-      # Promote the already-built PMTiles within R2 — server-side copy, no
-      # download/upload through the runner.
-      - name: Publish PMTiles to R2
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
+      - name: Promote bundles → bathymetry/${{ env.GEBCO_YEAR }}/
         run: |
-          aws s3 cp "s3://${{ secrets.R2_BUCKET }}/build/${{ github.sha }}/" \
-            "s3://${{ secrets.R2_BUCKET }}/gebco/${GEBCO_YEAR}/" \
-            --recursive --exclude '*' --include '*.pmtiles' \
-            --endpoint-url "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+          aws s3 cp "s3://$R2_BUCKET/build/${{ github.sha }}/" \
+            "s3://$R2_BUCKET/bathymetry/${GEBCO_YEAR}/" --recursive
+
+  # Deploy the serving Worker (reads bathymetry/<year>/ from the same bucket).
+  deploy-worker:
+    if: github.event_name == 'release'
+    needs: publish-r2
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: wrangler deploy
+        working-directory: worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+        run: |
+          npm ci
+          npx wrangler deploy --var "TILES_PREFIX:bathymetry/${GEBCO_YEAR}/"
 
   # Deploy the viewer to GitHub Pages.
   deploy-pages:
     if: github.event_name == 'release'
     needs: web
     runs-on: ubuntu-latest
-    permissions:
-      pages: write
-      id-token: write
+    permissions: { pages: write, id-token: write }
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    concurrency:
-      group: pages
-      cancel-in-progress: false
+    concurrency: { group: pages, cancel-in-progress: false }
     steps:
       - id: deployment
         uses: actions/deploy-pages@v5

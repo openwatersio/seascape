@@ -1,0 +1,11 @@
+.git
+node_modules
+worker/node_modules
+dist
+data
+output
+work
+**/.venv
+pipelines/store
+**/__pycache__
+.playwright-mcp

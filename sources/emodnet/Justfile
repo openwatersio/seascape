@@ -1,0 +1,9 @@
+# EMODnet 2024 — European seas. Run from pipelines/:  just ../sources/emodnet/
+# Fetched as an ERDDAP griddap bbox subset. No datum transform.
+[no-cd]
+default:
+    uv run python source_download_erddap.py emodnet --bbox -36,15,43,90 --var elevation
+    uv run python source_normalize.py emodnet --crs EPSG:4326
+    uv run python source_bounds.py emodnet
+    uv run python source_polygonize.py emodnet 8
+    uv run python source_create_tarball.py emodnet

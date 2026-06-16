@@ -1,0 +1,3 @@
+# NOAA CUDEM master VRT on public S3. source_download reads via /vsis3/ and clips
+# to fetch_bbox, pulling only the intersecting tiles (no bulk download).
+s3://noaa-nos-coastal-lidar-pds/dem/NCEI_ninth_Topobathy_2014_8483/NCEI_ninth_Topobathy_2014_m8483_EPSG-4269.vrt

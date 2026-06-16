@@ -1,20 +1,18 @@
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
-import { Protocol } from "pmtiles";
-
-// ─── PMTiles protocol ─────────────────────────────────────────────────────
-const protocol = new Protocol();
-maplibregl.addProtocol("pmtiles", protocol.tile);
 
 // ─── Tile sources ───────────────────────────────────────────────────────
-// BBOX and TILES_BASE are injected at build time via vite.config.js.
-// eslint-disable-next-line no-undef
-const BBOX = __BBOX__ ? __BBOX__.split(",").map(Number) : [-180, -85, 180, 85];
-const suffix = __BBOX__ ? `_${__BBOX__}` : "";
-// eslint-disable-next-line no-undef
-const tilesBase = __TILES_BASE__ || location.origin;
-const terrainUrl = `pmtiles://${tilesBase}/terrain${suffix}.pmtiles`;
-const contourUrl = `pmtiles://${tilesBase}/contours${suffix}.pmtiles`;
+// The serving Worker (worker/) presents one unified XYZ endpoint per layer:
+//   {base}/bathymetry/terrain/{z}/{x}/{y}    — Terrarium terrain (planet + overlays, overzoomed)
+//   {base}/bathymetry/contours/{z}/{x}/{y}   — MVT contours
+// VITE_BBOX (initial view) and VITE_TILES_BASE (worker URL) come from import.meta.env.
+const BBOX = import.meta.env.VITE_BBOX
+  ? import.meta.env.VITE_BBOX.split(",").map(Number)
+  : [-180, -85, 180, 85];
+const tilesBase = import.meta.env.VITE_TILES_BASE || "http://localhost:8787";
+const terrainTiles = `${tilesBase}/bathymetry/terrain/{z}/{x}/{y}`;
+const contourTiles = `${tilesBase}/bathymetry/contours/{z}/{x}/{y}`;
+const MAX_ZOOM = 13; // deepest source; the Worker overzooms the base for the rest
 
 // ─── Map style ────────────────────────────────────────────────────────────
 const style = {
@@ -31,17 +29,16 @@ const style = {
     },
     "terrain-dem": {
       type: "raster-dem",
-      url: terrainUrl,
+      tiles: [terrainTiles],
       tileSize: 512,
-      // maxzoom auto-detected from the PMTiles header so regional high-res bands render where present
-      encoding: "mapbox",
-      bounds: BBOX,
+      maxzoom: MAX_ZOOM, // Worker overzooms the z8 base for z>8 where no overlay exists
+      encoding: "terrarium",
       attribution: "&copy; <a href='https://www.gebco.net'>GEBCO</a>",
     },
     contours: {
       type: "vector",
-      url: contourUrl,
-      bounds: BBOX,
+      tiles: [contourTiles],
+      maxzoom: MAX_ZOOM,
     },
   },
   layers: [
@@ -145,6 +142,7 @@ const map = new maplibregl.Map({
   bounds: BBOX,
   hash: true,
 });
+window.map = map; // exposed for debugging / verification
 
 map.addControl(new maplibregl.NavigationControl());
 
@@ -164,9 +162,11 @@ const toggles = {
 
 map.on("load", () => {
   for (const [inputId, layerIds] of Object.entries(toggles)) {
-    document.getElementById(inputId).addEventListener("change", (e) => {
+    document.getElementById(inputId)?.addEventListener("change", (e) => {
       const vis = e.target.checked ? "visible" : "none";
-      layerIds.forEach((id) => map.setLayoutProperty(id, "visibility", vis));
+      layerIds.forEach((id) => {
+        if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", vis);
+      });
     });
   }
 });

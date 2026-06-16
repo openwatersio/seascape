@@ -1,0 +1,3 @@
+# GEBCO 2026 global grid, GeoTIFF zip (~4.2 GB). source_download extracts the
+# tiles. Served from our R2 mirror (CEDA firewalls cloud-runner IPs).
+https://tiles.openwaters.io/source/gebco_2026_geotiff.zip

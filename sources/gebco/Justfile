@@ -1,0 +1,11 @@
+# GEBCO 2026 — the global base (source #0). Run from pipelines/:
+#   just ../sources/gebco/
+# Fetched as a zip, then extracted. No datum transform.
+[no-cd]
+default:
+    uv run python source_download.py gebco
+    uv run python source_unzip.py gebco
+    uv run python source_normalize.py gebco --crs EPSG:4326
+    uv run python source_bounds.py gebco
+    uv run python source_polygonize.py gebco 8
+    uv run python source_create_tarball.py gebco

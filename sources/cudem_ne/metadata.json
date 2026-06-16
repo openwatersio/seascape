@@ -1,0 +1,7 @@
+{
+    "name": "NOAA CUDEM 1/9 arc-second (NCEI Topobathy 2014)",
+    "producer": "NOAA NCEI",
+    "website": "https://www.ncei.noaa.gov/products/coastal-relief-model",
+    "license": "public domain (U.S. Government work)",
+    "max_zoom": 13
+}
