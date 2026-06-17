@@ -52,14 +52,26 @@ def create_folder(path):
     Path(path).mkdir(parents=True, exist_ok=True)
 
 
-def http_download(url, dest, chunk=1 << 20):
-    '''Stream a URL to dest with requests (handles query-string URLs; no shell).'''
+def http_download(url, dest, chunk=1 << 20, retries=5):
+    '''Stream a URL to dest with requests (handles query-string URLs; no shell).
+    Retries with backoff on transient network errors — the public data servers
+    (EMODnet, SDFE, …) reset connections under load.'''
+    import time
     import requests
-    with requests.get(url, stream=True, timeout=60) as r:
-        r.raise_for_status()
-        with open(dest, 'wb') as f:
-            for part in r.iter_content(chunk):
-                f.write(part)
+    for attempt in range(retries):
+        try:
+            with requests.get(url, stream=True, timeout=120) as r:
+                r.raise_for_status()
+                with open(dest, 'wb') as f:
+                    for part in r.iter_content(chunk):
+                        f.write(part)
+            return
+        except requests.exceptions.RequestException as e:
+            if attempt == retries - 1:
+                raise
+            wait = 2 ** attempt
+            print(f"  download {url} failed ({e}); retry {attempt + 1}/{retries - 1} in {wait}s")
+            time.sleep(wait)
 
 
 def get_aggregation_ids():
