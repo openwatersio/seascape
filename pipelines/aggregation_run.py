@@ -82,7 +82,15 @@ def dirty_filepaths():
         return pmtiles not in have
 
     dirty = [fp for fp in all_csvs if needs_build(fp)]
-    return [fp for fp in dirty if not os.path.isfile(fp.replace("-aggregation.csv", "-aggregation.done"))]
+    dirty = [fp for fp in dirty if not os.path.isfile(fp.replace("-aggregation.csv", "-aggregation.done"))]
+    # Order heaviest-first so the strided shard slices (dirty[i::n]) each draw a
+    # balanced mix instead of one shard piling up the dense high-zoom tiles (the
+    # straggler). child_z is a strong cost proxy: each level quadruples the output
+    # tiles and multiplies the contour feature count. Deterministic, so every runner
+    # derives the identical order and the shards still partition with no overlap.
+    def child_z(fp):
+        return int(fp.split("/")[-1].replace("-aggregation.csv", "").split("-")[3])
+    return sorted(dirty, key=lambda fp: (-child_z(fp), fp))
 
 
 def run_all(filepaths):
