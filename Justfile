@@ -18,11 +18,12 @@ sources:
         just ../sources/"$id"/
     done
 
-# Planet build: cover -> aggregate -> downsample -> bundle (BBOX="W,S,E,N" for a region).
+# Planet build: cover -> aggregate -> downsample -> bundle -> contours (BBOX="W,S,E,N" for a region).
 planet:
     just cover
     uv run python aggregation_run.py
     just combine
+    just contours
 
 # Plan the covering: slice the planet into aggregation tiles (BBOX="W,S,E,N" for a region).
 cover:
@@ -36,12 +37,27 @@ aggregate i n:
 shard-matrix max:
     @uv run python aggregation_run.py matrix {{max}}
 
-# Single-runner finish: overview pyramid -> planet/overlay/contour bundles + manifest.
+# Single-runner terrain finish: overview pyramid -> planet/overlay bundles + manifest.
 combine:
     uv run python downsampling.py cover
     uv run python downsampling.py run
     uv run python bundle.py
+
+# Contours, whole set (local/regional). CI shards these across runners — see below.
+contours:
     uv run python contour_run.py bundle
+
+# Print the CI contour-shard matrix as JSON (<= max shards, sized to the FGB count).
+contour-matrix max:
+    @uv run python contour_run.py bundle-matrix {{max}}
+
+# tippecanoe one contour shard i of n (strided FGB slice -> contours-shard-{i}.pmtiles).
+contour-shard i n:
+    uv run python contour_run.py bundle-shard {{i}} {{n}}
+
+# tile-join the per-shard contour pmtiles into contours.pmtiles.
+contour-merge:
+    uv run python contour_run.py bundle-merge
 
 # Build the NY-harbor demo (GEBCO base + CUDEM) and seed it into the local Worker
 # R2. Requires the GEBCO grid extracted in data/ (clips it locally; no 4 GB fetch).

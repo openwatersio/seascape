@@ -19,6 +19,7 @@ it hid GEBCO above z9 — not worth losing GEBCO at high zoom. Smoothing is the
 real seam mitigation.)
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -147,20 +148,60 @@ def _tippecanoe(fgbs, minz, maxz, out):
         check=True)
 
 
-def bundle():
+def _global_maxz(fgbs):
+    return max(int(f.split("/")[-1].replace(".fgb", "").split("-")[3]) for f in fgbs)
+
+
+def bundle(shard=None, n=None):
+    """tippecanoe the contour FGBs into pmtiles. Whole set by default; with (shard, n)
+    a strided FGB slice → contours-shard-{shard}.pmtiles for the CI fan-out (a single
+    global tippecanoe blows the 6 h job cap at planet scale). All shards use the GLOBAL
+    maxz so the per-shard pmtiles tile-join cleanly in bundle_merge()."""
     fgbs = sorted(glob("store/contour/*.fgb"))
     if not fgbs:
         print("contour bundle: no contour FGBs")
         return
-    maxz = max(int(f.split("/")[-1].replace(".fgb", "").split("-")[3]) for f in fgbs)
+    maxz = _global_maxz(fgbs)
     utils.create_folder("store/bundle")
-    out = "store/bundle/contours.pmtiles"
-    _tippecanoe(fgbs, 0, maxz, out)
-    print(f"contour bundle: {out} (z0-{maxz}, {len(fgbs)} tile FGBs)")
+    if shard is None:
+        _tippecanoe(fgbs, 0, maxz, "store/bundle/contours.pmtiles")
+        print(f"contour bundle: store/bundle/contours.pmtiles (z0-{maxz}, {len(fgbs)} FGBs)")
+        return
+    part = fgbs[shard::n]
+    if not part:
+        print(f"contour shard {shard}/{n}: no FGBs in slice")
+        return
+    out = f"store/bundle/contours-shard-{shard}.pmtiles"
+    _tippecanoe(part, 0, maxz, out)
+    print(f"contour shard {shard}/{n}: {out} (z0-{maxz}, {len(part)} FGBs)")
+
+
+def bundle_matrix(maxshards):
+    """Print the CI contour-shard matrix JSON (<= maxshards, sized to the FGB count)."""
+    n = min(int(maxshards), max(len(glob("store/contour/*.fgb")), 1))
+    print(json.dumps([{"i": i, "n": n} for i in range(n)]))
+
+
+def bundle_merge():
+    """tile-join the per-shard contour pmtiles into one contours.pmtiles (-pk keeps
+    every feature; the shards are disjoint FGB slices unioned per tile)."""
+    shards = sorted(glob("store/bundle/contours-shard-*.pmtiles"))
+    if not shards:
+        print("contour merge: no shard pmtiles")
+        return
+    subprocess.run(["tile-join", "-o", "store/bundle/contours.pmtiles", "-f", "-pk", *shards], check=True)
+    print(f"contour merge: store/bundle/contours.pmtiles ({len(shards)} shards)")
 
 
 if __name__ == "__main__":
-    if sys.argv[1:2] == ["bundle"]:
+    a = sys.argv[1:]
+    if a[:1] == ["bundle"]:
         bundle()
+    elif a[:1] == ["bundle-shard"]:
+        bundle(int(a[1]), int(a[2]))
+    elif a[:1] == ["bundle-matrix"]:
+        bundle_matrix(a[1])
+    elif a[:1] == ["bundle-merge"]:
+        bundle_merge()
     else:
-        sys.exit("usage: contour_run.py bundle   (generate runs inside aggregation_run)")
+        sys.exit("usage: contour_run.py bundle | bundle-shard <i> <n> | bundle-matrix <max> | bundle-merge")

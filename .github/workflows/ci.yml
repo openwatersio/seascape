@@ -194,8 +194,9 @@ jobs:
           aws s3 sync store/contour "s3://$R2_BUCKET/store/contour"
           aws s3 sync store/aggregation "s3://$R2_BUCKET/store/aggregation"
 
-  # Single-runner finish: overview pyramid → planet + per-source overlays +
-  # contours + manifest. Runs even if aggregate had nothing to do (clean rebuild).
+  # Single-runner terrain finish: overview pyramid → planet + per-source overlays +
+  # manifest. Contours are built separately (sharded, below). Runs even on a clean
+  # rebuild.
   bundle:
     needs: aggregate
     if: ${{ !cancelled() && needs.aggregate.result == 'success' }}
@@ -226,6 +227,74 @@ jobs:
           aws s3 cp store/bundle/manifest.json "s3://$R2_BUCKET/build/${{ github.sha }}/manifest.json" \
             --content-type application/json
 
+  # ─── Contours (sharded — one global tippecanoe blows the 6 h cap at planet scale) ─
+  # Size the fan-out to the FGB count (no download — just an R2 listing).
+  contour-plan:
+    needs: aggregate
+    if: ${{ !cancelled() && needs.aggregate.result == 'success' }}
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.m.outputs.shards }}
+    steps:
+      - id: m
+        run: |
+          count=$(aws s3 ls "s3://$R2_BUCKET/store/contour/" --recursive | grep -c '\.fgb$' || true)
+          shards=$(python3 -c "import json,sys; c=int(sys.argv[1]); n=min(${AGG_SHARDS}, max(c,1)); print(json.dumps([{'i':i,'n':n} for i in range(n)]))" "$count")
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
+          echo "contour FGBs: $count → matrix $shards"
+
+  # tippecanoe one strided FGB slice per runner → a per-shard contours pmtiles.
+  contours:
+    needs: [aggregate, contour-plan]
+    if: ${{ !cancelled() && needs.contour-plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: read }
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.contour-plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/ghcr-login
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with: { tool-cache: true, android: true, dotnet: true, haskell: true, large-packages: true, swap-storage: true }
+      # Each shard pulls all FGBs (to derive the global maxz + its slice) and tiles
+      # only its slice. (Pulling all to every shard is the simple version; pull only
+      # the slice if FGB egress becomes the bottleneck.)
+      - name: Pull contour FGBs from R2
+        run: |
+          mkdir -p store/contour store/bundle
+          aws s3 sync "s3://$R2_BUCKET/store/contour" store/contour
+      - name: Contour shard ${{ matrix.shard.i }}/${{ matrix.shard.n }}
+        run: |
+          docker run --rm -v "$PWD/store:/app/pipelines/store" \
+            "$IMAGE:${{ github.sha }}" just contour-shard ${{ matrix.shard.i }} ${{ matrix.shard.n }}
+      - name: Push shard pmtiles to R2
+        run: |
+          aws s3 cp store/bundle "s3://$R2_BUCKET/build/${{ github.sha }}/contour-shards/" \
+            --recursive --exclude '*' --include 'contours-shard-*.pmtiles' --content-type application/octet-stream
+
+  # tile-join the per-shard pmtiles into one contours.pmtiles.
+  contour-bundle:
+    needs: contours
+    if: ${{ !cancelled() && needs.contours.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: read }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/ghcr-login
+      - name: Pull shard pmtiles from R2
+        run: |
+          mkdir -p store/bundle
+          aws s3 sync "s3://$R2_BUCKET/build/${{ github.sha }}/contour-shards" store/bundle
+      - name: Merge contours
+        run: docker run --rm -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just contour-merge
+      - name: Push contours.pmtiles to R2 build
+        run: |
+          aws s3 cp store/bundle/contours.pmtiles "s3://$R2_BUCKET/build/${{ github.sha }}/contours.pmtiles" \
+            --content-type application/octet-stream
+
   # The viewer references tiles by URL at runtime, so it builds independently.
   web:
     runs-on: ubuntu-latest
@@ -248,13 +317,13 @@ jobs:
   # Promote this commit's bundles to the served year prefix (server-side copy).
   publish-r2:
     if: github.event_name == 'release'
-    needs: bundle
+    needs: [bundle, contour-bundle]
     runs-on: ubuntu-latest
     steps:
       - name: Promote bundles → bathymetry/${{ env.GEBCO_YEAR }}/
         run: |
           aws s3 cp "s3://$R2_BUCKET/build/${{ github.sha }}/" \
-            "s3://$R2_BUCKET/bathymetry/${GEBCO_YEAR}/" --recursive
+            "s3://$R2_BUCKET/bathymetry/${GEBCO_YEAR}/" --recursive --exclude 'contour-shards/*'
 
   # Deploy the serving Worker (reads bathymetry/<year>/ from the same bucket).
   deploy-worker:
