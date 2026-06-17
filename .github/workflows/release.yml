@@ -1,11 +1,19 @@
 name: Release
 
-# A published release republishes the build the tagged commit already produced on
-# main (build/<sha>/ in R2) — no rebuild — and deploys the Worker + viewer. The
-# build pipeline lives in ci.yml; release a commit that was built on main.
+# Republishes a build that was already produced on main (build/<sha>/ in R2) — no
+# rebuild — and deploys the Worker + viewer. The build pipeline lives in ci.yml.
+# A published release promotes the build for its tagged commit. Run manually
+# (workflow_dispatch from main, with a `sha`) to publish any other built commit
+# using the current workflow rather than the one at that commit.
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Commit SHA of the build to publish (blank = this commit)"
+        required: false
+        default: ""
 
 env:
   R2_BUCKET: ${{ secrets.R2_BUCKET }}
@@ -18,14 +26,17 @@ jobs:
   # Promote build/<sha>/ → the served prefix (server-side copy, no rebuild).
   publish-r2:
     runs-on: ubuntu-latest
+    env:
+      SHA: ${{ github.event.inputs.sha || github.sha }}
     steps:
-      - name: Promote build/${{ github.sha }} → bathymetry/
+      - name: Promote build → bathymetry/
         run: |
-          if ! aws s3 ls "s3://$R2_BUCKET/build/${{ github.sha }}/manifest.json" >/dev/null 2>&1; then
-            echo "::error::No build at build/${{ github.sha }}/ — release a commit that was built on main."
+          echo "publishing build/$SHA"
+          if ! aws s3 ls "s3://$R2_BUCKET/build/$SHA/manifest.json" >/dev/null 2>&1; then
+            echo "::error::No build at build/$SHA/ — release/dispatch a commit that was built on main."
             exit 1
           fi
-          aws s3 cp "s3://$R2_BUCKET/build/${{ github.sha }}/" \
+          aws s3 cp "s3://$R2_BUCKET/build/$SHA/" \
             "s3://$R2_BUCKET/bathymetry/" --recursive --exclude 'contour-shards/*'
 
   # Deploy the serving Worker (reads bathymetry/ from the same R2 bucket).
