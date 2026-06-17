@@ -12,6 +12,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential libsqlite3-dev zlib1g-dev \
   && rm -rf /var/lib/apt/lists/*
 
+# Every source is read over /vsicurl (R2/NOAA), so a transient HTTP/curl blip — an R2
+# 500 InternalError, a "Recv failure: Connection reset by peer" — must not kill an
+# hour-long aggregate shard mid-read. Retry such errors instead of failing. Applies to
+# every gdal subprocess (and local dev). Mirrors the http_download backoff on the Python side.
+ENV GDAL_HTTP_MAX_RETRY=5 \
+    GDAL_HTTP_RETRY_DELAY=1
+
 # tippecanoe + tile-join (Felt fork) — contour vector tiles.
 RUN git clone --depth 1 https://github.com/felt/tippecanoe.git /tmp/tippecanoe \
   && cd /tmp/tippecanoe && make -j"$(nproc)" && make install && rm -rf /tmp/tippecanoe
