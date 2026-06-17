@@ -33,17 +33,20 @@ X_MIN_3857, _, X_MAX_3857, __ = transform_bounds('EPSG:4326', 'EPSG:3857', -180,
 
 
 def run_command(command, silent=True, env=None):
+    """Run a shell command and return (stdout, stderr). Raise on non-zero exit — don't
+    silently swallow failures."""
     if env is None:
         env = os.environ.copy()
     if not silent:
         print(command)
     p = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
     stdout, stderr = p.communicate()
-    err = stderr.decode()
-    if err != '' and not silent:
+    out, err = stdout.decode(), stderr.decode()
+    if p.returncode != 0:
+        raise RuntimeError(f"command failed (exit {p.returncode}): {command}\n{err}")
+    if err and not silent:
         print(err)
-    out = stdout.decode()
-    if out != '' and not silent:
+    if out and not silent:
         print(out)
     return out, err
 

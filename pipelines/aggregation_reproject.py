@@ -202,6 +202,15 @@ def _check():
     warp_mixed([a], just_a, 9, tile, 0)
     va, vboth = valid(just_a), valid(both)
     assert vboth > va > 0, (va, vboth)
+
+    # run_command must RAISE on a failed gdalbuildvrt (not swallow it) — the bug that let a
+    # missing VRT reach gdalwarp as a baffling "No such file" and kill an hour-long shard.
+    miss = f"{d}/miss.vrt"
+    try:
+        utils.run_command(f"gdalbuildvrt -overwrite {miss} {d}/does-not-exist.tif")
+        assert False, "expected run_command to raise on a failed gdalbuildvrt"
+    except RuntimeError:
+        assert not os.path.exists(miss)
     print(f"aggregation_reproject.py self-check ok (valid pixels: A={va}, A+B={vboth})")
 
 
