@@ -23,6 +23,10 @@ from pmtiles.reader import Reader, MmapSource
 import encode
 import utils
 
+# Child pmtiles the covering referenced but that weren't present on disk (a tile no
+# aggregate shard produced, or that didn't sync). Collected so run() can report them.
+MISSING_CHILDREN = set()
+
 
 # ── cover ────────────────────────────────────────────────────────────────────
 
@@ -99,8 +103,17 @@ def create_tile(parent_x, parent_y, parent_z, tmp_folder, pmtiles_filenames):
             filename = tile_to_filename[child]
             fz, fx, fy, _ = (int(a) for a in filename.replace(".pmtiles", "").split("-"))
             folder = utils.get_pmtiles_folder(fx, fy, fz)
-            with open(f"{folder}/{filename}", "r+b") as f:
+            child_path = f"{folder}/{filename}"
+            # A tile the covering referenced but no aggregate shard produced (or that
+            # didn't sync): treat that quadrant as empty rather than abort the whole
+            # pyramid, and record it so the gap is visible (not silently dropped).
+            if not os.path.isfile(child_path):
+                MISSING_CHILDREN.add(filename)
+                continue
+            with open(child_path, "r+b") as f:
                 child_bytes = Reader(MmapSource(f)).get(child.z, child.x, child.y)
+            if child_bytes is None:
+                continue
             rgb = imagecodecs.webp_decode(child_bytes).astype(np.float32)
             full[512 * row:512 * (row + 1), 512 * col:512 * (col + 1)] = encode.decode(rgb)
 
@@ -171,6 +184,11 @@ def run():
     for child_zoom in sorted(by_child_zoom, reverse=True):
         for filepath in by_child_zoom[child_zoom]:
             run_one(filepath)
+
+    if MISSING_CHILDREN:
+        sample = ", ".join(sorted(MISSING_CHILDREN)[:15])
+        print(f"WARN: {len(MISSING_CHILDREN)} referenced pmtiles missing — "
+              f"left as gaps in the pyramid: {sample}{' …' if len(MISSING_CHILDREN) > 15 else ''}")
 
 
 if __name__ == "__main__":
