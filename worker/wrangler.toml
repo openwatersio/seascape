@@ -8,7 +8,7 @@ name = "bathymetry-tiles"
 # populate it from pipelines/store/bundle via `npm run seed` (see seed.sh).
 [[r2_buckets]]
 binding = "TILES"
-bucket_name = "openwaters-tiles"
+bucket_name = "tiles"
 
 [vars]
 # Key prefix within the bucket (e.g. "bathymetry/" in production); "" = root.

@@ -213,6 +213,11 @@ export default {
       x = +m[3],
       y = +m[4];
 
+    // Out-of-range x/y (the pmtiles coord check throws on these) → blank tile, not a 500.
+    const n = 2 ** z;
+    if (x >= n || y >= n)
+      return layer === "contours" ? noTile() : transparentResponse();
+
     if (layer === "contours") {
       const t = await tile(env, "contours.pmtiles", z, x, y);
       return t ? new Response(t, { headers: MVT }) : noTile();
