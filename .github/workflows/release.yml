@@ -23,15 +23,19 @@ env:
   AWS_ENDPOINT_URL: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
 
 jobs:
-  # Promote build/<sha>/ → the served prefix (server-side copy, no rebuild).
+  # Promote build/<sha>/ → releases/<sha>/ (server-side copy, no rebuild). build/ is
+  # GC'd after 7 days; releases/ has NO lifecycle rule, so the live bundle is never
+  # collected out from under the Worker regardless of release cadence. Atomicity comes
+  # from deploy-worker flipping TILES_PREFIX *after* this lands in the unserved prefix —
+  # clients keep reading the old releases/<sha>/ until the new Worker version rolls out.
   publish-r2:
     runs-on: ubuntu-latest
     env:
       SHA: ${{ github.event.inputs.sha || github.sha }}
     steps:
-      - name: Promote build → bathymetry/
+      - name: Promote build → releases/
         run: |
-          echo "publishing build/$SHA"
+          echo "publishing build/$SHA → releases/$SHA"
           if ! aws s3 ls "s3://$R2_BUCKET/build/$SHA/manifest.json" >/dev/null 2>&1; then
             echo "::error::No build at build/$SHA/ — release/dispatch a commit that was built on main."
             exit 1
@@ -43,15 +47,33 @@ jobs:
           # manifest.json is below the multipart threshold and hits that path — round-trip it
           # through the runner, where the upload sends no tagging header. Small future overlays
           # would need the same; lower the threshold or switch to rclone if that happens.
-          aws s3 cp "s3://$R2_BUCKET/build/$SHA/" "s3://$R2_BUCKET/bathymetry/" \
+          aws s3 cp "s3://$R2_BUCKET/build/$SHA/" "s3://$R2_BUCKET/releases/$SHA/" \
             --recursive --exclude 'contour-shards/*' --exclude 'manifest.json' --copy-props none
           aws s3 cp "s3://$R2_BUCKET/build/$SHA/manifest.json" - \
-            | aws s3 cp - "s3://$R2_BUCKET/bathymetry/manifest.json" --content-type application/json
+            | aws s3 cp - "s3://$R2_BUCKET/releases/$SHA/manifest.json" --content-type application/json
+      - name: Prune old releases (keep newest 3)
+        run: |
+          # Count-based retention (current + 2 rollback targets), ordered by each
+          # release's manifest.json mtime — never age/cadence dependent, so releases/
+          # needs no lifecycle rule. The copy above runs first, so $SHA is always kept.
+          keep=$(aws s3 ls "s3://$R2_BUCKET/releases/" --recursive \
+            | grep '/manifest\.json$' | sort -r | awk '{print $4}' | cut -d/ -f2 | head -3)
+          [ -n "$keep" ] || { echo "::error::no releases found — refusing to prune"; exit 1; }
+          for sha in $(aws s3 ls "s3://$R2_BUCKET/releases/" | awk '{print $2}' | tr -d /); do
+            grep -qx "$sha" <<<"$keep" || {
+              echo "pruning releases/$sha"
+              aws s3 rm "s3://$R2_BUCKET/releases/$sha" --recursive
+            }
+          done
 
-  # Deploy the serving Worker (reads bathymetry/ from the same R2 bucket).
+  # Deploy the serving Worker pointed at releases/<sha>/. This deploy IS the atomic
+  # cutover: Cloudflare rolls the new version globally as a unit, so no client ever
+  # sees a mix of old/new bundles. Rollback = re-dispatch with a prior (kept) sha.
   deploy-worker:
     needs: publish-r2
     runs-on: ubuntu-latest
+    env:
+      SHA: ${{ github.event.inputs.sha || github.sha }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v4
@@ -61,9 +83,13 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
           npm ci
-          npx wrangler deploy --var "TILES_PREFIX:bathymetry/"
+          # Bind the same bucket the build writes to; wrangler.toml can't read env vars,
+          # so overwrite the placeholder name at deploy (keeps worker + build in sync).
+          sed -i "s|^bucket_name = .*|bucket_name = \"$R2_BUCKET\"|" wrangler.toml
+          npx wrangler deploy --var "TILES_PREFIX:releases/$SHA/"
 
   # Build the viewer (pointed at the Worker) and deploy it to GitHub Pages.
   deploy-pages:
