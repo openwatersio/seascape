@@ -106,23 +106,34 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/ghcr-login
+      # Skip the whole fetch when R2 already holds this source built from the same
+      # recipe (source data is stable per release; only re-prepare when the recipe
+      # under sources/<id>/ changes). The hash marker lives beside the source data.
+      - name: Already current in R2?
+        id: check
+        env:
+          RECIPE_HASH: ${{ hashFiles(format('sources/{0}/**', matrix.source)) }}
+        run: |
+          have=$(aws s3 cp "s3://$R2_BUCKET/store/source/${{ matrix.source }}/.recipe-hash" - 2>/dev/null || true)
+          if [ -n "$RECIPE_HASH" ] && [ "$have" = "$RECIPE_HASH" ]; then current=true; else current=false; fi
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "hash=$RECIPE_HASH" >> "$GITHUB_OUTPUT"
+          echo "${{ matrix.source }}: recipe=$RECIPE_HASH r2=${have:-none} → current=$current"
       # GEBCO's 4 GB zip + extract needs headroom.
       - name: Free disk space
-        if: matrix.source == 'gebco'
+        if: steps.check.outputs.current != 'true' && matrix.source == 'gebco'
         uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
         with: { tool-cache: true, android: true, dotnet: true, haskell: true, large-packages: true, swap-storage: true }
-      - name: Cache prepared source
-        uses: actions/cache@v4
-        with:
-          path: store/source/${{ matrix.source }}
-          key: source-${{ matrix.source }}-${{ hashFiles(format('sources/{0}/**', matrix.source)) }}
       - name: Prepare ${{ matrix.source }}
+        if: steps.check.outputs.current != 'true'
         run: |
           mkdir -p store
           docker run --rm \
             -v "$PWD/store:/app/pipelines/store" \
             "$IMAGE:${{ github.sha }}" just source ${{ matrix.source }}
+          printf '%s' "${{ steps.check.outputs.hash }}" > "store/source/${{ matrix.source }}/.recipe-hash"
       - name: Push source to R2
+        if: steps.check.outputs.current != 'true'
         run: aws s3 sync "store/source/${{ matrix.source }}" "s3://$R2_BUCKET/store/source/${{ matrix.source }}" --delete
 
   # Cover the planet into aggregation tiles, diff against the previous covering,
