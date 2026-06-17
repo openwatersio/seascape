@@ -49,7 +49,14 @@ def gpkg_tile_urls(gpkg_url, bbox):
     ``bbox`` (W,S,E,N lon/lat) pushes an OGR spatial filter (gpkg geometry is WGS84) so a regional
     build reads only nearby rows."""
     gdf = gpd.read_file("/vsicurl/" + gpkg_url, bbox=tuple(bbox) if bbox else None)
-    return [u for u in gdf["GeoTIFF_Link"] if u]
+    return _populated_links(gdf["GeoTIFF_Link"])
+
+
+def _populated_links(links):
+    """Drop unpopulated tiles. pandas reads a NULL GeoTIFF_Link as float NaN — and
+    ``bool(nan)`` is True — so a bare ``if u`` lets NaN through and ``u.lower()`` later
+    blows up. Keep only non-empty strings. (~5k of BlueTopo's ~12.7k tiles are unpopulated.)"""
+    return [u for u in links if isinstance(u, str) and u]
 
 
 def main():
@@ -78,6 +85,8 @@ def _check():
     )
     assert _newest_key(sample).endswith("20260616_191529.gpkg"), _newest_key(sample)
     assert _newest_key("<ListBucketResult/>") is None
+    # unpopulated tiles read as float NaN (truthy!) — must be dropped, not .lower()'d
+    assert _populated_links(["a.tif", "", float("nan"), "b.tiff"]) == ["a.tif", "b.tiff"]
     print("source_register_remote_geopkg.py self-check ok")
 
 
