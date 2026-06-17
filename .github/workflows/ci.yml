@@ -131,10 +131,13 @@ jobs:
           docker run --rm \
             -v "$PWD/store:/app/pipelines/store" \
             "$IMAGE:${{ github.sha }}" just source ${{ matrix.source }}
-          printf '%s' "${{ steps.check.outputs.hash }}" > "store/source/${{ matrix.source }}/.recipe-hash"
       - name: Push source to R2
         if: steps.check.outputs.current != 'true'
-        run: aws s3 sync "store/source/${{ matrix.source }}" "s3://$R2_BUCKET/store/source/${{ matrix.source }}" --delete
+        run: |
+          aws s3 sync "store/source/${{ matrix.source }}" "s3://$R2_BUCKET/store/source/${{ matrix.source }}" --delete --exclude '.recipe-hash'
+          # The container writes store/ as root, so write the marker to R2 from stdin
+          # (not into the root-owned dir); --exclude above keeps --delete off it.
+          printf '%s' "${{ steps.check.outputs.hash }}" | aws s3 cp - "s3://$R2_BUCKET/store/source/${{ matrix.source }}/.recipe-hash"
 
   # Cover the planet into aggregation tiles, diff against the previous covering,
   # and emit the shard matrix sized to the dirty count.
