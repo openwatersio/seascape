@@ -4,7 +4,7 @@ Bathymetry as web map tiles for MapLibre / Mapbox GL, build from a mosaic of glo
 
 Coverage is global through z8 (~15″) with regional detail to z14 (~0.25″) where high-res sources exist.
 
-> ### **[Preview](https://openwatersio.github.io/bathymetry/)**
+### **[Preview](https://openwatersio.github.io/bathymetry/)**
 
 > [!WARNING]
 > **Not for navigational use.** Do not use this bathymetry for navigation, or in any
@@ -21,7 +21,7 @@ Coverage is global through z8 (~15″) with regional detail to z14 (~0.25″) wh
 
 ## Usage
 
-## TileJSON
+### TileJSON
 
 The bathymetry is available as XYZ tiles in two flavors:
 
