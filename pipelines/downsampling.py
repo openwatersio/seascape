@@ -178,15 +178,52 @@ def tiles_intersect(a, b):
 SHARD_ROOT_Z = max(utils.macrotile_z - utils.num_overviews, 0)
 
 
-def shard_ancestor(filepath):
-    """The SHARD_ROOT_Z-ancestor id a deep downsampling csv belongs to, or None if
-    it's a tail csv (extent below the root zoom, so its output spans ancestors)."""
-    z, x, y, _ = (int(a) for a in filepath.split("/")[-1].replace("-downsampling.csv", "").split("-"))
+def ancestor_id(z, x, y):
+    """The SHARD_ROOT_Z-ancestor id of a tile, or None if below the root zoom."""
     if z < SHARD_ROOT_Z:
         return None
     tile = mercantile.Tile(x=x, y=y, z=z)
     a = tile if z == SHARD_ROOT_Z else mercantile.parent(tile, zoom=SHARD_ROOT_Z)
     return f"{a.z}-{a.x}-{a.y}"
+
+
+def shard_ancestor(filepath):
+    """The SHARD_ROOT_Z-ancestor id a deep downsampling csv belongs to, or None if
+    it's a tail csv (extent below the root zoom, so its output spans ancestors)."""
+    z, x, y, _ = (int(a) for a in filepath.split("/")[-1].replace("-downsampling.csv", "").split("-"))
+    return ancestor_id(z, x, y)
+
+
+def owned_ancestors(i, n):
+    """The strided slice of dirty deep ancestors shard i of n owns (the same split
+    run() and matrix() use), so shard-keys and run agree on what a shard touches."""
+    ancestors = sorted({a for fp in dirty_filepaths() if (a := shard_ancestor(fp)) is not None})
+    return set(ancestors[i::n])
+
+
+def shard_keys(i, n):
+    """Filter store/pmtiles-keys.txt (the R2 listing) to the tiles shard i reads —
+    those under its owned ancestors — and write them to store/shard-keys.txt. Lets CI
+    pull a shard's slice of the pmtiles store instead of the whole tens-of-GB store
+    (a tile's extent zoom is monotonic with content, so everything a shard reads sits
+    under one of its ancestors)."""
+    owned = owned_ancestors(i, n)
+    with open("store/pmtiles-keys.txt") as f:
+        keys = [line.strip() for line in f if line.strip()]
+    out = []
+    for key in keys:
+        name = key.split("/")[-1]
+        if not name.endswith(".pmtiles"):
+            continue
+        try:
+            z, x, y, _ = (int(a) for a in name.replace(".pmtiles", "").split("-"))
+        except ValueError:
+            continue
+        if ancestor_id(z, x, y) in owned:
+            out.append(key)
+    with open("store/shard-keys.txt", "w") as f:
+        f.write("".join(k + "\n" for k in out))
+    print(f"shard {i}/{n}: {len(out)} of {len(keys)} pmtiles selected")
 
 
 def dirty_filepaths():
@@ -261,9 +298,7 @@ def run(shard=None, tail=False):
     if tail:
         filepaths = [fp for fp in filepaths if shard_ancestor(fp) is None]
     elif shard is not None:
-        i, n = shard
-        ancestors = sorted({a for fp in filepaths if (a := shard_ancestor(fp)) is not None})
-        owned = set(ancestors[i::n])
+        owned = owned_ancestors(*shard)
         filepaths = [fp for fp in filepaths if shard_ancestor(fp) in owned]
     execute(filepaths)
 
@@ -288,5 +323,8 @@ if __name__ == "__main__":
         run(shard=(int(argv[2]), int(argv[3])))
     elif argv[:1] == ["matrix"] and len(argv) == 2:
         matrix(int(argv[1]))
+    elif argv[:1] == ["shard-keys"] and len(argv) == 3:
+        shard_keys(int(argv[1]), int(argv[2]))
     else:
-        sys.exit("usage: downsampling.py <cover | run [shard <i> <n> | tail] | matrix <max>>")
+        sys.exit("usage: downsampling.py <cover | run [shard <i> <n> | tail] | "
+                 "matrix <max> | shard-keys <i> <n>>")

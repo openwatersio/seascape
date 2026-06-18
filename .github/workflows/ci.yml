@@ -255,14 +255,20 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/ghcr-login
-      - name: Pull covering + tiles from R2
+      - name: Pull covering + this shard's tiles from R2
         run: |
           mkdir -p store/aggregation store/pmtiles
-          # Coverings (incl. -downsampling.csv from plan) + the aggregate leaf tiles
-          # each shard reads. ponytail: whole pmtiles store, not just this shard's
-          # ancestors — switch to per-ancestor includes if the pull dominates.
+          # Coverings (incl. -downsampling.csv from plan) — small, needed to derive the
+          # dirty set + which ancestors this shard owns.
           aws s3 sync "s3://$DATA_BUCKET/bathymetry/aggregation" store/aggregation
-          aws s3 sync "s3://$DATA_BUCKET/bathymetry/pmtiles" store/pmtiles
+          # Only this shard's slice of store/pmtiles (its ancestors' tiles), NOT the
+          # whole tens-of-GB store: list the keys, let Python filter to the shard, then
+          # parallel-copy preserving the z7-sharded layout.
+          aws s3 ls "s3://$DATA_BUCKET/bathymetry/pmtiles/" --recursive | awk '{print $4}' > store/pmtiles-keys.txt
+          docker run --rm -v "$PWD/store:/app/pipelines/store" \
+            "$IMAGE:${{ github.sha }}" just downsample-shard-keys ${{ matrix.shard.i }} ${{ matrix.shard.n }}
+          echo "pulling $(wc -l < store/shard-keys.txt) of $(wc -l < store/pmtiles-keys.txt) pmtiles"
+          xargs -P 8 -I{} sh -c 'k="$1"; d="store/${k#bathymetry/}"; mkdir -p "$(dirname "$d")"; aws s3 cp "s3://$DATA_BUCKET/$k" "$d" --quiet' _ {} < store/shard-keys.txt
       - name: Downsample shard ${{ matrix.shard.i }}/${{ matrix.shard.n }}
         run: |
           docker run --rm -v "$PWD/store:/app/pipelines/store" \
@@ -287,14 +293,21 @@ jobs:
       - uses: ./.github/actions/ghcr-login
       - name: Pull store from R2
         run: |
-          mkdir -p store
+          # bundle.py concatenates EVERY tile into planet + per-source overlays, so the
+          # whole pmtiles store (tens of GB) must be on disk — it won't fit the ~20 GB
+          # root FS. Stage it on the runner's large ephemeral disk (/mnt, ~70 GB) via a
+          # store -> /mnt/store symlink so the paths below + the container mount are
+          # unchanged. (Per-source overlay sharding is the real scaling fix; bundle.py E3.)
+          sudo mkdir -p /mnt/store && sudo chown "$(id -u):$(id -g)" /mnt/store
+          ln -sfn /mnt/store store
+          mkdir -p store/aggregation store/pmtiles
           # tail = the coarse pyramid levels (deep levels already built by the
           # sharded downsample job) + bundle.py (terrain only); contours are bundled
           # by the separate sharded contour jobs, so store/contour is NOT pulled here.
           aws s3 sync "s3://$DATA_BUCKET/bathymetry/aggregation" store/aggregation
           aws s3 sync "s3://$DATA_BUCKET/bathymetry/pmtiles" store/pmtiles
       - name: Downsample tail + bundle
-        run: docker run --rm -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just downsample-tail-bundle
+        run: docker run --rm -v "/mnt/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just downsample-tail-bundle
       - name: Push pyramid + bundles to R2
         run: |
           # Tail overview tiles + downsampling done-markers feed the next incremental run.

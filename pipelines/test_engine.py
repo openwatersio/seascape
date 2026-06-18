@@ -90,6 +90,25 @@ def main():
         run(tmp, "downsampling.py", "run", "tail")
         run(tmp, "bundle.py", "1")
 
+        # shard-keys (the CI per-shard pull filter) must select every deep tile (extent
+        # z >= SHARD_ROOT_Z) for exactly one shard and nothing below — a miss would pull
+        # the wrong tiles in CI and leave silent holes.
+        import glob as _glob
+        shard_root_z = 10 - 2  # MACROTILE_Z - NUM_OVERVIEWS, the run() env above
+        pmtiles = [os.path.basename(p) for p in _glob.glob(f"{tmp}/store/pmtiles/**/*.pmtiles", recursive=True)]
+        with open(f"{tmp}/store/pmtiles-keys.txt", "w") as f:
+            f.write("".join(f"pmtiles/{n}\n" for n in pmtiles))
+        deep = {n for n in pmtiles if int(n.split("-")[0]) >= shard_root_z}
+        selected = []
+        for i in range(2):
+            run(tmp, "downsampling.py", "shard-keys", str(i), "2")
+            with open(f"{tmp}/store/shard-keys.txt") as f:
+                selected.append({os.path.basename(l.strip()) for l in f if l.strip()})
+        union = selected[0] | selected[1]
+        assert union == deep, f"shard-keys miscovers deep tiles; missing {deep - union}, extra {union - deep}"
+        assert not (selected[0] & selected[1]), f"shards must be disjoint: {selected[0] & selected[1]}"
+        print(f"shard-keys ok — {len(deep)} deep pmtiles partitioned across 2 shards, none below z{shard_root_z}")
+
         # covering wrote the cap into child_z: the deepest aggregation tile is z9, not z11.
         agg_dir = f"{tmp}/store/aggregation"
         agg_id = sorted(os.listdir(agg_dir))[-1]

@@ -46,12 +46,17 @@ combine:
 # CI downsampling fan-out (deep levels shard by ancestor, coarse tail on the bundler):
 #   plan job   -> just downsample-cover   (writes -downsampling.csv beside the covering)
 #   plan job   -> just downsample-matrix N (the shard matrix, sized to the dirt)
+#   matrix job -> just downsample-shard-keys i n  (pick this shard's pmtiles to pull)
 #   matrix job -> just downsample-shard i n
 #   bundle job -> just downsample-tail-bundle
 downsample-cover:
     uv run python downsampling.py cover
 downsample-matrix max:
     @uv run python downsampling.py matrix {{max}}
+# Filter store/pmtiles-keys.txt -> store/shard-keys.txt (only the tiles shard i reads),
+# so CI pulls a shard's slice of store/pmtiles instead of the whole tens-of-GB store.
+downsample-shard-keys i n:
+    uv run python downsampling.py shard-keys {{i}} {{n}}
 downsample-shard i n:
     uv run python downsampling.py run shard {{i}} {{n}}
 downsample-tail-bundle:
