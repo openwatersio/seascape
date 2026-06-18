@@ -39,6 +39,11 @@ jobs:
       - name: Promote build → tiles bucket
         run: |
           echo "publishing bathymetry/build/$SHA → tiles:bathymetry/$SHA"
+          # manifest.json is copied last, so its presence means a complete prior promotion.
+          if aws s3 ls "s3://$TILES_BUCKET/bathymetry/$SHA/manifest.json" >/dev/null 2>&1; then
+            echo "tiles:bathymetry/$SHA already published — skipping promote"
+            exit 0
+          fi
           if ! aws s3 ls "s3://$DATA_BUCKET/bathymetry/build/$SHA/manifest.json" >/dev/null 2>&1; then
             echo "::error::No build at bathymetry/build/$SHA/ — release/dispatch a commit that was built on main."
             exit 1
