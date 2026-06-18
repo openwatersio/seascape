@@ -126,17 +126,6 @@ jobs:
           echo "current=$current" >> "$GITHUB_OUTPUT"
           echo "hash=$RECIPE_HASH" >> "$GITHUB_OUTPUT"
           echo "${{ matrix.source }}: recipe=$RECIPE_HASH r2=${have:-none} volatile=$volatile → current=$current"
-      # GEBCO's 4 GB zip + extract needs headroom.
-      - name: Free disk space
-        if: steps.check.outputs.current != 'true' && matrix.source == 'gebco'
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: true
       # Seed the previous bounds.csv so a re-registered streaming source reuses cached
       # tile headers and only reads newly-added URLs (CUDEM's 942 header reads → ~0 on a
       # rebuild). Harmless for the rest: a GeoPackage source rebuilds bounds from its index,
@@ -220,16 +209,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/ghcr-login
-      # Dense-coast contour shards stage large FlatGeobufs.
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: true
       - name: Pull covering from R2
         run: |
           mkdir -p store/aggregation store/pmtiles store/contour
@@ -273,15 +252,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/ghcr-login
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: true
       - name: Pull covering + tiles from R2
         run: |
           mkdir -p store/aggregation store/pmtiles
@@ -312,15 +282,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/ghcr-login
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: true
       - name: Pull store from R2
         run: |
           mkdir -p store
@@ -371,15 +332,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/ghcr-login
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: true
       # Pull ONLY this shard's FGB slice (not the whole set). List the FGB keys
       # (sorted = the order Python globs), derive the global maxz (so every shard
       # tiles to the same depth and tile-joins cleanly), and parallel-copy the
