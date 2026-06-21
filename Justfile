@@ -90,31 +90,38 @@ contour-shard i:
 contour-merge:
     uv run python contour_run.py bundle-merge
 
-# Build a regional preview into the local Worker R2: GEBCO base + the US streaming
-# sources (CUDEM, BlueTopo) clipped to BBOX, best-wins. BBOX="W,S,E,N" (default: NY
-# harbor; e.g. Chesapeake = "-76.5,37.0,-76.0,37.5"). Requires the GEBCO quadrant grids
-# in data/ (clips locally; no 4 GB fetch). View with the two dev servers in separate terminals:
+# Build a regional preview into the local Worker R2 — a faithful slice of the planet
+# build for BBOX="W,S,E,N" (default: NY harbor; e.g. Chesapeake = "-76.5,37.0,-76.0,37.5").
+# Refreshes each source's tiny bounds.csv from R2 and range-reads the COGs from R2 (prepared
+# sources) / NOAA (streaming) via SOURCE_VSI_BASE — the same read path as CI's aggregate, so
+# no local source prep. `just preview-local` instead builds from already-prepared sources in
+# store/source (no R2; SOURCE_VSI_BASE unset). Override SOURCE_VSI_BASE/BOUNDS_BASE for a mirror.
+# View with the two dev servers in separate terminals:
 #   cd worker && npm install && npm run dev               # tile Worker on :8787
 #   VITE_TILES_BASE=http://localhost:8787 npm run dev     # Vite on :5173 (repo root)
-preview bbox="-74.30,40.40,-73.75,40.80":
+preview bbox="-74.30,40.40,-73.75,40.80" local="":
     #!/usr/bin/env bash
     set -euo pipefail
-    IFS=, read -r W S E N <<< "{{bbox}}"
     export BBOX="{{bbox}}"
+    if [ -z "{{local}}" ]; then
+        export SOURCE_VSI_BASE="${SOURCE_VSI_BASE:-/vsicurl/https://data.openwaters.io/bathymetry/source}"
+        BOUNDS_BASE="${BOUNDS_BASE:-https://data.openwaters.io/bathymetry/source}"
+        for id in $(uv run python -c "import config; print('\n'.join(config.sources()))"); do
+            mkdir -p "store/source/$id"
+            curl -fsS "$BOUNDS_BASE/$id/bounds.csv" -o "store/source/$id/bounds.csv" \
+                || { echo "skip $id (no bounds.csv in R2)"; rm -rf "store/source/$id"; }
+        done
+        # BlueTopo changes frequently, so re-sync the source bounds
+        just source bluetopo
+    else
+        unset SOURCE_VSI_BASE  # read prepared COGs from store/source on disk
+    fi
     rm -rf store/aggregation store/pmtiles store/bundle store/meta store/contour
-    mkdir -p store/source/gebco
-    # GEBCO base: clip from a VRT over the quadrant grids so any BBOX works (assumes a
-    # single GEBCO vintage in data/; the glob mosaics whatever quadrants are present).
-    gdalbuildvrt -q -overwrite store/source/gebco.vrt ../data/gebco_*.tif
-    gdal_translate -q -projwin "$W" "$N" "$E" "$S" store/source/gebco.vrt store/source/gebco/gebco_0.tif
-    uv run python source_bounds.py gebco
-    # US streaming sources: register manifest/gpkg tiles as /vsicurl refs (header reads
-    # only, BBOX-prefiltered); aggregation range-reads the COGs straight from NOAA S3.
-    # Re-registered every run so a changed BBOX re-scopes (0 tiles outside their coverage).
-    uv run python source_register_remote_urllist.py cudem
-    uv run python source_register_remote_geopkg.py bluetopo
     just planet
     ../worker/seed.sh
+
+# Preview from already-prepared sources in store/source (no R2/network for prepared sources).
+preview-local bbox="-74.30,40.40,-73.75,40.80": (preview bbox "local")
 
 # Offline self-checks (synthetic data, no network).
 test-sources:
