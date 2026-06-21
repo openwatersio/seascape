@@ -33,6 +33,12 @@ from aggregation_reproject import get_resolution
 
 SKIP_CONTOUR_SMOOTH = os.environ.get("SKIP_CONTOUR_SMOOTH", "")
 CHAIKIN_ITERATIONS = 5
+# Drop spurious tiny closed contours (abyssal stipple — micro-loops around bumps
+# near a deep contour value) at deep levels only. Shallow rings are navigable
+# shoals and are kept untouched (IHO safe-side: never drop a charted shoal). Areas
+# in m² (geometry is EPSG:3857 here).
+DEEP_CUTOFF_M = int(os.environ.get("CONTOUR_RING_DEEP_CUTOFF", "1000"))
+MIN_RING_AREA_M2 = float(os.environ.get("CONTOUR_RING_MIN_AREA", "16e6"))  # ~16 km²
 
 
 def _run(cmd, what):
@@ -77,13 +83,30 @@ def _smooth_geom(geom, tol, iterations):
     return geom
 
 
+def _drop_small_rings(geom, min_area):
+    """Drop closed-ring parts enclosing < min_area m²; keep open lines. None if empty."""
+    from shapely.geometry import MultiLineString, Polygon
+    parts = [geom] if geom.geom_type == "LineString" else list(geom.geoms)
+    kept = [p for p in parts
+            if not (len(p.coords) > 3 and p.coords[0] == p.coords[-1]
+                    and Polygon(p.coords).area < min_area)]
+    if not kept:
+        return None
+    return kept[0] if len(kept) == 1 else MultiLineString(kept)
+
+
 def smooth_and_enrich(in_fgb, out_fgb, tol, smooth):
-    """Chaikin-smooth (in 3857) and add depth_abs_m, with geopandas."""
+    """Chaikin-smooth (in 3857), drop deep micro-loop stipple, add depth_abs_m."""
     import geopandas as gpd
     gdf = gpd.read_file(in_fgb)
     if smooth:
         gdf["geometry"] = [_smooth_geom(g, tol, CHAIKIN_ITERATIONS) for g in gdf.geometry]
     gdf["depth_abs_m"] = (-gdf["depth_m"]).round().astype(int)
+    deep = gdf["depth_abs_m"] >= DEEP_CUTOFF_M
+    if deep.any():
+        gdf.loc[deep, "geometry"] = [_drop_small_rings(g, MIN_RING_AREA_M2)
+                                     for g in gdf.loc[deep, "geometry"]]
+        gdf = gdf[gdf.geometry.notna() & ~gdf.geometry.is_empty]
     gdf.to_file(out_fgb, driver="FlatGeobuf")
 
 
@@ -196,6 +219,20 @@ def bundle_merge():
     print(f"contour merge: store/bundle/contours.pmtiles ({len(shards)} shards)")
 
 
+def _check():
+    """Deep micro-loops dropped; big deep ring and open lines kept."""
+    import numpy as np
+    from shapely.geometry import LineString
+    def ring(r, n=48):
+        t = np.linspace(0, 2 * np.pi, n, endpoint=False)
+        pts = [(r * np.cos(a), r * np.sin(a)) for a in t]
+        return LineString(pts + [pts[0]])  # explicitly closed
+    assert _drop_small_rings(ring(100), MIN_RING_AREA_M2) is None        # ~0.03 km² → drop
+    assert _drop_small_rings(ring(3000), MIN_RING_AREA_M2) is not None   # ~28 km²  → keep
+    assert _drop_small_rings(LineString([(0, 0), (5e3, 0), (1e4, 5e3)]), MIN_RING_AREA_M2) is not None  # open line kept
+    print("contour_run ring-drop self-check ok")
+
+
 if __name__ == "__main__":
     a = sys.argv[1:]
     if a[:1] == ["bundle"]:
@@ -204,5 +241,7 @@ if __name__ == "__main__":
         bundle(int(a[1]))
     elif a[:1] == ["bundle-merge"]:
         bundle_merge()
+    elif a[:1] == ["check"]:
+        _check()
     else:
-        sys.exit("usage: contour_run.py bundle | bundle-shard <i> | bundle-merge")
+        sys.exit("usage: contour_run.py bundle | bundle-shard <i> | bundle-merge | check")
