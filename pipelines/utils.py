@@ -152,7 +152,9 @@ def get_aggregation_item_string(aggregation_id, filename):
 
 def get_dirty_aggregation_filenames(current_aggregation_id, last_aggregation_id):
     filepaths = sorted(glob(f'store/aggregation/{current_aggregation_id}/*-aggregation.csv'))
-    if last_aggregation_id is None:
+    # FORCE_REBUILD treats every tile as changed — the escape hatch for pipeline-code
+    # changes (smoothing, contour generation), which the source-coverage diff can't see.
+    if last_aggregation_id is None or os.environ.get("FORCE_REBUILD"):
         return [filepath.split('/')[-1] for filepath in filepaths]
     dirty_filenames = []
     for filepath in filepaths:

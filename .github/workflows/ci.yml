@@ -26,6 +26,10 @@ on:
         description: "Aggregate matrix shards (<= 256)"
         required: false
         default: "24"
+      force:
+        description: "Force full rebuild — ignore the incremental diff (use after pipeline-code changes)"
+        type: boolean
+        default: false
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
@@ -35,6 +39,9 @@ env:
   DATA_BUCKET: data
   AGG_SHARDS: ${{ github.event.inputs.shards || '24' }}
   BBOX: ${{ github.event.inputs.bbox || '' }}
+  # Set by the `force` dispatch input → consumed by get_dirty_aggregation_filenames to
+  # mark every tile dirty (the source-coverage diff can't see pipeline-code changes).
+  FORCE_REBUILD: ${{ github.event.inputs.force == 'true' && '1' || '' }}
   # R2 via the S3 API (aws-cli v2 honours AWS_ENDPOINT_URL).
   AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -203,13 +210,13 @@ jobs:
       - id: m
         name: Emit aggregate shard matrix
         run: |
-          SHARDS=$(docker run --rm -v "$PWD/store:/app/pipelines/store" \
+          SHARDS=$(docker run --rm -e FORCE_REBUILD -v "$PWD/store:/app/pipelines/store" \
             "$IMAGE:${{ github.sha }}" just shard-matrix "$AGG_SHARDS" | tail -n1)
           echo "shards=$SHARDS" >> "$GITHUB_OUTPUT"
       - id: dm
         name: Emit downsample shard matrix
         run: |
-          SHARDS=$(docker run --rm -v "$PWD/store:/app/pipelines/store" \
+          SHARDS=$(docker run --rm -e FORCE_REBUILD -v "$PWD/store:/app/pipelines/store" \
             "$IMAGE:${{ github.sha }}" just downsample-matrix "$AGG_SHARDS" | tail -n1)
           echo "shards=$SHARDS" >> "$GITHUB_OUTPUT"
 
@@ -245,7 +252,7 @@ jobs:
           # the /vsicurl reads accumulate (per worker).
           docker run --rm -v "$PWD/store:/app/pipelines/store" \
             -e SOURCE_VSI_BASE="/vsicurl/https://data.openwaters.io/bathymetry/source" \
-            -e AGG_PROCESSES=2 -e GDAL_CACHEMAX=256 \
+            -e AGG_PROCESSES=2 -e GDAL_CACHEMAX=256 -e FORCE_REBUILD \
             "$IMAGE:${{ github.sha }}" just aggregate ${{ matrix.shard.i }} ${{ matrix.shard.n }}
       - name: Push tiles + contours + done-markers to R2
         run: |
@@ -280,13 +287,13 @@ jobs:
           # whole tens-of-GB store: list the keys, let Python filter to the shard, then
           # parallel-copy preserving the z7-sharded layout.
           aws s3 ls "s3://$DATA_BUCKET/bathymetry/pmtiles/" --recursive | awk '{print $4}' > store/pmtiles-keys.txt
-          docker run --rm -v "$PWD/store:/app/pipelines/store" \
+          docker run --rm -e FORCE_REBUILD -v "$PWD/store:/app/pipelines/store" \
             "$IMAGE:${{ github.sha }}" just downsample-shard-keys ${{ matrix.shard.i }} ${{ matrix.shard.n }}
           echo "pulling $(wc -l < store/shard-keys.txt) of $(wc -l < store/pmtiles-keys.txt) pmtiles"
           xargs -P 8 -I{} sh -c 'k="$1"; d="store/${k#bathymetry/}"; mkdir -p "$(dirname "$d")"; aws s3 cp "s3://$DATA_BUCKET/$k" "$d" --quiet' _ {} < store/shard-keys.txt
       - name: Downsample shard ${{ matrix.shard.i }}/${{ matrix.shard.n }}
         run: |
-          docker run --rm -v "$PWD/store:/app/pipelines/store" \
+          docker run --rm -e FORCE_REBUILD -v "$PWD/store:/app/pipelines/store" \
             "$IMAGE:${{ github.sha }}" just downsample-shard ${{ matrix.shard.i }} ${{ matrix.shard.n }}
       - name: Push pyramid + done-markers to R2
         run: |
@@ -322,7 +329,7 @@ jobs:
       - name: Coarse tail + group matrix
         id: g
         run: |
-          docker run --rm -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just downsample-tail
+          docker run --rm -e FORCE_REBUILD -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just downsample-tail
           # bundle-groups verifies the pyramid is whole (fails here, before any overlay
           # ships) then prints the group names as a JSON matrix.
           GROUPS=$(docker run --rm -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just bundle-groups | tail -n1)
