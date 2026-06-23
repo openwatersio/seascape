@@ -1,0 +1,24 @@
+name: Pull covering
+description: >
+  Sync per-covering tarballs from R2 and unpack them in place. Each covering is
+  one gzipped tar (covering.tar.gz of ~2k tiny CSVs) instead of the loose files —
+  a latency-bound sync of thousands of objects collapses to a handful. Markers
+  are the per-build resume state (-*.done); only the shard jobs that retry need
+  them, so the plan job pulls tarballs alone.
+inputs:
+  markers:
+    description: Also pull -*.done resume markers (aggregate/downsample need them; plan doesn't).
+    default: "true"
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        mkdir -p store/aggregation
+        args=(--exclude '*' --include '*/covering.tar.gz')
+        [ "${{ inputs.markers }}" = "true" ] && args+=(--include '*/*.done')
+        aws s3 sync --no-progress "s3://$DATA_BUCKET/bathymetry/aggregation" store/aggregation "${args[@]}"
+        for t in store/aggregation/*/covering.tar.gz; do
+          [ -e "$t" ] || continue
+          tar -C "$(dirname "$t")" -xzf "$t"
+        done

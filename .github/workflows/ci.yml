@@ -173,17 +173,21 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/ghcr-login
-      - name: Pull bounds + previous covering from R2
+      - name: Pull bounds + pmtiles index from R2
         run: |
-          mkdir -p store/source store/aggregation
+          mkdir -p store/source
           # Covering only needs each source's bounds.csv (not the full DEM)…
           aws s3 sync "s3://$DATA_BUCKET/bathymetry/source" store/source --exclude '*' --include '*/bounds.csv'
-          # …plus the prior covering(s) so the dirty-diff has something to compare to.
-          aws s3 sync --no-progress "s3://$DATA_BUCKET/bathymetry/aggregation" store/aggregation
           # …and the list of already-built pmtiles, so the diff rebuilds any covering
           # tile whose artifact is missing (self-heal — coverings are pushed before
           # the tiles exist, so a failed prior build can leave gaps the diff trusts).
           aws s3 ls "s3://$DATA_BUCKET/bathymetry/pmtiles/" --recursive | awk '{print $4}' > store/pmtiles-keys.txt || true
+      # …plus the prior covering(s) so the dirty-diff has something to compare to.
+      # markers: false — the diff reads CSVs only, never the resume markers.
+      - name: Pull previous covering from R2
+        uses: ./.github/actions/pull-covering
+        with:
+          markers: "false"
       - name: Cover
         run: |
           # Aggregation covering, then the downsampling coverings (-downsampling.csv)
@@ -191,14 +195,19 @@ jobs:
           docker run --rm -e BBOX -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just cover
           docker run --rm -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just downsample-cover
       - name: Push covering to R2
-        run: aws s3 sync store/aggregation "s3://$DATA_BUCKET/bathymetry/aggregation"
+        run: |
+          # One gzipped tar per covering (covering.tar.gz) instead of ~2k loose CSVs —
+          # turns a latency-bound sync of thousands of tiny objects into a single PUT.
+          # ULIDs sort chronologically, so the newest dir is the covering just written.
+          id=$(ls store/aggregation | sort | tail -1)
+          tar -C "store/aggregation/$id" -czf /tmp/covering.tar.gz .
+          aws s3 cp /tmp/covering.tar.gz "s3://$DATA_BUCKET/bathymetry/aggregation/$id/covering.tar.gz"
       - name: Prune old coverings (keep newest 3)
         run: |
-          # store/aggregation accrues one covering dir (ULID) per build, but every
-          # consumer reads only the newest two (current + previous, for the dirty-diff).
-          # Without this, each of ~50 downstream jobs re-syncs the entire backlog —
-          # 15 coverings ≈ 28k tiny files, a latency-bound ~3 min sync apiece. Drop all
-          # but the newest 3 (one extra for margin); ULIDs sort chronologically.
+          # R2 accrues one covering dir (ULID) per build, but every consumer reads only
+          # the newest two (current + previous, for the dirty-diff). Each dir is a tarball
+          # plus its build's resume markers; without pruning the backlog grows unbounded.
+          # Drop all but the newest 3 (one extra for margin); ULIDs sort chronologically.
           ids=$(aws s3 ls "s3://$DATA_BUCKET/bathymetry/aggregation/" | awk '{print $2}' | tr -d /)
           keep=$(echo "$ids" | sort | tail -3)
           for id in $ids; do
@@ -234,12 +243,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/ghcr-login
+      # Source COGs are NOT pulled — reproject range-reads them via /vsicurl from
+      # public R2 (and CUDEM from public NOAA). Only the covering + pmtiles keys.
       - name: Pull covering from R2
+        uses: ./.github/actions/pull-covering
+      - name: Pull pmtiles index from R2
         run: |
-          mkdir -p store/aggregation store/pmtiles store/contour
-          # Source COGs are NOT pulled — reproject range-reads them via /vsicurl from
-          # public R2 (and CUDEM from public NOAA). Only the covering + pmtiles keys.
-          aws s3 sync --no-progress "s3://$DATA_BUCKET/bathymetry/aggregation" store/aggregation
+          mkdir -p store/pmtiles store/contour
           # Same pmtiles listing the plan used, so shards re-derive the identical
           # dirty set (changed tiles + any whose pmtiles is missing).
           aws s3 ls "s3://$DATA_BUCKET/bathymetry/pmtiles/" --recursive | awk '{print $4}' > store/pmtiles-keys.txt || true
@@ -258,7 +268,9 @@ jobs:
         run: |
           aws s3 sync store/pmtiles "s3://$DATA_BUCKET/bathymetry/pmtiles"
           aws s3 sync store/contour "s3://$DATA_BUCKET/bathymetry/contour"
-          aws s3 sync store/aggregation "s3://$DATA_BUCKET/bathymetry/aggregation"
+          # Markers only — the covering tarball is immutable (plan owns it) and the
+          # untarred CSVs must not be re-uploaded as the loose files we just collapsed.
+          aws s3 sync store/aggregation "s3://$DATA_BUCKET/bathymetry/aggregation" --exclude '*' --include '*.done'
 
   # Overview pyramid, sharded. The deep levels partition into read-closed subtrees
   # (one per ancestor at the covering's seed zoom) so they fan out with no
@@ -277,12 +289,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/ghcr-login
-      - name: Pull covering + this shard's tiles from R2
+      # Coverings (incl. -downsampling.csv from plan) — needed to derive the dirty set
+      # + which ancestors this shard owns, plus this shard's prior-attempt resume markers.
+      - name: Pull covering from R2
+        uses: ./.github/actions/pull-covering
+      - name: Pull this shard's tiles from R2
         run: |
-          mkdir -p store/aggregation store/pmtiles
-          # Coverings (incl. -downsampling.csv from plan) — small, needed to derive the
-          # dirty set + which ancestors this shard owns.
-          aws s3 sync --no-progress "s3://$DATA_BUCKET/bathymetry/aggregation" store/aggregation
+          mkdir -p store/pmtiles
           # Only this shard's slice of store/pmtiles (its ancestors' tiles), NOT the
           # whole tens-of-GB store: list the keys, let Python filter to the shard, then
           # parallel-copy preserving the z7-sharded layout.
@@ -300,7 +313,8 @@ jobs:
           # Disjoint tile keys + this shard's -downsampling.done markers (no --delete,
           # so shards/tail never clobber each other's markers or the coverings).
           aws s3 sync store/pmtiles "s3://$DATA_BUCKET/bathymetry/pmtiles"
-          aws s3 sync store/aggregation "s3://$DATA_BUCKET/bathymetry/aggregation"
+          # Markers only — covering tarball is immutable, untarred CSVs must not re-upload.
+          aws s3 sync store/aggregation "s3://$DATA_BUCKET/bathymetry/aggregation" --exclude '*' --include '*.done'
 
   # Terrain bundle, fanned out so each runner holds only ONE group's tiles + output — not
   # the whole store plus every overlay at once, which overran the disk (the pmtiles writer
@@ -318,13 +332,14 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/ghcr-login
-      - name: Pull store from R2
+      - name: Pull covering from R2
+        uses: ./.github/actions/pull-covering
+      - name: Pull pmtiles store from R2
         run: |
           # The tail is finished here on one runner from the full store; the matrix jobs
           # below each pull only their group. Contours are bundled by the separate sharded
           # jobs, so store/contour is NOT pulled here.
-          mkdir -p store/aggregation store/pmtiles
-          aws s3 sync --no-progress "s3://$DATA_BUCKET/bathymetry/aggregation" store/aggregation
+          mkdir -p store/pmtiles
           aws s3 sync "s3://$DATA_BUCKET/bathymetry/pmtiles" store/pmtiles
       - name: Coarse tail + group matrix
         id: g
@@ -368,7 +383,8 @@ jobs:
           # Tail overview tiles + downsampling done-markers feed the next incremental run,
           # and the matrix jobs' R2 listing must include the tail tiles.
           aws s3 sync store/pmtiles "s3://$DATA_BUCKET/bathymetry/pmtiles"
-          aws s3 sync store/aggregation "s3://$DATA_BUCKET/bathymetry/aggregation"
+          # Markers only — covering tarball is immutable, untarred CSVs must not re-upload.
+          aws s3 sync store/aggregation "s3://$DATA_BUCKET/bathymetry/aggregation" --exclude '*' --include '*.done'
 
   # One runner per group: pull only this group's pmtiles slice, bundle it, push the overlay
   # + its manifest fragment. Peak disk = one group's tiles + ~2x its output, so it scales
@@ -394,12 +410,13 @@ jobs:
           haskell: true
           large-packages: true
           swap-storage: true
+      # Covering — group-keys derives which pmtiles belong to this group, the same way
+      # bundle assigns local files, so we pull only this group's slice.
+      - name: Pull covering from R2
+        uses: ./.github/actions/pull-covering
       - name: Pull this group's tiles from R2
         run: |
-          mkdir -p store/aggregation store/pmtiles store/bundle
-          # Coverings (small) — group-keys derives which pmtiles belong to this group, the
-          # same way bundle assigns local files, so we pull only this group's slice.
-          aws s3 sync --no-progress "s3://$DATA_BUCKET/bathymetry/aggregation" store/aggregation
+          mkdir -p store/pmtiles store/bundle
           aws s3 ls "s3://$DATA_BUCKET/bathymetry/pmtiles/" --recursive | awk '{print $4}' > store/pmtiles-keys.txt
           docker run --rm -v "$PWD/store:/app/pipelines/store" \
             "$IMAGE:${{ github.sha }}" just bundle-group-keys ${{ matrix.group }}
