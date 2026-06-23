@@ -355,9 +355,13 @@ jobs:
             echo "=== dmesg (last 40) ==="; sudo dmesg 2>/dev/null | tail -40 || true
             exit "$rc"
           fi
-          set -e
+          # DIAGNOSTIC: both docker runs exit 0 yet the step dies here silently — trace
+          # the exact failing command (set -x) + disk state. GITHUB_OUTPUT=[$GITHUB_OUTPUT]
+          echo "=== df -h ==="; df -h || true
+          echo "GITHUB_OUTPUT=[$GITHUB_OUTPUT]"
+          set -ex
           GROUPS=$(tail -n1 /tmp/groups.txt)
-          echo "groups=$GROUPS" >> "$GITHUB_OUTPUT"
+          printf 'groups=%s\n' "$GROUPS" >> "$GITHUB_OUTPUT"
           echo "bundle groups: $GROUPS"
       - name: Push tail tiles + done-markers to R2
         run: |
