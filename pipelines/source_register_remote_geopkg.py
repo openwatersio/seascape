@@ -1,7 +1,7 @@
 """Register a streaming source from a tile-scheme *GeoPackage* index (e.g. NOAA S-102's
 navigation tile scheme): a per-tile URL column — named by ``link_column`` in metadata
-(``S102V30`` for S-102, ``GeoTIFF_Link`` for a BlueTopo-style index) — gives each tile's
-COG/HDF5; features with a null link are dropped.
+(``S102V30`` for S-102; defaults to ``GeoTIFF_Link``) — gives each tile's COG/HDF5;
+features with a null link are dropped.
 
 ``file_list.txt`` holds either the tile-scheme prefix (``…/_CATALOG/`` for S-102 — the newest
 dated ``.gpkg`` under it is resolved via one public S3 list) or a direct ``.gpkg`` URL. ``BBOX``
@@ -83,7 +83,7 @@ def gpkg_bounds(gpkg_url, bbox, link_col="GeoTIFF_Link"):
     The gpkg indexes every tile (footprint geometry + Resolution + a per-tile URL), so 3857 bounds
     come from reprojecting the footprint and pixel size from ``_dims``. ``bbox`` (W,S,E,N lon/lat)
     pushes an OGR spatial filter (gpkg geometry is WGS84) so a regional build reads only nearby rows.
-    ``link_col`` names the per-tile URL column — ``GeoTIFF_Link`` (BlueTopo), ``S102V30`` (NOAA S-102)."""
+    ``link_col`` names the per-tile URL column — ``S102V30`` (S-102), else the ``GeoTIFF_Link`` default."""
     gdf = gpd.read_file("/vsicurl/" + gpkg_url, bbox=tuple(bbox) if bbox else None)
     gdf = gdf[_populated_mask(gdf[link_col])]
     if gdf.empty:
