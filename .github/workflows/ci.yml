@@ -243,17 +243,15 @@ jobs:
           id=$(ls store/aggregation | sort | tail -1)
           ls "store/aggregation/$id"/*-aggregation.csv "store/aggregation/$id"/*-downsampling.csv 2>/dev/null \
             | sed 's#.*/##; s/-aggregation\.csv$//; s/-downsampling\.csv$//' | sort -u > /tmp/valid-pmt-stems.txt
-          aws s3 ls "s3://$DATA_BUCKET/bathymetry/pmtiles/" --recursive | awk '{print $NF}' | grep '\.pmtiles$' | sort > /tmp/r2-pmt-keys.txt || true
-          sed 's#.*/##; s/\.pmtiles$//' /tmp/r2-pmt-keys.txt | sort -u | comm -23 - /tmp/valid-pmt-stems.txt > /tmp/orphan-pmt-stems.txt
-          if [ -s /tmp/orphan-pmt-stems.txt ]; then
-            while read -r key; do
-              [ -n "$key" ] || continue
-              grep -qxF "$(basename "$key" .pmtiles)" /tmp/orphan-pmt-stems.txt && {
-                echo "pruning orphan pmtiles $key"
-                aws s3 rm "s3://$DATA_BUCKET/$key"
-              }
-            done < /tmp/r2-pmt-keys.txt
-          fi
+          aws s3 ls "s3://$DATA_BUCKET/bathymetry/pmtiles/" --recursive | awk '{print $NF}' | grep '\.pmtiles$' > /tmp/r2-pmt-keys.txt || true
+          # orphan keys = R2 key whose {z}-{x}-{y}-{child_z} basename isn't a current stem
+          awk 'NR==FNR{ok[$0]=1; next}{s=$0; sub(/.*\//,"",s); sub(/\.pmtiles$/,"",s); if(!(s in ok)) print}' \
+            /tmp/valid-pmt-stems.txt /tmp/r2-pmt-keys.txt > /tmp/orphan-pmt-keys.txt
+          echo "pruning $(wc -l < /tmp/orphan-pmt-keys.txt) orphan pmtiles of $(wc -l < /tmp/r2-pmt-keys.txt)"
+          while read -r key; do
+            [ -n "$key" ] || continue
+            aws s3 rm "s3://$DATA_BUCKET/$key"
+          done < /tmp/orphan-pmt-keys.txt
       - id: m
         name: Emit aggregate shard matrix
         run: |
