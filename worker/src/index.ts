@@ -89,7 +89,9 @@ function pm(env: Env, file: string): PMTiles {
 let manifestCache: Manifest | undefined;
 async function manifest(env: Env): Promise<Manifest> {
   if (!manifestCache) {
-    const obj = await env.TILES.get((env.RELEASE_PREFIX ?? "") + "manifest.json");
+    const obj = await env.TILES.get(
+      (env.RELEASE_PREFIX ?? "") + "manifest.json",
+    );
     if (!obj) throw new Error("manifest.json missing");
     manifestCache = JSON.parse(await obj.text());
   }
@@ -198,23 +200,24 @@ async function _makeTransparent(): Promise<ArrayBuffer> {
     lossless: 1,
   });
 }
-function transparentTile(): ArrayBuffer {
-  return transparentCache ?? new ArrayBuffer(0);
-}
-async function transparentResponse(): Promise<Response> {
+async function transparentBytes(): Promise<ArrayBuffer> {
   if (!transparentCache) transparentCache = await _makeTransparent();
-  return new Response(transparentCache, { headers: WEBP });
+  return transparentCache;
 }
 
 const CORS = { "access-control-allow-origin": "*" };
+// Stable tile URLs: a deploy never orphans cached tiles, and stale-while-revalidate/-if-error keep
+// serving them (refreshing in the background) so a nav app shows stale bathymetry over a blank tile.
+const TILE_CACHE =
+  "public, max-age=3600, stale-while-revalidate=31536000, stale-if-error=31536000";
 const WEBP = {
   "content-type": "image/webp",
-  "cache-control": "public, max-age=86400",
+  "cache-control": TILE_CACHE,
   ...CORS,
 };
 const MVT = {
   "content-type": "application/x-protobuf",
-  "cache-control": "public, max-age=86400",
+  "cache-control": TILE_CACHE,
   ...CORS,
 };
 
@@ -223,9 +226,32 @@ export default {
     const noTile = () => new Response(null, { status: 204, headers: CORS });
     const url = new URL(req.url);
     const path = url.pathname;
+    // ETag = release id (from RELEASE_PREFIX): every resource the worker serves is deterministic
+    // within a release, so one id validates all of them. A revalidation that still matches gets a
+    // bodyless 304 — cheap refresh for stale-while-revalidate/-if-error. (ETag is per release, so a
+    // deploy re-downloads even unchanged tiles; a per-tile content hash would avoid that, at the
+    // cost of hashing every response.)
+    const etag = `"${(env.RELEASE_PREFIX ?? "").split("/").filter(Boolean).pop() ?? "dev"}"`;
+    const fresh = req.headers.get("If-None-Match") === etag;
+    const send = (
+      body: BodyInit | null,
+      headers: Record<string, string>,
+    ): Response =>
+      fresh
+        ? new Response(null, {
+            status: 304,
+            headers: {
+              etag,
+              "cache-control": headers["cache-control"],
+              ...CORS,
+            },
+          })
+        : new Response(body, { headers: { ...headers, etag, ...CORS } });
     const json = (o: unknown) =>
-      new Response(JSON.stringify(o), {
-        headers: { "content-type": "application/json", ...CORS },
+      send(JSON.stringify(o), {
+        "content-type": "application/json",
+        "cache-control":
+          "public, max-age=60, stale-while-revalidate=604800, stale-if-error=31536000",
       });
     // The mount prefix (the Cloudflare route) is present in prod and absent in
     // dev at root — tolerate both: strip it when present, else treat the path as
@@ -290,15 +316,19 @@ export default {
       y = +m[3];
     const ext = m[4];
 
+    // Tile revalidation that still matches the deployed release → 304, skip the R2 read entirely.
+    if (fresh) return send(null, WEBP);
+
     const isVector = ext === "pbf" || ext === "mvt";
 
     // Out-of-range x/y (the pmtiles coord check throws on these) → blank tile, not a 500.
     const n = 2 ** z;
-    if (x >= n || y >= n) return isVector ? noTile() : transparentResponse();
+    if (x >= n || y >= n)
+      return isVector ? noTile() : send(await transparentBytes(), WEBP);
 
     if (isVector) {
       const t = await tile(env, "contours.pmtiles", z, x, y);
-      return t ? new Response(t, { headers: MVT }) : noTile();
+      return t ? send(t, MVT) : noTile();
     }
 
     // Terrain always returns a valid 512px tile (transparent sea-level on a miss)
@@ -306,7 +336,7 @@ export default {
     const mf = await manifest(env);
     if (z <= mf.planet.max_zoom) {
       const t = await tile(env, "planet.pmtiles", z, x, y);
-      return t ? new Response(t, { headers: WEBP }) : transparentResponse();
+      return t ? send(t, WEBP) : send(await transparentBytes(), WEBP);
     }
     // Deepest-first: serve (or overzoom) the highest-res source covering this tile,
     // so above an overlay's native zoom we upscale THAT overlay's regional detail
@@ -322,13 +352,14 @@ export default {
           z <= s.max_zoom
             ? await tile(env, s.file, z, x, y)
             : await overzoom(env, s.file, s.max_zoom, z, x, y);
-        if (t) return new Response(t, { headers: WEBP });
+        if (t) return send(t, WEBP);
       } catch (e) {
-        console.log(`overlay ${s.file} failed at ${z}/${x}/${y}, trying next: ${e}`);
+        console.log(
+          `overlay ${s.file} failed at ${z}/${x}/${y}, trying next: ${e}`,
+        );
       }
     }
     // No overlay covers it: overzoom the planet, or transparent if even that's absent.
-    if (!transparentCache) transparentCache = await _makeTransparent();
     const planetOz = await overzoom(
       env,
       "planet.pmtiles",
@@ -337,6 +368,6 @@ export default {
       x,
       y,
     );
-    return new Response(planetOz ?? transparentCache, { headers: WEBP });
+    return send(planetOz ?? (await transparentBytes()), WEBP);
   },
 };
