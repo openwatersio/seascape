@@ -79,7 +79,7 @@ def smooth_tiff(path, block=None):
         h_total, w_total = src.height, src.width
     # Re-write as a 512-blocked GTiff (aggregation_tile asserts 512 block shapes).
     profile.update(driver="GTiff", count=1, tiled=True, blockxsize=512, blockysize=512,
-                   compress="deflate")
+                   compress="zstd", predictor=3, num_threads="all_cpus")
     tmp = path + ".smooth.tif"
     with rasterio.open(path) as src, rasterio.open(tmp, "w", **profile) as dst:
         for row in range(0, h_total, block):

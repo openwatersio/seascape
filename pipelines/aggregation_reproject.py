@@ -110,8 +110,12 @@ def warp_mixed(inputs, out_tif, zoom, aggregation_tile, buffer):
     left, bottom, right, top = mercantile.xy_bounds(aggregation_tile)
     left, bottom, right, top = left - buffer, bottom - buffer, right + buffer, top + buffer
     res = get_resolution(zoom)
+    # ZSTD+predictor3 (single-band Float32) shrinks this transient ~4x; SPARSE_OK skips
+    # all-nodata blocks. Cuts the disk a deep z->z14 tile needs (a 32768px tile is ~4 GB
+    # uncompressed) and the I/O writing it.
     _run(f"GDAL_CACHEMAX=512 gdalwarp -overwrite -t_srs EPSG:3857 -tr {res} {res} "
-         f"-te {left} {bottom} {right} {top} -r {RESAMPLE} -dstnodata {NODATA} -co TILED=YES "
+         f"-te {left} {bottom} {right} {top} -r {RESAMPLE} -dstnodata {NODATA} "
+         "-co TILED=YES -co SPARSE_OK=YES -co COMPRESS=ZSTD -co PREDICTOR=3 -co NUM_THREADS=ALL_CPUS "
          f"{' '.join(inputs)} {out_tif}",
          f"gdalwarp(mixed) {out_tif}")
 
@@ -140,8 +144,12 @@ def create_warp(vrt, vrt_3857, zoom, aggregation_tile, buffer):
 
 
 def translate(in_filepath, out_filepath):
+    # ZSTD (no predictor — ADD_ALPHA makes this Float32 + a Byte alpha band, and
+    # PREDICTOR=3 is float-only) + NUM_THREADS. The merge reads these per-source COGs and
+    # inherits the profile into the merged DEM, so compressing here propagates downstream.
     _run("GDAL_CACHEMAX=512 gdal_translate -of COG -co BIGTIFF=IF_NEEDED -co ADD_ALPHA=YES "
-         f"-co OVERVIEWS=NONE -co SPARSE_OK=YES -co BLOCKSIZE=512 -co COMPRESS=NONE {in_filepath} {out_filepath}",
+         "-co OVERVIEWS=NONE -co SPARSE_OK=YES -co BLOCKSIZE=512 "
+         f"-co COMPRESS=ZSTD -co NUM_THREADS=ALL_CPUS {in_filepath} {out_filepath}",
          f"gdal_translate {in_filepath}")
 
 
@@ -195,6 +203,8 @@ def reproject(filepath):
             warp_mixed(per_tile_vrts(tmp_folder, i, source_items), merged,
                        maxzoom, aggregation_tile, buffer_3857_rounded)
             translate(merged, out_tiff)
+            os.remove(merged)  # free the multi-GB warp intermediate now, not at end-of-tile
+                               # (rmtree) — it's never read again once the COG exists
         else:
             vrt = create_virtual_raster(tmp_folder, i, source_items)
             vrt_3857 = f"{tmp_folder}/{i}-3857.vrt"
