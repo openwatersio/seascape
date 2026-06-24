@@ -121,7 +121,7 @@ jobs:
       - uses: ./.github/actions/ghcr-login
       # Unless a source is flagged "volatile" in metadata.json or its recipe under
       # sources/<id>/ changed, skip the fetch and reuse R2's copy (a recipe-hash marker
-      # beside the data tracks this). Volatile sources (BlueTopo/CUDEM) read a live
+      # beside the data tracks this). Volatile sources (S-102/CUDEM) read a live
       # upstream catalog whose tile list drifts, so they re-register every build.
       - name: Already current in R2?
         id: check

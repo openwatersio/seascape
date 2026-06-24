@@ -35,9 +35,22 @@ NODATA = -9999
 RESAMPLE = os.environ.get("AGG_RESAMPLE", "cubicspline")
 
 
+def negate_band1(filepath):
+    """Flip band-1 sign on valid pixels (depth +down -> elevation -down), leaving NODATA
+    and any alpha band untouched. Streamed sources skip source_datum, so a positive-down
+    source (S-102 stores depth) is converted here, right after warp. In-place band-1
+    rewrite so the COG's alpha mask band survives. When the pipeline flips to
+    depth-canonical internally, drop this and the `negate` flag — ingest becomes a no-op."""
+    with rasterio.open(filepath, "r+") as ds:
+        a = ds.read(1)
+        m = (a != NODATA) & ~np.isnan(a)
+        a[m] = -a[m]
+        ds.write(a, 1)
+
+
 def band_select(source):
-    """`-b N ` (trailing space) if the source pins a band, else ''. BlueTopo is 3-band
-    (elevation/uncertainty/contributor); band 1 is elevation."""
+    """`-b N ` (trailing space) if the source pins a band, else ''. S-102 is 2-band
+    (depth/uncertainty); band 1 is depth (negated to elevation after warp)."""
     band = config.load_metadata(source).get("band")
     return f"-b {band} " if band else ""
 
@@ -55,7 +68,7 @@ def create_virtual_raster(tmp_folder, i, source_items):
 
 def per_tile_vrts(tmp_folder, i, source_items):
     """One single-band VRT per tile, for a `mixed_crs` source (per-tile UTM zones, e.g.
-    BlueTopo). gdalbuildvrt refuses to merge differing CRS into one VRT — it silently
+    NOAA S-102). gdalbuildvrt refuses to merge differing CRS into one VRT — it silently
     drops the off-CRS tiles, holing zone seams — so each tile gets its own VRT and
     gdalwarp (which does reproject per input) mosaics them into 3857 in warp_mixed."""
     source = source_items[0]["source"]
@@ -181,6 +194,8 @@ def reproject(filepath):
             vrt_3857 = f"{tmp_folder}/{i}-3857.vrt"
             create_warp(vrt, vrt_3857, maxzoom, aggregation_tile, buffer_3857_rounded)
             translate(vrt_3857, out_tiff)
+        if config.load_metadata(source_items[0]["source"]).get("negate"):
+            negate_band1(out_tiff)  # streamed positive-down source (S-102 depth) -> elevation
         if len(grouped) > 1 and not contains_nodata_pixels(out_tiff):
             break
 
@@ -253,6 +268,21 @@ def _check():
             pass
     finally:
         utils.run_command, time.sleep = real_run, real_sleep
+
+    # negate_band1: valid band-1 pixels flip sign; NODATA and the 2nd (alpha) band untouched.
+    neg = f"{d}/neg.tif"
+    arr = np.array([[5.0, NODATA], [10.0, -3.0]], dtype="float32")  # depths + a nodata cell
+    alpha = np.array([[7.0, 0.0], [7.0, 7.0]], dtype="float32")
+    with rasterio.open(neg, "w", driver="GTiff", height=2, width=2, count=2, dtype="float32",
+                       nodata=NODATA, crs="EPSG:3857", transform=from_origin(0, 2, 1, 1)) as dst:
+        dst.write(arr, 1); dst.write(alpha, 2)
+    negate_band1(neg)
+    with rasterio.open(neg) as src:
+        o1, o2 = src.read(1), src.read(2)
+    assert o1[0, 0] == -5.0 and o1[1, 0] == -10.0 and o1[1, 1] == 3.0, o1  # valid flipped
+    assert o1[0, 1] == NODATA, o1                                          # nodata not flipped
+    assert (o2 == alpha).all(), o2                                         # 2nd band preserved
+
     print(f"aggregation_reproject.py self-check ok (valid pixels: A={va}, A+B={vboth})")
 
 

@@ -1,0 +1,12 @@
+{
+    "name": "NOAA S-102 Bathymetric Surface",
+    "producer": "NOAA Office of Coast Survey",
+    "website": "https://noaa-s102-pds.s3.amazonaws.com/README.html",
+    "license": "public domain (U.S. Government work)",
+    "max_zoom": 14,
+    "band": 1,
+    "mixed_crs": true,
+    "volatile": true,
+    "negate": true,
+    "link_column": "S102V30"
+}

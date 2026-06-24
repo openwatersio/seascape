@@ -1,0 +1,9 @@
+# NOAA S-102 Bathymetric Surface, US navigable waters. Run from pipelines/:  just ../sources/noaa_s102/
+# Streaming model: resolve the newest navigation tile-scheme GeoPackage, register every tile's
+# S102V30 .h5 URL as a /vsicurl/ reference (header-free — the gpkg is the index). Aggregation
+# range-reads the HDF5 off S3. Per-tile UTM zones + depth (positive-down): metadata sets
+# mixed_crs + band 1 + negate (depth->elevation at reproject, since streamed sources skip
+# source_datum). Already MLLW — no datum offset. Sibling of BlueTopo but datum-clean.
+[no-cd]
+default:
+    uv run python source_register_remote_geopkg.py noaa_s102

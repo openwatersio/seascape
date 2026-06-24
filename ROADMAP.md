@@ -79,7 +79,7 @@ overlaps. Zoom caps are display caps (per source via `max_zoom`), not native res
 | DDM (Denmark) | 50 m       | z12      | Danish EEZ         | MSL (DKMSL2022)        | `ddm`               |
 | CUDEM 1/9     | ~3.4 m     | z13      | US coast           | NAVD88                 | `cudem`             |
 | CUDEM 1/3     | ~10 m      | z12      | US coast (broader) | NAVD88                 | `cudem_third`       |
-| BlueTopo      | 2–16 m     | z14      | US navigable       | MLLW/NAVD88 (per-tile) | `bluetopo` (branch) |
+| NOAA S-102    | ~4–16 m    | z14      | US navigable       | MLLW (+ uncertainty)   | `noaa_s102`         |
 
 Not yet ingested: CUDEM territory products (HI/PR/USVI/Guam/AmSam/CNMI) and NIWA NZ
 — pulled in when needed.
