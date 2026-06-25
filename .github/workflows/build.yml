@@ -1,0 +1,514 @@
+name: Build
+
+# Heavy planet build (see CONTRIBUTING.md / the port plan):
+#   image → sources (per-source matrix) → plan (cover + diff) → aggregate
+#   (sharded fan-out) → bundle + contours. Releasing/deploying is release.yml.
+#
+# State lives in R2 under a single persistent prefix `store/` (the consolidated
+# pipelines/store dir) so rebuilds are incremental: `plan` diffs the new covering
+# against the previous one and only the changed aggregation tiles get rebuilt;
+# clean tiles' pmtiles/contours are reused straight from the store. Final bundles
+# land in build/<sha>/; a release promotes that build (see release.yml).
+#
+# Runs on manual dispatch only (a shared incremental store shouldn't be mutated by
+# routine pushes); any branch can trigger one via workflow_dispatch (optionally with
+# a BBOX). The light per-commit checks live in ci.yml. Releasing a commit promotes
+# the build a dispatch produced for it — so dispatch a build before you release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bbox:
+        description: 'Bounding box "W,S,E,N" (empty = full global)'
+        required: false
+        default: ""
+      shards:
+        description: "Aggregate matrix shards (<= 256)"
+        required: false
+        default: "24"
+      force:
+        description: "Force full rebuild — ignore the incremental diff (use after pipeline-code changes)"
+        type: boolean
+        default: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+  # The public "data" bucket (data.openwaters.io) holds all build state + per-commit
+  # builds, compartmentalized per product under bathymetry/. release.yml promotes a
+  # finished build into the separate Worker-fronted "tiles" bucket for serving.
+  DATA_BUCKET: data
+  AGG_SHARDS: ${{ github.event.inputs.shards || '24' }}
+  BBOX: ${{ github.event.inputs.bbox || '' }}
+  # Set by the `force` dispatch input → consumed by get_dirty_aggregation_filenames to
+  # mark every tile dirty (the source-coverage diff can't see pipeline-code changes).
+  FORCE_REBUILD: ${{ github.event.inputs.force == 'true' && '1' || '' }}
+  # R2 via the S3 API (aws-cli v2 honours AWS_ENDPOINT_URL).
+  AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  AWS_DEFAULT_REGION: auto
+  AWS_ENDPOINT_URL: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+  # R2 occasionally returns a transient 500 InternalError; the CLI default (~3 tries)
+  # gives up mid-sync. Adaptive retry + a high ceiling rides it out across every aws s3 call.
+  AWS_RETRY_MODE: adaptive
+  AWS_MAX_ATTEMPTS: "10"
+
+# One full build at a time, globally (not per-ref): the incremental store is shared,
+# so two builds must never run concurrently. cancel-in-progress: false → a new
+# dispatch queues behind the running build rather than cancelling it mid-write.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  # Build + push the toolchain image. buildx GHA cache → only recompiles when the
+  # Dockerfile changes (shared with ci.yml, so a push-built image is reused here).
+  image:
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: write }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v3
+      - uses: ./.github/actions/ghcr-login
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Enumerate the sources (one dir per source) into a matrix.
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      sources: ${{ steps.l.outputs.sources }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: l
+        run: echo "sources=$(ls -1 sources | jq -R -s -c 'split("\n")|map(select(length>0))')" >> "$GITHUB_OUTPUT"
+
+  # Prepare each source (fetch → datum → normalize → bounds → polygon → tarball)
+  # and push its store/source/<id> to R2. One source failing doesn't sink the rest
+  # (the covering simply omits it). Cache skips re-fetching unchanged sources.
+  sources:
+    needs: [image, discover]
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: read }
+    strategy:
+      fail-fast: false
+      matrix:
+        source: ${{ fromJSON(needs.discover.outputs.sources) }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/ghcr-login
+      # Unless a source is flagged "volatile" in metadata.json or its recipe under
+      # sources/<id>/ changed, skip the fetch and reuse R2's copy (a recipe-hash marker
+      # beside the data tracks this). Volatile sources (S-102/CUDEM) read a live
+      # upstream catalog whose tile list drifts, so they re-register every build.
+      - name: Already current in R2?
+        id: check
+        env:
+          RECIPE_HASH: ${{ hashFiles(format('sources/{0}/**', matrix.source)) }}
+        run: |
+          volatile=$(jq -r '.volatile // false' "sources/${{ matrix.source }}/metadata.json")
+          have=$(aws s3 cp "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/.recipe-hash" - 2>/dev/null || true)
+          if [ "$volatile" = "true" ]; then current=false
+          elif [ -n "$RECIPE_HASH" ] && [ "$have" = "$RECIPE_HASH" ]; then current=true
+          else current=false; fi
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "hash=$RECIPE_HASH" >> "$GITHUB_OUTPUT"
+          echo "${{ matrix.source }}: recipe=$RECIPE_HASH r2=${have:-none} volatile=$volatile → current=$current"
+      # Seed the previous bounds.csv so a re-registered streaming source reuses cached
+      # tile headers and only reads newly-added URLs (CUDEM's 942 header reads → ~0 on a
+      # rebuild). Harmless for the rest: a GeoPackage source rebuilds bounds from its index,
+      # a prepared source overwrites it.
+      - name: Seed previous bounds
+        if: steps.check.outputs.current != 'true'
+        run: |
+          mkdir -p "store/source/${{ matrix.source }}"
+          aws s3 cp "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/bounds.csv" \
+            "store/source/${{ matrix.source }}/bounds.csv" 2>/dev/null || true
+      - name: Prepare ${{ matrix.source }}
+        if: steps.check.outputs.current != 'true'
+        run: |
+          mkdir -p store
+          docker run --rm \
+            -v "$PWD/store:/app/pipelines/store" \
+            "$IMAGE:${{ github.sha }}" just source ${{ matrix.source }}
+      - name: Push source to R2
+        if: steps.check.outputs.current != 'true'
+        run: |
+          aws s3 sync "store/source/${{ matrix.source }}" "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}" --delete --exclude '.recipe-hash'
+          # The container writes store/ as root, so write the marker to R2 from stdin
+          # (not into the root-owned dir); --exclude above keeps --delete off it.
+          printf '%s' "${{ steps.check.outputs.hash }}" | aws s3 cp - "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/.recipe-hash"
+
+  # Cover the planet into aggregation tiles, diff against the previous covering,
+  # and emit the shard matrix sized to the dirty count.
+  plan:
+    needs: [image, sources]
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: read }
+    outputs:
+      shards: ${{ steps.m.outputs.shards }}
+      ds_shards: ${{ steps.dm.outputs.shards }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/ghcr-login
+      - name: Pull bounds + pmtiles index from R2
+        run: |
+          mkdir -p store/source
+          # Covering only needs each source's bounds.csv (not the full DEM)…
+          aws s3 sync "s3://$DATA_BUCKET/bathymetry/source" store/source --exclude '*' --include '*/bounds.csv'
+          # …and the list of already-built pmtiles, so the diff rebuilds any covering
+          # tile whose artifact is missing (self-heal — coverings are pushed before
+          # the tiles exist, so a failed prior build can leave gaps the diff trusts).
+          aws s3 ls "s3://$DATA_BUCKET/bathymetry/pmtiles/" --recursive | awk '{print $4}' > store/pmtiles-keys.txt || true
+      # …plus the prior covering(s) so the dirty-diff has something to compare to.
+      # markers: false — the diff reads CSVs only, never the resume markers.
+      - name: Pull previous covering from R2
+        uses: ./.github/actions/pull-covering
+        with:
+          markers: "false"
+      - name: Cover
+        run: |
+          # Aggregation covering, then the downsampling coverings (-downsampling.csv)
+          # so the sharded downsample job downstream sees the same plan from R2.
+          docker run --rm -e BBOX -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just cover
+          docker run --rm -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just downsample-cover
+      - name: Push covering to R2
+        run: |
+          # One gzipped tar per covering (covering.tar.gz) instead of ~2k loose CSVs —
+          # turns a latency-bound sync of thousands of tiny objects into a single PUT.
+          # ULIDs sort chronologically, so the newest dir is the covering just written.
+          id=$(ls store/aggregation | sort | tail -1)
+          tar -C "store/aggregation/$id" -czf /tmp/covering.tar.gz .
+          aws s3 cp /tmp/covering.tar.gz "s3://$DATA_BUCKET/bathymetry/aggregation/$id/covering.tar.gz"
+      - name: Prune old coverings (keep newest 3)
+        run: |
+          # R2 accrues one covering dir (ULID) per build, but every consumer reads only
+          # the newest two (current + previous, for the dirty-diff). Each dir is a tarball
+          # plus its build's resume markers; without pruning the backlog grows unbounded.
+          # Drop all but the newest 3 (one extra for margin); ULIDs sort chronologically.
+          ids=$(aws s3 ls "s3://$DATA_BUCKET/bathymetry/aggregation/" | awk '{print $2}' | tr -d /)
+          keep=$(echo "$ids" | sort | tail -3)
+          for id in $ids; do
+            grep -qx "$id" <<<"$keep" || {
+              echo "pruning covering $id"
+              aws s3 rm "s3://$DATA_BUCKET/bathymetry/aggregation/$id" --recursive
+            }
+          done
+      - name: Prune orphaned contour FGBs (covering re-tiled)
+        run: |
+          # store/contour FGBs are keyed {z}-{x}-{y}-{child_z}, same as the covering's
+          # aggregation tiles. A source's footprint/maxzoom shift re-tiles its area, but
+          # the sync (line ~270) has no --delete, so the superseded FGB lingers in R2 and
+          # contour bundle globs EVERY FGB → two contour sets overlap. Drop any R2 FGB
+          # whose stem isn't a current-covering tile (this job just wrote the covering).
+          id=$(ls store/aggregation | sort | tail -1)
+          ls "store/aggregation/$id"/*-aggregation.csv | sed 's#.*/##; s/-aggregation\.csv$//' | sort > /tmp/valid-stems.txt
+          aws s3 ls "s3://$DATA_BUCKET/bathymetry/contour/" --recursive | awk '{print $NF}' | grep '\.fgb$' > /tmp/r2-fgbs.txt || true
+          while read -r key; do
+            [ -n "$key" ] || continue
+            grep -qx "$(basename "$key" .fgb)" /tmp/valid-stems.txt || {
+              echo "pruning orphan contour $key"
+              aws s3 rm "s3://$DATA_BUCKET/$key"
+            }
+          done < /tmp/r2-fgbs.txt
+      - name: Prune orphaned pmtiles (covering re-tiled)
+        run: |
+          # Same orphan class as the contour prune: a re-tiled covering leaves the old
+          # tile's pmtiles in R2 (sync has no --delete). bundle.py already filters orphans
+          # out at bundle time, so this is storage hygiene — keeps the pmtiles listing the
+          # dirty-diff/group-keys scan from growing dead keys. Valid stems = this covering's
+          # aggregate AND downsample tiles (downsample also emits pmtiles; cover ran both).
+          id=$(ls store/aggregation | sort | tail -1)
+          ls "store/aggregation/$id"/*-aggregation.csv "store/aggregation/$id"/*-downsampling.csv 2>/dev/null \
+            | sed 's#.*/##; s/-aggregation\.csv$//; s/-downsampling\.csv$//' | sort -u > /tmp/valid-pmt-stems.txt
+          aws s3 ls "s3://$DATA_BUCKET/bathymetry/pmtiles/" --recursive | awk '{print $NF}' | grep '\.pmtiles$' > /tmp/r2-pmt-keys.txt || true
+          # orphan keys = R2 key whose {z}-{x}-{y}-{child_z} basename isn't a current stem
+          awk 'NR==FNR{ok[$0]=1; next}{s=$0; sub(/.*\//,"",s); sub(/\.pmtiles$/,"",s); if(!(s in ok)) print}' \
+            /tmp/valid-pmt-stems.txt /tmp/r2-pmt-keys.txt > /tmp/orphan-pmt-keys.txt
+          echo "pruning $(wc -l < /tmp/orphan-pmt-keys.txt) orphan pmtiles of $(wc -l < /tmp/r2-pmt-keys.txt)"
+          while read -r key; do
+            [ -n "$key" ] || continue
+            aws s3 rm "s3://$DATA_BUCKET/$key"
+          done < /tmp/orphan-pmt-keys.txt
+      - id: m
+        name: Emit aggregate shard matrix
+        run: |
+          SHARDS=$(docker run --rm -e FORCE_REBUILD -v "$PWD/store:/app/pipelines/store" \
+            "$IMAGE:${{ github.sha }}" just shard-matrix "$AGG_SHARDS" | tail -n1)
+          echo "shards=$SHARDS" >> "$GITHUB_OUTPUT"
+      - id: dm
+        name: Emit downsample shard matrix
+        run: |
+          SHARDS=$(docker run --rm -e FORCE_REBUILD -v "$PWD/store:/app/pipelines/store" \
+            "$IMAGE:${{ github.sha }}" just downsample-matrix "$AGG_SHARDS" | tail -n1)
+          echo "shards=$SHARDS" >> "$GITHUB_OUTPUT"
+
+  # Reproject → merge → tile → contour for one strided slice of the dirty tiles.
+  # Shards re-derive the same sorted dirty list and never overlap, so each pushes
+  # disjoint tile keys back to the store.
+  aggregate:
+    needs: [image, sources, plan]
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: read }
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/ghcr-login
+      # Source COGs are NOT pulled — reproject range-reads them via /vsicurl from
+      # public R2 (and CUDEM from public NOAA). Only the covering + pmtiles keys.
+      - name: Pull covering from R2
+        uses: ./.github/actions/pull-covering
+      - name: Pull pmtiles index from R2
+        run: |
+          mkdir -p store/pmtiles store/contour
+          # Same pmtiles listing the plan used, so shards re-derive the identical
+          # dirty set (changed tiles + any whose pmtiles is missing).
+          aws s3 ls "s3://$DATA_BUCKET/bathymetry/pmtiles/" --recursive | awk '{print $4}' > store/pmtiles-keys.txt || true
+      - name: Aggregate shard ${{ matrix.shard.i }}/${{ matrix.shard.n }}
+        run: |
+          # SOURCE_VSI_BASE → reproject resolves each source tile to a public /vsicurl
+          # URL on R2 instead of a local store/source path. No credentials needed.
+          # AGG_PROCESSES caps concurrent tiles (each holds a multi-GB merged DEM) so
+          # a heavy shard doesn't OOM the runner; GDAL_CACHEMAX trims the block cache
+          # the /vsicurl reads accumulate (per worker).
+          docker run --rm -v "$PWD/store:/app/pipelines/store" \
+            -e SOURCE_VSI_BASE="/vsicurl/https://data.openwaters.io/bathymetry/source" \
+            -e AGG_PROCESSES=2 -e GDAL_CACHEMAX=256 -e FORCE_REBUILD \
+            "$IMAGE:${{ github.sha }}" just aggregate ${{ matrix.shard.i }} ${{ matrix.shard.n }}
+      - name: Push tiles + contours + done-markers to R2
+        run: |
+          aws s3 sync store/pmtiles "s3://$DATA_BUCKET/bathymetry/pmtiles"
+          aws s3 sync store/contour "s3://$DATA_BUCKET/bathymetry/contour"
+          # Markers only — the covering tarball is immutable (plan owns it) and the
+          # untarred CSVs must not be re-uploaded as the loose files we just collapsed.
+          aws s3 sync store/aggregation "s3://$DATA_BUCKET/bathymetry/aggregation" --exclude '*' --include '*.done'
+
+  # Overview pyramid, sharded. The deep levels partition into read-closed subtrees
+  # (one per ancestor at the covering's seed zoom) so they fan out with no
+  # coordination, exactly like aggregate; the coarse global tail (a few cheap levels
+  # whose tiles span subtrees) is finished on the single bundle runner below. The
+  # level barrier stays inside each runner. A clean rebuild still spins one no-op shard.
+  downsample:
+    needs: [image, aggregate, plan]
+    if: ${{ !cancelled() && needs.aggregate.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: read }
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.ds_shards) }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/ghcr-login
+      # Coverings (incl. -downsampling.csv from plan) — needed to derive the dirty set
+      # + which ancestors this shard owns, plus this shard's prior-attempt resume markers.
+      - name: Pull covering from R2
+        uses: ./.github/actions/pull-covering
+      - name: Pull this shard's tiles from R2
+        run: |
+          mkdir -p store/pmtiles
+          # Only this shard's slice of store/pmtiles (its ancestors' tiles), NOT the
+          # whole tens-of-GB store: list the keys, let Python filter to the shard, then
+          # parallel-copy preserving the z7-sharded layout.
+          aws s3 ls "s3://$DATA_BUCKET/bathymetry/pmtiles/" --recursive | awk '{print $4}' > store/pmtiles-keys.txt
+          docker run --rm -e FORCE_REBUILD -v "$PWD/store:/app/pipelines/store" \
+            "$IMAGE:${{ github.sha }}" just downsample-shard-keys ${{ matrix.shard.i }} ${{ matrix.shard.n }}
+          echo "pulling $(wc -l < store/shard-keys.txt) of $(wc -l < store/pmtiles-keys.txt) pmtiles"
+          xargs -P 8 -I{} sh -c 'k="$1"; d="store/${k#bathymetry/}"; mkdir -p "$(dirname "$d")"; aws s3 cp "s3://$DATA_BUCKET/$k" "$d" --quiet' _ {} < store/shard-keys.txt
+      - name: Downsample shard ${{ matrix.shard.i }}/${{ matrix.shard.n }}
+        run: |
+          docker run --rm -e FORCE_REBUILD -v "$PWD/store:/app/pipelines/store" \
+            "$IMAGE:${{ github.sha }}" just downsample-shard ${{ matrix.shard.i }} ${{ matrix.shard.n }}
+      - name: Push pyramid + done-markers to R2
+        run: |
+          # Disjoint tile keys + this shard's -downsampling.done markers (no --delete,
+          # so shards/tail never clobber each other's markers or the coverings).
+          aws s3 sync store/pmtiles "s3://$DATA_BUCKET/bathymetry/pmtiles"
+          # Markers only — covering tarball is immutable, untarred CSVs must not re-upload.
+          aws s3 sync store/aggregation "s3://$DATA_BUCKET/bathymetry/aggregation" --exclude '*' --include '*.done'
+
+  # Terrain bundle, fanned out so each runner holds only ONE group's tiles + output — not
+  # the whole store plus every overlay at once, which overran the disk (the pmtiles writer
+  # spools each tile then copies it into the archive, so finalize ~2x's a bundle). bundle-plan
+  # finishes the coarse pyramid tail (it spans ancestors, so it can't be a deep shard) and
+  # verifies the pyramid is whole, then emits one matrix job per group; bundle-merge stitches
+  # the per-group manifest fragments. Contours are built separately (sharded, below).
+  bundle-plan:
+    needs: downsample
+    if: ${{ !cancelled() && needs.downsample.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: read }
+    outputs:
+      groups: ${{ steps.g.outputs.groups }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/ghcr-login
+      - name: Pull covering from R2
+        uses: ./.github/actions/pull-covering
+      - name: Pull pmtiles store from R2
+        run: |
+          # The tail is finished here on one runner from the full store; the matrix jobs
+          # below each pull only their group. Contours are bundled by the separate sharded
+          # jobs, so store/contour is NOT pulled here.
+          mkdir -p store/pmtiles
+          aws s3 sync "s3://$DATA_BUCKET/bathymetry/pmtiles" store/pmtiles
+      - name: Coarse tail + group matrix
+        id: g
+        run: |
+          docker run --rm -e FORCE_REBUILD -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just downsample-tail
+          docker run --rm -e FORCE_REBUILD -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just bundle-groups > /tmp/groups.txt
+          # Emit the JSON matrix via the heredoc form, NOT name=value: the runner's post-step
+          # processing of `groups=[...]` fails the step (every shell op here exits 0 — the
+          # failure is in GitHub's output handling, not the script), and <<EOF is accepted.
+          {
+            echo "groups<<EOF"
+            tail -n1 /tmp/groups.txt
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "bundle groups: $(tail -n1 /tmp/groups.txt)"
+      - name: Push tail tiles + done-markers to R2
+        run: |
+          # Tail overview tiles + downsampling done-markers feed the next incremental run,
+          # and the matrix jobs' R2 listing must include the tail tiles.
+          aws s3 sync store/pmtiles "s3://$DATA_BUCKET/bathymetry/pmtiles"
+          # Markers only — covering tarball is immutable, untarred CSVs must not re-upload.
+          aws s3 sync store/aggregation "s3://$DATA_BUCKET/bathymetry/aggregation" --exclude '*' --include '*.done'
+
+  # One runner per group: pull only this group's pmtiles slice, bundle it, push the overlay
+  # + its manifest fragment. Peak disk = one group's tiles + ~2x its output, so it scales
+  # with the biggest single overlay, not the whole planet.
+  bundle:
+    needs: bundle-plan
+    if: ${{ !cancelled() && needs.bundle-plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: read }
+    strategy:
+      fail-fast: false
+      matrix:
+        group: ${{ fromJSON(needs.bundle-plan.outputs.groups) }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/ghcr-login
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+      # Covering — group-keys derives which pmtiles belong to this group, the same way
+      # bundle assigns local files, so we pull only this group's slice.
+      - name: Pull covering from R2
+        uses: ./.github/actions/pull-covering
+      - name: Pull this group's tiles from R2
+        run: |
+          mkdir -p store/pmtiles store/bundle
+          aws s3 ls "s3://$DATA_BUCKET/bathymetry/pmtiles/" --recursive | awk '{print $4}' > store/pmtiles-keys.txt
+          docker run --rm -v "$PWD/store:/app/pipelines/store" \
+            "$IMAGE:${{ github.sha }}" just bundle-group-keys ${{ matrix.group }}
+          echo "pulling $(wc -l < store/keys.txt) of $(wc -l < store/pmtiles-keys.txt) pmtiles for ${{ matrix.group }}"
+          xargs -P 8 -I{} sh -c 'k="$1"; d="store/${k#bathymetry/}"; mkdir -p "$(dirname "$d")"; aws s3 cp "s3://$DATA_BUCKET/$k" "$d" --quiet' _ {} < store/keys.txt
+      - name: Bundle ${{ matrix.group }}
+        run: docker run --rm -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just bundle-group ${{ matrix.group }}
+      - name: Push ${{ matrix.group }} overlay + fragment to R2
+        run: |
+          B="s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}"
+          aws s3 cp "store/bundle/${{ matrix.group }}.pmtiles" "$B/${{ matrix.group }}.pmtiles" --content-type application/octet-stream
+          aws s3 cp "store/bundle/${{ matrix.group }}.json" "$B/bundle-frags/${{ matrix.group }}.json" --content-type application/json
+
+  # Stitch the per-group manifest fragments into manifest.json (copied last, so its
+  # presence marks a complete build for release.yml). A failed overlay leaves no manifest.
+  bundle-merge:
+    needs: bundle
+    if: ${{ !cancelled() && needs.bundle.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: read }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/ghcr-login
+      - name: Merge manifest from fragments
+        run: |
+          mkdir -p store/bundle
+          aws s3 sync "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/bundle-frags" store/bundle
+          docker run --rm -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just bundle-merge
+          aws s3 cp store/bundle/manifest.json "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/manifest.json" \
+            --content-type application/json
+
+  # ─── Contours (sharded — one global tippecanoe blows the 6 h cap at planet scale) ─
+  # Size the fan-out to the FGB count (no download — just an R2 listing).
+  contour-plan:
+    needs: aggregate
+    if: ${{ !cancelled() && needs.aggregate.result == 'success' }}
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.m.outputs.shards }}
+    steps:
+      - id: m
+        run: |
+          count=$(aws s3 ls "s3://$DATA_BUCKET/bathymetry/contour/" --recursive | grep -c '\.fgb$' || true)
+          shards=$(python3 -c "import json,sys; c=int(sys.argv[1]); n=min(${AGG_SHARDS}, max(c,1)); print(json.dumps([{'i':i,'n':n} for i in range(n)]))" "$count")
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
+          echo "contour FGBs: $count → matrix $shards"
+
+  # tippecanoe one strided FGB slice per runner → a per-shard contours pmtiles.
+  contours:
+    needs: [aggregate, contour-plan]
+    if: ${{ !cancelled() && needs.contour-plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: read }
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.contour-plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/ghcr-login
+      # Pull ONLY this shard's FGB slice (not the whole set). List the FGB keys
+      # (sorted = the order Python globs), derive the global maxz (so every shard
+      # tiles to the same depth and tile-joins cleanly), and parallel-copy the
+      # strided slice this shard owns.
+      - name: Pull this shard's FGB slice from R2
+        run: |
+          mkdir -p store/contour store/bundle
+          aws s3 ls "s3://$DATA_BUCKET/bathymetry/contour/" --recursive | awk '{print $NF}' | grep '\.fgb$' | sort > /tmp/all.txt
+          sed 's#.*/##; s/\.fgb$//' /tmp/all.txt | awk -F- '{print $4}' | sort -n | tail -1 > store/contour-maxz.txt
+          awk -v i="${{ matrix.shard.i }}" -v n="${{ matrix.shard.n }}" 'NR % n == (i + 1) % n' /tmp/all.txt \
+            | xargs -P 8 -I{} aws s3 cp "s3://$DATA_BUCKET/{}" store/contour/
+          echo "shard ${{ matrix.shard.i }}/${{ matrix.shard.n }}: $(ls store/contour/*.fgb 2>/dev/null | wc -l) FGBs, global maxz $(cat store/contour-maxz.txt)"
+      - name: Contour shard ${{ matrix.shard.i }}
+        run: |
+          docker run --rm -v "$PWD/store:/app/pipelines/store" \
+            "$IMAGE:${{ github.sha }}" just contour-shard ${{ matrix.shard.i }}
+      - name: Push shard pmtiles to R2
+        run: |
+          aws s3 cp store/bundle "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/contour-shards/" \
+            --recursive --exclude '*' --include 'contours-shard-*.pmtiles' --content-type application/octet-stream
+
+  # tile-join the per-shard pmtiles into one contours.pmtiles.
+  contour-bundle:
+    needs: contours
+    if: ${{ !cancelled() && needs.contours.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: read }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/ghcr-login
+      - name: Pull shard pmtiles from R2
+        run: |
+          mkdir -p store/bundle
+          aws s3 sync "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/contour-shards" store/bundle
+      - name: Merge contours
+        run: docker run --rm -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just contour-merge
+      - name: Push contours.pmtiles to R2 build
+        run: |
+          aws s3 cp store/bundle/contours.pmtiles "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/contours.pmtiles" \
+            --content-type application/octet-stream

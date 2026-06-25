@@ -1,7 +1,7 @@
 name: Release
 
 # Republishes a build that was already produced on main (bathymetry/build/<sha>/ in R2) — no
-# rebuild — and deploys the Worker + viewer. The build pipeline lives in ci.yml.
+# rebuild — and deploys the Worker + viewer. The build pipeline lives in build.yml.
 # A published release promotes the build for its tagged commit. Run manually
 # (workflow_dispatch from main, with a `sha`) to publish any other built commit
 # using the current workflow rather than the one at that commit.

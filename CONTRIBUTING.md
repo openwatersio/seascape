@@ -126,10 +126,10 @@ source's nodata would otherwise punch holes over the base).
 
 ## CI / build & release
 
-`.github/workflows/ci.yml` (build) and `release.yml` (publish + deploy):
+`.github/workflows/ci.yml` (per-commit checks), `build.yml` (full build), and `release.yml` (publish + deploy):
 
-- **Every push** builds the toolchain image and runs the offline self-checks (`test-sources`, `test-engine`); the viewer builds too.
-- **Default branch / manual dispatch** runs the full build: prepare each source (matrix) → plan the covering and diff it against the previous run → aggregate the changed tiles (sharded across runners) → bundle planet + overlays + contours + manifest. Build state and per-commit bundles persist in the public **data bucket** (`data.openwaters.io`) under `bathymetry/`, so rebuilds are incremental. Manual runs (Actions → Build → Run workflow) accept an optional `bbox` and shard count.
+- **Every push** (ci.yml) builds the toolchain image and runs the offline self-checks (`test-sources`, `test-engine`); the viewer builds too.
+- **Manual dispatch** (build.yml) runs the full build: prepare each source (matrix) → plan the covering and diff it against the previous run → aggregate the changed tiles (sharded across runners) → bundle planet + overlays + contours + manifest. Build state and per-commit bundles persist in the public **data bucket** (`data.openwaters.io`) under `bathymetry/`, so rebuilds are incremental. Manual runs (Actions → Build → Run workflow) accept an optional `bbox` and shard count.
 - **On a published release** the build for that commit is promoted from the data bucket into the Worker-fronted **serving bucket** (`tiles.openwaters.io`) at `bathymetry/<sha>/`, the Worker is deployed pointing at that release (`RELEASE_PREFIX`), and the viewer ships to GitHub Pages. Re-dispatching `release.yml` with a prior built sha republishes it with no rebuild.
 
 Two R2 buckets — `data` (public, all build state) and the serving bucket. Required

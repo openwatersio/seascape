@@ -70,15 +70,17 @@ tile bbox → 4326. Seam continuity comes from **buffer the DEM input, restrict 
 tile output** (deterministic merge → byte-identical overlap → lines meet at the clip).
 Contour tiles are tile-keyed in `store/contour` so clean tiles persist across runs.
 
-### CI / incremental (`.github/workflows/ci.yml`)
+### CI / incremental (`ci.yml` checks, `build.yml` build)
 
+`ci.yml` runs the light per-commit checks (image → check + web) on every push.
+The full build lives in `build.yml`:
 `image → sources (matrix) → plan (cover + dirty-diff) → aggregate (sharded fan-out)
 → bundle → publish/worker/pages`. State persists in R2 under `store/`, so a rebuild
 diffs the new covering against the previous (`get_dirty_aggregation_filenames`) and
 only changed aggregation tiles rebuild; clean tiles' pmtiles/contours are reused.
 `aggregate` shards by strided slice of the dirty list (`aggregation_run.py shard i n`).
-Heavy build runs on `workflow_dispatch` only (a shared store shouldn't be mutated by
-routine pushes); pushes run just the light checks. Releasing a commit promotes the
+The build runs on `workflow_dispatch` only (a shared store shouldn't be mutated by
+routine pushes). Releasing a commit promotes the
 build a dispatch produced for it — so dispatch a build before you release that commit.
 On release, bundles promote to `bathymetry/<year>/`, the Worker deploys (`wrangler`),
 and the viewer ships to Pages.

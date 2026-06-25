@@ -56,7 +56,7 @@ parallel once 2–3 land.
 
 ## ✅ Milestone 1 — Build scaling
 
-The [global build](.github/workflows/ci.yml) is sharded geographically and runs in parallel across GitHub's
+The [global build](.github/workflows/build.yml) is sharded geographically and runs in parallel across GitHub's
 free concurrent runners, with build state cached in R2 so a rebuild only redoes the
 regions that changed and reuses the rest — and the shards stitch back together
 without seams at their boundaries.
