@@ -1,0 +1,5 @@
+# Great Barrier Reef Bathymetry 2020 30 m (gbr30) — GBR + Coral Sea + QLD coast.
+# One ~3.8 GB zip of 4 COG tiles (A–D) + metadata.txt; EPSG:4326, Float32,
+# NoData -9999, MSL. Values are elevation (seafloor negative) → no negate.
+# Range-readable bucket. Heavier than a standard runner's disk — stage it.
+https://files.ausseabed.gov.au/survey/Great%20Barrier%20Reef%20Bathymetry%202020%2030m.zip

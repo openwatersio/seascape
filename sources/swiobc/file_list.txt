@@ -1,0 +1,5 @@
+# swIOBC — SW Indian Ocean / E. Africa (Kenya, Tanzania, Mozambique, Madagascar).
+# 250 m, EPSG:4326, Float32, ~711 MB single GeoTIFF. Fully-populated topobathy:
+# NoData is unset but verified hole-free (no fill spike, 0% zeros), so none needed.
+# Values are elevation (seafloor negative, like GEBCO) → no negate.
+https://store.pangaea.de/Publications/DorschelB-etal_2017/swIOBC_grid.tif

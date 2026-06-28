@@ -206,17 +206,17 @@ R2 → stream (EMODnet/DDM path). **C** = viewer/encrypted/request-only (unusabl
 
 Roughly in coverage-per-effort order:
 
-1. **[CHS NONNA-10/100](https://data.chs-shc.ca/)** (Canada) — 10 m / 100 m, **Chart Datum** (exactly the low-water datum the chart wants), OGL-Canada. Covers Canadian coasts + the Canadian Great Lakes half + the Canadian Arctic. Access B (no public COG bucket). z13 / z11.
-2. **[gbr30](https://files.ausseabed.gov.au/survey/Great%20Barrier%20Reef%20Bathymetry%202020%2030m.zip)** (Australia) — 30 m, CC-BY 4.0, one range-readable 3.8 GB file over the Great Barrier Reef + Coral Sea. Turnkey. z12.
-3. **AusSeabed survey COGs** (Australia) — 2–10 m, CC-BY 4.0, on a **public S3 bucket** (`ausseabed-public-warehouse-bathymetry`, ap-southeast-2) → pure access-A streaming like CUDEM. Patchy per-survey footprints (needs a coverage-polygon index). z12–13.
-4. **[INFOMAR](https://data-infomargis.opendata.arcgis.com/)** (Ireland) — 5–10 m (2 m best inshore), **LAT**, CC-BY 4.0. Pick the WGS84 variant. z12–13.
-5. **[Vaklodingen 20m](https://downloads.rijkswaterstaatdata.nl/bodemhoogte_20mtr/bodemhoogte_20mtr.tif)** (Netherlands) — 20 m, **CC0**, a single ~97 MB GeoTIFF (EPSG:28992 → reproject). Cleanest ingest in the whole catalog. z12.
+1. **[Vaklodingen 20m](https://downloads.rijkswaterstaatdata.nl/bodemhoogte_20mtr/bodemhoogte_20mtr.tif)** (Netherlands) — 20 m, **CC0**, a single ~97 MB GeoTIFF (EPSG:28992). Cleanest ingest in the catalog. z12. ✅ built (`sources/vaklodingen`).
+2. **[gbr30](https://files.ausseabed.gov.au/survey/Great%20Barrier%20Reef%20Bathymetry%202020%2030m.zip)** (Australia) — 30 m, CC-BY 4.0, one range-readable 3.8 GB zip of 4 COG tiles over the Great Barrier Reef + Coral Sea. z12. ✅ built (`sources/gbr30`).
+3. **[CHS NONNA-10/100](https://data.chs-shc.ca/)** (Canada) — 10 m / 100 m, **Chart Datum** (exactly the low-water datum the chart wants), OGL-Canada. Covers Canadian coasts + the Canadian Great Lakes half + the Canadian Arctic. Access B (no public COG bucket). z13 / z11.
+4. **AusSeabed survey COGs** (Australia) — 2–10 m, CC-BY 4.0, on a **public S3 bucket** (`ausseabed-public-warehouse-bathymetry`, ap-southeast-2) → pure access-A streaming like CUDEM. Patchy per-survey footprints (needs a coverage-polygon index). z12–13.
+5. **[INFOMAR](https://data-infomargis.opendata.arcgis.com/)** (Ireland) — 5–10 m (2 m best inshore), **LAT**, CC-BY 4.0. Pick the WGS84 variant. z12–13.
 6. **UK [SurfZone 2m](https://environment.data.gov.uk/dataset/77e6f743-d708-4909-a80f-9510b7dbaa16) + [CCO swath](https://maps.coastalmonitoring.org/cco/)** (England) — 1–2 m, OGL v3. England nearshore patchwork (EPSG:27700, ODN datum). z13–14.
 7. **[BATNAS](https://tanahair.indonesia.go.id/demnas/)** (Indonesia) — 6″ (~180 m), open w/ attribution (no resale), covers the whole archipelago. Login-gated fetch → R2. z10.
-8. **[EMODnet DTM 2024](https://emodnet.ec.europa.eu/en/bathymetry) — extend the clip** to the N. African Med shelf (Morocco→Egypt) + the Caribbean tile it already includes. Same product/pipeline we run for Europe → near-zero marginal effort. CC-BY 4.0, LAT. z11.
-9. **[swIOBC](https://doi.pangaea.de/10.1594/PANGAEA.880618)** (SW Indian Ocean) — 250 m, CC-BY 3.0, real uplift over GEBCO off Kenya/Tanzania/Mozambique/Madagascar. One PANGAEA fetch. z9–10.
-10. **[IBCSO v2](https://doi.pangaea.de/10.1594/PANGAEA.937574)** (Southern Ocean, N to 50°S) — 500 m, CC-BY 4.0. Only clearly-open Antarctic option; reproject EPSG:9354. z8–9.
-11. **Inland lakes** (separate layer, pure GEBCO gap-fill): **[African Great Lakes CC0 bundle](https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/ITCOGT)** (Victoria/Albert/Edward/George, one .7z), **[swisstopo Alpine lakes](https://data.geo.admin.ch/api/stac/v1/collections/ch.swisstopo.swissbathy3d/items)** + **[Bodensee](https://doi.org/10.1594/PANGAEA.855987)**, **[Great Salt Lake](https://doi.org/10.5066/P9DGG75W)** (0.5 m, stream the 34 GB), **[Lake Tahoe](https://pubs.usgs.gov/dds/dds-55/pacmaps/exports/lt_bathy.e00.gz)**, and **[NOAA NOS Estuarine DEMs](https://www.ncei.noaa.gov/products/estuarine-bathymetric-digital-elevation-models)** (70 US estuaries, already MLLW).
+8. **[swIOBC](https://doi.pangaea.de/10.1594/PANGAEA.880618)** (SW Indian Ocean) — 250 m, CC-BY 3.0, EPSG:4326 topobathy off Kenya/Tanzania/Mozambique/Madagascar; ~2× GEBCO. One ~711 MB GeoTIFF, z9. ✅ built (`sources/swiobc`).
+9. **Inland lakes** (separate layer, pure GEBCO gap-fill): **[African Great Lakes CC0 bundle](https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/ITCOGT)** (Victoria/Albert/Edward/George, one .7z), **[swisstopo Alpine lakes](https://data.geo.admin.ch/api/stac/v1/collections/ch.swisstopo.swissbathy3d/items)** + **[Bodensee](https://doi.org/10.1594/PANGAEA.855987)**, **[Great Salt Lake](https://doi.org/10.5066/P9DGG75W)** (0.5 m, stream the 34 GB), **[Lake Tahoe](https://pubs.usgs.gov/dds/dds-55/pacmaps/exports/lt_bathy.e00.gz)**, and **[NOAA NOS Estuarine DEMs](https://www.ncei.noaa.gov/products/estuarine-bathymetric-digital-elevation-models)** (70 US estuaries, already MLLW).
+
+EMODnet already covers European seas **including the N. African Med shelf** (the 58 tiles we ingest are the full product; the Mediterranean is enclosed, so its tiles carry the African shore) — no extension needed. IBCSO v2 (Southern Ocean) is omitted on purpose: at 500 m it matches GEBCO's resolution and is already folded into GEBCO via Seabed 2030, so it adds no coverage (see the regional tables below).
 
 ### Canada, Arctic, Antarctic & global compilations
 
@@ -224,7 +224,7 @@ Roughly in coverage-per-effort order:
 | ------ | --- | -------- | ----- | ------- | --- | ---------------- |
 | CHS NONNA-10 | ~10 m | Cdn coasts + Great Lakes + Cdn Arctic | **Chart Datum** ✓ | OGL-Canada ✓ | z13 | **BUILD** (B; no COG bucket → WCS/zip → R2) |
 | CHS NONNA-100 | ~100 m | same | Chart Datum ✓ | OGL-Canada ✓ | z11 | OPPORTUNISTIC (B) — fallback where 10 m has gaps |
-| IBCSO v2 | 500 m | Southern Ocean, N→50°S | MSL | CC-BY 4.0 ✓ | z8–9 | **BUILD** (B) — reproject EPSG:9354; only open Antarctic |
+| IBCSO v2 | 500 m (≈GEBCO) | Southern Ocean, N→50°S | MSL | CC-BY 4.0 ✓ | — | **SKIP** — ≈GEBCO res AND already folded into GEBCO via Seabed 2030 (no new coverage); <85°S untileable |
 | IBCAO v5.2 | 100 m | Arctic, S→64°N | MSL | ⚠ disclaimer-gated, ambiguous | z11 | OPPORTUNISTIC — **verify redistribution first**; EPSG:3996 |
 | GMRT v4.x | ~100 m (multibeam only) | global swaths | mixed | CC-BY 4.0 ✓ | z9–12 | OPPORTUNISTIC — dynamic GridServer, targeted fill only |
 | SRTM15+ V2.7 | ~450 m | global | MSL | public domain | — | SKIP — same res as GEBCO, already folded in |
@@ -274,8 +274,8 @@ Roughly in coverage-per-effort order:
 
 | Source | Res | Coverage | Datum | License | Cap | Verdict (access) |
 | ------ | --- | -------- | ----- | ------- | --- | ---------------- |
-| EMODnet DTM 2024 (extend clip) | 115 m | N. African Med shelf + Caribbean tile | **LAT** ✓ | CC-BY 4.0 ✓ | z11 | **BUILD** (B) — already pipelined, just widen the clip |
-| swIOBC | 250 m | SW Indian Ocean / E. Africa | ~MSL | CC-BY 3.0 ✓ | z9–10 | **BUILD** (B) — one PANGAEA fetch |
+| EMODnet DTM 2024 _(already ingested)_ | 115 m | European seas + **N. African Med shelf** | **LAT** ✓ | CC-BY 4.0 ✓ | z11 | covers the N-African Med coast as part of the existing product; EMODnet is European/NE-Atlantic so nothing reaches the Caribbean |
+| swIOBC | 250 m | SW Indian Ocean / E. Africa | ~MSL | CC-BY 3.0 ✓ | z9 | **BUILT** (B) — one ~711 MB GeoTIFF |
 | GMRT | ~100 m swaths | global multibeam | mixed | CC-BY 4.0 ✓ | z9–11 | OPPORTUNISTIC — patchy; "not for navigation" |
 | Red Sea / Strait of Tiran patches | 10–30 m | Red Sea rift + Tiran | unstated | CC-BY 4.0 ✓ | z12 | OPPORTUNISTIC (B) — Tiran coastal; rest deep curiosities |
 | Chilean fjord grids | 10–50 m | S. Chile fjords | SHOA-CD | per-record — **verify** | z12 | OPPORTUNISTIC (B) — license-gated scattered patches |
@@ -343,11 +343,9 @@ Reuse map — which recipe each clones, and the params that change:
 
 | Source | Clones | source `--crs` | datum step | `max_zoom` | fetch note |
 | ------ | ------ | -------------- | ---------- | ---------- | ---------- |
-| Vaklodingen | `ddm` | EPSG:28992 | — (NAP bed elev) | 12 | one file |
-| gbr30 | `emodnet` | EPSG:4326 | — (MSL) | 12 | one zip |
-| swIOBC | `gebco` | verify | — | 10 | one PANGAEA file |
-| IBCSO v2 | `gebco` | EPSG:9354 | — | 9 | one file; polar warp |
-| EMODnet ext | _edit `emodnet`_ | — | — | 11 | add N-Afr+Carib tiles to `file_list` |
+| Vaklodingen ✅ | `ddm` | EPSG:28992 | — (NAP bed elev) | 12 | one file |
+| gbr30 ✅ | `emodnet` | EPSG:4326 | — (MSL) | 12 | one zip of 4 COG tiles |
+| swIOBC ✅ | `gebco` | EPSG:4326 | — | 9 | one ~711 MB GeoTIFF |
 | INFOMAR | `emodnet` | EPSG:4326 | — (LAT, neg) | 13 | enumerate WGS84 tiles |
 | UK SurfZone | `emodnet` | EPSG:27700 | — (ODN) | 13 | enumerate 5 km tiles |
 | AusSeabed | `cudem` | `mixed_crs` | — (per-survey) | 12 | enumerate L3 S3 COG urllist |
@@ -363,7 +361,7 @@ Sequenced to prove the cheap path before the awkward ones:
 
 - **P0 — pilot:** Vaklodingen (CC0, single file). Proves a non-US prepared overlay
   flows source→cover→aggregate→bundle→preview end-to-end. Smallest possible diff.
-- **P1 — single-file wins:** gbr30, swIOBC, IBCSO v2, + the EMODnet clip extension.
+- **P1 — single-file wins:** gbr30 ✅, swIOBC (one PANGAEA fetch).
 - **P2 — multi-tile prepared:** INFOMAR, UK SurfZone (build the tile `file_list`).
 - **P3 — streamed S3:** AusSeabed — enumerate the public-bucket L3 COGs into a
   urllist, `mixed_crs` per-survey reproject. The one with real assembly work.

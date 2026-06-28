@@ -1,0 +1,8 @@
+{
+    "name": "Great Barrier Reef Bathymetry 2020 30 m (gbr30)",
+    "producer": "Geoscience Australia / AusSeabed (R. Beaman)",
+    "website": "https://www.ausseabed.gov.au/data/bathymetry",
+    "license": "CC-BY 4.0",
+    "max_zoom": 12,
+    "datum": "MSL (approx)"
+}

@@ -1,0 +1,11 @@
+# Great Barrier Reef 30 m (gbr30) — GBR/Coral Sea. Run from pipelines/:  just ../sources/gbr30/
+# One zip of 4 COG tiles; values are MSL elevation (seafloor negative, like GEBCO) →
+# no datum transform. Already EPSG:4326; normalize re-asserts it, warp happens in aggregation.
+[no-cd]
+default:
+    uv run python source_download.py gbr30
+    uv run python source_unzip.py gbr30
+    uv run python source_normalize.py gbr30 --crs EPSG:4326
+    uv run python source_bounds.py gbr30
+    uv run python source_polygonize.py gbr30 8
+    uv run python source_create_tarball.py gbr30
