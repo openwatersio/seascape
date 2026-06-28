@@ -1,0 +1,5 @@
+# Vaklodingen 20 m — single LZW GeoTIFF, Dutch coastal waters + estuaries + main
+# rivers/IJsselmeer. EPSG:28992 (RD New); values are bed *elevation* in NAP
+# (seafloor negative, like GEBCO) so no negate. ~97 MB, NoData 3.4e38. Yearly
+# product — this is the current (2026-04) release; bump the filename on refresh.
+https://downloads.rijkswaterstaatdata.nl/bodemhoogte_20mtr/bodemhoogte_20mtr.tif
