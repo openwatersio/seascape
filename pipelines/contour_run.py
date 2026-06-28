@@ -180,7 +180,9 @@ def _tippecanoe(fgbs, minz, maxz, out):
         ["tippecanoe", "-o", out, "-f", "-l", "contours",
          "-n", "Bathymetric contours", "-A", utils.ATTRIBUTION,
          "-Z", str(minz), "-z", str(maxz), "-P", "-q", "--drop-densest-as-needed",
-         "--simplification", "4",  # geometric vertex thinning at low zoom (full detail at maxz)
+         # Aggressive low-zoom vertex thinning (tolerance scales with zoom distance from
+         # maxz, so maxz detail is untouched). Env-tunable to dial on a re-bundle.
+         "--simplification", os.environ.get("CONTOUR_SIMPLIFICATION", "8"),
          "-y", "depth_m", "-y", "depth_abs_m", "-j", PER_ZOOM_FILTER, *fgbs],
         check=True)
 
