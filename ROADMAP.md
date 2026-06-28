@@ -79,21 +79,20 @@ overlaps. Zoom caps are display caps (per source via `max_zoom`), not native res
 | DDM (Denmark) | 50 m       | z12      | Danish EEZ         | MSL (DKMSL2022)        | `ddm`               |
 | CUDEM 1/9     | ~3.4 m     | z13      | US coast           | NAVD88                 | `cudem`             |
 | CUDEM 1/3     | ~10 m      | z12      | US coast (broader) | NAVD88                 | `cudem_third`       |
-| BlueTopo      | 2–16 m     | z14      | US navigable       | MLLW/NAVD88 (per-tile) | `bluetopo` (branch) |
+| NOAA S-102    | ~4–16 m    | z14      | US navigable       | MLLW (+ uncertainty)   | `noaa_s102`         |
 
 Not yet ingested: CUDEM territory products (HI/PR/USVI/Guam/AmSam/CNMI) and NIWA NZ
 — pulled in when needed.
 
-The large US sources (CUDEM, BlueTopo) are range-read straight off NOAA's public
-buckets at build time rather than downloaded — CUDEM alone is ~188 GB. BlueTopo was
-the one source needing real engine work: its tiles come from a GeoPackage index and
-span multiple UTM zones, so the mosaic reprojects them per-tile rather than as one
-VRT. A green full-US BlueTopo CI run is the last bit of execution polish.
+The large US sources (CUDEM, S-102) are range-read straight off NOAA's public
+buckets at build time rather than downloaded — CUDEM alone is ~188 GB. S-102 takes
+the per-tile engine path: its tiles come from a GeoPackage index and span multiple
+UTM zones, so the mosaic reprojects them per-tile rather than as one VRT.
 
 Vertical datum here is only a _first cut_ — one constant offset per source. The
 proper spatially-varying datum, quality masking, and provenance are promoted to
 Milestones 3 and 5; opportunistic data/ops sit in the backlog below. Note streamed
-sources (CUDEM/BlueTopo) keep no local copy, so they bypass the per-file offset step
+sources (CUDEM, S-102) keep no local copy, so they bypass the per-file offset step
 — Milestone 3 covers how the datum work reaches them.
 
 ---
@@ -116,13 +115,13 @@ separation, not a constant.
   `ingest`, replacing the constant offset where coverage exists.
 - Keep the constant offset as the fallback where no separation model exists —
   but log it, and bias it conservative.
-- Per-source datum metadata in each source's `metadata.json` drives this. Note
-  BlueTopo is **not** uniformly MLLW — its tiles are per-tile mixed MLLW/NAVD88
-  (verified against the bucket), so even "already low-water, don't touch" can't be
-  a blanket per-source rule.
-- **Caveat — streamed sources skip `source_datum.py`.** CUDEM/BlueTopo are
-  `/vsicurl/` references range-read straight off NOAA at reproject time, so there's
-  no local value-transform step to swap an offset into. Two ways to reach them: (a)
+- Per-source datum metadata in each source's `metadata.json` drives this. NOAA S-102
+  now supplies US navigable waters already on MLLW (it supersedes BlueTopo, whose raw
+  tiles were per-tile mixed MLLW/NAVD88), so the main remaining US datum work is CUDEM
+  (NAVD88 → low-water).
+- **Caveat — streamed sources skip `source_datum.py`.** CUDEM is a
+  `/vsicurl/` reference range-read straight off NOAA at reproject time, so there's
+  no local value-transform step to swap an offset into. Two ways to reach it: (a)
   apply the separation grid on the fly in the aggregation reproject — a value-add
   pass after warp, keeps the no-download model (preferred); or (b) re-process each
   tile through `source_datum.py` into our own R2 bucket (datum-corrected COGs) and

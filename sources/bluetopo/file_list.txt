@@ -1,8 +1,0 @@
-# NOAA BlueTopo national bathymetry — a GeoPackage *tile index*, not a urllist.
-# source_register_remote_geopkg resolves the newest BlueTopo_Tile_Scheme_<date>.gpkg under
-# this prefix, reads each populated tile's GeoTIFF_Link (full https URL) and registers
-# it as a /vsicurl/ streaming reference — no download. ~7,400 tiles, per-tile UTM zones
-# (EPSG:269NN), 3-band Float32 (band 1 = elevation, positive-up), MLLW/NAVD88 datum
-# (per-tile, mixed; VDatum deferred to Phase 5). NOAA re-publishes the gpkg as tiles
-# are surveyed, so pointing at the prefix tracks coverage without re-listing here.
-https://noaa-ocs-nationalbathymetry-pds.s3.amazonaws.com/BlueTopo/_BlueTopo_Tile_Scheme/

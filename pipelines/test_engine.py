@@ -69,6 +69,29 @@ def decode_bundles(tmp):
     return by_zoom
 
 
+def check_priority():
+    """get_grouped_source_items merge order: a metadata `priority` source wins overlap even
+    over a finer (higher-maxzoom) source; without priority, native resolution decides."""
+    import utils
+    import config
+    orig = config.load_metadata
+    d = tempfile.mkdtemp()
+    csv = os.path.join(d, "x.csv")
+    with open(csv, "w") as f:
+        f.write("source,filename,maxzoom\nB,b.tif,13\nA,a.tif,11\n")  # B finer, A coarser
+    try:
+        config.load_metadata = lambda s: {"priority": 1} if s == "A" else {}
+        order = [g[0]["source"] for g in utils.get_grouped_source_items(csv)]
+        assert order[0] == "A", f"priority should win merge order: {order}"
+        config.load_metadata = lambda s: {}  # no priority anywhere
+        order = [g[0]["source"] for g in utils.get_grouped_source_items(csv)]
+        assert order[0] == "B", f"without priority, finer (maxzoom 13) wins: {order}"
+        print("priority ok — datum-authoritative source wins merge order; else maxzoom")
+    finally:
+        config.load_metadata = orig
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     tmp = tempfile.mkdtemp()
     try:
@@ -183,4 +206,5 @@ def main():
 
 
 if __name__ == "__main__":
+    check_priority()
     main()

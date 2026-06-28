@@ -111,8 +111,8 @@ preview bbox="-74.30,40.40,-73.75,40.80" local="":
             curl -fsS "$BOUNDS_BASE/$id/bounds.csv" -o "store/source/$id/bounds.csv" \
                 || { echo "skip $id (no bounds.csv in R2)"; rm -rf "store/source/$id"; }
         done
-        # BlueTopo changes frequently, so re-sync the source bounds
-        just source bluetopo
+        # S-102 re-registers from a live catalog (and may not be in R2 yet), so re-sync it
+        just source noaa_s102
     else
         unset SOURCE_VSI_BASE  # read prepared COGs from store/source on disk
     fi

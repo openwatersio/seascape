@@ -96,7 +96,7 @@ Set `BBOX="W,S,E,N"` for a regional build; `just --list` shows all recipes.
    - `metadata.json` — `name`, `producer`, `website`, `license`, and an optional `max_zoom` cap (omit to use the source's native resolution; cap it for high-res lidar like CUDEM).
    - `file_list.txt` — source URL(s): `https://…`, `s3://…` (read via `/vsis3/`), an ERDDAP `…/griddap/…` base, a `.zip`, or a local path.
    - `Justfile` — compose the shared `pipelines/source_*.py` steps the source needs. Copy an existing recipe and adjust:
-     - http GeoTIFF → `source_download`; ERDDAP → `source_download_erddap --bbox …`; public COG tiles → `source_register_remote_urllist` (flat urllist, e.g. CUDEM) or `source_register_remote_geopkg` (GeoPackage tile index, e.g. BlueTopo) — streaming `/vsicurl` refs, no download; zip → `source_download` + `source_unzip`.
+     - http GeoTIFF → `source_download`; ERDDAP → `source_download_erddap --bbox …`; public COG tiles → `source_register_remote_urllist` (flat urllist, e.g. CUDEM) or `source_register_remote_geopkg` (GeoPackage tile index, e.g. NOAA S-102) — streaming `/vsicurl` refs, no download; zip → `source_download` + `source_unzip`.
      - positive-down depths or a datum offset → `source_datum --negate --offset N`.
      - always: `source_normalize --crs EPSG:… [--nodata N]` → `source_bounds` → `source_polygonize <id> 8` → `source_create_tarball`.
 2. `just source <id>` (verify it lands in `pipelines/store/source/<id>/`).

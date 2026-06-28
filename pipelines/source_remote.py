@@ -12,7 +12,7 @@ sources). No normalize (tiles are already COGs with CRS + nodata), no polygonize
 Two enumeration shapes pick a front-end CLI. A flat text urllist
 (``source_register_remote_urllist``, CUDEM) has no per-tile metadata, so it
 ``register_tiles`` — opening each header to read bounds + size. A tile-scheme GeoPackage
-(``source_register_remote_geopkg``, BlueTopo) already *is* the index (footprint geometry +
+(``source_register_remote_geopkg``, NOAA S-102) already *is* the index (footprint geometry +
 resolution per tile), so it derives the bounds rows itself and calls ``write_bounds`` directly,
 skipping ~7k header round-trips.
 """

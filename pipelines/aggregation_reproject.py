@@ -35,9 +35,25 @@ NODATA = -9999
 RESAMPLE = os.environ.get("AGG_RESAMPLE", "cubicspline")
 
 
+def negate_band1(filepath):
+    """Flip band-1 sign on valid pixels (depth +down -> elevation -down), leaving invalid
+    pixels and the alpha band untouched. Streamed sources skip source_datum, so a
+    positive-down source (S-102 stores depth) is converted here, right after warp. The file
+    is a COG (translate -of COG), so the in-place band-1 update needs IGNORE_COG_LAYOUT_BREAK
+    — it's a transient the merge re-reads then deletes, so breaking the COG layout costs
+    nothing. read_masks honours alpha-or-nodata validity (don't compare to a NODATA value:
+    ADD_ALPHA moves the mask off the data band). Drop this when the pipeline goes
+    depth-canonical internally."""
+    with rasterio.open(filepath, "r+", IGNORE_COG_LAYOUT_BREAK="YES") as ds:
+        a = ds.read(1)
+        mask = ds.read_masks(1) != 0
+        a[mask] = -a[mask]
+        ds.write(a, 1)
+
+
 def band_select(source):
-    """`-b N ` (trailing space) if the source pins a band, else ''. BlueTopo is 3-band
-    (elevation/uncertainty/contributor); band 1 is elevation."""
+    """`-b N ` (trailing space) if the source pins a band, else ''. S-102 is 2-band
+    (depth/uncertainty); band 1 is depth (negated to elevation after warp)."""
     band = config.load_metadata(source).get("band")
     return f"-b {band} " if band else ""
 
@@ -55,7 +71,7 @@ def create_virtual_raster(tmp_folder, i, source_items):
 
 def per_tile_vrts(tmp_folder, i, source_items):
     """One single-band VRT per tile, for a `mixed_crs` source (per-tile UTM zones, e.g.
-    BlueTopo). gdalbuildvrt refuses to merge differing CRS into one VRT — it silently
+    NOAA S-102). gdalbuildvrt refuses to merge differing CRS into one VRT — it silently
     drops the off-CRS tiles, holing zone seams — so each tile gets its own VRT and
     gdalwarp (which does reproject per input) mosaics them into 3857 in warp_mixed."""
     source = source_items[0]["source"]
@@ -94,8 +110,12 @@ def warp_mixed(inputs, out_tif, zoom, aggregation_tile, buffer):
     left, bottom, right, top = mercantile.xy_bounds(aggregation_tile)
     left, bottom, right, top = left - buffer, bottom - buffer, right + buffer, top + buffer
     res = get_resolution(zoom)
+    # ZSTD+predictor3 (single-band Float32) shrinks this transient ~4x; SPARSE_OK skips
+    # all-nodata blocks. Cuts the disk a deep z->z14 tile needs (a 32768px tile is ~4 GB
+    # uncompressed) and the I/O writing it.
     _run(f"GDAL_CACHEMAX=512 gdalwarp -overwrite -t_srs EPSG:3857 -tr {res} {res} "
-         f"-te {left} {bottom} {right} {top} -r {RESAMPLE} -dstnodata {NODATA} -co TILED=YES "
+         f"-te {left} {bottom} {right} {top} -r {RESAMPLE} -dstnodata {NODATA} "
+         "-co TILED=YES -co SPARSE_OK=YES -co COMPRESS=ZSTD -co PREDICTOR=3 -co NUM_THREADS=ALL_CPUS "
          f"{' '.join(inputs)} {out_tif}",
          f"gdalwarp(mixed) {out_tif}")
 
@@ -124,8 +144,12 @@ def create_warp(vrt, vrt_3857, zoom, aggregation_tile, buffer):
 
 
 def translate(in_filepath, out_filepath):
+    # ZSTD (no predictor — ADD_ALPHA makes this Float32 + a Byte alpha band, and
+    # PREDICTOR=3 is float-only) + NUM_THREADS. The merge reads these per-source COGs and
+    # inherits the profile into the merged DEM, so compressing here propagates downstream.
     _run("GDAL_CACHEMAX=512 gdal_translate -of COG -co BIGTIFF=IF_NEEDED -co ADD_ALPHA=YES "
-         f"-co OVERVIEWS=NONE -co SPARSE_OK=YES -co BLOCKSIZE=512 -co COMPRESS=NONE {in_filepath} {out_filepath}",
+         "-co OVERVIEWS=NONE -co SPARSE_OK=YES -co BLOCKSIZE=512 "
+         f"-co COMPRESS=ZSTD -co NUM_THREADS=ALL_CPUS {in_filepath} {out_filepath}",
          f"gdal_translate {in_filepath}")
 
 
@@ -157,7 +181,10 @@ def reproject(filepath):
         return
 
     grouped = utils.get_grouped_source_items(filepath)
-    maxzoom = grouped[0][0]["maxzoom"]
+    # Build at the FINEST source's resolution, not the top-priority group's: merge order is
+    # priority-then-maxzoom, so grouped[0] may be a coarser datum-authoritative source (S-102)
+    # — don't let it lower the grid and upsample a finer source that's also present.
+    maxzoom = max(g[0]["maxzoom"] for g in grouped)
     resolution = get_resolution(maxzoom)
 
     # Always buffer (even single-source) so the merged DEM has a halo for contour
@@ -176,11 +203,15 @@ def reproject(filepath):
             warp_mixed(per_tile_vrts(tmp_folder, i, source_items), merged,
                        maxzoom, aggregation_tile, buffer_3857_rounded)
             translate(merged, out_tiff)
+            os.remove(merged)  # free the multi-GB warp intermediate now, not at end-of-tile
+                               # (rmtree) — it's never read again once the COG exists
         else:
             vrt = create_virtual_raster(tmp_folder, i, source_items)
             vrt_3857 = f"{tmp_folder}/{i}-3857.vrt"
             create_warp(vrt, vrt_3857, maxzoom, aggregation_tile, buffer_3857_rounded)
             translate(vrt_3857, out_tiff)
+        if config.load_metadata(source_items[0]["source"]).get("negate"):
+            negate_band1(out_tiff)  # streamed positive-down source (S-102 depth) -> elevation
         if len(grouped) > 1 and not contains_nodata_pixels(out_tiff):
             break
 
@@ -253,6 +284,22 @@ def _check():
             pass
     finally:
         utils.run_command, time.sleep = real_run, real_sleep
+
+    # negate_band1 must handle the REAL pipeline file: a COG (translate -of COG) with an
+    # ADD_ALPHA mask band. A plain GTiff would miss the COG-layout update error the build hit.
+    src = f"{d}/depth.tif"
+    arr = np.array([[5.0, NODATA], [10.0, -3.0]], dtype="float32")  # depths + a nodata cell
+    with rasterio.open(src, "w", driver="GTiff", height=2, width=2, count=1, dtype="float32",
+                       nodata=NODATA, crs="EPSG:3857", transform=from_origin(0, 2, 1, 1)) as dst:
+        dst.write(arr, 1)
+    cog = f"{d}/depth_cog.tif"
+    translate(src, cog)        # -of COG -co ADD_ALPHA=YES, exactly as reproject() does
+    negate_band1(cog)          # must not raise on the COG layout, and flip only valid pixels
+    with rasterio.open(cog) as r:
+        o, valid = r.read(1), (r.read_masks(1) != 0)
+    assert o[0, 0] == -5.0 and o[1, 0] == -10.0 and o[1, 1] == 3.0, o   # valid pixels flipped
+    assert not valid[0, 1], "nodata cell must stay masked (and unflipped)"
+
     print(f"aggregation_reproject.py self-check ok (valid pixels: A={va}, A+B={vboth})")
 
 

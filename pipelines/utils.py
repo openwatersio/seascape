@@ -189,28 +189,36 @@ def existing_pmtiles():
 
 
 def get_grouped_source_items(filepath):
-    '''group source items by maxzoom and source, most-important first'''
+    '''Group source items per (priority, maxzoom, source), most-important first. Merge
+    order is priority DESC then maxzoom DESC: a source with metadata `priority` > 0 (e.g.
+    S-102, already on a chart datum) wins the overlap even over a finer source; ties fall
+    back to native resolution. This sets merge ORDER only — build resolution is the finest
+    source's (see aggregation_reproject), so a coarse high-priority source can't lower the grid.'''
+    import config
     with open(filepath) as f:
         lines = f.readlines()[1:]  # skip header
+    prio = {}
     line_tuples = []
     for line in lines:
         source, filename, maxzoom = line.strip().split(',')
-        line_tuples.append((-int(maxzoom), source, filename))
+        if source not in prio:
+            prio[source] = config.load_metadata(source).get('priority', 0)
+        line_tuples.append((-prio[source], -int(maxzoom), source, filename))
     line_tuples = sorted(line_tuples)
 
     grouped_source_items = []
-    last_signature = (line_tuples[0][0], line_tuples[0][1])
+    last_signature = line_tuples[0][:3]  # (-priority, -maxzoom, source)
     current_group = []
     for line_tuple in line_tuples:
-        signature = (line_tuple[0], line_tuple[1])
+        signature = line_tuple[:3]
         if signature != last_signature:
             grouped_source_items.append(current_group)
             current_group = []
             last_signature = signature
         current_group.append({
-            'maxzoom': -line_tuple[0],
-            'source': line_tuple[1],
-            'filename': line_tuple[2],
+            'maxzoom': -line_tuple[1],
+            'source': line_tuple[2],
+            'filename': line_tuple[3],
         })
     grouped_source_items.append(current_group)
     return grouped_source_items

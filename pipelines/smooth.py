@@ -78,8 +78,12 @@ def smooth_tiff(path, block=None):
         nodata = src.nodata if src.nodata is not None else NODATA
         h_total, w_total = src.height, src.width
     # Re-write as a 512-blocked GTiff (aggregation_tile asserts 512 block shapes).
+    # Predictor by dtype (3=float, 2=int, else 1): the merged DEM is Float32 over regional
+    # sources but Int16 where GEBCO dominates, and PREDICTOR=3 is float-only.
+    dt = profile["dtype"]
+    predictor = 3 if dt in ("float32", "float64") else 2 if "int" in dt else 1
     profile.update(driver="GTiff", count=1, tiled=True, blockxsize=512, blockysize=512,
-                   compress="deflate")
+                   compress="zstd", predictor=predictor, num_threads="all_cpus")
     tmp = path + ".smooth.tif"
     with rasterio.open(path) as src, rasterio.open(tmp, "w", **profile) as dst:
         for row in range(0, h_total, block):
@@ -134,6 +138,17 @@ def _check():
     with rasterio.open(p) as src:
         got = src.read(1)
     assert np.max(np.abs(got - ref)) < 1e-2, np.max(np.abs(got - ref))
+
+    # Int16 path (GEBCO is Int16): smooth_tiff must pick predictor=2, not the float-only 3.
+    i16 = f"{d}/i16.tif"
+    arr16 = big.clip(-32000, 0).astype("int16")
+    with rasterio.open(i16, "w", driver="GTiff", height=600, width=600, count=1,
+                       dtype="int16", nodata=-32768, crs="EPSG:3857",
+                       transform=from_origin(0, 6000, 10, 10)) as dst:
+        dst.write(arr16, 1)
+    smooth_tiff(i16, block=128)  # must not raise on Int16 (the predictor=3 regression)
+    with rasterio.open(i16) as src:
+        assert src.read(1).std() < arr16.std(), "Int16 smoothing should denoise"
     print("smooth.py self-check ok")
 
 

@@ -1,9 +1,0 @@
-# NOAA BlueTopo national bathymetry, US navigable waters. Run from pipelines/:  just ../sources/bluetopo/
-# Streaming model: resolve the tile-scheme GeoPackage, register every populated tile
-# as a /vsicurl/ reference (header reads only — no download). Aggregation range-reads
-# the COGs from S3. Per-tile UTM zones + 3-band rasters: metadata sets mixed_crs + band
-# so the reproject warps heterogeneous CRS and selects the elevation band. No
-# normalize/datum/tarball (tiles are already COGs; MLLW->MSL deferred to Phase 5).
-[no-cd]
-default:
-    uv run python source_register_remote_geopkg.py bluetopo
