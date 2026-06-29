@@ -1,4 +1,0 @@
-# CHS NONNA-100 has NO static download URLs — source_download_nonna.py harvests tiles
-# via the public guest API (no account). So this file_list is intentionally empty; the
-# harvest BBOX (Canada by default) lives in the Justfile. See source_download_nonna.py
-# for the 3-step API (guest token → feature query → objectstore download).

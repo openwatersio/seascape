@@ -1,8 +1,0 @@
-{
-    "name": "CHS NONNA-100 Bathymetry (Canada, 100 m)",
-    "producer": "Canadian Hydrographic Service (CHS) / DFO",
-    "website": "https://data.chs-shc.ca/",
-    "license": "CHS NONNA Licence (open, attribution; non-navigational use)",
-    "max_zoom": 10,
-    "datum": "Chart Datum (CD)"
-}

@@ -82,7 +82,7 @@ overlaps. Zoom caps are display caps (per source via `max_zoom`), not native res
 | NOAA S-102    | ~4–16 m    | z14      | US navigable       | MLLW (+ uncertainty)   | `noaa_s102`         |
 
 Not yet ingested: CUDEM territory products (HI/PR/USVI/Guam/AmSam/CNMI) — pulled in
-when needed. The worldwide expansion candidates (Canada/NONNA, Australia, Ireland,
+when needed. The worldwide expansion candidates (Canada, Australia, Ireland,
 Indonesia, the lakes, …) are catalogued under [Source expansion](#source-expansion--worldwide-coverage-candidates) below.
 
 The large US sources (CUDEM, S-102) are range-read straight off NOAA's public
@@ -208,11 +208,11 @@ Roughly in coverage-per-effort order:
 
 1. **[Vaklodingen 20m](https://downloads.rijkswaterstaatdata.nl/bodemhoogte_20mtr/bodemhoogte_20mtr.tif)** (Netherlands) — 20 m, **CC0**, a single ~97 MB GeoTIFF (EPSG:28992). Cleanest ingest in the catalog. z12. ✅ built (`sources/vaklodingen`).
 2. **[gbr30](https://files.ausseabed.gov.au/survey/Great%20Barrier%20Reef%20Bathymetry%202020%2030m.zip)** (Australia) — 30 m, CC-BY 4.0, one range-readable 3.8 GB zip of 4 COG tiles over the Great Barrier Reef + Coral Sea. z12. ✅ built (`sources/gbr30`).
-3. **[CHS NONNA](https://data.chs-shc.ca/)** (Canada) — **Chart Datum** (exactly the low-water datum the chart wants), open CHS licence. Covers Canadian coasts + the Cdn Great Lakes half + the Cdn Arctic. No static URLs, but a **public guest API** (reverse-engineered): `pipelines/source_download_nonna.py` harvests tiles for a BBOX (guest token → feature query → objectstore download — no account). **NONNA-100 + NONNA-10 both built** — sibling sources `sources/nonna_100` (z10) and `sources/nonna_10` (z13, RepresentationLevel 5), cudem/cudem_third pattern; EPSG:4326, elevation on CD/no-negate. Caveat: a *national* 10 m harvest is hundreds of GB — scope by region for real builds.
+3. **CHS NONNA** (Canada) — **evaluated and shelved.** Genuinely valuable (10 m on **Chart Datum**, reached via a reverse-engineered public guest API), but it's sparse multibeam *survey coverage*, not a continuous grid (NONNA-100 ≈9% valid/tile) — the wrong shape for this DEM mosaic: pixel-exact `source_polygonize` explodes (~1 M vertices for 15 tiles) and a national 10 m harvest is ~65 k tiles / hundreds of GB (a CI build died mid-download). Better fit for the **Milestone-4 soundings layer**. Sources + the `source_download_nonna` harvester are removed from the tree but recoverable from git history (commit `9f93ad3`).
 4. **[AusBathyTopo 250m](https://www.ausseabed.gov.au/data/bathymetry)** (Australia) — national 250 m bathy/topo compilation, CC-BY 4.0, MSL, EPSG:4326. One ~2.8 GB COG zip; fills the AU EEZ at z9 (gbr30 wins the GBR/Coral Sea overlap). ✅ built (`sources/ausbathytopo`). *The per-survey 2–10 m AusSeabed COGs — the z12–13 prize — are **deferred**: served via portal/WCS + a survey coverage DB, not a clean static urllist, so they need a custom coverage-DB fetch.*
 5. **[INFOMAR](https://www.infomar.ie/)** (Ireland) — **10 m inshore** (`sources/infomar_10m`, z13) + **25 m shelf** (`sources/infomar_25m`, z11), **LAT**, CC-BY 4.0. Two **sibling sources** (cudem/cudem_third pattern). Both set `priority: 1` to outrank EMODnet regardless of any zoom tie (decoupling precedence from zoom, like S-102 vs CUDEM); `max_zoom` stays the honest native (z13 / z11) and the 10 m wins inshore via finer maxzoom within the tier. WGS84/LAT, no embedded CRS → assign EPSG:4326. 100 m offshore omitted (≈EMODnet). ✅ built.
 6. **UK [SurfZone 2m](https://environment.data.gov.uk/dataset/77e6f743-d708-4909-a80f-9510b7dbaa16) + [CCO swath](https://maps.coastalmonitoring.org/cco/)** (England) — 1–2 m, OGL v3, EPSG:27700, **ODN datum** (topographic, not chart). No static tile URLs — download is the interactive DefraDataDownload tool or a WCS endpoint, and coverage is the narrow intertidal strip. Belongs with the **awkward-fetch sources** (mirror-to-R2 / WCS), not a clean file_list — deferred to P4. z13–14.
-7. **[BATNAS](https://tanahair.indonesia.go.id/demnas/)** (Indonesia) — 6″ (~180 m), open w/ attribution (no resale), covers the whole archipelago. Login-gated fetch → R2. z10.
+7. **[BATNAS](https://tanahair.indonesia.go.id/demnas/)** (Indonesia) — 6″ (~180 m), MSL, open w/ attribution (no resale), whole archipelago. ✅ **built** (`sources/batnas`). Its download is reCAPTCHA-login-gated (not CI-fetchable), so the **53 surveyed 5° sheets are mirrored to R2** (`data/bathymetry/mirror/batnas/`) and the recipe is a **standard prepared source** fetching that mirror over public HTTPS — CI-reproducible, no token. `sources/batnas/harvest.py` (stdlib-only, standalone) refreshes the mirror via a one-time login token when BIG ships a new version. EPSG:4326 (assign — not embedded), elevation/no-negate, z10.
 8. **[swIOBC](https://doi.pangaea.de/10.1594/PANGAEA.880618)** (SW Indian Ocean) — 250 m, CC-BY 3.0, EPSG:4326 topobathy off Kenya/Tanzania/Mozambique/Madagascar; ~2× GEBCO. One ~711 MB GeoTIFF, z9. ✅ built (`sources/swiobc`).
 9. **Inland lakes** (separate layer, pure GEBCO gap-fill): **[African Great Lakes CC0 bundle](https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/ITCOGT)** (Victoria/Albert/Edward/George, one .7z), **[swisstopo Alpine lakes](https://data.geo.admin.ch/api/stac/v1/collections/ch.swisstopo.swissbathy3d/items)** + **[Bodensee](https://doi.org/10.1594/PANGAEA.855987)**, **[Great Salt Lake](https://doi.org/10.5066/P9DGG75W)** (0.5 m, stream the 34 GB), **[Lake Tahoe](https://pubs.usgs.gov/dds/dds-55/pacmaps/exports/lt_bathy.e00.gz)**, and **[NOAA NOS Estuarine DEMs](https://www.ncei.noaa.gov/products/estuarine-bathymetric-digital-elevation-models)** (70 US estuaries, already MLLW).
 
@@ -222,8 +222,7 @@ EMODnet already covers European seas **including the N. African Med shelf** (the
 
 | Source | Res | Coverage | Datum | License | Cap | Verdict (access) |
 | ------ | --- | -------- | ----- | ------- | --- | ---------------- |
-| CHS NONNA-100 | ~100 m | Cdn coasts + Great Lakes + Cdn Arctic | **Chart Datum** ✓ | open CHS licence ✓ | z10 | **BUILT** — guest-API harvest via `source_download_nonna` |
-| CHS NONNA-10 | ~10 m | same | Chart Datum ✓ | open CHS licence ✓ | z13 | **BUILT** — same harvester, RepresentationLevel 5; national 10 m = 100s of GB (scope by region) |
+| CHS NONNA-10/100 | 10 m / 100 m | Cdn coasts + Great Lakes + Arctic | **Chart Datum** ✓ | open CHS licence ✓ | — | **SHELVED** — sparse survey coverage (not gridded): polygonize explodes, national harvest impractical; → Milestone-4 soundings (harvester in git `9f93ad3`) |
 | IBCSO v2 | 500 m (≈GEBCO) | Southern Ocean, N→50°S | MSL | CC-BY 4.0 ✓ | — | **SKIP** — ≈GEBCO res AND already folded into GEBCO via Seabed 2030 (no new coverage); <85°S untileable |
 | IBCAO v5.2 | 100 m | Arctic, S→64°N | MSL | ⚠ disclaimer-gated, ambiguous | z11 | OPPORTUNISTIC — **verify redistribution first**; EPSG:3996 |
 | GMRT v4.x | ~100 m (multibeam only) | global swaths | mixed | CC-BY 4.0 ✓ | z9–12 | OPPORTUNISTIC — dynamic GridServer, targeted fill only |
@@ -262,7 +261,7 @@ EMODnet already covers European seas **including the N. African Med shelf** (the
 
 | Source | Res | Coverage | Datum | License | Cap | Verdict (access) |
 | ------ | --- | -------- | ----- | ------- | --- | ---------------- |
-| BATNAS (Indonesia, BIG) | ~180 m | Indonesian archipelago | MSL (verify) | open, attrib, no resale ✓ | z10 | **BUILD** (B; login-gated fetch → R2) |
+| BATNAS (Indonesia, BIG) | ~180 m | Indonesian archipelago | MSL ✓ | open, attrib, no resale ✓ | z10 | **BUILT** — token-API harvest (`source_download_batnas`); mirror to R2 for CI |
 | KHOA BADA2024 (Korea) | ~150 m | Korean coast/EEZ | unknown — **verify** | KOGL Type 1 ✓ | z11 | OPPORTUNISTIC (B) — confirm datum + KOGL badge |
 | HHU24SWDSCS (S. China Sea) | 10 m | scattered SCS reefs | SDB | CC-BY 4.0 ✓ | z12 | OPPORTUNISTIC (B) — sparse, contested waters |
 | Japan (JODC J-EGG500, JHA M7000) | 500 m | Japan | — | **no-redistribute / paid ✗** | — | SKIP — soundings already reach us via GEBCO |
@@ -309,7 +308,7 @@ labeled cosmetic low-zoom fill.
 ### Cross-cutting notes
 
 - **Datum is the recurring wrinkle.** Already low-water (ideal, plug into Milestone 3
-  cleanly): NONNA, INFOMAR, UKHO-EEZ, Kartverket, BSH, SHOM, NOS-Estuarine (MLLW).
+  cleanly): INFOMAR, UKHO-EEZ, Kartverket, BSH, SHOM, NOS-Estuarine (MLLW).
   Need an offset: everything MSL/NAP/ODN/elevation (AusBathyTopo, gbr30, swIOBC, Vaklodingen,
   the lakes). eHydro mixes MLLW vs LWRP **per district** — its single biggest ingest risk.
 - **Access-A (no-download) streams beyond CUDEM/S-102:** Great Salt Lake's single GeoTIFF.
@@ -352,9 +351,7 @@ Reuse map — which recipe each clones, and the params that change:
 | UK SurfZone | _(deferred → P4)_ | EPSG:27700 | — (ODN) | 13 | WCS/interactive only — no static tile URLs |
 | AusBathyTopo ✅ | `emodnet` | EPSG:4326 | — (MSL) | 9 | one ~2.8 GB national COG zip |
 | AusSeabed COGs | _(deferred)_ | — | — | 12–13 | per-survey; portal/WCS + coverage DB, not a urllist |
-| CHS NONNA-100 ✅ | _custom_ | EPSG:4326 | — (Chart Datum) | 10 | guest-API harvest (`source_download_nonna`, level 2), not mirror-to-R2 |
-| CHS NONNA-10 ✅ | _custom_ | EPSG:4326 | — (Chart Datum) | 13 | same harvester, level 5; sibling of nonna_100 |
-| BATNAS | `emodnet` | EPSG:4326 | — (MSL) | 10 | one-time auth fetch → R2 → prepared |
+| BATNAS ✅ | _custom_ | EPSG:4326 (assign) | — (MSL) | 10 | token-API harvest (`source_download_batnas`); mirror to R2 |
 | African Great Lakes | `ddm` | per-lake UTM | `--offset` per lake | 11 | un-.7z |
 | swisstopo + Bodensee | `ddm` | 2056 / 25832 | `--offset` (LN02/DHHN92→0) | 14 | STAC / PANGAEA |
 | Lake Tahoe | `ddm` | e00 grid | `--offset` (lake level) | 13 | `.e00` → tif |
@@ -371,9 +368,10 @@ Sequenced to prove the cheap path before the awkward ones:
 - **P3 — Australia:** AusBathyTopo 250 m national grid ✅ (clean single-file fill). The
   per-survey 2–10 m AusSeabed COGs are deferred — served via portal/WCS + a coverage DB,
   not a clean urllist, so they need a custom coverage-DB fetch when the detail is worth it.
-- **P4 — gated/awkward fetch:** NONNA ✅ turned out scriptable — a public guest API
-  (`source_download_nonna`), nonna_100 built (no R2 mirror needed). BATNAS (Indonesia,
-  login) and UK SurfZone + CCO (England, WCS/interactive) still need a one-time fetch → R2.
+- **P4 — gated/awkward fetch:** BATNAS ✅ (reCAPTCHA login → token API, `source_download_batnas`;
+  harvest once, mirror to R2). UK SurfZone + CCO (England, WCS/interactive) is the last one.
+  *(NONNA was built here too, then shelved — sparse survey coverage, wrong fit for the DEM
+  mosaic; see the catalog. Revisit for Milestone-4 soundings.)*
 - **P5 — inland lakes layer:** confirm a lake overlay bundles with no false land,
   then African Great Lakes / swisstopo+Bodensee / Tahoe / Great Salt Lake / NOS
   estuaries. Shared mechanic = lakebed elevation→depth via `source_datum --offset`.
@@ -407,11 +405,12 @@ need/effort justifies; the inline notes above point here):
   ambiguous (disclaimer-gated). Resolve the licence before building.
 - **INFOMAR 100 m offshore** — only if a deep-offshore Irish gap appears; ≈EMODnet res and
   likely redundant with the 25 m IE-Waters grid. One-line `file_list` add.
-- **NONNA national harvest** — both NONNA sources (10 m + 100 m) are built and validated by
-  region; a *national* harvest (esp. 10 m, hundreds of GB) needs region-scoped BBOX runs, and
-  the coverage polygon needs simplifying: NONNA's sparse multibeam swaths make `source_polygonize`
-  trace every nodata hole (~1 M vertices for 15 tiles), so dissolve/simplify the footprint (or
-  use tile-bbox coverage) at national scale.
+- **NONNA (shelved)** — sparse multibeam *survey coverage* doesn't fit the continuous-DEM
+  mosaic: pixel-exact `source_polygonize` blows up (~1 M vertices for 15 tiles) and a national
+  10 m harvest is ~65 k tiles / hundreds of GB (CI died mid-download, no retry/resume). Removed
+  from the tree (recoverable at git `9f93ad3`). Revisit for the Milestone-4 **soundings** layer,
+  where sparse Chart-Datum points fit naturally — that, plus a resilient harvester and tile-bbox
+  (not pixel-exact) coverage, is what it would need.
 
 (Concrete source candidates — marine and inland, with resolution/license/datum and
 BUILD/SKIP verdicts — live in [Source expansion](#source-expansion--worldwide-coverage-candidates) above. GLOBathy and the

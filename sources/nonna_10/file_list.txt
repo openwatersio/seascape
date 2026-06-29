@@ -1,4 +1,0 @@
-# CHS NONNA-10 has NO static download URLs — source_download_nonna.py harvests tiles via the
-# public guest API (no account), same as nonna_100 but RepresentationLevel 5 = NONNA 10 m
-# (0.1° tiles). The harvest BBOX (Canada by default) lives in the Justfile. A national 10 m
-# harvest is hundreds of GB, so scope it by region for real builds.
