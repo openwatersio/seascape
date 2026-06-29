@@ -1,0 +1,14 @@
+# GSC Canada West Coast 10 m topo-bathy DEM (BC). Run from pipelines/:  just ../sources/gsc_pacific/
+# Prepared multi-tile source: fetches our R2-mirrored tiles of the WEST_COAST_DEM raster. The source
+# ships as one ~7.9 GB FileGDB whose DEM subdataset is 86117x94543 (~32 GB uncompressed) — too big
+# for a single per-file pass, so it was pre-tiled once (pipelines/tile_raster.py, 16384 px, all-nodata
+# tiles dropped → 23 tiles) and the tiles mirrored to R2. EPSG:3005 is embedded (no --crs); values are
+# elevation (seafloor negative, like GEBCO) → no datum transform. Per-tile processing keeps normalize/
+# polygonize memory-safe; the aggregate range-reads per window. z13.
+[no-cd]
+default:
+    uv run python source_download.py gsc_pacific
+    uv run python source_normalize.py gsc_pacific
+    uv run python source_bounds.py gsc_pacific
+    uv run python source_polygonize.py gsc_pacific 8
+    uv run python source_create_tarball.py gsc_pacific

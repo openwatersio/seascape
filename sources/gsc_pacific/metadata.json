@@ -1,0 +1,8 @@
+{
+    "name": "GSC Canada West Coast Topo-Bathymetric DEM 10 m (BC coast + Salish Sea)",
+    "producer": "Geological Survey of Canada / NRCan (MGMSP)",
+    "website": "https://open.canada.ca/data/en/dataset/e6e11b99-f0cc-44f7-f5eb-3b995fb1637e",
+    "license": "Open Government Licence – Canada",
+    "max_zoom": 13,
+    "datum": "EPSG:3005 horizontal; vertical unverified (topo-bathy; confirm at ingest)"
+}

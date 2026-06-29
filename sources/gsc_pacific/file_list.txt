@@ -1,0 +1,31 @@
+# GSC Canada West Coast Topo-Bathymetric DEM (NRCan Open File 8963, MGMSP) — 10 m continuous
+# topo-bathy DEM, BC North Coast/PNCIMA + Salish Sea. EPSG:3005 (NAD83/BC Albers), NoData
+# 3.4e38, elevation (seafloor negative, land positive) → no negate. OGL-Canada. z13.
+# The source ships as one ~7.9 GB FileGDB (WEST_COAST_DEM, 86117x94543, ~32 GB uncompressed).
+# We extract that subdataset and tile it (pipelines/tile_raster.py, 16384 px, all-nodata
+# tiles dropped → 23 tiles) and mirror the tiles to R2 — per-tile processing keeps normalize/
+# polygonize memory-safe and lets the aggregate range-read. Refresh: re-extract + re-tile +
+# re-upload when NRCan reissues (raw FileGDB also mirrored at mirror/gsc_pacific/).
+https://data.openwaters.io/bathymetry/mirror/gsc_pacific/tiles/tile_00_00.tif
+https://data.openwaters.io/bathymetry/mirror/gsc_pacific/tiles/tile_00_01.tif
+https://data.openwaters.io/bathymetry/mirror/gsc_pacific/tiles/tile_00_02.tif
+https://data.openwaters.io/bathymetry/mirror/gsc_pacific/tiles/tile_01_00.tif
+https://data.openwaters.io/bathymetry/mirror/gsc_pacific/tiles/tile_01_01.tif
+https://data.openwaters.io/bathymetry/mirror/gsc_pacific/tiles/tile_01_02.tif
+https://data.openwaters.io/bathymetry/mirror/gsc_pacific/tiles/tile_02_00.tif
+https://data.openwaters.io/bathymetry/mirror/gsc_pacific/tiles/tile_02_01.tif
+https://data.openwaters.io/bathymetry/mirror/gsc_pacific/tiles/tile_02_02.tif
+https://data.openwaters.io/bathymetry/mirror/gsc_pacific/tiles/tile_02_03.tif
+https://data.openwaters.io/bathymetry/mirror/gsc_pacific/tiles/tile_03_01.tif
+https://data.openwaters.io/bathymetry/mirror/gsc_pacific/tiles/tile_03_02.tif
+https://data.openwaters.io/bathymetry/mirror/gsc_pacific/tiles/tile_03_03.tif
+https://data.openwaters.io/bathymetry/mirror/gsc_pacific/tiles/tile_03_04.tif
+https://data.openwaters.io/bathymetry/mirror/gsc_pacific/tiles/tile_04_01.tif
+https://data.openwaters.io/bathymetry/mirror/gsc_pacific/tiles/tile_04_02.tif
+https://data.openwaters.io/bathymetry/mirror/gsc_pacific/tiles/tile_04_03.tif
+https://data.openwaters.io/bathymetry/mirror/gsc_pacific/tiles/tile_04_04.tif
+https://data.openwaters.io/bathymetry/mirror/gsc_pacific/tiles/tile_04_05.tif
+https://data.openwaters.io/bathymetry/mirror/gsc_pacific/tiles/tile_05_02.tif
+https://data.openwaters.io/bathymetry/mirror/gsc_pacific/tiles/tile_05_03.tif
+https://data.openwaters.io/bathymetry/mirror/gsc_pacific/tiles/tile_05_04.tif
+https://data.openwaters.io/bathymetry/mirror/gsc_pacific/tiles/tile_05_05.tif
