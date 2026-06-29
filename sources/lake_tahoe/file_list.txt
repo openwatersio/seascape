@@ -1,0 +1,6 @@
+# USGS DDS-55 Lake Tahoe multibeam bathymetry (Gardner/Dartnell), 10 m. The grid
+# ships as an ARC/INFO .e00 export (lt_bathy.e00.gz); GDAL here has no E00GRID driver,
+# so source_download_tahoe.py parses the GRD section directly. WGS84/UTM 10N (EPSG:32610),
+# values are bed ELEVATION in m above MSL (1400.017 deepest .. 1898.999 surface) → offset
+# -1899 (the survey's reference lake elevation) brings the surface to ~0, bed negative.
+https://pubs.usgs.gov/dds/dds-55/pacmaps/exports/lt_bathy.e00.gz

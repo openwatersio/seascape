@@ -1,0 +1,8 @@
+{
+    "name": "Lake Tahoe Bathymetry (USGS DDS-55, 10 m)",
+    "producer": "USGS (J.V. Gardner, P. Dartnell) — DDS-55",
+    "website": "https://pubs.usgs.gov/dds/dds-55/pacmaps/lt_data.htm",
+    "license": "public domain (U.S. Government work)",
+    "max_zoom": 13,
+    "datum": "bed elevation, m above MSL; surface ~1899 m → offset -1899 to make surface ~0"
+}

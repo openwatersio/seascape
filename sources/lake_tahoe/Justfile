@@ -1,0 +1,14 @@
+# Lake Tahoe (USGS DDS-55, 10 m). Run from pipelines/:  just ../sources/lake_tahoe/
+# ARC/INFO .e00 export; source_download_tahoe parses the GRD section to a Float32 tif
+# (no E00GRID driver in stock GDAL). EPSG:32610 (WGS84/UTM 10N). Values are bed ELEVATION
+# in m above MSL (1400.017 deepest .. 1898.999 surface) → --offset -1899 (the survey's
+# reference lake elevation) makes the surface ~0 and the bed negative. No negate.
+# Lake is hydraulically isolated, so no ocean seam.
+[no-cd]
+default:
+    uv run python source_download_tahoe.py lake_tahoe
+    uv run python source_datum.py lake_tahoe --offset -1899
+    uv run python source_normalize.py lake_tahoe --crs EPSG:32610
+    uv run python source_bounds.py lake_tahoe
+    uv run python source_polygonize.py lake_tahoe 8
+    uv run python source_create_tarball.py lake_tahoe
