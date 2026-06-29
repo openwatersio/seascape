@@ -1,0 +1,9 @@
+{
+    "name": "NOAA NOS Estuarine Bathymetric DEMs (30 m)",
+    "producer": "NOAA NOS / NCEI",
+    "website": "https://www.ncei.noaa.gov/products/estuarine-bathymetric-digital-elevation-models",
+    "license": "public domain (U.S. Government work)",
+    "max_zoom": 11,
+    "datum": "MLLW (local tidal datum, 19-yr epoch) — coastal source, no offset",
+    "mixed_crs": true
+}

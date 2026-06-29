@@ -48,12 +48,17 @@ def merge_source(source):
     merged = f"store/polygon/{source}/merged.gpkg"
     if os.path.isfile(merged):
         os.remove(merged)
-    utils.run_command(f"ogr2ogr -f GPKG {merged} store/polygon/{source}/{filenames[0]}.gpkg", silent=False)
+    # Reproject every per-file footprint to EPSG:4326 before union. Each polygon is
+    # emitted in its tif's native CRS; for a mixed_crs source (per-file UTM zones,
+    # e.g. noaa_estuarine) merging without -t_srs would union UTM metres with degrees
+    # into a nonsensical polygon. 4326 is the common frame the covering/footprint
+    # layer expect; single-CRS sources are unaffected (one reprojection to lon/lat).
+    utils.run_command(f"ogr2ogr -f GPKG -t_srs EPSG:4326 {merged} store/polygon/{source}/{filenames[0]}.gpkg", silent=False)
     for j, filename in enumerate(filenames[1:]):
         if j % 100 == 0:
             print(f"{j:_} / {len(filenames):_}")
         utils.run_command(
-            f"ogr2ogr -f GPKG -update -append {merged} "
+            f"ogr2ogr -f GPKG -t_srs EPSG:4326 -update -append {merged} "
             f"store/polygon/{source}/{filename}.gpkg -nln out -addfields", silent=True)
     union = f"store/polygon/{source}.gpkg"
     if os.path.isfile(union):

@@ -1,0 +1,75 @@
+# NOAA NOS Estuarine Bathymetric DEMs — 69 US estuaries, ~30 m, MLLW (local tidal
+# datum, 19-yr epoch). NAD83/UTM per estuary (zone varies) → mixed_crs source.
+# Bed elevation already in GEBCO convention (negative), so no negate, no offset.
+# THREDDS fileServer; one .nc per estuary, converted to .tif by source_download_estuarine.py.
+# Source catalog: https://www.ngdc.noaa.gov/thredds/catalog/regional/catalog.html
+# Comment lines to build a subset.
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/albemarle_sound_s010_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/altamaha_river_s150_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/apalachicola_bay_g100_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/aransas_bay_g300_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/atchafalaya_bay_g220_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/baffin_bay_g320_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/bar_harbor_N036_2018.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/barataria_bay_G200_2018.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/barnegat_bay_m070_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/biscayne_bay_S200_2018.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/bogue_sound_s030_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/broad_river_s110_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/buzzards_bay_m010_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/calcasieu_lake_g240_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/cape_cod_bay_n180_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/cape_fear_river_s050_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/casco_bay_N100_2018.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/charleston_harbor_S080_2017.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/charlotte_harbor_G050_2018.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/chesapeake_bay_M130_2017.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/choctawhatchee_bay_G120_2018.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/columbia_river_p260_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/corpus_christi_bay_G310_2018.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/delaware_bay_m090_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/galveston_bay_G260_2018.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/gardiners_bay_m030_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/grays_harbor_P280_2018.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/great_bay_n130_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/great_south_bay_m050_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/indian_river_S190_2018.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/long_island_sound_m040_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/massachusetts_bay_n170_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/matagorda_bay_g280_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/mississippi_sound_g170_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/mobile_bay_g150_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/monterey_bay_P080_2018.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/muscongus_bay_n060_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/narragansett_bay_m020_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/new_jersey_inland_bays_m080_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/ossabaw_sound_S130_2018.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/pamlico_sound_s020_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/penobscot_bay_n050_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/pensacola_bay_G130_2018.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/perdido_bay_G140_2018.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/puget_sound_p290_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/saco_bay_N110_2018.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/san_antonio_bay_g290_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/san_diego_bay_P020_2017.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/san_francisco_bay_P090_2018.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/san_pedro_bay_P050_2018.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/santa_monica_bay_P060_2018.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/santee_river_s070_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/sarasota_bay_G060_2017.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/savannah_river_s120_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/sheepscot_bay_n080_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/southern_florida_F010_2018.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/standrew_bay_g110_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/standrew_stsimons_sounds_s160_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/stcatherines_sapelo_sounds_s140_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/sthelena_sound_s100_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/stjohns_river_s180_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/stmarys_river_cumberland_sound_s170_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/tampa_bay_G070_2017.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/terrebonne_timbalier_bays_g210_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/tomales_bay_P110_2018.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/umpqua_river_p180_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/willapa_bay_P270_2018.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/winyah_bay_s060_30m.nc
+https://www.ngdc.noaa.gov/thredds/fileServer/regional/yaquina_bay_p210_30m.nc
