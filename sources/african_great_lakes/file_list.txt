@@ -1,0 +1,7 @@
+# African Great Lakes (GLWNB-2020) — Victoria, Albert, Edward, George surveyed
+# bathymetry, CC0. Harvard Dataverse doi:10.7910/DVN/ITCOGT. The DEMs live in one
+# .7z (Bathymetric_Rasters.7z, 4 Analytical rasters); GDAL /vsi7z reads them, no 7z
+# binary needed. Values are water DEPTH (positive down, 0 at surface) → negate.
+# Per-lake CRS (Victoria LCC, Albert/George UTM36N, Edward UTM35S) → mixed_crs.
+# Dataverse access URL for datafile id 4889647:
+https://dataverse.harvard.edu/api/access/datafile/4889647

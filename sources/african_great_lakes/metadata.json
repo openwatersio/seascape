@@ -1,0 +1,10 @@
+{
+    "name": "African Great Lakes Bathymetry (GLWNB-2020): Victoria, Albert, Edward, George",
+    "producer": "Hamilton et al. 2022 (East Carolina University) — Sci. Data 9:649",
+    "website": "https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/ITCOGT",
+    "license": "CC0 1.0",
+    "max_zoom": 13,
+    "datum": "depth below lake surface (per-lake sounding datum, EGM2008/WGS84) — depth, so negate; no offset",
+    "negate": true,
+    "mixed_crs": true
+}
