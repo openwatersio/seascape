@@ -1,0 +1,4 @@
+# Lac Léman (Lake Geneva) — swisstopo swissBATHY3D, ~2 m. One esriasciigrid.zip of
+# ~693 .asc tiles; source_download_swissbathy mosaics them. EPSG:2056 (CH1903+ LV95),
+# values are bed elevation in LN02 (m above sea level); surface 372 m → offset -372.
+https://data.geo.admin.ch/ch.swisstopo.swissbathy3d/swissbathy3d_lacleman/swissbathy3d_lacleman_2056_5728.esriasciigrid.zip

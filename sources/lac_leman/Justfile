@@ -1,0 +1,13 @@
+# Lac Léman (Lake Geneva) — swissBATHY3D, ~2 m. Run from pipelines/:  just ../sources/lac_leman/
+# One esriasciigrid.zip of ~693 .asc tiles; source_download_swissbathy mosaics them to a tif.
+# Values are bed elevation in LN02 (m above sea level); surface 372 m → --offset -372 makes
+# the surface ~0, the bed negative. EPSG:2056 (CH1903+ LV95) assigned in normalize.
+# Lake is hydraulically isolated, so no ocean seam.
+[no-cd]
+default:
+    uv run python source_download_swissbathy.py lac_leman
+    uv run python source_datum.py lac_leman --offset -372
+    uv run python source_normalize.py lac_leman --crs EPSG:2056
+    uv run python source_bounds.py lac_leman
+    uv run python source_polygonize.py lac_leman 8
+    uv run python source_create_tarball.py lac_leman
