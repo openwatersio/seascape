@@ -51,12 +51,14 @@ jobs:
           set -o pipefail
           # R2 has no object tagging, and the AWS CLI touches tags on every server-side copy.
           # Multipart copies (the big files) survive with --copy-props none; a single-part
-          # CopyObject still sends x-amz-tagging-directive: REPLACE, which R2 rejects. Only
-          # manifest.json is below the multipart threshold and hits that path — round-trip it
-          # through the runner, where the upload sends no tagging header. Small future overlays
-          # would need the same; lower the threshold or switch to rclone if that happens.
+          # CopyObject still sends x-amz-tagging-directive: REPLACE, which R2 rejects. Small
+          # files hit that path: manifest.json must reach the bucket, so round-trip it through
+          # the runner (the upload sends no tagging header); contour-maxz.txt is a build-only
+          # handoff, so it's just excluded like contour-shards/bundle-frags. New *promoted*
+          # small files need the round-trip too; lower the threshold or switch to rclone.
           aws s3 cp "s3://$DATA_BUCKET/bathymetry/build/$SHA/" "s3://$TILES_BUCKET/bathymetry/$SHA/" \
-            --recursive --exclude 'contour-shards/*' --exclude 'bundle-frags/*' --exclude 'manifest.json' --copy-props none
+            --recursive --exclude 'contour-shards/*' --exclude 'bundle-frags/*' \
+            --exclude 'manifest.json' --exclude 'contour-maxz.txt' --copy-props none
           aws s3 cp "s3://$DATA_BUCKET/bathymetry/build/$SHA/manifest.json" - \
             | aws s3 cp - "s3://$TILES_BUCKET/bathymetry/$SHA/manifest.json" --content-type application/json
       - name: Prune old releases (keep newest 3)
