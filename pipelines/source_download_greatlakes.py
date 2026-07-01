@@ -6,8 +6,9 @@ low-water chart-datum analog), so the lake bed is negative and the surrounding l
 These are full open-lake grids, so they cover both the US and Canadian sides (the lakes are
 single water bodies — this fills the Canadian Great Lakes that had no source).
 
-file_list.txt holds the five main-lake tarball URLs (Superior, Michigan, Huron, Erie,
-Ontario; St. Clair — tiny, Huron–Erie corridor — isn't published at NGDC's path). The
+file_list.txt holds five tarball URLs (Superior, Michigan, Huron, Erie, Ontario) — which
+cover all six Great Lakes water bodies: NGDC's Erie grid is "Lake Erie and Lake Saint
+Clair", so Lake St. Clair rides along in erie_lld (no separate St. Clair grid exists). The
 recipe then drops land above LWD (source_datum --clamp-positive → lake-only) and assigns
 EPSG:4269 in normalize (the CRS ships as a .prj sidecar we don't keep). No login, ~220 MB.
 """
