@@ -29,10 +29,11 @@ PIPE = os.path.dirname(os.path.abspath(__file__))
 
 
 def run(tmp, *args):
-    # Small macrotile_z / num_overviews keep the synthetic rasters tiny.
-    # SKIP_CONTOURS/SKIP_SMOOTH: this is the raster priority test (both have/need none).
+    # Small macrotile_z / num_overviews keep the synthetic rasters tiny. No skip flags — the
+    # value-exact e2e composes only the stages it needs (`aggregation_run.py step reproject merge
+    # tile`, omitting the slope blur) rather than skipping a stage of the full run.
     env = {**os.environ, "SOURCES_DIR": "sources", "PYTHONPATH": PIPE,
-           "MACROTILE_Z": "10", "NUM_OVERVIEWS": "2", "SKIP_CONTOURS": "1", "SKIP_SMOOTH": "1"}
+           "MACROTILE_Z": "10", "NUM_OVERVIEWS": "2"}
     subprocess.run([sys.executable, os.path.join(PIPE, args[0]), *args[1:]],
                    cwd=tmp, env=env, check=True)
 
@@ -212,7 +213,7 @@ def main():
         run(tmp, "source_bounds.py", "base")
         run(tmp, "source_bounds.py", "fine")
         run(tmp, "aggregation_covering.py")
-        run(tmp, "aggregation_run.py")
+        run(tmp, "aggregation_run.py", "step", "reproject", "merge", "tile")
         run(tmp, "downsampling.py", "cover")
         run(tmp, "downsampling.py", "freeze")  # the CI path: shards + tail read this frozen list
         # Exercise the CI fan-out (deep shards + coarse tail), not just the single
@@ -245,7 +246,7 @@ def main():
         # pmtiles across the groups: a tile in no group is missing from the bundles (a
         # hole the Worker overzooms GEBCO into); a tile in two is double-bundled.
         cli_env = {**os.environ, "SOURCES_DIR": "sources", "PYTHONPATH": PIPE,
-                   "MACROTILE_Z": "10", "NUM_OVERVIEWS": "2", "SKIP_CONTOURS": "1", "SKIP_SMOOTH": "1"}
+                   "MACROTILE_Z": "10", "NUM_OVERVIEWS": "2"}
         names = json.loads(subprocess.run(
             [sys.executable, os.path.join(PIPE, "bundle.py"), "groups"],
             cwd=tmp, env=cli_env, check=True, capture_output=True, text=True).stdout.splitlines()[-1])

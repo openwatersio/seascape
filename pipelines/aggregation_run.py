@@ -9,6 +9,9 @@ CLI:
   aggregation_run.py freeze          write the dirty list into the covering (plan, once)
   aggregation_run.py shard <i> <n>   process the frozen dirty[i::n] (matrix shard i of n)
   aggregation_run.py matrix <max>    print the shard matrix JSON (sized to the dirt)
+  aggregation_run.py step <name>...  run only the named stage(s) over the covering (reproject |
+                                     merge | smooth | tile | contour) — stages run independently,
+                                     no skip flags; omit a stage by leaving it out
 
 `shard` takes a strided slice of the single dirty list `freeze` wrote, so every shard
 partitions the identical list — no overlap, no coordination, nothing recomputed per shard.
@@ -28,25 +31,44 @@ import contour_run
 import smooth
 import utils
 
-# Both forks share the merged DEM; set these to 1 for raster-only / no-smooth runs.
-SKIP_CONTOURS = os.environ.get("SKIP_CONTOURS", "")
-SKIP_SMOOTH = os.environ.get("SKIP_SMOOTH", "")
+# The aggregation stages, each operating on one tile's covering CSV. There are NO skip flags:
+# run the full sequence (production / `just planet` / a shard) or any subset independently via
+# the `step` CLI. To omit a stage (e.g. the slope blur in a value-exact test), just don't run it.
+def _smooth(filepath):
+    smooth.smooth_merged(filepath.replace("-aggregation.csv", "-tmp"))  # slope-selective blur
+
+
+STEPS = {
+    "reproject": aggregation_reproject.reproject,
+    "merge": aggregation_merge.merge,
+    "smooth": _smooth,
+    "tile": aggregation_tile.main,        # raster Terrain-RGB tiles
+    "contour": contour_run.generate,      # vector contours off the merged DEM
+}
+FULL = ["reproject", "merge", "smooth", "tile", "contour"]
 
 
 def run(filepath):
+    """Full pipeline for one tile: every stage, then drop the tmp DEM and mark it done."""
     item = filepath.split("/")[-1].replace("-aggregation.csv", "")
     print(f"{item} start")
-    aggregation_reproject.reproject(filepath)
-    aggregation_merge.merge(filepath)
-    tmp_folder = filepath.replace("-aggregation.csv", "-tmp")
-    if not SKIP_SMOOTH:
-        smooth.smooth_merged(tmp_folder)     # slope-selective blur, shared by both
-    aggregation_tile.main(filepath)          # raster Terrain-RGB tiles
-    if not SKIP_CONTOURS:
-        contour_run.generate(filepath)       # vector contours off the merged DEM
-    shutil.rmtree(tmp_folder)
+    for name in FULL:
+        STEPS[name](filepath)
+    shutil.rmtree(filepath.replace("-aggregation.csv", "-tmp"))
     utils.run_command(f'touch {filepath.replace("-aggregation.csv", "-aggregation.done")}')
     print(f"{item} end")
+
+
+def run_steps(names):
+    """Run only the named stage(s) over every covering tile, in order, leaving the tmp DEM in
+    place (no cleanup, no .done) so a later invocation can pick it up — for running stages
+    independently (dev / the engine test), with no skip flag."""
+    bad = [n for n in names if n not in STEPS]
+    if bad:
+        sys.exit(f"unknown step(s) {bad}; choose from {list(STEPS)}")
+    for filepath in covering_sorted():
+        for name in names:
+            STEPS[name](filepath)
 
 
 def covering_sorted():
@@ -144,10 +166,12 @@ def main(argv):
     elif argv[:1] == ["shard"]:
         i, n = int(argv[1]), int(argv[2])
         run_all(work_list()[i::n])
+    elif argv[:1] == ["step"]:
+        run_steps(argv[1:])
     elif not argv:
         run_all(dirty_filepaths())
     else:
-        sys.exit("usage: aggregation_run.py [freeze | shard <i> <n> | matrix <max>]")
+        sys.exit("usage: aggregation_run.py [freeze | shard <i> <n> | matrix <max> | step <name>...]")
 
 
 if __name__ == "__main__":

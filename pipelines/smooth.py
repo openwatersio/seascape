@@ -16,7 +16,7 @@ so peak memory is one padded block, not the whole raster — a z14 macrotile is
 Sigma is in merged-DEM pixels, so the physical blur scale tracks the tile's zoom
 (coarse base tiles blur more in metres, fine regional tiles less) — roughly what we
 want (coarse data is noisier). Revisit with a physical-scale sigma if it
-over/under-blurs. SKIP_SMOOTH=1 disables it.
+over/under-blurs. Run as the `smooth` stage of aggregation_run (omit that stage to skip it).
 """
 
 import glob

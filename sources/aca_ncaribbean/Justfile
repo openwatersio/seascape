@@ -1,0 +1,17 @@
+# Allen Coral Atlas SDB (N. Caribbean, Florida & Bahamas) — 10 m, CC-BY 4.0. Run from pipelines/:
+#   just ../sources/aca_ncaribbean/
+# R2 MIRROR of the raw ACA download (account-gated behind an expiring signed GCS URL → not CI-fetchable;
+# mirrored once like BATNAS). One ~23 GB Int16 GeoTIFF, too big for the per-file steps to hold in memory,
+# so tile_raster splits it into per-tile rasters (dropping all-nodata ocean tiles) right after download.
+# Tiles are pristine source values: Int16 CENTIMETRES, positive-down depth, NoData 0, EPSG:4326.
+# SDB only resolves shallow water (~0–20 m where the bottom is visible); everything deeper is NoData → GEBCO.
+[no-cd]
+default:
+    uv run python source_download.py aca_ncaribbean
+    uv run python tile_raster.py aca_ncaribbean
+    uv run python source_datum.py aca_ncaribbean --negate --scale 0.01 # turns cm depth → metres
+    uv run python source_smooth.py aca_ncaribbean --sigma 8 --max-depth 18   # denoise + drop water >18 m (SDB's reliable limit) → GEBCO fills the deep via the merge
+    uv run python source_normalize.py aca_ncaribbean --crs EPSG:4326
+    uv run python source_bounds.py aca_ncaribbean
+    uv run python source_polygonize.py aca_ncaribbean 8
+    uv run python source_create_tarball.py aca_ncaribbean

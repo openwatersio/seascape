@@ -14,16 +14,37 @@ import os
 from multiprocessing import Pool
 import shutil
 
+import rasterio
+
 import utils
 
 SILENT = True
 
+# Cap the polygonized mask's longest side (pixels). Pixel-exact polygons of a speckly mask — e.g.
+# scattered satellite-derived reefs across a 16k-px Allen Coral Atlas tile — blow past gdal/sqlite
+# vertex limits ("sqlite3_bind_blob() failed: too big"). Larger masks are downsampled to this first,
+# only ever downscaling and taking the max per block so coverage never shrinks (it generalizes
+# outward, the conservative direction). The footprint feeds the covering (which aggregation tiles to
+# consider); ~native/N precision is ample there. Files already <= this are untouched.
+COVERAGE_MAX_PX = 1024
+
 
 def polygonize_tif(source, filename):
+    src_tif = f"store/source/{source}/{filename}"
     mask = f"store/polygon/{source}/{filename}"
     utils.run_command(
-        f'GDAL_CACHEMAX=1024 gdal_calc.py -A store/source/{source}/{filename} '
+        f'GDAL_CACHEMAX=1024 gdal_calc.py -A {src_tif} '
         f'--outfile={mask} --calc="A*0+1" --type=Byte --overwrite', silent=SILENT)
+    with rasterio.open(src_tif) as s:
+        width, height = s.width, s.height
+    factor = max(1, -(-max(width, height) // COVERAGE_MAX_PX))  # ceil-divide -> downscale factor
+    if factor > 1:
+        coarse = mask + ".coarse.tif"
+        utils.run_command(
+            f'GDAL_CACHEMAX=1024 gdalwarp -r max '
+            f'-ts {max(1, width // factor)} {max(1, height // factor)} '
+            f'-overwrite {mask} {coarse}', silent=SILENT)
+        os.replace(coarse, mask)
     utils.run_command(
         f'GDAL_CACHEMAX=1024 gdal_polygonize.py {mask} -b 1 -f "GPKG" '
         f'store/polygon/{source}/{filename}.gpkg -overwrite', silent=SILENT)
