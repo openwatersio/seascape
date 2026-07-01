@@ -1,0 +1,15 @@
+# NOAA NCEI Great Lakes Bathymetry (~90 m) — full open-lake, US + Canadian sides.
+# Run from pipelines/:  just ../sources/great_lakes/
+# source_download_greatlakes fetches the 6 lake tarballs and extracts each _lld.tif.
+# Values are elevation on each lake's Low Water Datum (LWD): bed negative, land positive.
+# --clamp-positive drops cells above LWD (surrounding land) → lake-only; no negate, no offset
+# (LWD is already the low-water/chart datum). CRS is a .prj sidecar we drop → normalize
+# assigns EPSG:4269 (NAD83 ≈ WGS84). Lakes are isolated → no ocean seam.
+[no-cd]
+default:
+    uv run python source_download_greatlakes.py great_lakes
+    uv run python source_datum.py great_lakes --clamp-positive
+    uv run python source_normalize.py great_lakes --crs EPSG:4269
+    uv run python source_bounds.py great_lakes
+    uv run python source_polygonize.py great_lakes 8
+    uv run python source_create_tarball.py great_lakes

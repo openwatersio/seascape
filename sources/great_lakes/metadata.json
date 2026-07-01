@@ -1,0 +1,8 @@
+{
+    "name": "NOAA NCEI Great Lakes Bathymetry (~90 m)",
+    "producer": "NOAA NCEI",
+    "website": "https://www.ncei.noaa.gov/products/great-lakes-bathymetry",
+    "license": "public domain (U.S. Government work)",
+    "max_zoom": 10,
+    "datum": "Low Water Datum (LWD) per lake — a low-water / chart-datum analog"
+}
