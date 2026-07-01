@@ -31,8 +31,18 @@ import config
 import utils
 from aggregation_reproject import get_resolution
 
-SKIP_CONTOUR_SMOOTH = os.environ.get("SKIP_CONTOUR_SMOOTH", "")
 CHAIKIN_ITERATIONS = 5
+# Skip Chaikin in the navigable band: corner-cutting bows a contour toward the deep
+# side at shallow-convex bends, which shrinks a shoal (unsafe). Shallow lines keep
+# their raw gdal_contour geometry (sub-pixel simplify only); deeper contours smooth
+# for looks. Mirrors smooth.DEPTH_FULL / the ECDIS safety-contour depth.
+NAV_SMOOTH_MAX_M = int(os.environ.get("CONTOUR_NAV_SMOOTH_MAX", "30"))
+
+
+def _chaikin_iters(depth_abs_m):
+    return 0 if depth_abs_m <= NAV_SMOOTH_MAX_M else CHAIKIN_ITERATIONS
+
+
 # Drop spurious tiny closed contours (abyssal stipple — micro-loops around bumps
 # near a deep contour value) at deep levels only. Shallow rings are navigable
 # shoals and are kept untouched (IHO safe-side: never drop a charted shoal). Areas
@@ -95,13 +105,15 @@ def _drop_small_rings(geom, min_area):
     return kept[0] if len(kept) == 1 else MultiLineString(kept)
 
 
-def smooth_and_enrich(in_fgb, out_fgb, tol, smooth):
-    """Chaikin-smooth (in 3857), drop deep micro-loop stipple, add depth_abs_m."""
+def smooth_and_enrich(in_fgb, out_fgb, tol):
+    """Chaikin-smooth (in 3857), drop deep micro-loop stipple, add depth_abs_m.
+    Navigable-band lines skip corner-cutting (see _chaikin_iters) so smoothing never
+    understates a shoal."""
     import geopandas as gpd
     gdf = gpd.read_file(in_fgb)
-    if smooth:
-        gdf["geometry"] = [_smooth_geom(g, tol, CHAIKIN_ITERATIONS) for g in gdf.geometry]
     gdf["depth_abs_m"] = (-gdf["depth_m"]).round().astype(int)
+    gdf["geometry"] = [_smooth_geom(g, tol, _chaikin_iters(d))
+                       for g, d in zip(gdf.geometry, gdf["depth_abs_m"])]
     deep = gdf["depth_abs_m"] >= DEEP_CUTOFF_M
     if deep.any():
         gdf.loc[deep, "geometry"] = [_drop_small_rings(g, MIN_RING_AREA_M2)
@@ -129,7 +141,7 @@ def generate(filepath):
         return
 
     smoothed = f"{tmp}/contour-smooth.fgb"
-    smooth_and_enrich(raw, smoothed, tol=get_resolution(child_z), smooth=not SKIP_CONTOUR_SMOOTH)
+    smooth_and_enrich(raw, smoothed, tol=get_resolution(child_z))
 
     b = mercantile.xy_bounds(tile)  # unbuffered, tile-aligned (EPSG:3857)
     clipped = f"{tmp}/contour-clip.fgb"
@@ -355,6 +367,9 @@ def _check():
     fgbs = ["store/contour/4-5-6-8.fgb", "store/contour/11-300-400-13.fgb"]
     assert _live_fgbs(fgbs, {"11-300-400-13"}) == ["store/contour/11-300-400-13.fgb"]
     assert _live_fgbs(fgbs, None) == fgbs
+    # navigable-band contours skip Chaikin (never bow a shoal deeper); deeper ones smooth
+    assert _chaikin_iters(10) == 0 and _chaikin_iters(NAV_SMOOTH_MAX_M) == 0
+    assert _chaikin_iters(NAV_SMOOTH_MAX_M + 1) == CHAIKIN_ITERATIONS
     print("contour_run ring-drop + orphan-filter self-check ok")
 
 
