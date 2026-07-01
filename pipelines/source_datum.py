@@ -1,7 +1,9 @@
-"""Apply the bathymetry value transform: ``negate`` then ``datum_offset_m``.
+"""Apply the bathymetry value transform: ``scale`` then ``negate`` then ``datum_offset_m``.
 
 Reads the knobs from ``metadata.json``:
 
+  - ``scale``: multiply valid pixels for a unit conversion, applied first — e.g.
+    ``0.01`` for a source stored in centimetres (Allen Coral Atlas SDB) to reach metres.
   - ``negate``: flip positive-down depth sources (e.g. DDM, stored as +depth) to
     negative-down elevation.
   - ``datum_offset_m``: constant added to bring the source to ~MSL (a single
@@ -22,7 +24,7 @@ import numpy as np
 import rasterio
 
 
-def transform_file(filepath, negate, offset, clamp_positive=False):
+def transform_file(filepath, negate, offset, clamp_positive=False, scale=1.0):
     with rasterio.open(filepath) as src:
         profile = src.profile
         data = src.read(1)
@@ -30,6 +32,8 @@ def transform_file(filepath, negate, offset, clamp_positive=False):
 
     data = data.astype("float32")
     valid = data[mask]
+    if scale != 1.0:
+        valid = valid * np.float32(scale)
     if negate:
         valid = -valid
     if offset:
@@ -58,19 +62,22 @@ def main():
     p.add_argument("source")
     p.add_argument("--negate", action="store_true", help="flip positive-down depth to negative-down elevation")
     p.add_argument("--offset", type=float, default=0.0, help="metres added to reach ~MSL")
+    p.add_argument("--scale", type=float, default=1.0,
+                   help="multiply valid pixels (unit conversion, applied before negate) — "
+                        "e.g. 0.01 for centimetre depths to metres")
     p.add_argument("--clamp-positive", action="store_true",
                    help="after the offset, drop cells > 0 (above the water surface) to nodata — "
                         "removes a lake DEM's land fringe / a topobathy playa")
     a = p.parse_args()
 
-    if not a.negate and a.offset == 0 and not a.clamp_positive:
-        print(f"{a.source}: no datum transform (negate=False, offset=0)")
+    if not a.negate and a.offset == 0 and a.scale == 1.0 and not a.clamp_positive:
+        print(f"{a.source}: no datum transform (negate=False, offset=0, scale=1)")
         return
     filepaths = sorted(glob(f"store/source/{a.source}/*.tif"))
-    print(f"{a.source}: negate={a.negate} offset={a.offset} clamp_positive={a.clamp_positive} "
-          f"on {len(filepaths)} file(s)")
+    print(f"{a.source}: scale={a.scale} negate={a.negate} offset={a.offset} "
+          f"clamp_positive={a.clamp_positive} on {len(filepaths)} file(s)")
     for filepath in filepaths:
-        transform_file(filepath, a.negate, a.offset, a.clamp_positive)
+        transform_file(filepath, a.negate, a.offset, a.clamp_positive, a.scale)
 
 
 def _check():
@@ -108,6 +115,19 @@ def _check():
         o2 = src.read(1)
     assert o2[0, 0] == -50.0 and o2[0, 1] == -10.0, o2  # bed kept
     assert o2[1, 0] == nodata and o2[1, 1] == nodata, o2  # +5 land clamped; nodata untouched
+
+    # scale + negate: centimetre depths (ACA SDB) -> metres, flipped to elevation
+    path3 = os.path.join(d, "t3.tif")
+    arr3 = np.array([[100.0, 313.0, nodata]], dtype="float32")  # +depth in cm
+    with rasterio.open(path3, "w", driver="GTiff", height=1, width=3, count=1,
+                       dtype="float32", nodata=nodata, crs="EPSG:4326",
+                       transform=from_origin(0, 1, 1, 1)) as dst:
+        dst.write(arr3, 1)
+    transform_file(path3, negate=True, offset=0.0, scale=0.01)  # cm depth -> m elevation
+    with rasterio.open(path3) as src:
+        o3 = src.read(1)
+    assert abs(o3[0, 0] - (-1.0)) < 1e-6 and abs(o3[0, 1] - (-3.13)) < 1e-6, o3
+    assert o3[0, 2] == nodata, o3  # nodata untouched by scale+negate
     print("source_datum.py self-check ok")
 
 

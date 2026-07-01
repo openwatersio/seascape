@@ -1,0 +1,6 @@
+# Allen Coral Atlas SDB (N. Caribbean, Florida & Bahamas), 10 m, CC-BY 4.0 — our R2 MIRROR of the raw
+# ACA download (account-gated behind an expiring signed GCS URL → not CI-fetchable; mirrored once like
+# BATNAS). One ~23 GB Int16 GeoTIFF: CENTIMETRES, positive-down depth, NoData 0, EPSG:4326. The recipe
+# tiles it (tile_raster — too big for the per-file steps to hold in memory), then source_datum --negate
+# --scale 0.01 turns cm depth → metres elevation. Refresh = re-download from ACA, re-sync to R2 (rclone).
+https://data.openwaters.io/bathymetry/mirror/aca_ncaribbean/ACA_NCaribbean_Florida_Bahamas_SDB_10m_cm.tif

@@ -1,0 +1,8 @@
+{
+    "name": "Allen Coral Atlas Satellite-Derived Bathymetry (N. Caribbean, Florida & Bahamas, 10 m)",
+    "producer": "Allen Coral Atlas / Arizona State University",
+    "website": "https://allencoralatlas.org/",
+    "license": "CC-BY 4.0",
+    "max_zoom": 11,
+    "datum": "~MSL (instantaneous sea surface; satellite-derived)"
+}
