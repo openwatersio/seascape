@@ -184,12 +184,12 @@ def generate(filepath):
 # Scale-dependent contour interval: coarse isobaths zoomed out, finer zoomed in
 # (charts thin the deep, not the shelf — abyssal contours stipple into noise at
 # small scale). (zoom_ceiling, depths_m shown below it); at/above the last ceiling
-# every level shows. Mirrors the viewer's CONTOUR_TIERS in index.js.
+# every level shows. Each list must be a subset of config.CONTOUR_LEVELS.
 CONTOUR_TIERS = [
     (5, [-200, -1000, -2000, -4000]),
     (7, [-200, -500, -1000, -2000, -3000, -4000]),
-    (9, [-50, -100, -150, -200, -500, -1000, -1500, -2000, -3000, -4000, -5000, -6000, -8000, -10000]),
-    (11, [-10, -20, -30, -40, -50, -75, -100, -150, -200, -500, -1000, -1500, -2000, -3000, -4000, -5000, -6000, -8000, -10000]),
+    (9, [-50, -100, -200, -300, -500, -1000, -2000, -3000, -4000, -5000, -6000, -8000, -10000]),
+    (11, [-10, -20, -30, -50, -100, -200, -300, -500, -1000, -2000, -3000, -4000, -5000, -6000, -8000, -10000]),
 ]
 
 
@@ -397,6 +397,8 @@ def _check():
     assert _chaikin_iters(NAV_SMOOTH_MAX_M + 1) == CHAIKIN_ITERATIONS
     # metre and feet/fathom isobaths each get their own per-zoom bands in the tippecanoe filter
     assert '["==", "sys", "m"]' in PER_ZOOM_FILTER and '["==", "sys", "ft"]' in PER_ZOOM_FILTER
+    # every tier level must exist in the generated contour set (else it filters to nothing)
+    assert all(d in config.CONTOUR_LEVELS for _, depths in CONTOUR_TIERS for d in depths)
     print("contour_run ring-drop + orphan-filter self-check ok")
 
 

@@ -81,24 +81,14 @@ const soundingText = [
   ["to-string", ["get", "depth_m"]], // metres (default; also covers unit unset)
 ];
 // Contours: metre isobaths (sys != "ft", also legacy no-sys tiles) vs the fathom-curve set
-// (sys == "ft"), which labels as feet or fathoms. Metres label every 10 m; feet/fathom label
-// every curve (already sparse — collision thins them).
+// (sys == "ft"), which labels as feet or fathoms. Both systems label every curve — the
+// standard isobath sets are sparse enough that GL collision thins the labels.
 const IS_FEET = ["any", ["==", UNIT, "ft"], ["==", UNIT, "fm"]]; // metres is the fallback (unit unset)
 const contourLineFilter = [
   "case",
   IS_FEET,
   ["==", ["get", "sys"], "ft"],
   ["!=", ["get", "sys"], "ft"],
-];
-const contourLabelFilter = [
-  "case",
-  IS_FEET,
-  ["==", ["get", "sys"], "ft"],
-  [
-    "all",
-    ["!=", ["get", "sys"], "ft"],
-    ["==", ["%", ["to-number", ["get", "depth_abs_m"]], 10], 0],
-  ],
 ];
 const contourLabelText = [
   "case",
@@ -110,49 +100,47 @@ const contourLabelText = [
 ];
 
 // Shared label styling so soundings and contour labels read as one chart (same font, size,
-// colour, halo). Soundings override the colour to hazard-red at/above the safety depth.
+// colour, halo). Soundings at/shoaler than the safety depth print black (S-52).
 const LABEL_FONT = ["Open Sans Regular"];
 const LABEL_SIZE = ["interpolate", ["linear"], ["zoom"], 8, 9, 13, 12];
 const LABEL_COLOR = "#036";
 const LABEL_HALO = "#fff";
 
 // Depth-shading colour ramp (elevation → colour), chart-convention tints: shoal-dark →
-// deep-white (INT/NOAA), flat white beyond the 50 m curve so tint stays monotonic in depth.
+// deep-white (INT/NOAA), flat white beyond the deepest edge so tint stays monotonic in depth.
 // Bands are perceptually spaced (adjacent ΔE ≥ 7 after 0.85-opacity compositing), weighted
-// toward the shoal bands where depth discrimination matters. The hazard tint folds into THIS
-// one color-relief ramp: two color-relief layers on one DEM source don't composite (only the
-// first renders), so water shallower than the safety depth is painted into the ramp itself as
-// HAZARD_COLOR. Rebuilt in JS on safety change — an interpolate stop can't be a live
-// global-state value, so unlike the unit/safety filters this one uses setPaintProperty.
-const DEPTH_RAMP = [
-  -10000,
-  "#e9f7ff",
-  -50.1,
-  "#e9f7ff",
-  -50,
+// toward the shoal bands where depth discrimination matters. Band edges sit on isobaths the
+// chart draws — metric levels, or the classic fathom curves in ft/fm mode — so tint boundaries
+// land on contour lines rather than between them (paper-chart practice). The hazard tint folds
+// into THIS one color-relief ramp: two color-relief layers on one DEM source don't composite
+// (only the first renders), so water shallower than the safety depth is painted into the ramp
+// itself as HAZARD_COLOR. Rebuilt in JS on safety or unit change — an interpolate stop can't
+// be a live global-state value, so unlike the unit/safety filters this one uses setPaintProperty.
+const BAND_COLORS = [
+  "#e9f7ff", // deepest band
   "#c9e9fd",
-  -20.1,
-  "#c9e9fd",
-  -20,
   "#a5d9fb",
-  -10.1,
-  "#a5d9fb",
-  -10,
   "#7fc7f8",
-  -5.1,
-  "#7fc7f8",
-  -5,
   "#5db5f0",
-  -2.1,
-  "#5db5f0",
-  -2,
-  "#3fa2e4",
-  -0.01,
-  "#3fa2e4",
-  0,
-  "rgba(0,0,0,0)", // land → transparent (OSM shows through)
+  "#3fa2e4", // shoalest band
 ];
-const HAZARD_COLOR = "#1f86cb"; // one perceptual step darker than the 0-2 m band
+const BAND_EDGES = {
+  m: [50, 20, 10, 5, 2],
+  ft: [30, 10, 5, 3, 1].map((fm) => fm * 1.8288), // fathom curves 30/10/5/3/1 fm
+};
+// Land above datum: translucent buff wash (paper-chart figure-ground — white stays
+// unambiguously "deep water"); OSM streets/names read through it.
+const LAND_COLOR = "rgba(247,240,221,0.66)";
+const depthRamp = (edges) => {
+  const stops = [-10000, BAND_COLORS[0]];
+  edges.forEach((d, i) =>
+    stops.push(-d - 0.1, BAND_COLORS[i], -d, BAND_COLORS[i + 1]),
+  );
+  stops.push(-0.01, BAND_COLORS[5], 0, LAND_COLOR);
+  return stops;
+};
+let DEPTH_RAMP = depthRamp(BAND_EDGES.m); // swapped by applyUnit on unit change
+const HAZARD_COLOR = "#1f86cb"; // one perceptual step darker than the shoalest band
 // Colour of the depth ramp at elevation e (linear-interpolated). Used to pin a normal-coloured
 // stop right at the safety depth so the flip to HAZARD_COLOR is a crisp ~0.01 m edge at ANY safety
 // value — otherwise the blend feathers by however far −safety lands from the nearest ramp stop.
@@ -188,7 +176,7 @@ const depthReliefColor = (safety) => {
       -0.01,
       HAZARD_COLOR,
       0,
-      "rgba(0,0,0,0)",
+      LAND_COLOR,
     );
   return ["interpolate", ["linear"], ["elevation"], ...stops];
 };
@@ -225,7 +213,7 @@ const style = {
       id: "osm-base",
       type: "raster",
       source: "osm",
-      paint: { "raster-opacity": 0.3 },
+      paint: { "raster-opacity": 1 },
     },
     {
       id: "depth-shading",
@@ -272,7 +260,7 @@ const style = {
       type: "symbol",
       source: "contours",
       "source-layer": "contours",
-      filter: contourLabelFilter,
+      filter: contourLineFilter,
       minzoom: 8,
       layout: {
         "symbol-placement": "line",
@@ -303,7 +291,8 @@ const style = {
         "text-padding": 8,
       },
       paint: {
-        // Soundings at or above the safety depth turn hazard-red (S-52 emphasis); safety=0 → all normal.
+        // Soundings at or shoaler than the safety depth print black — S-52 shows unsafe-water
+        // soundings in black and lets the hazard tint carry the alarm; safety=0 → all normal.
         "text-color": [
           "case",
           [
@@ -311,7 +300,7 @@ const style = {
             [">", ["global-state", "safety"], 0],
             ["<=", ["get", "depth_m"], ["global-state", "safety"]],
           ],
-          "#b00020",
+          "#000",
           LABEL_COLOR,
         ],
         "text-halo-color": LABEL_HALO,
@@ -401,11 +390,6 @@ const toggles = {
 };
 
 map.on("load", () => {
-  // Seed the unit variable from the control (metres is also the expression fallback if unset).
-  map.setGlobalStateProperty(
-    "unit",
-    document.getElementById("unit-select")?.value || "m",
-  );
   // Safety depth (metres, default 2): drives the hazard tint (via the depth-shading ramp) and
   // the red-sounding emphasis (via the `safety` state var). 0 = off.
   let safetyMetres = 2;
@@ -418,9 +402,16 @@ map.on("load", () => {
       depthReliefColor(safetyMetres),
     );
   };
+  // Unit change swaps the ramp's band edges to the active system's isobaths and repaints (via
+  // applySafety); every other unit-aware expression re-evaluates off the `unit` state variable.
+  const applyUnit = (u) => {
+    map.setGlobalStateProperty("unit", u);
+    DEPTH_RAMP = depthRamp(BAND_EDGES[u === "m" ? "m" : "ft"]);
+    applySafety();
+  };
   const safetyInput = document.getElementById("safety-depth");
   if (safetyInput) safetyInput.value = safetyMetres;
-  applySafety();
+  applyUnit(document.getElementById("unit-select")?.value || "m");
   safetyInput?.addEventListener("input", (e) => {
     safetyMetres = parseFloat(e.target.value) || 0;
     applySafety();
@@ -433,12 +424,9 @@ map.on("load", () => {
       });
     });
   }
-  // One variable drives every unit-aware expression above — no per-layer restyle.
   document
     .getElementById("unit-select")
-    ?.addEventListener("change", (e) =>
-      map.setGlobalStateProperty("unit", e.target.value),
-    );
+    ?.addEventListener("change", (e) => applyUnit(e.target.value));
 });
 
 // ─── Click to inspect ─────────────────────────────────────────────────────
