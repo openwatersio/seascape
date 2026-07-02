@@ -53,6 +53,44 @@ const coverageColor =
       ]
     : "#f58231";
 
+// ─── Unit-aware chart expressions (driven by the `unit` global state) ─────────
+// One global-state variable — `unit` ("m" | "ft" | "fm") — drives every sounding/contour
+// label and which isobaths show. The Units control flips it with a single
+// setGlobalStateProperty call; MapLibre re-evaluates the expressions below (filters included),
+// so there's no per-layer setFilter/setLayoutProperty on change.
+//
+// Soundings (`soundings` layer): props depth_m / depth_ft / depth_fm, all floored toward
+// shallower; depth_m already carries one decimal in the shoal band (<6 m) and an integer deeper,
+// so metres just print it. symbol-sort-key = depth_m places the shoalest first, so GL collision
+// keeps the most dangerous sounding when labels clash.
+const UNIT = ["global-state", "unit"];
+const soundingText = [
+  "case",
+  ["==", UNIT, "ft"], ["to-string", ["get", "depth_ft"]],
+  ["==", UNIT, "fm"], ["to-string", ["get", "depth_fm"]],
+  ["to-string", ["get", "depth_m"]], // metres (default; also covers unit unset)
+];
+// Contours: metre isobaths (sys != "ft", also legacy no-sys tiles) vs the fathom-curve set
+// (sys == "ft"), which labels as feet or fathoms. Metres label every 10 m; feet/fathom label
+// every curve (already sparse — collision thins them).
+const IS_FEET = ["any", ["==", UNIT, "ft"], ["==", UNIT, "fm"]]; // metres is the fallback (unit unset)
+const contourLineFilter = [
+  "case",
+  IS_FEET, ["==", ["get", "sys"], "ft"],
+  ["!=", ["get", "sys"], "ft"],
+];
+const contourLabelFilter = [
+  "case",
+  IS_FEET, ["==", ["get", "sys"], "ft"],
+  ["all", ["!=", ["get", "sys"], "ft"], ["==", ["%", ["to-number", ["get", "depth_abs_m"]], 10], 0]],
+];
+const contourLabelText = [
+  "case",
+  ["==", UNIT, "ft"], ["concat", ["to-string", ["get", "depth_ft"]], "ft"],
+  ["==", UNIT, "fm"], ["concat", ["to-string", ["get", "depth_fm"]], "fm"],
+  ["concat", ["to-string", ["get", "depth_abs_m"]], "m"],
+];
+
 // ─── Map style ────────────────────────────────────────────────────────────
 const style = {
   version: 8,
@@ -145,6 +183,7 @@ const style = {
       type: "line",
       source: "contours",
       "source-layer": "contours",
+      filter: contourLineFilter,
       paint: {
         "line-color": "#777",
         "line-width": 0.5,
@@ -156,11 +195,11 @@ const style = {
       type: "symbol",
       source: "contours",
       "source-layer": "contours",
-      filter: ["==", ["%", ["to-number", ["get", "depth_abs_m"]], 10], 0],
+      filter: contourLabelFilter,
       minzoom: 8,
       layout: {
         "symbol-placement": "line",
-        "text-field": ["concat", ["to-string", ["get", "depth_abs_m"]], "m"],
+        "text-field": contourLabelText,
         "text-size": ["interpolate", ["linear"], ["zoom"], 8, 8, 13, 10],
         "text-font": ["Open Sans Regular"],
         "text-letter-spacing": 0.1,
@@ -169,6 +208,25 @@ const style = {
       },
       paint: {
         "text-color": "#777",
+      },
+    },
+    {
+      id: "soundings",
+      type: "symbol",
+      source: "contours",
+      "source-layer": "soundings",
+      minzoom: 7,
+      layout: {
+        "text-field": soundingText,
+        "text-font": ["Open Sans Regular"],
+        "text-size": ["interpolate", ["linear"], ["zoom"], 7, 9, 13, 12],
+        "symbol-sort-key": ["get", "depth_m"], // shoalest first → wins collisions
+        "text-padding": 8,
+      },
+      paint: {
+        "text-color": "#036",
+        "text-halo-color": "#fff",
+        "text-halo-width": 1,
       },
     },
     {
@@ -243,6 +301,7 @@ const toggles = {
   "toggle-hillshade": ["hillshade"],
   "toggle-contours": ["contour-lines"],
   "toggle-labels": ["contour-labels"],
+  "toggle-soundings": ["soundings"],
   "toggle-sources": [
     "source-fill",
     "source-highlight",
@@ -252,6 +311,8 @@ const toggles = {
 };
 
 map.on("load", () => {
+  // Seed the unit variable from the control (metres is also the expression fallback if unset).
+  map.setGlobalStateProperty("unit", document.getElementById("unit-select")?.value || "m");
   for (const [inputId, layerIds] of Object.entries(toggles)) {
     document.getElementById(inputId)?.addEventListener("change", (e) => {
       const vis = e.target.checked ? "visible" : "none";
@@ -260,6 +321,10 @@ map.on("load", () => {
       });
     });
   }
+  // One variable drives every unit-aware expression above — no per-layer restyle.
+  document.getElementById("unit-select")?.addEventListener("change", (e) =>
+    map.setGlobalStateProperty("unit", e.target.value),
+  );
 });
 
 // ─── Click to inspect ─────────────────────────────────────────────────────

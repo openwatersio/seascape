@@ -105,13 +105,23 @@ def _drop_small_rings(geom, min_area):
     return kept[0] if len(kept) == 1 else MultiLineString(kept)
 
 
-def smooth_and_enrich(in_fgb, out_fgb, tol):
-    """Chaikin-smooth (in 3857), drop deep micro-loop stipple, add depth_abs_m.
-    Navigable-band lines skip corner-cutting (see _chaikin_iters) so smoothing never
-    understates a shoal."""
+def smooth_and_enrich(sources, out_fgb, tol):
+    """Concatenate the metre + feet contour sets (each `(fgb, sys)`), tag `sys`, Chaikin-smooth
+    (in 3857, nav-band skip so smoothing never understates a shoal), drop deep micro-loop stipple,
+    and add depth_abs_m / depth_ft / depth_fm. Feet features sit on whole-fathom depths so their
+    depth_ft/depth_fm round clean; the viewer labels metre features in metres, feet features in
+    feet or fathoms."""
     import geopandas as gpd
-    gdf = gpd.read_file(in_fgb)
+    import pandas as pd
+    parts = []
+    for fgb, sys in sources:
+        g = gpd.read_file(fgb)
+        g["sys"] = sys
+        parts.append(g)
+    gdf = gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), crs=parts[0].crs)
     gdf["depth_abs_m"] = (-gdf["depth_m"]).round().astype(int)
+    gdf["depth_ft"] = (-gdf["depth_m"] / 0.3048).round().astype(int)
+    gdf["depth_fm"] = (-gdf["depth_m"] / 1.8288).round().astype(int)
     gdf["geometry"] = [_smooth_geom(g, tol, _chaikin_iters(d))
                        for g, d in zip(gdf.geometry, gdf["depth_abs_m"])]
     deep = gdf["depth_abs_m"] >= DEEP_CUTOFF_M
@@ -135,13 +145,22 @@ def generate(filepath):
 
     levels = " ".join(str(l) for l in config.CONTOUR_LEVELS)
     raw = f"{tmp}/contour-raw.fgb"
-    _run(f"gdal_contour -q -fl {levels} -a depth_m -f FlatGeobuf {dem} {raw}", "gdal_contour")
-    if feature_count(raw) == 0:
+    _run(f"gdal_contour -q -fl {levels} -a depth_m -f FlatGeobuf {dem} {raw}", "gdal_contour m")
+    sources = [(raw, "m")]
+
+    # A second set at the fathom curves for feet/fathom charts (same DEM, tagged sys=ft).
+    levels_ft = " ".join(str(l) for l in config.CONTOUR_LEVELS_FT)
+    raw_ft = f"{tmp}/contour-raw-ft.fgb"
+    _run(f"gdal_contour -q -fl {levels_ft} -a depth_m -f FlatGeobuf {dem} {raw_ft}", "gdal_contour ft")
+    if feature_count(raw_ft) > 0:
+        sources.append((raw_ft, "ft"))
+
+    if sum(feature_count(f) for f, _ in sources) == 0:
         print(f"contour: no ocean features for {filename}")
         return
 
     smoothed = f"{tmp}/contour-smooth.fgb"
-    smooth_and_enrich(raw, smoothed, tol=get_resolution(child_z))
+    smooth_and_enrich(sources, smoothed, tol=get_resolution(child_z))
 
     b = mercantile.xy_bounds(tile)  # unbuffered, tile-aligned (EPSG:3857)
     clipped = f"{tmp}/contour-clip.fgb"
@@ -175,12 +194,17 @@ CONTOUR_TIERS = [
 
 
 def _per_zoom_filter():
-    """Build tippecanoe's -j filter (exclusive $zoom bands) from CONTOUR_TIERS."""
+    """tippecanoe's -j filter (exclusive $zoom bands). Metre isobaths (sys=m) keep the hand-picked
+    CONTOUR_TIERS per zoom. Feet/fathom isobaths (sys=ft) mirror that thinning by depth — at each
+    zoom they show only curves at least as deep as the shallowest metre curve shown, so deep
+    fathom curves drop out at low zoom like the metre deep ones. Native+ zoom shows every curve."""
     bands, lo = [], 0
     for hi, depths in CONTOUR_TIERS:
-        bands.append(["all", [">=", "$zoom", lo], ["<", "$zoom", hi], ["in", "depth_m", *depths]])
+        min_abs = min(-d for d in depths)  # shallowest metre curve shown in this band
+        bands.append(["all", [">=", "$zoom", lo], ["<", "$zoom", hi], ["==", "sys", "m"], ["in", "depth_m", *depths]])
+        bands.append(["all", [">=", "$zoom", lo], ["<", "$zoom", hi], ["==", "sys", "ft"], [">=", "depth_abs_m", min_abs]])
         lo = hi
-    bands.append(["all", [">=", "$zoom", lo]])  # native+ zoom: every level
+    bands.append(["all", [">=", "$zoom", lo]])  # native+ zoom: every curve, both systems
     return json.dumps({"*": ["any", *bands]})
 
 
@@ -195,7 +219,8 @@ def _tippecanoe(fgbs, minz, maxz, out):
          # Aggressive low-zoom vertex thinning (tolerance scales with zoom distance from
          # maxz, so maxz detail is untouched). Env-tunable to dial on a re-bundle.
          "--simplification", os.environ.get("CONTOUR_SIMPLIFICATION", "8"),
-         "-y", "depth_m", "-y", "depth_abs_m", "-j", PER_ZOOM_FILTER, *fgbs],
+         "-y", "depth_m", "-y", "depth_abs_m", "-y", "sys", "-y", "depth_ft", "-y", "depth_fm",
+         "-j", PER_ZOOM_FILTER, *fgbs],
         check=True)
 
 
@@ -370,6 +395,8 @@ def _check():
     # navigable-band contours skip Chaikin (never bow a shoal deeper); deeper ones smooth
     assert _chaikin_iters(10) == 0 and _chaikin_iters(NAV_SMOOTH_MAX_M) == 0
     assert _chaikin_iters(NAV_SMOOTH_MAX_M + 1) == CHAIKIN_ITERATIONS
+    # metre and feet/fathom isobaths each get their own per-zoom bands in the tippecanoe filter
+    assert '["==", "sys", "m"]' in PER_ZOOM_FILTER and '["==", "sys", "ft"]' in PER_ZOOM_FILTER
     print("contour_run ring-drop + orphan-filter self-check ok")
 
 

@@ -24,6 +24,7 @@ planet:
     uv run python aggregation_run.py
     just combine
     just contours
+    just soundings
 
 # Plan the covering: slice the planet into aggregation tiles (BBOX="W,S,E,N" for a region).
 cover:
@@ -89,6 +90,11 @@ bundle-merge:
 contours:
     uv run python contour_run.py bundle
 
+# Soundings: bundle the per-tile points, then fold them into contours.pmtiles (one vector source).
+soundings:
+    uv run python soundings_run.py bundle
+    uv run python soundings_run.py fold
+
 # tippecanoe this shard's local FGBs -> contours-shard-{i}.pmtiles (CI pulls only the
 # shard's slice + writes store/contour-maxz.txt; merged by contour-merge).
 contour-shard i:
@@ -124,7 +130,7 @@ preview bbox="-74.30,40.40,-73.75,40.80" local="":
     else
         unset SOURCE_VSI_BASE  # read prepared COGs from store/source on disk
     fi
-    rm -rf store/aggregation store/pmtiles store/bundle store/meta store/contour
+    rm -rf store/aggregation store/pmtiles store/bundle store/meta store/contour store/soundings
     just planet
     ../worker/seed.sh
 

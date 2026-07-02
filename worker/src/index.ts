@@ -310,7 +310,21 @@ export default {
         vector_layers: [
           {
             id: "contours",
-            fields: { depth_m: "Number", depth_abs_m: "Number" },
+            fields: {
+              depth_m: "Number",
+              depth_abs_m: "Number",
+              sys: "String",
+              depth_ft: "Number",
+              depth_fm: "Number",
+            },
+          },
+          {
+            id: "soundings",
+            fields: {
+              depth_m: "Number",
+              depth_ft: "Number",
+              depth_fm: "Number",
+            },
           },
         ],
         attribution: mf.attribution ?? "",

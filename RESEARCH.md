@@ -187,6 +187,10 @@ For web-only prototyping it's useful, but for production cross-platform use, pre
 | [prozessor13/maplibre-contour](https://github.com/prozessor13/maplibre-contour)                         | Fork with `lineLevels`, isobands, spot soundings          | Explicit elevation values instead of uniform intervals.                                                                                      |
 | [OpenSeaMap/opendem.info](https://opendem.info/download_bathymetry.html)                                | GEBCO-derived contours                                    |                                                                                                                                              |
 
+For the cartographic standards behind soundings/contours/safety depth (IHO S-4/S-57/S-52,
+NOAA, and the sounding-selection literature), see
+[docs/nautical-chart-references.md](docs/nautical-chart-references.md).
+
 ---
 
 ## Key Tools
