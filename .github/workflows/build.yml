@@ -213,13 +213,13 @@ jobs:
               aws s3 rm "s3://$DATA_BUCKET/bathymetry/aggregation/$id" --recursive
             }
           done
-      - name: Prune orphaned contour FGBs (covering re-tiled)
+      - name: Prune orphaned contour FGBs + soundings (covering re-tiled)
         run: |
-          # store/contour FGBs are keyed {z}-{x}-{y}-{child_z}, same as the covering's
-          # aggregation tiles. A source's footprint/maxzoom shift re-tiles its area, but
-          # the sync (line ~270) has no --delete, so the superseded FGB lingers in R2 and
-          # contour bundle globs EVERY FGB → two contour sets overlap. Drop any R2 FGB
-          # whose stem isn't a current-covering tile (this job just wrote the covering).
+          # store/contour FGBs (and store/soundings geojson) are keyed {z}-{x}-{y}-{child_z},
+          # same as the covering's aggregation tiles. A source's footprint/maxzoom shift
+          # re-tiles its area, but the sync (line ~270) has no --delete, so the superseded
+          # file lingers in R2 and bundle globs EVERY one → two sets overlap. Drop any R2
+          # file whose stem isn't a current-covering tile (this job just wrote the covering).
           id=$(ls store/aggregation | sort | tail -1)
           ls "store/aggregation/$id"/*-aggregation.csv | sed 's#.*/##; s/-aggregation\.csv$//' | sort > /tmp/valid-stems.txt
           aws s3 ls "s3://$DATA_BUCKET/bathymetry/contour/" --recursive | awk '{print $NF}' | grep '\.fgb$' > /tmp/r2-fgbs.txt || true
@@ -230,6 +230,14 @@ jobs:
               aws s3 rm "s3://$DATA_BUCKET/$key"
             }
           done < /tmp/r2-fgbs.txt
+          aws s3 ls "s3://$DATA_BUCKET/bathymetry/soundings/" --recursive | awk '{print $NF}' | grep '\.geojson$' > /tmp/r2-snd.txt || true
+          while read -r key; do
+            [ -n "$key" ] || continue
+            grep -qx "$(basename "$key" .geojson)" /tmp/valid-stems.txt || {
+              echo "pruning orphan soundings $key"
+              aws s3 rm "s3://$DATA_BUCKET/$key"
+            }
+          done < /tmp/r2-snd.txt
       - name: Prune orphaned pmtiles (covering re-tiled)
         run: |
           # Same orphan class as the contour prune: a re-tiled covering leaves the old
@@ -285,14 +293,15 @@ jobs:
           # No R2 listing here: the shard reads its work from the plan's frozen dirty list
           # (shipped in the covering tarball, pulled above), so every shard partitions the
           # SAME list. Reproject range-reads sources via /vsicurl, so no pmtiles are pulled.
-          mkdir -p store/pmtiles store/contour
+          mkdir -p store/pmtiles store/contour store/soundings
       - name: Aggregate shard ${{ matrix.shard.i }}/${{ matrix.shard.n }}
         run: |
           # SOURCE_VSI_BASE → reproject resolves each source tile to a public /vsicurl
           # URL on R2 instead of a local store/source path. No credentials needed.
           # AGG_PROCESSES caps concurrent tiles (each holds a multi-GB merged DEM) so
           # a heavy shard doesn't OOM the runner; GDAL_CACHEMAX trims the block cache
-          # the /vsicurl reads accumulate (per worker).
+          # the /vsicurl reads accumulate (per worker). GDAL HTTP retry is set globally
+          # in the Dockerfile (GDAL_HTTP_MAX_RETRY/RETRY_DELAY), so no per-run flag here.
           docker run --rm -v "$PWD/store:/app/pipelines/store" \
             -e SOURCE_VSI_BASE="/vsicurl/https://data.openwaters.io/bathymetry/source" \
             -e AGG_PROCESSES=2 -e GDAL_CACHEMAX=256 -e FORCE_REBUILD \
@@ -301,6 +310,7 @@ jobs:
         run: |
           aws s3 sync store/pmtiles "s3://$DATA_BUCKET/bathymetry/pmtiles"
           aws s3 sync store/contour "s3://$DATA_BUCKET/bathymetry/contour"
+          aws s3 sync store/soundings "s3://$DATA_BUCKET/bathymetry/soundings"
           # Markers only — the covering tarball is immutable (plan owns it) and the
           # untarred CSVs must not be re-uploaded as the loose files we just collapsed.
           aws s3 sync store/aggregation "s3://$DATA_BUCKET/bathymetry/aggregation" --exclude '*' --include '*.done'
@@ -525,13 +535,17 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/ghcr-login
-      - name: Pull shard pmtiles from R2
+      - name: Pull shard pmtiles + soundings from R2
         run: |
-          mkdir -p store/bundle
+          mkdir -p store/bundle store/soundings
           aws s3 sync "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/contour-shards" store/bundle
           aws s3 cp "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/contour-maxz.txt" store/contour-maxz.txt
+          aws s3 sync "s3://$DATA_BUCKET/bathymetry/soundings" store/soundings
       - name: Merge contours
         run: docker run --rm -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just contour-merge
+      # Soundings aren't sharded (sparse) — bundle them here and fold into contours.pmtiles.
+      - name: Fold in soundings
+        run: docker run --rm -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just soundings
       - name: Push contours.pmtiles to R2 build
         run: |
           aws s3 cp store/bundle/contours.pmtiles "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/contours.pmtiles" \

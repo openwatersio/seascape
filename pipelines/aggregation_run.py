@@ -26,10 +26,12 @@ import aggregation_reproject
 import aggregation_tile
 import contour_run
 import smooth
+import soundings_run
 import utils
 
-# Both forks share the merged DEM; set these to 1 for raster-only / no-smooth runs.
+# The forks share the merged DEM; set these to 1 for raster-only / no-smooth runs.
 SKIP_CONTOURS = os.environ.get("SKIP_CONTOURS", "")
+SKIP_SOUNDINGS = os.environ.get("SKIP_SOUNDINGS", "")
 SKIP_SMOOTH = os.environ.get("SKIP_SMOOTH", "")
 
 
@@ -44,7 +46,10 @@ def run(filepath):
     aggregation_tile.main(filepath)          # raster Terrain-RGB tiles
     if not SKIP_CONTOURS:
         contour_run.generate(filepath)       # vector contours off the merged DEM
-    shutil.rmtree(tmp_folder)
+    if not SKIP_SOUNDINGS:
+        soundings_run.generate(filepath)     # vector soundings off the same merged DEM
+    if not os.environ.get("KEEP_TMP"):       # KEEP_TMP=1 preserves the merged DEM for re-running a fork
+        shutil.rmtree(tmp_folder)
     utils.run_command(f'touch {filepath.replace("-aggregation.csv", "-aggregation.done")}')
     print(f"{item} end")
 

@@ -91,4 +91,4 @@ and the viewer ships to Pages.
 - `pipelines/*.py` vendored from mapterhorn keep its BSD-3 attribution (`pipelines/LICENSE.mapterhorn`).
 - Each non-trivial step ships a runnable self-check (`test_*.py`, `python encode.py`, `python smooth.py`).
 - Mark deliberate simplifications with a plain comment naming the ceiling + upgrade path (no special label).
-- Design docs: [ROADMAP.md](ROADMAP.md) (goal, workstreams, source/coverage, build scaling — where the work is going), [CONTRIBUTING.md](CONTRIBUTING.md) (dev flow), `RESEARCH.md`, and the port plan referenced in commits.
+- Design docs: [ROADMAP.md](ROADMAP.md) (goal, workstreams, source/coverage, build scaling — where the work is going), [CONTRIBUTING.md](CONTRIBUTING.md) (dev flow), `RESEARCH.md`, [docs/nautical-chart-references.md](docs/nautical-chart-references.md) (IHO/NOAA chart standards + sounding-selection literature — for chart-data-model work), and the port plan referenced in commits.

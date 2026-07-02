@@ -75,7 +75,9 @@ just test-engine     # offline aggregation/bundle self-check (priority, zoom cap
 Key knobs (env vars, read by `pipelines/utils.py` / `bundle.py`):
 `MACROTILE_Z` (base/overlay split, default 8), `NUM_OVERVIEWS`, `BBOX`,
 `SMOOTH_DEM_SIGMA`/`SMOOTH_SLOPE_LOW`/`SMOOTH_SLOPE_HIGH`, `SKIP_SMOOTH`,
-`SKIP_CONTOURS`, `SKIP_CONTOUR_SMOOTH`.
+`SKIP_CONTOURS`, `SKIP_SOUNDINGS`, `CONTOUR_NAV_SMOOTH_MAX` (navigable-band
+contour-smoothing gate; replaces the retired `SKIP_CONTOUR_SMOOTH`),
+`SOUND_CELL_PX`/`SOUND_MIN_DEPTH_M` (sounding spacing / min charted depth).
 
 ## In the container
 

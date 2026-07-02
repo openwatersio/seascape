@@ -12,13 +12,21 @@ from glob import glob
 
 SOURCES_DIR = os.environ.get("SOURCES_DIR", "../sources")
 
-# Non-uniform bathymetric contour levels (metres, most-negative first): fine in
-# the shallows, coarse in the deep. Ported from scripts/config.sh.
+# Standard INT isobaths (IHO S-4 B-411), metres, most-negative first. The shallow
+# ladder (2/5/10/20/30) is also the S-52 safety-contour value set; fine depth detail
+# between curves is the soundings layer's job, not extra isobaths.
 CONTOUR_LEVELS = [int(x) for x in (
-    "-10000 -8000 -6000 -5000 -4000 -3000 -2000 -1500 -1000 -500 -200 -150 "
-    "-100 -75 -50 -45 -40 -35 -30 -25 -20 -15 -14 -13 -12 -11 -10 -9 -8 -7 -6 "
-    "-5 -4 -3 -2 -1"
+    "-10000 -8000 -6000 -5000 -4000 -3000 -2000 -1000 -500 -300 -200 "
+    "-100 -50 -30 -20 -10 -5 -2"
 ).split()]
+
+# Feet/fathom isobaths: a second contour set at the classic fathom curves. Friendly feet depths
+# (6, 12, 18, 30, 60, 120, 180, 300, 600 ft …) are exactly whole fathoms in feet, so one geometry
+# labels as either — the viewer picks feet or fathoms. In metres (negative, positive-down) for
+# gdal_contour. Full depth range so feet/fathom mode has isobaths everywhere, not just the shelf.
+FATHOM_CURVES = [1, 2, 3, 5, 10, 20, 30, 50, 100, 200, 300, 500, 1000, 2000, 3000, 5000]
+# Ascending (deepest first, like CONTOUR_LEVELS) — gdal_contour -fl needs strictly increasing.
+CONTOUR_LEVELS_FT = sorted(round(-fm * 1.8288, 4) for fm in FATHOM_CURVES)
 
 
 def sources():

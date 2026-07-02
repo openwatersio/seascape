@@ -6,24 +6,28 @@ export function unpackTerrarium(r: number, g: number, b: number): number {
   return r * 256 + g + b / 256 - 32768;
 }
 
-// Catmull-Rom cubic through p1,p2 (t in [0,1]); p0,p3 are the outer neighbours.
-// Constant input -> constant output and a linear ramp stays linear, so a locally-flat
-// source cell borrows slope from its neighbours instead of stepping — that's what keeps
-// iso-depth edges smooth across coarse cells. Can overshoot slightly near sharp steps.
-export function catmullRom(
+// Cubic B-spline (approximating) over the 4-tap neighbourhood; t in [0,1] between p1,p2.
+// The four weights are non-negative and sum to 1, so every output is a convex blend of the
+// taps — it can't overshoot, so a sharp shelf edge can't ring into a halo (unlike Catmull-
+// Rom / cubic-convolution, whose negative lobes are exactly the ring). It's also C2, the
+// smoothest of the practical kernels, so the derived hillshade has no slope creases. The
+// trade: it's non-interpolating, so it smooths (blurs) rather than passing through the
+// samples — it still reproduces flats and linear ramps exactly, only curvature is rounded.
+// This is the kernel GDAL calls `cubicspline`.
+export function cubicBSpline(
   p0: number,
   p1: number,
   p2: number,
   p3: number,
   t: number,
 ): number {
-  return (
-    0.5 *
-    (2 * p1 +
-      (p2 - p0) * t +
-      (2 * p0 - 5 * p1 + 4 * p2 - p3) * t * t +
-      (3 * p1 - 3 * p2 + p3 - p0) * t * t * t)
-  );
+  const t2 = t * t,
+    t3 = t2 * t;
+  const w0 = (1 - 3 * t + 3 * t2 - t3) / 6, // (1-t)^3 / 6
+    w1 = (4 - 6 * t2 + 3 * t3) / 6,
+    w2 = (1 + 3 * t + 3 * t2 - 3 * t3) / 6,
+    w3 = t3 / 6;
+  return w0 * p0 + w1 * p1 + w2 * p2 + w3 * p3;
 }
 
 // Writes R,G,B,A straight into an RGBA buffer at byte offset `di` (avoids a per-pixel

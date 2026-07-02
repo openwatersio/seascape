@@ -1,13 +1,26 @@
 // Run: node src/terrarium.test.mjs   (Node ≥22.18 strips the imported .ts)
 import assert from "node:assert/strict";
-import { unpackTerrarium, packTerrariumInto, catmullRom } from "./terrarium.ts";
+import {
+  unpackTerrarium,
+  packTerrariumInto,
+  cubicBSpline,
+} from "./terrarium.ts";
 
-// Catmull-Rom: hits the inner control points, keeps a flat region flat (no overshoot on
-// constant input → no spurious band-edge fringe), and reproduces a linear ramp exactly.
-assert.equal(catmullRom(3, 7, 9, 2, 0), 7); // t=0 → p1
-assert.equal(catmullRom(3, 7, 9, 2, 1), 9); // t=1 → p2
-assert.equal(catmullRom(5, 5, 5, 5, 0.37), 5); // constant stays constant
-assert.ok(Math.abs(catmullRom(0, 1, 2, 3, 0.5) - 1.5) < 1e-12); // linear ramp → linear
+// cubicBSpline: non-negative weights that sum to 1 (a convex blend), so it keeps a flat
+// region flat and reproduces a linear ramp exactly — only curvature gets smoothed. It's
+// approximating, so it does NOT pass through the samples (that's the deliberate blur).
+assert.equal(cubicBSpline(5, 5, 5, 5, 0.37), 5); // constant stays constant
+assert.ok(Math.abs(cubicBSpline(0, 1, 2, 3, 0.5) - 1.5) < 1e-12); // linear → linear
+assert.ok(Math.abs(cubicBSpline(0, 1, 2, 3, 0) - 1) < 1e-12); // linear exact at the knot too
+
+// Non-negative weights ⇒ every output stays within the min/max of its 4 taps ⇒ it can
+// never overshoot ⇒ no halo. Sweep a sharp shelf edge and a bump and assert the bound.
+for (let t = 0; t <= 1; t += 0.05) {
+  const edge = cubicBSpline(-100, -20, -20, -20, t); // deep → flat shallow shelf
+  assert.ok(edge >= -100 - 1e-9 && edge <= -20 + 1e-9, `no overshoot at shelf edge t=${t}`);
+  const bump = cubicBSpline(-100, -20, -20, -100, t); // plateau between two drops
+  assert.ok(bump <= -20 + 1e-9, `no overshoot above plateau t=${t}`);
+}
 
 const buf = new Uint8ClampedArray(4);
 const roundtrip = (h) => {

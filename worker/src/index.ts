@@ -12,16 +12,18 @@
  *   - z > planet.max_zoom, a source overlay covers it → that overlay's tile
  *   - otherwise                  → OVERZOOM the planet's deepest ancestor tile
  *
- * Overzoom of Terrarium is bicubic ON DECODED HEIGHTS, not on the packed bytes: decode
- * each source pixel to a float elevation, bicubically interpolate the elevations, re-encode.
+ * Overzoom of Terrarium is a cubic B-spline ON DECODED HEIGHTS, not on the packed bytes:
+ * decode each source pixel to a float elevation, resample the elevations, re-encode.
  * Averaging the raw RGB would corrupt the decode (G wraps at 256). Nearest leaves flat
- * plateaus + cliffs; bilinear is only C0 so iso-depth band edges still step across coarse
- * source cells. Bicubic (Catmull-Rom) is C1, so those edges curve smoothly. Contours need
- * no overzoom — tippecanoe bakes base lines to the deepest zoom, so it's passthrough.
+ * plateaus + cliffs; bilinear is only C0 so iso-depth band edges still step; cubic
+ * convolution / Catmull-Rom is C1 but its negative lobes ring past a sharp shelf edge into
+ * a halo. The B-spline (GDAL's `cubicspline`) has a non-negative C2 basis: no ring, no
+ * step, smoothest surface — it smooths (blurs) rather than interpolating, the accepted
+ * trade. Contours need no overzoom — tippecanoe bakes base lines to the deepest zoom.
  */
 
 import { PMTiles, Source, RangeResponse } from "pmtiles";
-import { unpackTerrarium, packTerrariumInto, catmullRom } from "./terrarium";
+import { unpackTerrarium, packTerrariumInto, cubicBSpline } from "./terrarium";
 // jSquash on Workers: WASM must be imported as a module and passed to init()
 // (no fetch-based instantiation in the Workers runtime).
 import decodeWebp, { init as initWebpDecode } from "@jsquash/webp/decode";
@@ -126,11 +128,12 @@ function intersects(a: number[], b: number[]): boolean {
   return a[0] < b[2] && a[2] > b[0] && a[1] < b[3] && a[3] > b[1];
 }
 
-// ── Terrarium overzoom: bicubic (Catmull-Rom) on decoded heights ────────────
-// Decode the ancestor tile to elevations, bicubically resample the elevations into the
-// output sub-tile, re-encode. Bicubic is C1, so iso-depth band edges curve smoothly across
-// coarse source cells instead of stepping (bilinear is only C0). Sampling clamps to the
-// ancestor's edge: seams at ancestor-tile boundaries flatten slightly — invisible vs the steps.
+// ── Terrarium overzoom: cubic B-spline on decoded heights ───────────────────
+// Decode the ancestor tile to elevations, resample into the output sub-tile with a cubic
+// B-spline (GDAL's `cubicspline`), re-encode. Its basis is non-negative and C2, so it can't
+// overshoot a sharp shelf edge into a halo and leaves no stairstep — the trade is that it
+// smooths rather than interpolating. Sampling clamps to the ancestor's edge: seams at
+// ancestor-tile boundaries flatten slightly — invisible.
 async function overzoom(
   env: Env,
   srcFile: string,
@@ -183,12 +186,14 @@ async function overzoom(
         c1 = cl(ix, W - 1),
         c2 = cl(ix + 1, W - 1),
         c3 = cl(ix + 2, W - 1);
-      // cubic across each of the 4 rows, then cubic down the 4 results
-      const h = catmullRom(
-        catmullRom(ha[r0 + c0], ha[r0 + c1], ha[r0 + c2], ha[r0 + c3], tx),
-        catmullRom(ha[r1 + c0], ha[r1 + c1], ha[r1 + c2], ha[r1 + c3], tx),
-        catmullRom(ha[r2 + c0], ha[r2 + c1], ha[r2 + c2], ha[r2 + c3], tx),
-        catmullRom(ha[r3 + c0], ha[r3 + c1], ha[r3 + c2], ha[r3 + c3], tx),
+      // B-spline across each of the 4 rows, then down the 4 results. The kernel is non-
+      // negative, so its tensor product is non-negative in 2D too: this separable pass can't
+      // overshoot in either axis → no shelf-edge halo, and C2 everywhere → no stairstep.
+      const h = cubicBSpline(
+        cubicBSpline(ha[r0 + c0], ha[r0 + c1], ha[r0 + c2], ha[r0 + c3], tx),
+        cubicBSpline(ha[r1 + c0], ha[r1 + c1], ha[r1 + c2], ha[r1 + c3], tx),
+        cubicBSpline(ha[r2 + c0], ha[r2 + c1], ha[r2 + c2], ha[r2 + c3], tx),
+        cubicBSpline(ha[r3 + c0], ha[r3 + c1], ha[r3 + c2], ha[r3 + c3], tx),
         ty,
       );
       packTerrariumInto(out, (j * TILE + i) * 4, h);
@@ -310,7 +315,21 @@ export default {
         vector_layers: [
           {
             id: "contours",
-            fields: { depth_m: "Number", depth_abs_m: "Number" },
+            fields: {
+              depth_m: "Number",
+              depth_abs_m: "Number",
+              sys: "String",
+              depth_ft: "Number",
+              depth_fm: "Number",
+            },
+          },
+          {
+            id: "soundings",
+            fields: {
+              depth_m: "Number",
+              depth_ft: "Number",
+              depth_fm: "Number",
+            },
           },
         ],
         attribution: mf.attribution ?? "",

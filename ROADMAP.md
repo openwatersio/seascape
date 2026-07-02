@@ -137,24 +137,36 @@ separation model meets the constant-offset fallback.
 
 ## Milestone 4 — Chart data model
 
-A chart is more than shaded relief + decorative contours. Three additions:
+A chart is more than shaded relief + decorative contours. Landed on branch
+`milestone-4-chart-data-model` (PR #8) — the three additions plus feet/fathom units:
 
-1. **Soundings.** Point depths are the primary depth cue on a real chart. Derive
-   a sparse, de-conflicted sounding layer from the mosaic (sample shallow-biased,
-   thin by zoom, label in metres/feet/fathoms). New vector layer alongside
-   contours.
-2. **Safety contour.** A user-selectable depth (e.g. draft + margin) rendered
-   prominently, with water shallower than it shaded as a hazard. Needs the contour
-   set to include candidate safety depths and the viewer to restyle a chosen one
-   client-side.
-3. **Shallow-biased contours.** Revisit the Chaikin smoothing (`smooth-contours`):
-   corner-cutting that moves a contour into _deeper_ water violates the
-   conservative principle. Either constrain smoothing to never deepen a line, or
-   reduce/disable it near navigationally-relevant depths. This is a correctness
-   change to an existing step, not a new feature.
+1. **Soundings.** ✅ New `soundings` vector layer (`pipelines/soundings_run.py`),
+   forked off each aggregation tile's merged DEM and folded into `contours.pmtiles`.
+   The shoalest wet pixel per grid cell (floored toward shallower — never charts a
+   depth deeper than reality), placed on a jittered quincunx that restaggers per zoom
+   (a shoalest-per-block pyramid via tippecanoe `minzoom==maxzoom`) so every zoom is an
+   even, chart-like field that densifies inward. Labels in metres/feet/fathoms.
+   _Deferred:_ terrain-adaptive density (thin flat bottom, keep irregular — the
+   Zoraster prime/background split) so uniform-depth plains go quiet.
+2. **Safety depth.** ✅ Viewer-only (the contour levels already carry 1 m steps to
+   −15 m, so no pipeline change). A user-set safety depth (default 2 m) shades water
+   shallower than it as a hazard — folded into the single depth-shading `color-relief`
+   ramp (two color-relief layers on one DEM source don't composite; crisp edge at any
+   value) — and turns soundings ≤ safety hazard-red (S-52). The bold safety-_contour_
+   line was built then dropped; the DEM shading reads better. _Dropped:_ a red stipple
+   over the hazard (needs depth-area polygons; `gdal_contour -p` on the native z14 DEM
+   times out — not viable per-tile).
+3. **Shallow-biased contours.** ✅ Chaikin corner-cutting could bow a contour into
+   deeper water; gated off in the navigable band (≤ `CONTOUR_NAV_SMOOTH_MAX` = 30 m,
+   the ECDIS safety band) so smoothing never understates a shoal.
 
-These can land independently; (3) is the cheapest and most urgent because it fixes
-an existing safety-relevant behavior.
+**Feet / fathom.** ✅ A second contour set at the classic fathom curves (tagged
+`sys=ft`, labelled feet or fathoms) shares the `contours` layer; the viewer's Units
+selector flips one MapLibre `global-state` variable — no per-layer restyle. _Deferred:_
+safety input in the active unit (currently metres).
+
+Chart-cartography standards + the sounding-selection literature grounding all of the
+above: [docs/nautical-chart-references.md](docs/nautical-chart-references.md).
 
 ---
 
@@ -208,7 +220,7 @@ Roughly in coverage-per-effort order:
 
 1. **[Vaklodingen 20m](https://downloads.rijkswaterstaatdata.nl/bodemhoogte_20mtr/bodemhoogte_20mtr.tif)** (Netherlands) — 20 m, **CC0**, a single ~97 MB GeoTIFF (EPSG:28992). Cleanest ingest in the catalog. z12. ✅ built (`sources/vaklodingen`).
 2. **[gbr30](https://files.ausseabed.gov.au/survey/Great%20Barrier%20Reef%20Bathymetry%202020%2030m.zip)** (Australia) — 30 m, CC-BY 4.0, one range-readable 3.8 GB zip of 4 COG tiles over the Great Barrier Reef + Coral Sea. z12. ✅ built (`sources/gbr30`).
-3. **CHS NONNA** (Canada) — **evaluated and shelved.** Genuinely valuable (10 m on **Chart Datum**, reached via a reverse-engineered public guest API), but it's sparse multibeam *survey coverage*, not a continuous grid (NONNA-100 ≈9% valid/tile) — the wrong shape for this DEM mosaic: pixel-exact `source_polygonize` explodes (~1 M vertices for 15 tiles) and a national 10 m harvest is ~65 k tiles / hundreds of GB (a CI build died mid-download). Better fit for the **Milestone-4 soundings layer**. Sources + the `source_download_nonna` harvester are removed from the tree but recoverable from git history (commit `9f93ad3`).
+3. **GSC (Canada)** — the **GSC Atlantic Bathymetric Compilation** (NRCan OF 9064) is the Canadian source: a 100 m **continuous** compiled GeoTIFF (Scotian Shelf + Newfoundland-Labrador), OGL-Canada, LCC. ✅ built (`sources/gsc_atlantic`; CI fetches it — the GSC FTP throttles too slow for a local pull). The **GSC Pacific** 10 m DEM (OF 8963, BC + Salish Sea) is a follow-up — a 7.9 GB FileGDB / ~32 GB raster needing subdataset-extract + tiling. *(CHS NONNA was built here too then **shelved** — sparse multibeam survey coverage, not a continuous grid, so it blows up `source_polygonize` and a national harvest is impractical; better for the Milestone-4 soundings layer. Removed from the tree, recoverable at git `9f93ad3`.)*
 4. **[AusBathyTopo 250m](https://www.ausseabed.gov.au/data/bathymetry)** (Australia) — national 250 m bathy/topo compilation, CC-BY 4.0, MSL, EPSG:4326. One ~2.8 GB COG zip; fills the AU EEZ at z9 (gbr30 wins the GBR/Coral Sea overlap). ✅ built (`sources/ausbathytopo`). *The per-survey 2–10 m AusSeabed COGs — the z12–13 prize — are **deferred**: served via portal/WCS + a survey coverage DB, not a clean static urllist, so they need a custom coverage-DB fetch.*
 5. **[INFOMAR](https://www.infomar.ie/)** (Ireland) — **10 m inshore** (`sources/infomar_10m`, z13) + **25 m shelf** (`sources/infomar_25m`, z11), **LAT**, CC-BY 4.0. Two **sibling sources** (cudem/cudem_third pattern). Both set `priority: 1` to outrank EMODnet regardless of any zoom tie (decoupling precedence from zoom, like S-102 vs CUDEM); `max_zoom` stays the honest native (z13 / z11) and the 10 m wins inshore via finer maxzoom within the tier. WGS84/LAT, no embedded CRS → assign EPSG:4326. 100 m offshore omitted (≈EMODnet). ✅ built.
 6. **UK [SurfZone 2m](https://environment.data.gov.uk/dataset/77e6f743-d708-4909-a80f-9510b7dbaa16) + [CCO swath](https://maps.coastalmonitoring.org/cco/)** (England) — 1–2 m, OGL v3, EPSG:27700, **ODN datum** (topographic, not chart). No static tile URLs — download is the interactive DefraDataDownload tool or a WCS endpoint, and coverage is the narrow intertidal strip. Belongs with the **awkward-fetch sources** (mirror-to-R2 / WCS), not a clean file_list — deferred to P4. z13–14.
@@ -222,6 +234,8 @@ EMODnet already covers European seas **including the N. African Med shelf** (the
 
 | Source | Res | Coverage | Datum | License | Cap | Verdict (access) |
 | ------ | --- | -------- | ----- | ------- | --- | ---------------- |
+| **GSC Atlantic 100 m** (NRCan OF 9064) | 100 m | Scotian Shelf + Newfoundland-Labrador | unverified (confirm) | OGL-Canada ✓ | z10 | **BUILT** (recipe `sources/gsc_atlantic`; CI-fetched — GSC FTP too slow locally) — continuous compiled GeoTIFF, LCC; sign/datum verify on first build. The Canadian win. |
+| GSC Pacific 10 m (NRCan OF 8963) | 10 m | BC coast/PNCIMA + Salish Sea | unverified | OGL-Canada ✓ | z13 | FOLLOW-UP — 7.9 GB FileGDB, `WEST_COAST_DEM` raster 86k×94k (~32 GB uncompressed); needs OpenFileGDB subdataset extract + tiling |
 | CHS NONNA-10/100 | 10 m / 100 m | Cdn coasts + Great Lakes + Arctic | **Chart Datum** ✓ | open CHS licence ✓ | — | **SHELVED** — sparse survey coverage (not gridded): polygonize explodes, national harvest impractical; → Milestone-4 soundings (harvester in git `9f93ad3`) |
 | IBCSO v2 | 500 m (≈GEBCO) | Southern Ocean, N→50°S | MSL | CC-BY 4.0 ✓ | — | **SKIP** — ≈GEBCO res AND already folded into GEBCO via Seabed 2030 (no new coverage); <85°S untileable |
 | IBCAO v5.2 | 100 m | Arctic, S→64°N | MSL | ⚠ disclaimer-gated, ambiguous | z11 | OPPORTUNISTIC — **verify redistribution first**; EPSG:3996 |
