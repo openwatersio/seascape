@@ -12,7 +12,7 @@ The gpkg already *is* the index, so ``bounds.csv`` is built straight from it —
 geometry → 3857 bounds, ``Resolution`` → pixel size — with **no per-tile GDAL header reads**
 (7.4k ``/vsicurl`` round-trips would take ~40 min). The index can't see what's actually in
 the bucket, though, so one parallel HTTP HEAD sweep (~30 s) then drops products that are
-missing or stub-sized before they can crash an aggregate shard (see ``validate_objects``).
+missing or GDAL-unreadable before they can crash an aggregate shard (see ``validate_objects``).
 See ``source_remote`` for the streaming model; ``source_register_remote_urllist`` is the
 header-read flat-urllist variant (CUDEM).
 
@@ -104,15 +104,17 @@ def gpkg_bounds(gpkg_url, bbox, link_col="GeoTIFF_Link"):
     return rows
 
 
-# Objects smaller than this are stubs: NOAA has published S-102 products whose
-# BathymetryCoverage grid is 1x1 cells in a ~25 KB file (the bare HDF5 skeleton is
-# ~25 KB), which GDAL's S102 driver crashes on mid-aggregate. Every real product
-# sampled is >500 KB, so 100 KB only drops near-empty products — which carry no
-# usable data anyway. Report dropped products to NOAA OCS:
+# Objects smaller than this get PROBED before registering (not dropped on size alone —
+# real slivers of coastline compress under 50 KB; ~98 of S-102's 4.3k products are
+# sub-100 KB and most are fine). The probe exists because NOAA has published stub
+# products (a ~25 KB file whose BathymetryCoverage grid is 1x1 cells) that the
+# tile-scheme index still advertises at the nominal cell footprint, and older S102
+# drivers (container GDAL 3.8) crash on them mid-aggregate. Report stubs to NOAA OCS:
 # https://www.nauticalcharts.noaa.gov/customer-service/assist/
-MIN_OBJECT_BYTES = 100_000
+PROBE_UNDER_BYTES = 100_000
 # More drops than this means the catalog itself is broken (mass re-publish, auth
-# change) — fail the source rather than quietly registering a gutted coastline.
+# change) — fail the source rather than quietly registering a gutted coastline (the
+# previous bounds.csv in R2 keeps serving until the catalog recovers).
 MAX_DROPS = 50
 
 
@@ -134,23 +136,43 @@ def _head_size(url, tries=3):
             time.sleep(2 ** attempt)
 
 
-def validate_objects(rows, head=_head_size):
-    """Drop rows whose object is missing or stub-sized, loudly. The tile-scheme gpkg
-    advertises every product at its nominal cell footprint, so the index can't see a
-    stub — only the object's actual size can. One parallel HEAD sweep (~30 s for the
-    full S-102 catalog) is the cheapest read that catches it before an aggregate shard
-    segfaults an hour in."""
+def _gdal_openable(vsicurl_path, tries=3):
+    """Can the SAME GDAL the aggregate stage uses open this object? gdalinfo in a
+    subprocess, so a driver crash (older S102 drivers segfault on degenerate 1x1
+    products) is contained instead of killing registration — and the verdict tracks
+    whatever GDAL the toolchain image ships, so a GDAL upgrade that fixes the driver
+    automatically re-admits the products. Retries so a transient /vsicurl blip can't
+    misclassify a good product as unreadable."""
+    import subprocess
+    import time
+    for attempt in range(1, tries + 1):
+        if subprocess.run(["gdalinfo", vsicurl_path], capture_output=True).returncode == 0:
+            return True
+        if attempt < tries:
+            time.sleep(2 ** attempt)
+    return False
+
+
+def validate_objects(rows, head=_head_size, openable=_gdal_openable):
+    """Drop rows whose object is missing from the bucket or unreadable by GDAL, loudly.
+    The tile-scheme gpkg advertises every product at its nominal cell footprint, so the
+    index can't see either case. One parallel HEAD sweep (~30 s for the full catalog)
+    finds missing objects and flags suspiciously small ones; only those few candidates
+    get the heavier gdalinfo probe — small-but-real products stay registered."""
     from concurrent.futures import ThreadPoolExecutor
 
     urls = [row[0].replace("/vsicurl/", "", 1) for row in rows]
     with ThreadPoolExecutor(max_workers=16) as pool:
         sizes = list(pool.map(head, urls))
+        candidates = [row[0] for row, size in zip(rows, sizes)
+                      if size is not None and size < PROBE_UNDER_BYTES]
+        verdicts = dict(zip(candidates, pool.map(openable, candidates)))
     kept, dropped = [], 0
     for row, url, size in zip(rows, urls, sizes):
         if size is None:
             print(f"DROPPING {url}: object missing (in the catalog, not in the bucket)")
-        elif size < MIN_OBJECT_BYTES:
-            print(f"DROPPING {url}: {size} bytes < {MIN_OBJECT_BYTES} — stub product "
+        elif size < PROBE_UNDER_BYTES and not verdicts[row[0]]:
+            print(f"DROPPING {url}: {size} bytes and GDAL cannot open it — stub/corrupt product "
                   f"(report via https://www.nauticalcharts.noaa.gov/customer-service/assist/)")
         else:
             kept.append(row)
@@ -201,14 +223,25 @@ def _check():
     wl, wr, wext = _x_extent(-0.9999 * XM, 0.9999 * XM)
     assert wl > wr and 0 < wext < 0.01 * XM, (wl, wr, wext)
 
-    # validate_objects: keep real products, drop stubs (< MIN_OBJECT_BYTES) and objects
-    # the catalog lists but the bucket lacks; a systemic wipe (> MAX_DROPS) hard-fails.
+    # validate_objects: big products register unprobed; small ones are PROBED, and only
+    # the unreadable drop — a 46 KB sliver-of-coastline product is real and must stay
+    # (the size-only threshold dropped 90+ real products). Missing objects drop; a
+    # systemic wipe (> MAX_DROPS) hard-fails instead of registering a gutted coastline.
     row = lambda u: (f"/vsicurl/https://x/{u}", 0, 0, 1, 1, 10, 10)
-    sizes = {"https://x/real.h5": 5_000_000, "https://x/stub.h5": 25_048, "https://x/gone.h5": None}
-    kept = validate_objects([row("real.h5"), row("stub.h5"), row("gone.h5")], head=sizes.get)
-    assert [r[0] for r in kept] == ["/vsicurl/https://x/real.h5"], kept
+    sizes = {"https://x/real.h5": 5_000_000, "https://x/sliver.h5": 46_435,
+             "https://x/stub.h5": 25_048, "https://x/gone.h5": None}
+    probed = []
+    def fake_probe(path):
+        probed.append(path)
+        return "stub" not in path
+    kept = validate_objects([row("real.h5"), row("sliver.h5"), row("stub.h5"), row("gone.h5")],
+                            head=sizes.get, openable=fake_probe)
+    assert [r[0] for r in kept] == ["/vsicurl/https://x/real.h5", "/vsicurl/https://x/sliver.h5"], kept
+    assert sorted(probed) == ["/vsicurl/https://x/sliver.h5", "/vsicurl/https://x/stub.h5"], \
+        f"only small candidates get probed: {probed}"
     try:
-        validate_objects([row(f"gone{i}.h5") for i in range(MAX_DROPS + 1)], head=lambda u: None)
+        validate_objects([row(f"gone{i}.h5") for i in range(MAX_DROPS + 1)],
+                         head=lambda u: None, openable=lambda p: True)
         assert False, "expected a systemic drop count to exit"
     except SystemExit as e:
         assert "catalog looks broken" in str(e), e
