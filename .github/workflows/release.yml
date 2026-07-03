@@ -49,18 +49,27 @@ jobs:
             exit 1
           fi
           set -o pipefail
-          # R2 has no object tagging, and the AWS CLI touches tags on every server-side copy.
-          # Multipart copies (the big files) survive with --copy-props none; a single-part
-          # CopyObject still sends x-amz-tagging-directive: REPLACE, which R2 rejects. Small
-          # files hit that path: manifest.json must reach the bucket, so round-trip it through
-          # the runner (the upload sends no tagging header); contour-maxz.txt is a build-only
-          # handoff, so it's just excluded like contour-shards/bundle-frags. New *promoted*
-          # small files need the round-trip too; lower the threshold or switch to rclone.
-          aws s3 cp "s3://$DATA_BUCKET/bathymetry/build/$SHA/" "s3://$TILES_BUCKET/seascape/$SHA/" \
-            --recursive --exclude 'contour-shards/*' --exclude 'bundle-frags/*' \
-            --exclude 'manifest.json' --exclude 'contour-maxz.txt' --copy-props none
-          aws s3 cp "s3://$DATA_BUCKET/bathymetry/build/$SHA/manifest.json" - \
-            | aws s3 cp - "s3://$TILES_BUCKET/seascape/$SHA/manifest.json" --content-type application/json
+          # Promote object-by-object via `aws s3api copy-object`, NOT `aws s3 cp`: R2 has no
+          # object tagging, and s3 cp sends x-amz-tagging-directive: REPLACE on every
+          # single-part server-side copy, which R2 rejects (multipart copies of >8 MB files
+          # happened to dodge it — until the grid overlays made most of a release small
+          # files). copy-object sends no tagging header, stays server-side (no runner
+          # round-trip), and its default COPY metadata-directive carries the content-type
+          # the build set. Ceiling: CopyObject caps at 5 GB/object — if planet.pmtiles ever
+          # nears that, switch to multipart copy (or rclone).
+          # The build dir is flat after the excludes (bundle archives + manifest), so keys
+          # map by basename. manifest.json goes LAST — its presence marks a complete promote.
+          aws s3 ls "s3://$DATA_BUCKET/bathymetry/build/$SHA/" --recursive | awk '{print $4}' \
+            | grep -vE '/(contour-shards|bundle-frags)/' \
+            | grep -vE '/(manifest\.json|contour-maxz\.txt)$' > /tmp/promote-keys.txt
+          [ -s /tmp/promote-keys.txt ] || { echo "::error::nothing to promote under build/$SHA/"; exit 1; }
+          # Bounded outer retry per object + visible errors, like the build's R2 pulls.
+          # $DATA_BUCKET/$TILES_BUCKET/$SHA reach the inner shell via its ENVIRONMENT
+          # (not spliced into the script source, where a hostile dispatch sha could inject).
+          xargs -P 8 -I{} sh -c 'k="$1"; for a in 1 2 3 4 5; do aws s3api copy-object --copy-source "$DATA_BUCKET/$k" --bucket "$TILES_BUCKET" --key "seascape/$SHA/$(basename "$k")" >/dev/null && exit 0; sleep "$a"; done; echo "giving up on $k after 5 attempts" >&2; exit 1' _ {} < /tmp/promote-keys.txt
+          echo "promoted $(wc -l < /tmp/promote-keys.txt) objects"
+          aws s3api copy-object --copy-source "$DATA_BUCKET/bathymetry/build/$SHA/manifest.json" \
+            --bucket "$TILES_BUCKET" --key "seascape/$SHA/manifest.json" >/dev/null
       - name: Prune old releases (keep newest 3)
         run: |
           # Count-based retention (current + 2 rollback targets), ordered by each
