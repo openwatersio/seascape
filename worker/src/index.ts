@@ -2,7 +2,7 @@
  * Unified bathymetry tile endpoint.
  *
  *   GET /seascape/{z}/{x}/{y}.webp  (or .png)  → Terrarium WebP (raster terrain)
- *   GET /seascape/{z}/{x}/{y}.pbf   (or .mvt)  → MVT (vector — contours, more layers later)
+ *   GET /seascape/{z}/{x}/{y}.pbf   (or .mvt)  → MVT (vector — contours, soundings, drying, coverage)
  *
  * Extension picks the representation: webp/png → raster, pbf/mvt → vector.
  *
@@ -85,6 +85,11 @@ class R2Source implements Source {
 const pmCache = new Map<string, PMTiles>();
 function pm(env: Env, file: string): PMTiles {
   const key = (env.RELEASE_PREFIX ?? "") + file;
+  // Dev (no RELEASE_PREFIX): don't reuse the isolate cache. A local reseed replaces the
+  // pmtiles under the same key, and a cached instance's stale header/directory would then
+  // read the new bytes at old offsets (garbage / 500s) until wrangler restarts. A fresh
+  // instance re-reads them. Prod keys are release-immutable, so the cache is safe there.
+  if (!env.RELEASE_PREFIX) return new PMTiles(new R2Source(env.TILES, key));
   let p = pmCache.get(key);
   if (!p) {
     p = new PMTiles(new R2Source(env.TILES, key));
@@ -95,16 +100,17 @@ function pm(env: Env, file: string): PMTiles {
 
 let manifestCache: Manifest | undefined;
 async function manifest(env: Env): Promise<Manifest> {
-  if (!manifestCache) {
-    const obj = await env.TILES.get(
-      (env.RELEASE_PREFIX ?? "") + "manifest.json",
-    );
-    if (!obj) throw new Error("manifest.json missing");
-    manifestCache = JSON.parse(await obj.text());
-    // Tolerate a pre-grid manifest (old release / local seed): planet-only, no 500s.
-    manifestCache!.overlay ??= { split_z: 0, cells: {} };
-  }
-  return manifestCache!;
+  // Dev (no RELEASE_PREFIX): re-read every call — a local reseed replaces manifest.json under
+  // the running wrangler, and the isolate cache would otherwise pin the old one (e.g. an old
+  // contour max_zoom) until restart. Prod caches it (immutable within a release).
+  if (manifestCache && env.RELEASE_PREFIX) return manifestCache;
+  const obj = await env.TILES.get((env.RELEASE_PREFIX ?? "") + "manifest.json");
+  if (!obj) throw new Error("manifest.json missing");
+  const m: Manifest = JSON.parse(await obj.text());
+  // Tolerate a pre-grid manifest (old release / local seed): planet-only, no 500s.
+  m.overlay ??= { split_z: 0, cells: {} };
+  if (env.RELEASE_PREFIX) manifestCache = m;
+  return m;
 }
 
 async function tile(
@@ -238,22 +244,30 @@ export default {
     // bodyless 304 — cheap refresh for stale-while-revalidate/-if-error. (ETag is per release, so a
     // deploy re-downloads even unchanged tiles; a per-tile content hash would avoid that, at the
     // cost of hashing every response.)
+    // Dev (no RELEASE_PREFIX): serve uncacheable and drop the validator — a local reseed must
+    // show up immediately, but the ETag would be a constant "dev" that 304s stale bodies across
+    // reseeds (browser cache), and long stale-while-revalidate would keep serving them. Prod
+    // keeps the per-release ETag + long cache (every resource is deterministic within a release).
+    const dev = !env.RELEASE_PREFIX;
     const etag = `"${(env.RELEASE_PREFIX ?? "").split("/").filter(Boolean).pop() ?? "dev"}"`;
-    const fresh = req.headers.get("If-None-Match") === etag;
+    const fresh = !dev && req.headers.get("If-None-Match") === etag;
     const send = (
       body: BodyInit | null,
       headers: Record<string, string>,
-    ): Response =>
-      fresh
-        ? new Response(null, {
-            status: 304,
-            headers: {
-              etag,
-              "cache-control": headers["cache-control"],
-              ...CORS,
-            },
-          })
-        : new Response(body, { headers: { ...headers, etag, ...CORS } });
+    ): Response => {
+      if (fresh)
+        return new Response(null, {
+          status: 304,
+          headers: { etag, "cache-control": headers["cache-control"], ...CORS },
+        });
+      return new Response(body, {
+        headers: {
+          ...headers,
+          ...(dev ? { "cache-control": "no-store" } : { etag }),
+          ...CORS,
+        },
+      });
+    };
     const json = (o: unknown) =>
       send(JSON.stringify(o), {
         "content-type": "application/json",
@@ -389,7 +403,11 @@ export default {
           console.log(`overlay ${ov.file} failed at ${z}/${x}/${y}: ${e}`);
         }
       }
-      for (let sm = Math.min(ov.maxZoom, z - 1); sm > mf.planet.max_zoom; sm--) {
+      for (
+        let sm = Math.min(ov.maxZoom, z - 1);
+        sm > mf.planet.max_zoom;
+        sm--
+      ) {
         try {
           const t = await overzoom(env, ov.file, sm, z, x, y);
           if (t) return send(t, WEBP);
