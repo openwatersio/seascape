@@ -8,8 +8,9 @@ z11 in metadata) inside it — then runs the whole engine and asserts:
   - PRIORITY: at the fine source's zoom the merged value is the fine value (-50),
     not the base (-100) — highest-maxzoom source wins in overlap;
   - the base shows through where fine is absent (-100 present);
-  - the E1 split: planet.pmtiles spans z0..macrotile_z and the deeper fine tiles
-    land in the fine.pmtiles overlay (so the engine covers z0..11 across bundles).
+  - the bundle split: planet.pmtiles spans z0..macrotile_z and the deeper fine
+    tiles land in one overlay-{cell}.pmtiles per populated OVERLAY_SPLIT_Z grid
+    cell (so the engine covers z0..11 across bundles).
 
 Run from pipelines/:  uv run python test_engine.py
 """
@@ -52,8 +53,8 @@ def make_source(tmp, sid, west, north, deg, px, value, max_zoom):
 
 def decode_bundles(tmp):
     """Return {zoom: [median elevation per tile]} across ALL bundle pmtiles —
-    planet (z0..PLANET_MAX_ZOOM) plus the per-source overlays above it (E1
-    routes child_z > PLANET_MAX_ZOOM into <source>.pmtiles, not planet)."""
+    planet (z0..PLANET_MAX_ZOOM) plus the grid-cell overlays above it (bundle
+    routes child_z > PLANET_MAX_ZOOM into overlay-{cell}.pmtiles, not planet)."""
     import glob
     import imagecodecs
     from pmtiles.reader import Reader, MmapSource, all_tiles
@@ -200,6 +201,57 @@ def check_stale_overview():
             os.environ["FORCE_REBUILD"] = env_force
 
 
+def check_grid_split():
+    """The bundle grid: stem_groups routes base zooms to planet and deep stems to their
+    OVERLAY_SPLIT_Z cell; a coarse parent (z < split, a broad downsample extent) fans out
+    to its descendant cells, and create_archive keeps only each cell's own tiles — so the
+    sibling cells' archives partition the shared file exactly (no leaks, no dupes)."""
+    import bundle
+    import mercantile
+    from pmtiles.reader import Reader, MmapSource, all_tiles
+    from pmtiles.writer import Writer
+    from pmtiles.tile import zxy_to_tileid, TileType, Compression
+
+    assert bundle.stem_groups("8-77-95-8") == ["planet"], "base zoom must route to planet"
+    assert bundle.stem_groups("8-77-95-14") == ["5-9-11"], "deep macrotile → its z5 cell"
+    assert bundle.stem_groups("6-11-13-9") == ["5-5-6"], "overview parent → its z5 cell"
+    fan = bundle.stem_groups("4-4-5-9")
+    assert sorted(fan) == sorted(f"5-{x}-{y}" for x in (8, 9) for y in (10, 11)), \
+        f"coarse parent must fan out to its 4 descendant cells: {fan}"
+
+    tmp = tempfile.mkdtemp()
+    cwd = os.getcwd()
+    try:
+        os.chdir(tmp)
+        os.makedirs("store/pmtiles")
+        # One single-zoom archive under the coarse parent (4,4,5) at z9 — 1024 tiles
+        # spanning the 4 cells; payload = the tile id, so reads are verifiable.
+        children = list(mercantile.children(mercantile.Tile(x=4, y=5, z=4), zoom=9))
+        with open("store/pmtiles/4-4-5-9.pmtiles", "wb") as f:
+            w = Writer(f)
+            for tid in sorted(zxy_to_tileid(t.z, t.x, t.y) for t in children):
+                w.write_tile(tid, str(tid).encode())
+            w.finalize({"tile_type": TileType.WEBP, "tile_compression": Compression.NONE,
+                        "min_zoom": 9, "max_zoom": 9, "min_lon_e7": 0, "min_lat_e7": 0,
+                        "max_lon_e7": 1, "max_lat_e7": 1, "center_zoom": 9,
+                        "center_lon_e7": 0, "center_lat_e7": 0}, {})
+        seen = set()
+        for cell in fan:
+            meta = bundle.create_archive(["store/pmtiles/4-4-5-9.pmtiles"], cell)
+            with open(f"store/bundle/{meta['file']}", "r+b") as f:
+                for (z, x, y), data in all_tiles(Reader(MmapSource(f)).get_bytes):
+                    assert bundle.cell_of(z, x, y) == cell, f"tile {(z, x, y)} leaked into {cell}"
+                    assert data == str(zxy_to_tileid(z, x, y)).encode(), "payload mismatch"
+                    assert (z, x, y) not in seen, f"tile {(z, x, y)} bundled twice"
+                    seen.add((z, x, y))
+        assert len(seen) == len(children), \
+            f"cells must partition the coarse parent: {len(seen)} of {len(children)} tiles"
+        print(f"grid-split ok — {len(children)} tiles partitioned across {len(fan)} cells, no leaks/dupes")
+    finally:
+        os.chdir(cwd)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     tmp = tempfile.mkdtemp()
     try:
@@ -241,23 +293,32 @@ def main():
         assert not (selected[0] & selected[1]), f"shards must be disjoint: {selected[0] & selected[1]}"
         print(f"shard-keys ok — {len(deep)} deep pmtiles partitioned across 2 shards, none below z{shard_root_z}")
 
-        # bundle group-keys (the CI per-group pull filter) must partition EVERY terrain
+        # bundle matrix + group-keys (the CI pull filter) must partition EVERY terrain
         # pmtiles across the groups: a tile in no group is missing from the bundles (a
-        # hole the Worker overzooms GEBCO into); a tile in two is double-bundled.
+        # hole the Worker overzooms GEBCO into); a tile in two is double-bundled. The
+        # groups are planet + one overlay per z5 grid cell holding a deep (z11) tile.
+        agg_dir = f"{tmp}/store/aggregation"
+        agg_id = sorted(os.listdir(agg_dir))[-1]
+        agg_stems = [n.replace("-aggregation.csv", "").split("-")
+                     for n in os.listdir(f"{agg_dir}/{agg_id}") if n.endswith("-aggregation.csv")]
+        expected = {"planet"} | {f"5-{int(x) >> (int(z) - 5)}-{int(y) >> (int(z) - 5)}"
+                                 for z, x, y, cz in agg_stems if int(cz) > 10}
         cli_env = {**os.environ, "SOURCES_DIR": "sources", "PYTHONPATH": PIPE,
                    "MACROTILE_Z": "10", "NUM_OVERVIEWS": "2", "SKIP_CONTOURS": "1", "SKIP_SMOOTH": "1"}
-        names = json.loads(subprocess.run(
-            [sys.executable, os.path.join(PIPE, "bundle.py"), "groups"],
+        chunks = json.loads(subprocess.run(
+            [sys.executable, os.path.join(PIPE, "bundle.py"), "matrix", "2"],
             cwd=tmp, env=cli_env, check=True, capture_output=True, text=True).stdout.splitlines()[-1])
-        assert set(names) == {"planet", "fine"}, f"unexpected groups: {names}"
-        gsel = []
+        assert len(chunks) <= 2, f"matrix must respect the shard cap: {chunks}"
+        names = [n for c in chunks for n in c["cells"].split(",") if n]
+        assert sorted(names) == sorted(expected), f"unexpected groups: {sorted(names)} != {sorted(expected)}"
+        gsel = {}
         for name in names:
             run(tmp, "bundle.py", "group-keys", name)
             with open(f"{tmp}/store/keys.txt") as f:
-                gsel.append({os.path.basename(l.strip()) for l in f if l.strip()})
-        gunion = set().union(*gsel)
+                gsel[name] = {os.path.basename(l.strip()) for l in f if l.strip()}
+        gunion = set().union(*gsel.values())
         assert gunion == set(pmtiles), f"group-keys miscovers; missing {set(pmtiles) - gunion}, extra {gunion - set(pmtiles)}"
-        assert not (gsel[0] & gsel[1]), f"groups overlap: {gsel[0] & gsel[1]}"
+        assert sum(len(s) for s in gsel.values()) == len(gunion), "groups overlap"
         print(f"group-keys ok — {len(pmtiles)} pmtiles partitioned across {len(names)} group(s)")
 
         # orphan exclusion: a pmtiles left from a re-tiled covering (stem not in the
@@ -273,17 +334,19 @@ def main():
             assert orphan not in got, f"orphan {orphan} leaked into group {name}"
         print(f"orphan-exclusion ok — {orphan} excluded from every group")
 
-        # covering wrote the cap into child_z: the deepest aggregation tile is z9, not z11.
-        agg_dir = f"{tmp}/store/aggregation"
-        agg_id = sorted(os.listdir(agg_dir))[-1]
-        child_zs = [int(n.replace("-aggregation.csv", "").split("-")[3])
-                    for n in os.listdir(f"{agg_dir}/{agg_id}") if n.endswith("-aggregation.csv")]
+        # covering wrote the cap into child_z: the deepest aggregation tile is z11, not z13.
+        child_zs = [int(cz) for _, _, _, cz in agg_stems]
         assert max(child_zs) == 11, f"cap not applied (want 11): child_z={sorted(set(child_zs))}"
 
-        # E1 split: planet caps at macrotile_z (10); the z11 fine tiles route to
-        # the fine.pmtiles overlay. Both must exist.
+        # Bundle split: planet caps at macrotile_z (10); the z11 fine tiles route to
+        # their grid cells' overlay archives, and the manifest records the cells.
         assert os.path.exists(f"{tmp}/store/bundle/planet.pmtiles"), "missing planet.pmtiles"
-        assert os.path.exists(f"{tmp}/store/bundle/fine.pmtiles"), "missing fine overlay"
+        for cell in expected - {"planet"}:
+            assert os.path.exists(f"{tmp}/store/bundle/overlay-{cell}.pmtiles"), f"missing overlay {cell}"
+        mf = json.load(open(f"{tmp}/store/bundle/manifest.json"))
+        assert mf["planet"]["max_zoom"] == 10, f"planet cap wrong: {mf['planet']}"
+        assert set(mf["overlay"]["cells"]) == expected - {"planet"}, f"manifest cells: {mf['overlay']}"
+        assert all(v == 11 for v in mf["overlay"]["cells"].values()), f"cell max_zoom: {mf['overlay']}"
         by_zoom = decode_bundles(tmp)
         assert by_zoom, "no tiles in any bundle"
         max_z = max(by_zoom)
@@ -318,4 +381,5 @@ if __name__ == "__main__":
     check_priority()
     check_shard_partition()
     check_stale_overview()
+    check_grid_split()
     main()

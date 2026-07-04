@@ -20,22 +20,22 @@ const MAX_ZOOM = 13; // deepest source; the Worker overzooms the base for the re
 
 // The Worker overzooms the raster terrain server-side up to MAX_ZOOM, but vector
 // contours are a plain passthrough — so tell MapLibre their true max zoom (the
-// deepest source in the manifest) and it overzooms them client-side above that.
+// deepest overlay cell in the manifest) and it overzooms them client-side above that.
 const manifest = await fetch(`${tilesBase}/manifest.json`)
   .then((r) => r.json())
   .catch(() => null);
 const contourMax = manifest
   ? Math.max(
       manifest.planet.max_zoom,
-      ...manifest.sources.map((s) => s.max_zoom),
+      ...Object.values(manifest.overlay?.cells ?? {}),
     )
   : MAX_ZOOM;
 
 // ─── Source coverage (provenance) ───────────────────────────────────────────
 // The `coverage` layer baked into contours.pmtiles (source footprints, props
 // source_id / source_name / source_maxzoom). Drawn as polygons and queried on click to
-// report which source a depth came from. Colour each source by id off the manifest list
-// (a match expression); footprints of sources not in the manifest fall back to grey.
+// report which source a depth came from. Colour each source by id off the manifest's
+// source_ids (a match expression); ids not in the manifest fall back to grey.
 const COVERAGE_PALETTE = [
   "#e6194b",
   "#3cb44b",
@@ -49,12 +49,12 @@ const COVERAGE_PALETTE = [
   "#000075",
 ];
 const coverageColor =
-  manifest && manifest.sources.length
+  manifest && (manifest.source_ids ?? []).length
     ? [
         "match",
         ["get", "source_id"],
-        ...manifest.sources.flatMap((s, i) => [
-          s.id,
+        ...manifest.source_ids.flatMap((id, i) => [
+          id,
           COVERAGE_PALETTE[i % COVERAGE_PALETTE.length],
         ]),
         "#888",

@@ -6,11 +6,13 @@
  *
  * Extension picks the representation: webp/png → raster, pbf/mvt → vector.
  *
- * Reads the bundles published to R2 (planet.pmtiles + per-source <id>.pmtiles +
- * contours.pmtiles + manifest.json) and resolves per tile:
+ * Reads the bundles published to R2 (planet.pmtiles + one overlay-{cell}.pmtiles
+ * per populated grid cell + contours.pmtiles + manifest.json) and resolves per tile:
  *   - z ≤ planet.max_zoom        → planet tile
- *   - z > planet.max_zoom, a source overlay covers it → that overlay's tile
+ *   - z > planet.max_zoom, the tile's grid cell is populated → that cell's tile
+ *     (or the overzoomed deepest ancestor present in the cell)
  *   - otherwise                  → OVERZOOM the planet's deepest ancestor tile
+ * The owning cell is computed from the tile address (overlay.ts) — no bbox search.
  *
  * Overzoom of Terrarium is a cubic B-spline ON DECODED HEIGHTS, not on the packed bytes:
  * decode each source pixel to a float elevation, resample the elevations, re-encode.
@@ -24,6 +26,7 @@
 
 import { PMTiles, Source, RangeResponse } from "pmtiles";
 import { unpackTerrarium, packTerrariumInto, cubicBSpline } from "./terrarium";
+import { OverlayIndex, overlayFor } from "./overlay";
 // jSquash on Workers: WASM must be imported as a module and passed to init()
 // (no fetch-based instantiation in the Workers runtime).
 import decodeWebp, { init as initWebpDecode } from "@jsquash/webp/decode";
@@ -56,7 +59,8 @@ interface BundleMeta {
 }
 interface Manifest {
   planet: BundleMeta;
-  sources: (BundleMeta & { id: string })[]; // pre-sorted deepest-first
+  overlay: OverlayIndex; // {split_z, cells: {"z-x-y": max_zoom}}
+  source_ids?: string[]; // every configured source (the viewer's provenance palette)
   attribution?: string; // combined HTML credit for every contributing dataset
 }
 
@@ -97,6 +101,8 @@ async function manifest(env: Env): Promise<Manifest> {
     );
     if (!obj) throw new Error("manifest.json missing");
     manifestCache = JSON.parse(await obj.text());
+    // Tolerate a pre-grid manifest (old release / local seed): planet-only, no 500s.
+    manifestCache!.overlay ??= { split_z: 0, cells: {} };
   }
   return manifestCache!;
 }
@@ -110,22 +116,6 @@ async function tile(
 ): Promise<ArrayBuffer | undefined> {
   const r = await pm(env, file).getZxy(z, x, y);
   return r?.data;
-}
-
-// ── tile geometry ─────────────────────────────────────────────────────────
-function tileBounds(
-  z: number,
-  x: number,
-  y: number,
-): [number, number, number, number] {
-  const n = 2 ** z;
-  const lon = (i: number) => (i / n) * 360 - 180;
-  const lat = (j: number) =>
-    (Math.atan(Math.sinh(Math.PI * (1 - (2 * j) / n))) * 180) / Math.PI;
-  return [lon(x), lat(y + 1), lon(x + 1), lat(y)]; // w, s, e, n
-}
-function intersects(a: number[], b: number[]): boolean {
-  return a[0] < b[2] && a[2] > b[0] && a[1] < b[3] && a[3] > b[1];
 }
 
 // ── Terrarium overzoom: cubic B-spline on decoded heights ───────────────────
@@ -292,10 +282,10 @@ export default {
         name: "Open Waters Bathymetry (raster)",
         tiles: [`${url.origin}${mount}/{z}/{x}/{y}.webp`],
         minzoom: mf.planet.min_zoom,
-        // Worker overzooms past native data, so the served ceiling is the deepest source.
+        // Worker overzooms past native data, so the served ceiling is the deepest cell.
         maxzoom: Math.max(
           mf.planet.max_zoom,
-          ...mf.sources.map((s) => s.max_zoom),
+          ...Object.values(mf.overlay.cells),
         ),
         bounds: mf.planet.bbox,
         encoding: "terrarium",
@@ -369,28 +359,34 @@ export default {
       const t = await tile(env, "planet.pmtiles", z, x, y);
       return t ? send(t, WEBP) : send(await transparentBytes(), WEBP);
     }
-    // Deepest-first: serve (or overzoom) the highest-res source covering this tile,
-    // so above an overlay's native zoom we upscale THAT overlay's regional detail
-    // instead of the coarse planet.
-    const tb = tileBounds(z, x, y);
-    for (const s of mf.sources) {
-      if (!intersects(tb, s.bbox)) continue;
-      // A miss (covering claims this bbox but lacks the tile) OR an error (R2 miss, bad
-      // range, decode failure) must not dead-end the tile — fall through to the next
-      // covering source, then the planet overzoom below.
-      try {
-        const t =
-          z <= s.max_zoom
-            ? await tile(env, s.file, z, x, y)
-            : await overzoom(env, s.file, s.max_zoom, z, x, y);
-        if (t) return send(t, WEBP);
-      } catch (e) {
-        console.log(
-          `overlay ${s.file} failed at ${z}/${x}/${y}, trying next: ${e}`,
-        );
+    // The tile's grid cell, if populated: serve it directly, else overzoom the
+    // deepest ancestor present in the cell — the cell's max_zoom is only its
+    // deepest spot, and a shallower source in the same cell stops lower, so walk
+    // the ancestor zooms down until one is there (upscales the regional detail,
+    // not the coarse planet). A miss OR an error (R2 miss, bad range, decode
+    // failure) must not dead-end the tile — try the next level, then the planet.
+    const ov = overlayFor(mf.overlay, z, x, y);
+    if (ov) {
+      if (z <= ov.maxZoom) {
+        try {
+          const t = await tile(env, ov.file, z, x, y);
+          if (t) return send(t, WEBP);
+        } catch (e) {
+          console.log(`overlay ${ov.file} failed at ${z}/${x}/${y}: ${e}`);
+        }
+      }
+      for (let sm = Math.min(ov.maxZoom, z - 1); sm > mf.planet.max_zoom; sm--) {
+        try {
+          const t = await overzoom(env, ov.file, sm, z, x, y);
+          if (t) return send(t, WEBP);
+        } catch (e) {
+          console.log(
+            `overlay ${ov.file} overzoom z${sm} failed at ${z}/${x}/${y}: ${e}`,
+          );
+        }
       }
     }
-    // No overlay covers it: overzoom the planet, or transparent if even that's absent.
+    // Nothing in the cell: overzoom the planet, or transparent if even that's absent.
     const planetOz = await overzoom(
       env,
       "planet.pmtiles",

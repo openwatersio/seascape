@@ -33,9 +33,10 @@ just test-sources  # offline source-stage self-check (synthetic, no network)
 just test-engine   # offline aggregation/bundle self-check (priority, zoom cap, pyramid)
 ```
 
-Outputs land in `pipelines/store/bundle/`: `planet.pmtiles`, one `<source>.pmtiles`
-overlay per high-res source, `contours.pmtiles`, and `manifest.json`. Inspect a
-`.pmtiles` by dragging it into https://protomaps.github.io/PMTiles/.
+Outputs land in `pipelines/store/bundle/`: `planet.pmtiles`, one
+`overlay-{z}-{x}-{y}.pmtiles` per populated grid cell, `contours.pmtiles`, and
+`manifest.json`. Inspect a `.pmtiles` by dragging it into
+https://protomaps.github.io/PMTiles/.
 
 ## Architecture
 
@@ -48,19 +49,24 @@ overlay per high-res source, `contours.pmtiles`, and `manifest.json`. Inspect a
 - **source** (`source_*.py`, per `sources/<id>/`): fetch → datum offset → normalize to a 4326 COG → `bounds.csv` → coverage polygon → tarball. Each source owns its recipe (`sources/<id>/Justfile`) composing the shared steps; `metadata.json` is attribution + an optional `max_zoom` cap. Priority derives from `(maxzoom, id)` — GEBCO loses (smallest maxzoom), so regional sources win in overlap.
 - **aggregation** (`aggregation_*.py`): `cover` slices the planet into source-aware aggregation tiles (one CSV each); `run` reprojects each source by priority into a merged Float32 DEM (Gaussian seam feather), slope-smooths it (`smooth.py`), encodes Terrarium raster tiles, and forks contours (`contour_run.py`) off the same merged DEM.
 - **downsampling**: 2×2-average overview pyramid below each source's native maxzoom.
-- **bundle** (`bundle.py`): concat single-zoom pmtiles into `planet.pmtiles` (z0..`PLANET_MAX_ZOOM` = `macrotile_z`) + one `<source>.pmtiles` overlay per dominant high-res source + `manifest.json`. Contours bundle via tippecanoe.
+- **bundle** (`bundle.py`): concat single-zoom pmtiles into `planet.pmtiles` (z0..`PLANET_MAX_ZOOM` = `macrotile_z`) + one `overlay-{cell}.pmtiles` per populated `OVERLAY_SPLIT_Z` grid cell (default z5) + `manifest.json`. Contours bundle via tippecanoe.
 
-### Why a planet cap + overlays + Worker (the serving model)
+### Why a planet cap + grid overlays + Worker (the serving model)
 
-GEBCO is ~z8 native; regional sources reach ~z13. Baking a full z0–13 pyramid
+GEBCO is ~z8 native; regional sources reach ~z14. Baking a full z0–14 pyramid
 means upsampling GEBCO globally (hundreds of GB, no new data). Instead: **planet
-capped at `macrotile_z`** (complete, all-sources-merged base, ~1–2 GB), **per-source
-overlays** above it (each carrying the GEBCO-filled merged mosaic — Terrarium has no
-transparency, so an overlay must not punch holes), and the **`worker/` Cloudflare
-Worker** resolves per tile: z≤cap → planet; z>cap covered → overlay; else → overzoom
-the planet (nearest-neighbour for Terrarium) — one endpoint, no global upsampling, no
-holes. Reads all pmtiles from R2 over HTTP range. The viewer (`index.js`) points at
-the Worker; `VITE_TILES_BASE` selects the endpoint (empty → `localhost:8787` dev).
+capped at `macrotile_z`** (complete, all-sources-merged base, ~1–2 GB), **fixed-grid
+overlays** above it — one archive per populated `OVERLAY_SPLIT_Z` cell, each carrying
+the GEBCO-filled merged mosaic (Terrarium has no transparency, so an overlay must not
+punch holes) — and the **`worker/` Cloudflare Worker** resolves per tile: z≤cap →
+planet; z>cap in a populated cell → that cell's archive (the cell is computed from
+the tile address — no footprint search); else → overzoom the planet — one endpoint,
+no global upsampling, no holes. Overlays are grid cells rather than per-source
+archives on purpose: a cell is a fixed fraction of the globe, so a new source adds
+*cells* instead of growing any single archive (a per-source overlay's size tracked
+its footprint and outgrew CI runner disks). Reads all pmtiles from R2 over HTTP
+range. The viewer (`index.js`) points at the Worker; `VITE_TILES_BASE` selects the
+endpoint (empty → `localhost:8787` dev).
 
 ### Contours (the custom vector layer)
 

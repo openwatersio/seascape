@@ -1,7 +1,7 @@
 # Contributing
 
 This repo turns bathymetry DEMs (GEBCO + regional high-res sources) into MapLibre/Mapbox tiles, served through a single Cloudflare Worker endpoint. Per-source build
-steps feed a planet build, which produces a base + per-source overlays.
+steps feed a planet build, which produces a base + fixed-grid overlays.
 
 <!-- FIXME[claude]: remove this illustration or convert to mermaid? -->
 
@@ -68,12 +68,14 @@ just test-engine     # offline aggregation/bundle self-check (priority, zoom cap
 `just planet` writes to `pipelines/store/bundle/`:
 
 - `planet.pmtiles` — the all-sources-merged base, z0–`macrotile_z` (z8 = GEBCO native, no upsampling).
-- `<source>.pmtiles` — one per high-res source, z`macrotile_z+1`→source-max, carrying the GEBCO-filled merged mosaic in its footprint.
+- `overlay-{z}-{x}-{y}.pmtiles` — one per populated `OVERLAY_SPLIT_Z` grid cell (default z5), z`macrotile_z+1`→cell-max, carrying the GEBCO-filled merged mosaic under that cell.
 - `contours.pmtiles` — MVT contours (GEBCO baked to the deepest zoom by tippecanoe).
-- `manifest.json` — planet + per-source coverage (which source/zoom covers where) for the Worker.
+- `manifest.json` — planet metadata + `overlay.cells` ({cell: max_zoom}) for the Worker.
 
 Key knobs (env vars, read by `pipelines/utils.py` / `bundle.py`):
-`MACROTILE_Z` (base/overlay split, default 8), `NUM_OVERVIEWS`, `BBOX`,
+`MACROTILE_Z` (base/overlay split, default 8), `OVERLAY_SPLIT_Z` (overlay grid
+cell zoom, default 5 — raise it if a cell's bundle ever outgrows a CI runner),
+`NUM_OVERVIEWS`, `BBOX`,
 `SMOOTH_DEM_SIGMA`/`SMOOTH_SLOPE_LOW`/`SMOOTH_SLOPE_HIGH`, `SKIP_SMOOTH`,
 `SKIP_CONTOURS`, `SKIP_SOUNDINGS`, `CONTOUR_NAV_SMOOTH_MAX` (navigable-band
 contour-smoothing gate; replaces the retired `SKIP_CONTOUR_SMOOTH`),
@@ -102,7 +104,7 @@ Set `BBOX="W,S,E,N"` for a regional build; `just --list` shows all recipes.
      - positive-down depths or a datum offset → `source_datum --negate --offset N`.
      - always: `source_normalize --crs EPSG:… [--nodata N]` → `source_bounds` → `source_polygonize <id> 8` → `source_create_tarball`.
 2. `just source <id>` (verify it lands in `pipelines/store/source/<id>/`).
-3. `just planet` — it appears as a new `<source>.pmtiles` overlay + a manifest entry automatically (priority is derived from `(maxzoom, id)`).
+3. `just planet` — its tiles fold into the grid-cell overlays + manifest automatically (priority is derived from `(maxzoom, id)`).
 
 Transform params live in the recipe (CLI args); `metadata.json` is attribution +
 the optional `max_zoom` cap only.
@@ -112,7 +114,7 @@ the optional `max_zoom` cap only.
 The Worker presents one endpoint per layer and resolves per tile:
 
 ```
-GET /seascape/{z}/{x}/{y}.webp   raster: z≤8 → planet · z>8 covered → overlay · else → overzoom the planet (nearest-neighbour) · miss → transparent
+GET /seascape/{z}/{x}/{y}.webp   raster: z≤8 → planet · z>8 in a populated grid cell → that cell's overlay · else → overzoom the planet · miss → transparent
 GET /seascape/{z}/{x}/{y}.pbf    vector: contours.pmtiles passthrough
 GET /seascape/raster.json        TileJSON (terrarium raster)
 GET /seascape/vector.json        TileJSON (vector layers)

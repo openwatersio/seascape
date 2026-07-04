@@ -46,7 +46,8 @@ jobs:
           docker run --rm "$IMAGE:${{ github.sha }}" just test-sources
           docker run --rm "$IMAGE:${{ github.sha }}" just test-engine
 
-  # Compile-check the viewer (it's built + deployed on release; see release.yml).
+  # Compile-check the viewer (it's built + deployed on release; see release.yml)
+  # and run the Worker's dependency-free self-checks (plain node assert scripts).
   web:
     runs-on: ubuntu-latest
     steps:
@@ -57,3 +58,9 @@ jobs:
         run: |
           npm ci
           npm run build
+      - name: Worker self-checks
+        run: |
+          # The .mjs checks import .ts directly — needs Node >= 22.18 (default type
+          # stripping); "node-version: 22" above resolves the latest 22.x, which is past it.
+          node worker/src/terrarium.test.mjs
+          node worker/src/overlay.test.mjs

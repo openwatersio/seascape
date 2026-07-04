@@ -1,6 +1,6 @@
 # Bathymetry tiling pipeline. Run recipes from the repo root; they execute in
 # pipelines/ (via `set working-directory`). Stages: source -> aggregation ->
-# downsampling -> bundle; then worker/ serves planet + per-source overlays.
+# downsampling -> bundle; then worker/ serves planet + grid-cell overlays.
 # See CONTRIBUTING.md.
 
 set working-directory := 'pipelines'
@@ -57,7 +57,7 @@ combine:
 #   plan job   -> just downsample-matrix N (the shard matrix, sized to the dirt)
 #   matrix job -> just downsample-shard-keys i n  (pick this shard's pmtiles to pull)
 #   matrix job -> just downsample-shard i n
-#   plan  job  -> just downsample-tail + bundle-groups   (coarse tail, then the matrix)
+#   plan  job  -> just downsample-tail + bundle-matrix   (coarse tail, then the matrix)
 downsample-cover:
     uv run python downsampling.py cover
 downsample-matrix max:
@@ -71,14 +71,15 @@ downsample-shard i n:
 downsample-tail:
     uv run python downsampling.py run tail
 
-# CI terrain bundle fan-out (one matrix job per group keeps each runner's disk bounded by
-# ONE group's tiles + output, not the whole store; mirrors the downsample/contour shards):
-#   plan job   -> just downsample-tail + bundle-groups   (tail, verify, emit group matrix)
+# CI terrain bundle fan-out (planet + one overlay per OVERLAY_SPLIT_Z grid cell; each
+# matrix job loops its chunk of groups pull->bundle->push->clean one group at a time, so
+# a runner's disk is bounded by ONE group's tiles + output no matter how many sources land):
+#   plan job   -> just downsample-tail + bundle-matrix N (tail, verify, emit chunk matrix)
 #   matrix job -> just bundle-group-keys <name>          (pick this group's pmtiles to pull)
 #   matrix job -> just bundle-group <name>               (bundle one group + its fragment)
 #   merge job  -> just bundle-merge                      (fragments -> manifest.json)
-bundle-groups:
-    @uv run python bundle.py groups
+bundle-matrix max:
+    @uv run python bundle.py matrix {{max}}
 bundle-group-keys name:
     uv run python bundle.py group-keys {{name}}
 bundle-group name:

@@ -1,12 +1,21 @@
-"""Concatenate the single-zoom PMTiles into a planet base + per-source overlays.
+"""Concatenate the single-zoom PMTiles into a planet base + fixed-grid overlays.
 
 Everything at ``child_z <= PLANET_MAX_ZOOM`` (the GEBCO-native base cap, default =
-macrotile_z) goes into a complete ``planet.pmtiles`` (z0..cap). Higher-res tiles
-go into one ``<source>.pmtiles`` per **dominant high-res source** (e.g.
-``cudem_ne.pmtiles``, z(cap+1)..source-max), so each source is independently
-publishable. A ``manifest.json`` records planet + per-source coverage so the
-serving Worker can resolve regional-vs-planet and overzoom the base on miss (see
-SERVING / the plan's §Serving architecture).
+macrotile_z) goes into a complete ``planet.pmtiles`` (z0..cap). Higher-res tiles go
+into one ``overlay-{z}-{x}-{y}.pmtiles`` per populated cell of a fixed
+``OVERLAY_SPLIT_Z`` grid — each holding every z(cap+1)..zmax tile under that cell,
+from whatever sources are there.
+
+The grid is deliberately source-agnostic. Grouping overlays by source made each
+archive's size a function of a source's footprint: one deep source whose bbox
+swallowed the continent's interior became a catch-all that outgrew a CI runner's
+disk, and every new source made it worse. A grid cell is a fixed fraction of the
+globe, so new sources add *cells*, never bytes-per-cell; if a cell ever outgrows a
+runner, raise OVERLAY_SPLIT_Z. It also gives the serving Worker an O(1) route: the
+owning cell is computed from the tile address (no footprint search).
+
+``manifest.json`` records planet metadata + ``overlay`` ({split_z, cells: {cell:
+max_zoom}}) + the configured source ids (the viewer's provenance palette).
 
 Pure concat in tile-id order. Bundling everything (incremental rebuild is Phase E3).
 
@@ -29,37 +38,37 @@ import utils
 
 # Base cap = the GEBCO-native zoom (the planet is complete + overzoomable below it).
 PLANET_MAX_ZOOM = int(os.environ.get("PLANET_MAX_ZOOM", str(utils.macrotile_z)))
+# The overlay grid zoom. Every overlay tile (child_z > PLANET_MAX_ZOOM) belongs to
+# its ancestor cell at this zoom; one archive per populated cell.
+SPLIT_Z = int(os.environ.get("OVERLAY_SPLIT_Z", "5"))
+# cell_of shifts by (z - SPLIT_Z), so the grid must sit at or above the shallowest
+# overlay content zoom — fail fast here, not as a ValueError inside a matrix job.
+if SPLIT_Z > PLANET_MAX_ZOOM + 1:
+    sys.exit(f"OVERLAY_SPLIT_Z ({SPLIT_Z}) must be <= PLANET_MAX_ZOOM + 1 ({PLANET_MAX_ZOOM + 1})")
 
 
-def high_res_sources(aggregation_id):
-    """{source_id: {'bbox': [w,s,e,n], 'max_zoom': int}} for sources that own
-    regional (child_z > PLANET_MAX_ZOOM) aggregation tiles. The owner of a tile is
-    its deepest source (maxzoom == child_z), lex-first on a tie."""
-    sources = {}
-    for csv in glob(f"store/aggregation/{aggregation_id}/*-aggregation.csv"):
-        z, x, y, child_z = (int(a) for a in csv.split("/")[-1].replace("-aggregation.csv", "").split("-"))
-        if child_z <= PLANET_MAX_ZOOM:
-            continue
-        with open(csv) as f:
-            rows = [line.strip().split(",") for line in f.readlines()[1:]]
-        owner = sorted(s for s, fn, mz in rows if int(mz) == child_z)[0]
-        w, s, e, n = mercantile.bounds(x, y, z)
-        info = sources.setdefault(owner, {"bbox": [math.inf, math.inf, -math.inf, -math.inf], "max_zoom": 0})
-        b = info["bbox"]
-        b[0], b[1], b[2], b[3] = min(b[0], w), min(b[1], s), max(b[2], e), max(b[3], n)
-        info["max_zoom"] = max(info["max_zoom"], child_z)
-    return sources
+def cell_of(z, x, y):
+    """The SPLIT_Z grid cell name owning tile (z,x,y), z >= SPLIT_Z."""
+    return f"{SPLIT_Z}-{x >> (z - SPLIT_Z)}-{y >> (z - SPLIT_Z)}"
 
 
-def assign_source(z, x, y, sources):
-    """Pick the deepest high-res source whose footprint the tile extent overlaps."""
-    w, s, e, n = mercantile.bounds(x, y, z)
-    best, best_mz = None, -1
-    for src, info in sources.items():
-        bw, bs, be, bn = info["bbox"]
-        if w < be and e > bw and s < bn and n > bs and info["max_zoom"] > best_mz:
-            best, best_mz = src, info["max_zoom"]
-    return best
+def stem_groups(stem):
+    """Group name(s) a pmtiles stem {z}-{x}-{y}-{child_z} contributes to: 'planet'
+    for base zooms, else the overlay cell(s) its content tiles live under. Overlay
+    parents normally sit at z >= SPLIT_Z (exactly one cell — downsample extents
+    stay at z >= child_z - num_overviews); a coarser parent spans its descendant
+    cells, and create_archive keeps only each cell's own tiles."""
+    z, x, y, child_z = (int(a) for a in stem.split("-"))
+    if child_z <= PLANET_MAX_ZOOM:
+        return ["planet"]
+    if z >= SPLIT_Z:
+        return [cell_of(z, x, y)]
+    parent = mercantile.Tile(x=x, y=y, z=z)
+    return [f"{c.z}-{c.x}-{c.y}" for c in mercantile.children(parent, zoom=SPLIT_Z)]
+
+
+def archive_filename(name):
+    return f"{name}.pmtiles" if name == "planet" else f"overlay-{name}.pmtiles"
 
 
 def covering_stems(aggregation_id):
@@ -76,18 +85,17 @@ def covering_stems(aggregation_id):
 
 
 def group_filepaths(aggregation_id):
-    """{'planet': [...], '<source>': [...]} grouping every single-zoom pmtiles."""
-    sources = high_res_sources(aggregation_id)
+    """{'planet': [...], '<z>-<x>-<y>': [...]} — the grid partition of every
+    single-zoom pmtiles in the local store."""
     stems = covering_stems(aggregation_id)
     groups = {}
     for fp in sorted(glob("store/pmtiles/*.pmtiles") + glob("store/pmtiles/*/*.pmtiles")):
         stem = fp.split("/")[-1].replace(".pmtiles", "")
         if stem not in stems:  # orphan from a re-tiled covering (see covering_stems)
             continue
-        z, x, y, child_z = (int(a) for a in stem.split("-"))
-        name = "planet" if child_z <= PLANET_MAX_ZOOM else (assign_source(z, x, y, sources) or "planet")
-        groups.setdefault(name, []).append(fp)
-    return groups, sources
+        for name in stem_groups(stem):
+            groups.setdefault(name, []).append(fp)
+    return groups
 
 
 def read_full_archive(filepath):
@@ -100,8 +108,11 @@ def read_full_archive(filepath):
 
 
 def create_archive(filepaths, name):
+    """Concat the single-zoom pmtiles into store/bundle/<archive_filename(name)>.
+    For an overlay cell, tiles outside the cell (a coarse parent spanning cells)
+    are left to the sibling cells' archives."""
     utils.create_folder("store/bundle")
-    out_filepath = f"store/bundle/{name}.pmtiles"
+    out_filepath = f"store/bundle/{archive_filename(name)}"
     min_z, max_z = math.inf, 0
     min_lon, min_lat, max_lon, max_lat = math.inf, math.inf, -math.inf, -math.inf
 
@@ -114,12 +125,14 @@ def create_archive(filepaths, name):
             z, x, y, child_z = (int(a) for a in filepath.split("/")[-1].replace(".pmtiles", "").split("-"))
             parent = mercantile.Tile(x=x, y=y, z=z)
             tiles = [parent] if z == child_z else list(mercantile.children(parent, zoom=child_z))
+            if name != "planet":
+                tiles = [t for t in tiles if cell_of(t.z, t.x, t.y) == name]
             for tile in tiles:
                 tile_ids_and_filepaths.append((zxy_to_tileid(tile.z, tile.x, tile.y), filepath))
-            max_z, min_z = max(max_z, child_z), min(min_z, child_z)
-            west, south, east, north = mercantile.bounds(x, y, z)
-            min_lon, min_lat = min(min_lon, west), min(min_lat, south)
-            max_lon, max_lat = max(max_lon, east), max(max_lat, north)
+                max_z, min_z = max(max_z, tile.z), min(min_z, tile.z)
+                west, south, east, north = mercantile.bounds(tile)
+                min_lon, min_lat = min(min_lon, west), min(min_lat, south)
+                max_lon, max_lat = max(max_lon, east), max(max_lat, north)
 
         last_filepath = None
         tile_id_to_bytes = None
@@ -145,8 +158,8 @@ def create_archive(filepaths, name):
         )
         checksum = hash_writer.md5.hexdigest()
 
-    return {"file": f"{name}.pmtiles", "size": os.path.getsize(out_filepath), "md5sum": checksum,
-            "min_zoom": min_z, "max_zoom": max_z,
+    return {"file": archive_filename(name), "size": os.path.getsize(out_filepath),
+            "md5sum": checksum, "min_zoom": min_z, "max_zoom": max_z,
             "bbox": [min_lon, min_lat, max_lon, max_lat]}
 
 
@@ -163,10 +176,9 @@ def attribution():
     return " | ".join(parts)
 
 
-def bundle_group(item):
-    name, filepaths = item
-    print(f"bundling {name} ({len(filepaths)} pmtiles)...")
-    return name, create_archive(filepaths, name)
+def bundle_group(name, filepaths):
+    print(f"bundling {archive_filename(name)} ({len(filepaths)} pmtiles)...")
+    return create_archive(filepaths, name)
 
 
 def verify_complete(aggregation_id):
@@ -188,34 +200,37 @@ def verify_complete(aggregation_id):
 
 
 def _fragment(name, meta):
-    """{kind, [id], ...meta} — one per-group manifest fragment so a matrix bundle job's
-    metadata survives to the merge step (kind marks the planet base vs an overlay)."""
-    kind = "planet" if name == "planet" else "source"
-    return {"kind": kind, **({"id": name} if kind == "source" else {}), **meta}
+    """One per-group manifest fragment so a matrix bundle job's metadata survives to
+    the merge step. Planet keeps its full metadata; an overlay cell only needs its
+    max_zoom (the Worker computes the cell from the tile address — no bbox search)."""
+    if name == "planet":
+        return {"kind": "planet", **meta}
+    return {"kind": "cell", "cell": name, "max_zoom": meta["max_zoom"]}
 
 
 def _manifest_from_fragments(frags):
-    manifest = {"planet": None, "sources": []}
+    manifest = {"planet": None, "overlay": {"split_z": SPLIT_Z, "cells": {}}}
     for frag in frags:
-        frag = dict(frag)
-        if frag.pop("kind") == "planet":
-            manifest["planet"] = frag
+        if frag["kind"] == "planet":
+            manifest["planet"] = {k: v for k, v in frag.items() if k != "kind"}
         else:
-            manifest["sources"].append(frag)
-    # deepest first so the Worker picks the highest-res overlay where they overlap.
-    manifest["sources"].sort(key=lambda s: -s["max_zoom"])
+            manifest["overlay"]["cells"][frag["cell"]] = frag["max_zoom"]
+    manifest["source_ids"] = config.sources()  # the viewer's provenance palette
     manifest["attribution"] = attribution()
     return manifest
 
 
-def groups_matrix():
-    """Verify the pyramid is whole, then print the group names as a JSON matrix (the CI
-    spins one bundle job per group). Runs on the tail/plan runner, which holds the full
-    store after the coarse tail; a hole here fails the build before any overlay ships."""
+def groups_matrix(maxn):
+    """Verify the pyramid is whole, then print the CI bundle matrix: <= maxn chunks,
+    each a comma-joined strided slice of the group names. The partition rides IN the
+    matrix (not re-derived per job from a live R2 listing), so every job bundles the
+    exact set this full-store runner saw — the same freeze-the-plan reasoning as the
+    aggregate/downsample shards."""
     aggregation_id = utils.get_aggregation_ids()[-1]
     verify_complete(aggregation_id)
-    groups, _ = group_filepaths(aggregation_id)
-    print(json.dumps(sorted(groups)))
+    names = sorted(group_filepaths(aggregation_id))
+    n = min(maxn, max(len(names), 1))
+    print(json.dumps([{"cells": ",".join(names[i::n])} for i in range(n)]))
 
 
 def group_keys(name):
@@ -223,7 +238,6 @@ def group_keys(name):
     R2 listing (store/pmtiles-keys.txt) by the same rule group_filepaths uses on local
     files — so a matrix job pulls ONLY its group's slice, never the whole store."""
     aggregation_id = utils.get_aggregation_ids()[-1]
-    sources = high_res_sources(aggregation_id)
     stems = covering_stems(aggregation_id)
     out = []
     with open("store/pmtiles-keys.txt") as f:
@@ -235,12 +249,10 @@ def group_keys(name):
             if stem not in stems:  # orphan from a re-tiled covering (see covering_stems)
                 continue
             try:
-                z, x, y, child_z = (int(a) for a in stem.split("-"))
+                if name in stem_groups(stem):
+                    out.append(key)
             except ValueError:
                 continue
-            g = "planet" if child_z <= PLANET_MAX_ZOOM else (assign_source(z, x, y, sources) or "planet")
-            if g == name:
-                out.append(key)
     with open("store/keys.txt", "w") as f:
         f.write("".join(k + "\n" for k in out))
     print(f"group {name}: {len(out)} pmtiles selected")
@@ -250,7 +262,7 @@ def group(name):
     """Bundle one group from the tiles pulled locally (its slice only) + write its
     fragment. Disk stays bounded by one group's tiles + output, not the whole planet."""
     filepaths = sorted(glob("store/pmtiles/*.pmtiles") + glob("store/pmtiles/*/*.pmtiles"))
-    _, meta = bundle_group((name, filepaths))
+    meta = bundle_group(name, filepaths)
     utils.create_folder("store/bundle")
     with open(f"store/bundle/{name}.json", "w") as f:
         json.dump(_fragment(name, meta), f)
@@ -263,33 +275,32 @@ def merge():
     utils.create_folder("store/bundle")
     with open("store/bundle/manifest.json", "w") as f:
         json.dump(manifest, f, indent=2)
-    print(f"merged manifest: planet + {len(manifest['sources'])} overlay(s)")
+    print(f"merged manifest: planet + {len(manifest['overlay']['cells'])} overlay cell(s)")
 
 
 def main():
     """Local / single-runner: bundle every group sequentially, biggest first. The pmtiles
     writer spools each tile to a temp file then copies it into the archive (finalize ~2x's
     a bundle on disk), so building all groups at once piled every temp+final onto one disk
-    and blew it at planet scale — CI fans this out per group (groups/group/merge) instead."""
+    and blew it at planet scale — CI fans this out in cell chunks instead."""
     aggregation_id = utils.get_aggregation_ids()[-1]
     verify_complete(aggregation_id)
-    groups, _ = group_filepaths(aggregation_id)
+    groups = group_filepaths(aggregation_id)
     frags = []
     for name, filepaths in sorted(groups.items(), key=lambda kv: -len(kv[1])):
-        _, meta = bundle_group((name, filepaths))
-        frags.append(_fragment(name, meta))
+        frags.append(_fragment(name, bundle_group(name, filepaths)))
     manifest = _manifest_from_fragments(frags)
     with open("store/bundle/manifest.json", "w") as f:
         json.dump(manifest, f, indent=2)
-    print(f"created {len(groups)} bundle(s): {', '.join(groups)} + manifest.json")
+    print(f"created {len(groups)} bundle(s): {', '.join(sorted(groups))} + manifest.json")
 
 
 if __name__ == "__main__":
     a = sys.argv[1:]
     if not a:
         main()
-    elif a[:1] == ["groups"]:
-        groups_matrix()
+    elif a[:1] == ["matrix"] and len(a) == 2:
+        groups_matrix(int(a[1]))
     elif a[:1] == ["group-keys"] and len(a) == 2:
         group_keys(a[1])
     elif a[:1] == ["group"] and len(a) == 2:
@@ -297,4 +308,4 @@ if __name__ == "__main__":
     elif a[:1] == ["merge"]:
         merge()
     else:
-        sys.exit("usage: bundle.py [groups | group-keys <name> | group <name> | merge]")
+        sys.exit("usage: bundle.py [matrix <max> | group-keys <name> | group <name> | merge]")
