@@ -88,8 +88,11 @@ jobs:
         run: echo "sources=$(ls -1 sources | jq -R -s -c 'split("\n")|map(select(length>0))')" >> "$GITHUB_OUTPUT"
 
   # Prepare each source (fetch → datum → normalize → bounds → polygon → tarball)
-  # and push its store/source/<id> to R2. One source failing doesn't sink the rest
-  # (the covering simply omits it). Cache skips re-fetching unchanged sources.
+  # and push its store/source/<id> to R2. One source failing doesn't sink the rest:
+  # a failed source simply doesn't refresh its R2 state, so plan covers from its
+  # last successful bounds.csv (or omits a source that never succeeded) — hence the
+  # explicit `if:` on plan/aggregate below, which must run despite a red source.
+  # Cache skips re-fetching unchanged sources.
   sources:
     needs: [image, discover]
     runs-on: ubuntu-latest
@@ -147,6 +150,10 @@ jobs:
   # and emit the shard matrix sized to the dirty count.
   plan:
     needs: [image, sources]
+    # Run even when a source job failed (the whole build died skipped when the volatile
+    # S-102 registration hiccuped): plan reads bounds from R2, where a failed source's
+    # last successful state persists. Only a missing image is fatal.
+    if: ${{ !cancelled() && needs.image.result == 'success' }}
     runs-on: ubuntu-latest
     permissions: { contents: read, packages: read }
     outputs:
@@ -275,6 +282,8 @@ jobs:
   # disjoint tile keys back to the store.
   aggregate:
     needs: [image, sources, plan]
+    # Like plan: a red source job must not skip the build (see the sources comment).
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
     runs-on: ubuntu-latest
     permissions: { contents: read, packages: read }
     strategy:

@@ -125,13 +125,26 @@ def get_resolution(zoom):
     return (bounds.right - bounds.left) / 512
 
 
-def _run(cmd, what):
+def _run(cmd, what, tries=3):
     # Check the exit code, not stderr: gdal writes non-fatal warnings (e.g.
     # "Several coordinate operations" for datum transforms like 4269->3857) to
     # stderr, which must not be treated as a failure.
-    proc = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise Exception(f"{what} failed (exit {proc.returncode}):\n{proc.stdout}\n{proc.stderr}")
+    #
+    # Retry like _build_tile_vrt: these commands stream sources over /vsicurl, and a
+    # mid-transfer blip (truncated S3 range read, HDF5 "read through page buffer failed")
+    # surfaces as a nonzero exit that GDAL's request-level HTTP retry never saw. All
+    # callers pass -overwrite / fresh outputs, so a re-run is a clean fresh attempt; a
+    # deterministic failure (bad product, bad args) exhausts `tries` and still raises.
+    for attempt in range(1, tries + 1):
+        proc = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        if proc.returncode == 0:
+            return
+        if attempt < tries:
+            tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-3:]
+            print(f"RETRY {attempt}/{tries - 1}: {what} failed (exit {proc.returncode}), "
+                  f"retrying: {' | '.join(tail)}", flush=True)
+            time.sleep(5 * attempt)
+    raise Exception(f"{what} failed (exit {proc.returncode}):\n{proc.stdout}\n{proc.stderr}")
 
 
 def create_warp(vrt, vrt_3857, zoom, aggregation_tile, buffer):
@@ -284,6 +297,22 @@ def _check():
             pass
     finally:
         utils.run_command, time.sleep = real_run, real_sleep
+
+    # _run retries the same transient class (warp/translate over /vsicurl dying
+    # mid-transfer) then succeeds; a deterministic failure exhausts and raises.
+    # `false` fails every time; retry-then-succeed uses a marker file so attempt 2 differs.
+    real_sleep, time.sleep = time.sleep, lambda s: None
+    try:
+        marker = f"{d}/ran-once"
+        _run(f"test -f {marker} || {{ touch {marker}; false; }}", "flaky-cmd", tries=3)
+        assert os.path.exists(marker), "first attempt must have run"
+        try:
+            _run("false", "always-fails", tries=2)
+            assert False, "expected _run to raise after exhausting retries"
+        except Exception as e:
+            assert "always-fails failed" in str(e)
+    finally:
+        time.sleep = real_sleep
 
     # negate_band1 must handle the REAL pipeline file: a COG (translate -of COG) with an
     # ADD_ALPHA mask band. A plain GTiff would miss the COG-layout update error the build hit.
