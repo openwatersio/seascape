@@ -31,12 +31,6 @@ import landmask
 import utils
 
 
-def _run(cmd, what):
-    p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    if p.returncode != 0:
-        raise Exception(f"{what} failed (exit {p.returncode}):\n{p.stdout}\n{p.stderr}")
-
-
 def _polys(geom):
     """Every non-empty Polygon inside a geometry, recursing into Multi/GeometryCollection and
     dropping the line/point slivers a clip or make_valid can leave — so the output layer is
@@ -133,31 +127,26 @@ def generate(filepath):
         return
     geoms = smooth_polygons(geoms, tol=abs(transform.a) * 1.5)  # transform.a = pixel width (3857 m)
 
-    # make_valid + _polys in shapely (where the geoms already live) so ogr2ogr only ever sees valid,
-    # polygon-only input: its -clipsrc silently drops or crashes on an invalid ring (the planet-build
-    # failure) but is robust on valid input. DP simplify makes this rare, but the guard is cheap.
+    # Same seam contract as contours: de-staircase over the buffered grid, then clip to the
+    # unbuffered tile bbox (deterministic input -> byte-identical halo -> edges meet). Clip in
+    # shapely, NOT ogr2ogr -clipsrc: on a fractal coastline the clip can emit a GeometryCollection
+    # (polygon + a boundary-grazing edge) that a (multi)polygon FlatGeobuf layer refuses to write
+    # ("Mismatched geometry type", the planet-build failure) — and that surfaces only on the
+    # container's GDAL 3.8, not a newer local GDAL, so it can't be caught locally. make_valid + clip
+    # + _polys keeps only the polygonal parts of the RESULT, so the output is uniformly polygon by
+    # construction, version-independently. Reproject with geopandas in the same write.
     from shapely import make_valid
-    valid = [p for g in geoms for p in _polys(make_valid(g))]
-    if not valid:
-        print(f"drying: no foreshore for {filename}")
-        return
-    raw = f"{tmp}/drying-raw.fgb"
-    gpd.GeoDataFrame(geometry=valid, crs="EPSG:3857").to_file(raw, driver="FlatGeobuf")
-
-    # Same seam contract as contours: de-staircase over the buffered grid, then GDAL clips to the
-    # unbuffered tile bbox + reprojects (deterministic input -> byte-identical halo -> edges meet).
-    # One ogr2ogr pass: -clipsrc is in the source 3857 SRS, applied before -t_srs, like contour_run.
-    b = mercantile.xy_bounds(tile)  # unbuffered, tile-aligned (EPSG:3857)
-    utils.create_folder("store/drying")  # tile-keyed, so clean tiles persist across incremental runs
-    out = f"store/drying/{stem}.fgb"
-    _run(f"ogr2ogr -f FlatGeobuf -overwrite -nlt PROMOTE_TO_MULTI "
-         f"-clipsrc {b.left} {b.bottom} {b.right} {b.top} -t_srs EPSG:4326 {out} {raw}", "ogr2ogr clip")
-    n = contour_run.feature_count(out)
-    if n == 0:  # all foreshore was in the halo, none in the tile — don't leave an empty FGB to bundle
-        os.remove(out)
+    from shapely.geometry import box
+    clip = box(*mercantile.xy_bounds(tile))  # unbuffered, tile-aligned (EPSG:3857)
+    kept = [p for g in geoms for p in _polys(make_valid(g).intersection(clip))]
+    if not kept:
         print(f"drying: no foreshore in tile bbox for {filename}")
         return
-    print(f"drying: {filename} -> {n} polygons")
+
+    utils.create_folder("store/drying")  # tile-keyed, so clean tiles persist across incremental runs
+    out = f"store/drying/{stem}.fgb"
+    gpd.GeoDataFrame(geometry=kept, crs="EPSG:3857").to_crs("EPSG:4326").to_file(out, driver="FlatGeobuf")
+    print(f"drying: {filename} -> {len(kept)} polygons")
 
 
 # ── bundle ───────────────────────────────────────────────────────────────────
@@ -267,15 +256,20 @@ def _check():
     draw, dsm = axis_frac(dgeoms), axis_frac(smooth_polygons(dgeoms, tol=150))
     assert draw > 0.9 and dsm < 0.6, f"a staircase must de-stair (axis-aligned {draw:.2f} -> {dsm:.2f})"
 
-    # Regression for the planet-build OGR "Mismatched geometry type": a self-touching ring (which
-    # smoothing can produce) clipped to the tile bbox must reduce to clean, writable polygons via
-    # make_valid + _polys, not a GeometryCollection a (multi)polygon layer refuses.
+    # Regression for the planet-build OGR "Mismatched geometry type" (which only surfaced on the
+    # container's GDAL 3.8): the shapely clip must keep the layer uniformly polygon by construction.
+    # (1) a self-touching ring heals + clips to valid polygons; (2) a GeometryCollection — what a
+    # fractal-coastline clip produces — reduces to polygons only, dropping line/point slivers.
     from shapely import make_valid
-    from shapely.geometry import Polygon, box
+    from shapely.geometry import GeometryCollection, LineString, Point, Polygon, box
     bowtie = Polygon([(0, 0), (4, 4), (0, 4), (4, 0), (0, 0)])  # self-intersecting
     parts = _polys(make_valid(bowtie).intersection(box(-1, -1, 5, 5)))
     assert parts and all(p.geom_type == "Polygon" and p.is_valid and not p.is_empty for p in parts), \
         "a self-touching ring must reduce to valid, writable polygons"
+    mixed = GeometryCollection([Polygon([(0, 0), (2, 0), (2, 2), (0, 2)]),
+                                LineString([(3, 3), (4, 4)]), Point(5, 5)])
+    assert [p.geom_type for p in _polys(mixed)] == ["Polygon"], \
+        "a GeometryCollection must reduce to polygons only (drop line/point slivers)"
 
     print(f"drying_run self-check ok (foreshore pixels {int(arr.sum())}, {len(geoms)} polygons; "
           f"staircase de-staired axis-aligned {draw:.2f} -> {dsm:.2f})")
