@@ -201,9 +201,11 @@ async function overzoom(
   });
 }
 
-let transparentCache: ArrayBuffer | undefined;
-async function _makeTransparent(): Promise<ArrayBuffer> {
-  // Terrarium sea level (0 m) so the depth ramp renders it transparent.
+let seaLevelCache: ArrayBuffer | undefined;
+async function _makeSeaLevelTile(): Promise<ArrayBuffer> {
+  // Terrarium 0 m — the land value, which the depth ramp paints as the land
+  // wash. A missing tile degrades to land rendering, never to phantom water
+  // (Terrarium has no transparency to degrade to).
   await ensureCodec();
   const out = new Uint8ClampedArray(TILE * TILE * 4);
   for (let k = 0; k < TILE * TILE; k++) {
@@ -214,9 +216,9 @@ async function _makeTransparent(): Promise<ArrayBuffer> {
     lossless: 1,
   });
 }
-async function transparentBytes(): Promise<ArrayBuffer> {
-  if (!transparentCache) transparentCache = await _makeTransparent();
-  return transparentCache;
+async function seaLevelBytes(): Promise<ArrayBuffer> {
+  if (!seaLevelCache) seaLevelCache = await _makeSeaLevelTile();
+  return seaLevelCache;
 }
 
 const CORS = { "access-control-allow-origin": "*" };
@@ -423,19 +425,19 @@ export default {
     // Out-of-range x/y (the pmtiles coord check throws on these) → blank tile, not a 500.
     const n = 2 ** z;
     if (x >= n || y >= n)
-      return isVector ? noTile() : send(await transparentBytes(), WEBP);
+      return isVector ? noTile() : send(await seaLevelBytes(), WEBP);
 
     if (isVector) {
       const t = await tile(env, "vector.pmtiles", z, x, y);
       return t ? send(t, MVT) : noTile();
     }
 
-    // Terrain always returns a valid 512px tile (transparent sea-level on a miss)
+    // Terrain always returns a valid 512px tile (sea-level/land on a miss)
     // so raster-dem never sees a 0-dim neighbour during border backfill.
     const mf = await manifest(env);
     if (z <= mf.planet.max_zoom) {
       const t = await tile(env, "planet.pmtiles", z, x, y);
-      return t ? send(t, WEBP) : send(await transparentBytes(), WEBP);
+      return t ? send(t, WEBP) : send(await seaLevelBytes(), WEBP);
     }
     // The tile's grid cell, if populated: serve it directly, else overzoom the
     // deepest ancestor present in the cell — the cell's max_zoom is only its
@@ -468,7 +470,7 @@ export default {
         }
       }
     }
-    // Nothing in the cell: overzoom the planet, or transparent if even that's absent.
+    // Nothing in the cell: overzoom the planet, or sea-level if even that's absent.
     const planetOz = await overzoom(
       env,
       "planet.pmtiles",
@@ -477,6 +479,6 @@ export default {
       x,
       y,
     );
-    return send(planetOz ?? (await transparentBytes()), WEBP);
+    return send(planetOz ?? (await seaLevelBytes()), WEBP);
   },
 };

@@ -26,12 +26,20 @@ the decoded elevation is never deeper than the truth. The cost is an up-to-one-
 step shallow bias, which is sub-perceptual at the zoom each step is applied
 (z0 step = 2048 m on a 0..-10000 m range; z12 step = 0.5 m). Pass
 ``conservative=False`` for minimal-error round-to-nearest.
+
+One exception to the pure rounding: water never quantizes to 0. Elevation 0 is
+the land value (the land mask clamps land pixels to it, and the depth ramp
+draws it as land), so a negative input that would round to >= 0 — at z9 the
+step is 4 m, so that is ALL water shallower than 4 m — is capped at -LSB
+instead. Still shoal-biased; the only inputs it deepens are true depths
+shallower than the ~4 mm LSB, which are noise.
 """
 
 import numpy as np
 
 FULL_RESOLUTION_ZOOM = 19
 TERRARIUM_OFFSET = 32768.0
+LSB = 1.0 / 256.0  # Terrarium's vertical resolution (metres)
 
 
 def quantization_factor(z):
@@ -43,12 +51,14 @@ def quantize(data, z, conservative=True):
     """Round elevations (metres) to the per-zoom vertical step.
 
     conservative=True rounds toward shallower (never deepens); False is
-    round-to-nearest.
+    round-to-nearest. Water stays water either way: a negative input that
+    would round to >= 0 (land) caps at -LSB instead.
     """
     factor = quantization_factor(z)
-    scaled = np.asarray(data, dtype=np.float64) / factor
-    rounded = np.ceil(scaled) if conservative else np.round(scaled)
-    return rounded * factor
+    data = np.asarray(data, dtype=np.float64)
+    scaled = data / factor
+    rounded = (np.ceil(scaled) if conservative else np.round(scaled)) * factor
+    return np.where((data < 0) & (rounded >= 0), -LSB, rounded)
 
 
 def encode(data, z, conservative=True):
@@ -101,16 +111,27 @@ def _check():
         assert np.all(back >= depths - 1e-9), (z, depths[back < depths - 1e-9])
         # Shallow bias is bounded by one quantization step.
         assert np.all(back - depths <= step + 1e-9), (z, np.max(back - depths), step)
+        # Water stays water: negative input never quantizes to 0/land.
+        assert np.all(back[depths < 0] < 0), (z, back)
         # Bytes are valid and decode is exact for a dense random field too.
         rnd = np.random.default_rng(z).uniform(-10000, 100, size=(64, 64))
         rgb2 = encode(rnd, z, conservative=True)
         assert rgb2.dtype == np.uint8 and rgb2.min() >= 0 and rgb2.max() <= 255
-        assert np.all(decode(rgb2) >= rnd - 1e-9)
+        back2 = decode(rgb2)
+        # Never-deepen holds except sub-LSB water, which caps at -LSB.
+        assert np.all((back2 >= rnd - 1e-9) | ((rnd > -LSB) & (rnd < 0)))
+        assert np.all(back2[rnd < 0] < 0), z
 
     # Non-conservative round-to-nearest CAN deepen — confirms the modes differ.
     e = np.array([-7.0])  # z9 step = 4 m; nearest -> -8 (deeper), ceil -> -4 (shallower)
     assert decode(encode(e, 9, conservative=False))[0] < e[0]
     assert decode(encode(e, 9, conservative=True))[0] >= e[0]
+
+    # The water floor: shallow water that would round to 0 (land) caps at -LSB
+    # and survives the RGB round-trip exactly. -2.4 at z9 (4 m step) is the
+    # GEBCO shallow-shelf case; -0.001 is the sub-LSB deepen exception.
+    assert decode(encode(np.array([-2.4]), 9))[0] == -LSB
+    assert decode(encode(np.array([-0.001]), 12))[0] == -LSB
 
     print("encode.py self-check ok")
 

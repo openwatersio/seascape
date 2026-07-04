@@ -68,8 +68,20 @@ test("depthRelief folds a crisp hazard edge at the safety depth", () => {
   const hz = on.indexOf(day.hazard);
   expect(hz).toBeGreaterThan(0);
   expect(on[hz - 1]).toBe(-2 + 0.01); // normal colour pinned just below…
-  expect(on[hz + 1]).toBe(-0.01); // …hazard up to the shore
+  expect(on[hz + 1]).toBe(-1 / 256); // …hazard up to the encoder's water floor
   expect(on[on.length - 1]).toBe(day.land); // land wash still terminates the ramp
+});
+
+test("depthRelief stops stay strictly ascending for any safety depth", () => {
+  // Tiny values used to emit out-of-order/duplicate stops, which MapLibre
+  // rejects (breaking the whole depth-shading layer); they floor to just
+  // above the crisp-edge width.
+  for (const safety of [0.001, 0.015, 0.02, 0.03, 2, 10000]) {
+    const expr = raw(depthRelief(day, { unit: "m", safety }));
+    const stops = expr.slice(3).filter((_, i) => i % 2 === 0) as number[];
+    for (let i = 1; i < stops.length; i++)
+      expect(stops[i]).toBeGreaterThan(stops[i - 1]);
+  }
 });
 
 test("layers reference only the caller's source names", () => {
@@ -77,6 +89,11 @@ test("layers reference only the caller's source names", () => {
   expect(
     [...new Set(named.map((l) => (l as { source: string }).source))].sort(),
   ).toEqual(["bathy", "bathy-dem"]);
+});
+
+test("contour lines floor at z6 — depth shading carries lower zooms", () => {
+  const lines = layers().find((l) => l.id === "contour-lines");
+  expect((lines as { minzoom?: number }).minzoom).toBe(6);
 });
 
 test("layer ids are stable — consumers key toggles/queries off them", () => {

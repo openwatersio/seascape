@@ -96,12 +96,19 @@ const DEFAULT_GLYPHS =
 // shallower than the safety depth is painted into the ramp itself.
 type RampStops = (number | string)[]; // alternating elevation, colour
 
+// Terrarium's vertical LSB. The encoder clamps water to <= -LSB — elevation 0
+// means land — so the shoal tint runs flat down to -LSB and land starts at 0.
+const LSB = 1 / 256;
+
+// Width (metres) of the normal→hazard colour transition at the safety depth.
+const EDGE = 0.01;
+
 const depthRamp = (flavor: Flavor, edges: number[]): RampStops => {
   const stops: RampStops = [-10000, flavor.bandColors[0]];
   edges.forEach((d, i) =>
     stops.push(-d - 0.1, flavor.bandColors[i], -d, flavor.bandColors[i + 1]),
   );
-  stops.push(-0.01, flavor.bandColors[5], 0, flavor.land);
+  stops.push(-LSB, flavor.bandColors[5], 0, flavor.land);
   return stops;
 };
 
@@ -134,6 +141,11 @@ export function depthRelief(
   flavor: Flavor = day,
   { unit = "m", safety = 0 }: { unit?: Unit; safety?: number } = {},
 ): ExpressionSpecification {
+  // The crisp-edge stops below need s + EDGE to land strictly between the
+  // safety depth and the -LSB water stop, or the interpolate stops go out of
+  // ascending order and MapLibre rejects the whole expression. No real safety
+  // depth is centimetres, so floor tiny values instead of failing.
+  if (safety > 0) safety = Math.max(safety, EDGE + 2 * LSB);
   const ramp = depthRamp(flavor, flavor.bandEdges[unit === "m" ? "m" : "ft"]);
   const s = -safety;
   const stops: RampStops = [];
@@ -146,9 +158,9 @@ export function depthRelief(
     stops.push(
       s,
       rampColorAt(ramp, s),
-      s + 0.01,
+      s + EDGE,
       flavor.hazard,
-      -0.01,
+      -LSB,
       flavor.hazard,
       0,
       flavor.land,
@@ -298,6 +310,8 @@ export function layers(
       source: vector,
       "source-layer": "contours",
       filter: contourLineFilter,
+      // Presentation floor, not a data limit: below z6 isobaths read as clutter over depth shading.
+      minzoom: 6,
       paint: {
         "line-color": flavor.contour,
         "line-width": 0.5,
