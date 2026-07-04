@@ -174,6 +174,7 @@ export function sources({
   dem?: string;
   vector?: string;
 }): Record<string, SourceSpecification> {
+  tilesBase = tilesBase.replace(/\/+$/, ""); // tolerate a trailing slash
   return {
     [dem]: {
       type: "raster-dem",
@@ -503,6 +504,7 @@ export async function readDepth(
   lngLat: { lng: number; lat: number },
   zoom: number,
 ): Promise<number | null> {
+  tilesBase = tilesBase.replace(/\/+$/, ""); // tolerate a trailing slash
   const z = Math.max(0, Math.round(zoom));
   const n = 2 ** z;
   const fx = ((lngLat.lng + 180) / 360) * n;

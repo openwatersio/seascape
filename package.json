@@ -12,7 +12,7 @@
     "test": "npm test --workspaces --if-present"
   },
   "devDependencies": {
-    "@openwaters/seascape": "^0.1.0",
+    "@openwaters/seascape": "*",
     "maplibre-gl": "^5.21.1",
     "pmtiles": "^4.4.0",
     "vite": "^8.0.2"

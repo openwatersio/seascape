@@ -33,6 +33,12 @@ test("sources reference the endpoint's TileJSON, encoding inline", () => {
     { url?: string; encoding?: string }
   >;
   expect(src["seascape-dem"].url).toBe("https://t.example/raster.json");
+  // A trailing slash on tilesBase must not produce double-slash URLs.
+  const slashed = sources({ tilesBase: "https://t.example/" }) as Record<
+    string,
+    { url?: string }
+  >;
+  expect(slashed["seascape-dem"].url).toBe("https://t.example/raster.json");
   // MapLibre doesn't read `encoding` from TileJSON — it must be inline.
   expect(src["seascape-dem"].encoding).toBe("terrarium");
   expect(src["seascape-vector"].url).toBe("https://t.example/vector.json");

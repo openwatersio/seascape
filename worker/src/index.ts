@@ -303,23 +303,28 @@ export default {
     // the served style (the depth ramp can't read runtime state, so zero-build
     // consumers parameterize here instead).
     if (rel === "/style.json") {
+      // Uncacheable plain-text 400s: an intermediary must never cache an error
+      // for a URL that would succeed once the param is fixed.
+      const bad = (msg: string) =>
+        new Response(msg, {
+          status: 400,
+          headers: {
+            "content-type": "text/plain; charset=utf-8",
+            "cache-control": "no-store",
+            ...CORS,
+          },
+        });
       const unitParam = url.searchParams.get("unit");
       const unit =
         unitParam === null
           ? undefined
           : (["m", "ft", "fm"] as const).find((u) => u === unitParam);
       if (unitParam !== null && unit === undefined)
-        return new Response("unit must be m, ft, or fm", {
-          status: 400,
-          headers: CORS,
-        });
+        return bad("unit must be m, ft, or fm");
       const safetyParam = url.searchParams.get("safety");
       const safety = safetyParam === null ? undefined : Number(safetyParam);
       if (safety !== undefined && !(Number.isFinite(safety) && safety >= 0))
-        return new Response("safety must be a non-negative number (metres)", {
-          status: 400,
-          headers: CORS,
-        });
+        return bad("safety must be a non-negative number (metres)");
       return json(
         seascapeStyle({
           tilesBase,

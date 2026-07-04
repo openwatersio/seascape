@@ -87,13 +87,20 @@ map.on("load", () => {
   document
     .getElementById("unit-select")
     ?.addEventListener("change", applyControls);
+  // Layer toggles: the checkboxes are the source of truth — sync once on load
+  // (the style's own defaults may differ, e.g. hillshade ships hidden) and on
+  // every change.
   for (const [inputId, layerIds] of Object.entries(toggles)) {
-    document.getElementById(inputId)?.addEventListener("change", (e) => {
-      const vis = e.target.checked ? "visible" : "none";
+    const input = document.getElementById(inputId);
+    if (!input) continue;
+    const sync = () => {
+      const vis = input.checked ? "visible" : "none";
       layerIds.forEach((id) => {
         if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", vis);
       });
-    });
+    };
+    sync();
+    input.addEventListener("change", sync);
   }
 });
 
