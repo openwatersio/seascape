@@ -37,39 +37,37 @@ jobs:
       SHA: ${{ github.event.inputs.sha || github.sha }}
     steps:
       - name: Promote build → tiles bucket
+        # rclone, not the aws CLI: both buckets sit behind one account-level R2 endpoint, so this
+        # is a same-remote server-side copy (no download) that sends no object-tagging header at any
+        # file size. R2 doesn't implement tagging and rejects the aws CLI's x-amz-tagging-directive,
+        # which it emits on single-part CopyObject — so small overlays failed to promote.
+        env:
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true" # don't HEAD/create the bucket (R2 perms)
         run: |
-          echo "publishing bathymetry/build/$SHA → tiles:seascape/$SHA"
-          # manifest.json is copied last, so its presence means a complete prior promotion.
-          if aws s3 ls "s3://$TILES_BUCKET/seascape/$SHA/manifest.json" >/dev/null 2>&1; then
-            echo "tiles:seascape/$SHA already published — skipping promote"
-            exit 0
+          set -euo pipefail
+          sudo apt-get install -y rclone
+          src="R2:$DATA_BUCKET/bathymetry/build/$SHA"
+          dst="R2:$TILES_BUCKET/seascape/$SHA"
+          echo "publishing $src → $dst"
+          # manifest.json is copied last, so its presence means a complete promotion.
+          if [ -n "$(rclone lsf "$dst/" --include manifest.json)" ]; then
+            echo "$dst already published — skipping promote"; exit 0
           fi
-          if ! aws s3 ls "s3://$DATA_BUCKET/bathymetry/build/$SHA/manifest.json" >/dev/null 2>&1; then
-            echo "::error::No build at bathymetry/build/$SHA/ — release/dispatch a commit that was built on main."
+          if [ -z "$(rclone lsf "$src/" --include manifest.json)" ]; then
+            echo "::error::No build at $src/ — release/dispatch a commit that was built on main."
             exit 1
           fi
-          set -o pipefail
-          # Promote object-by-object via `aws s3api copy-object`, NOT `aws s3 cp`: R2 has no
-          # object tagging, and s3 cp sends x-amz-tagging-directive: REPLACE on every
-          # single-part server-side copy, which R2 rejects (multipart copies of >8 MB files
-          # happened to dodge it — until the grid overlays made most of a release small
-          # files). copy-object sends no tagging header, stays server-side (no runner
-          # round-trip), and its default COPY metadata-directive carries the content-type
-          # the build set. Ceiling: CopyObject caps at 5 GB/object — if planet.pmtiles ever
-          # nears that, switch to multipart copy (or rclone).
-          # The build dir is flat after the excludes (bundle archives + manifest), so keys
-          # map by basename. manifest.json goes LAST — its presence marks a complete promote.
-          aws s3 ls "s3://$DATA_BUCKET/bathymetry/build/$SHA/" --recursive | awk '{print $4}' \
-            | grep -vE '/(contour-shards|bundle-frags)/' \
-            | grep -vE '/(manifest\.json|contour-maxz\.txt)$' > /tmp/promote-keys.txt
-          [ -s /tmp/promote-keys.txt ] || { echo "::error::nothing to promote under build/$SHA/"; exit 1; }
-          # Bounded outer retry per object + visible errors, like the build's R2 pulls.
-          # $DATA_BUCKET/$TILES_BUCKET/$SHA reach the inner shell via its ENVIRONMENT
-          # (not spliced into the script source, where a hostile dispatch sha could inject).
-          xargs -P 8 -I{} sh -c 'k="$1"; for a in 1 2 3 4 5; do aws s3api copy-object --copy-source "$DATA_BUCKET/$k" --bucket "$TILES_BUCKET" --key "seascape/$SHA/$(basename "$k")" >/dev/null && exit 0; sleep "$a"; done; echo "giving up on $k after 5 attempts" >&2; exit 1' _ {} < /tmp/promote-keys.txt
-          echo "promoted $(wc -l < /tmp/promote-keys.txt) objects"
-          aws s3api copy-object --copy-source "$DATA_BUCKET/bathymetry/build/$SHA/manifest.json" \
-            --bucket "$TILES_BUCKET" --key "seascape/$SHA/manifest.json" >/dev/null
+          # contour-maxz.txt is a build-only handoff; contour-shards/bundle-frags are build scratch.
+          # manifest.json copied separately, last, so a crash mid-copy never leaves a false marker.
+          rclone copy "$src" "$dst" --transfers 16 --checkers 16 \
+            --exclude 'contour-shards/**' --exclude 'bundle-frags/**' \
+            --exclude 'manifest.json' --exclude 'contour-maxz.txt'
+          rclone copyto "$src/manifest.json" "$dst/manifest.json"
       - name: Prune old releases (keep newest 3)
         run: |
           # Count-based retention (current + 2 rollback targets), ordered by each
