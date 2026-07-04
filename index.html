@@ -16,15 +16,33 @@
     }
 
     #controls {
-      position: absolute;
-      top: 10px;
-      right: 10px;
       background: #fff;
       border-radius: 6px;
-      padding: 8px 12px;
       box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
       font: 13px/1.6 system-ui, sans-serif;
-      z-index: 1;
+    }
+
+    #controls summary {
+      list-style: none;
+      cursor: pointer;
+      width: 29px;
+      height: 29px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 22px;
+      margin-left: auto;
+    }
+
+    #controls summary::-webkit-details-marker {
+      display: none;
+    }
+
+    #controls-panel {
+      padding: 0 12px 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
     }
 
     #controls label {
@@ -35,40 +53,43 @@
 
 <body>
   <div id="map"></div>
-  <div id="controls">
-    <label>
-      <input type="checkbox" id="toggle-depth" checked /> Depth shading
-    </label><br />
-    <label>
-      <input type="checkbox" id="toggle-hillshade" /> Hillshade
-    </label><br />
-    <label>
-      <input type="checkbox" id="toggle-contours" checked /> Contours
-    </label><br />
-    <label>
-      <input type="checkbox" id="toggle-labels" checked /> Labels
-    </label><br />
-    <label>
-      <input type="checkbox" id="toggle-soundings" checked /> Soundings
-    </label><br />
-    <label>
-      <input type="checkbox" id="toggle-drying" checked /> Drying areas
-    </label><br />
-    <label>Units
-      <select id="unit-select">
-        <option value="m">metres</option>
-        <option value="ft">feet</option>
-        <option value="fm">fathoms</option>
-      </select>
-    </label><br />
-    <label title="Draft + margin; water shallower than this is shaded as a hazard (0 = off)">
-      Safety
-      <input type="number" id="safety-depth" min="0" step="1" value="2" style="width: 3.5em" /> m
-    </label><br />
-    <label>
-      <input type="checkbox" id="toggle-sources" /> Source coverage
-    </label>
-  </div>
+  <details id="controls" class="maplibregl-ctrl">
+    <summary title="Settings" aria-label="Settings" role="button">&#9881;</summary>
+    <div id="controls-panel">
+      <label>
+        <input type="checkbox" id="toggle-depth" checked /> Depth shading
+      </label>
+      <label>
+        <input type="checkbox" id="toggle-hillshade" checked /> Hillshade
+      </label>
+      <label>
+        <input type="checkbox" id="toggle-contours" checked /> Contours
+      </label>
+      <label>
+        <input type="checkbox" id="toggle-labels" checked /> Labels
+      </label>
+      <label>
+        <input type="checkbox" id="toggle-soundings" checked /> Soundings
+      </label>
+      <label>
+        <input type="checkbox" id="toggle-drying" checked /> Drying areas
+      </label>
+      <label>Units
+        <select id="unit-select">
+          <option value="m">metres</option>
+          <option value="ft">feet</option>
+          <option value="fm">fathoms</option>
+        </select>
+      </label>
+      <label title="Draft + margin; water shallower than this is shaded as a hazard (0 = off)">
+        Safety
+        <input type="number" id="safety-depth" min="0" step="1" value="2" style="width: 3.5em" /> m
+      </label>
+      <label>
+        <input type="checkbox" id="toggle-sources" /> Source coverage
+      </label>
+    </div>
+  </details>
 
   <script type="module" async src="./index.js"></script>
 </body>
