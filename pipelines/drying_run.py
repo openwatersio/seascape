@@ -37,6 +37,18 @@ def _run(cmd, what):
         raise Exception(f"{what} failed (exit {p.returncode}):\n{p.stdout}\n{p.stderr}")
 
 
+def _polys(geom):
+    """Every non-empty Polygon inside a geometry, recursing into Multi/GeometryCollection and
+    dropping the line/point slivers a clip or make_valid can leave — so the output layer is
+    uniformly polygon (FlatGeobuf rejects a mixed layer)."""
+    t = geom.geom_type
+    if t == "Polygon":
+        return [] if geom.is_empty else [geom]
+    if t in ("MultiPolygon", "GeometryCollection"):
+        return [p for g in geom.geoms for p in _polys(g)]
+    return []
+
+
 def drying_mask(dem_path, mask_path, cap):
     """Whole-tile Byte drying mask (1 = foreshore) built in windows, so the multi-GB Float32 DEM
     is never held whole — only this uint8 result (a quarter the size). 1 where a valid DEM pixel
@@ -76,44 +88,20 @@ def polygons(mask_arr, transform):
     return [shape(g) for g, _v in shapes(mask_arr, mask=mask_arr, transform=transform)]
 
 
-def _chaikin_closed(coords, iterations):
-    """Chaikin corner-cutting on a CLOSED ring (periodic — no pinned endpoint), so the pixel
-    staircase rounds into a smooth curve. Returns a re-closed coord array."""
-    import numpy as np
-    pts = np.asarray(coords[:-1], float)  # drop the duplicate closing vertex
-    for _ in range(iterations):
-        if len(pts) < 3:
-            break
-        nxt = np.roll(pts, -1, axis=0)
-        q, r = 0.75 * pts + 0.25 * nxt, 0.25 * pts + 0.75 * nxt
-        out = np.empty((2 * len(pts), 2))
-        out[0::2], out[1::2] = q, r
-        pts = out
-    return np.vstack([pts, pts[0]])
+def smooth_polygons(geoms, tol):
+    """De-staircase the polygonize output with topology-preserving Douglas-Peucker (shapely's
+    default simplify). It drops the 1-pixel steps while keeping every vertex within `tol` of the
+    true raster edge — a bounded-fidelity generalisation, unlike Chaikin corner-cutting, which
+    self-intersects at a thin foreshore neck, biases the polygon inward, and rounds genuinely
+    straight edges. Run in 3857 (tol in metres) BEFORE the tile clip so adjacent tiles de-staircase
+    their shared halo identically and the edges still meet. A staircase collapses to a clean
+    diagonal; a real straight edge stays straight.
 
-
-def smooth_polygons(geoms, tol, iterations=2):
-    """Kill the polygonize pixel staircase: simplify each ring to collapse the 1-pixel steps, then
-    Chaikin-smooth it into a curve — the same look the contours get, so the green foreshore edge
-    reads as a drawn shoreline, not a rasterised staircase. Done in 3857 (tol in metres) BEFORE the
-    tile clip, so adjacent tiles smooth their shared halo identically and the edges still meet."""
-    from shapely.geometry import Polygon, MultiPolygon
-
-    def one(poly):
-        p = poly.simplify(tol)
-        if p.is_empty or p.geom_type != "Polygon":
-            return p
-        holes = [_chaikin_closed(r.coords, iterations) for r in p.interiors]
-        return Polygon(_chaikin_closed(p.exterior.coords, iterations), holes)
-
-    out = []
-    for g in geoms:
-        parts = g.geoms if g.geom_type == "MultiPolygon" else [g]
-        smoothed = [one(p) for p in parts]
-        smoothed = [s for s in smoothed if not s.is_empty and s.geom_type == "Polygon"]
-        if smoothed:
-            out.append(smoothed[0] if len(smoothed) == 1 else MultiPolygon(smoothed))
-    return out
+    Curve ceiling: DP leaves generalised polylines (slightly angular), not smooth curves — fine for
+    a soft foreshore fill. For true curves the right place is the raster (blur the mask / extract an
+    iso-contour with marching squares), which is smooth and valid by construction; not worth it yet.
+    """
+    return [p for g in geoms for p in _polys(g.simplify(tol))]
 
 
 def generate(filepath):
@@ -145,24 +133,31 @@ def generate(filepath):
         return
     geoms = smooth_polygons(geoms, tol=abs(transform.a) * 1.5)  # transform.a = pixel width (3857 m)
 
-    # Same seam contract as contours: polygonize + smooth the buffered grid, then clip to the
-    # unbuffered tile bbox (deterministic input -> byte-identical halo -> polygon edges meet).
+    # make_valid + _polys in shapely (where the geoms already live) so ogr2ogr only ever sees valid,
+    # polygon-only input: its -clipsrc silently drops or crashes on an invalid ring (the planet-build
+    # failure) but is robust on valid input. DP simplify makes this rare, but the guard is cheap.
+    from shapely import make_valid
+    valid = [p for g in geoms for p in _polys(make_valid(g))]
+    if not valid:
+        print(f"drying: no foreshore for {filename}")
+        return
     raw = f"{tmp}/drying-raw.fgb"
-    gpd.GeoDataFrame(geometry=geoms, crs="EPSG:3857").to_file(raw, driver="FlatGeobuf")
+    gpd.GeoDataFrame(geometry=valid, crs="EPSG:3857").to_file(raw, driver="FlatGeobuf")
+
+    # Same seam contract as contours: de-staircase over the buffered grid, then GDAL clips to the
+    # unbuffered tile bbox + reprojects (deterministic input -> byte-identical halo -> edges meet).
+    # One ogr2ogr pass: -clipsrc is in the source 3857 SRS, applied before -t_srs, like contour_run.
     b = mercantile.xy_bounds(tile)  # unbuffered, tile-aligned (EPSG:3857)
-    clipped = f"{tmp}/drying-clip.fgb"
+    utils.create_folder("store/drying")  # tile-keyed, so clean tiles persist across incremental runs
+    out = f"store/drying/{stem}.fgb"
     _run(f"ogr2ogr -f FlatGeobuf -overwrite -nlt PROMOTE_TO_MULTI "
-         f"-clipsrc {b.left} {b.bottom} {b.right} {b.top} {clipped} {raw}", "ogr2ogr clip")
-    if contour_run.feature_count(clipped) == 0:
+         f"-clipsrc {b.left} {b.bottom} {b.right} {b.top} -t_srs EPSG:4326 {out} {raw}", "ogr2ogr clip")
+    n = contour_run.feature_count(out)
+    if n == 0:  # all foreshore was in the halo, none in the tile — don't leave an empty FGB to bundle
+        os.remove(out)
         print(f"drying: no foreshore in tile bbox for {filename}")
         return
-
-    # Tile-keyed (like store/contour) so clean tiles' polygons persist across incremental runs.
-    utils.create_folder("store/drying")
-    out = f"store/drying/{stem}.fgb"
-    _run(f"ogr2ogr -f FlatGeobuf -overwrite -nlt PROMOTE_TO_MULTI -t_srs EPSG:4326 {out} {clipped}",
-         "ogr2ogr reproject")
-    print(f"drying: {filename} -> {contour_run.feature_count(out)} polygons")
+    print(f"drying: {filename} -> {n} polygons")
 
 
 # ── bundle ───────────────────────────────────────────────────────────────────
@@ -252,24 +247,38 @@ def _check():
     assert any(g.covers(band_pt) for g in geoms), "a drying polygon must cover the foreshore band"
     assert not any(g.covers(land_pt) for g in geoms), "no drying polygon may cover land"
 
-    # Smoothing turns the pixel staircase into a curve: it must still cover the band interior and
-    # exclude land, and the raw polygonize edges (all axis-aligned) must lose that rectilinearity.
+    # De-staircasing must still cover the band interior and exclude land (DP keeps the axis-aligned
+    # rectangle a rectangle — a real straight edge is NOT rounded, which is the point).
+    sm = smooth_polygons(geoms, tol=abs(transform.a) * 1.5)
+    assert any(g.covers(band_pt) for g in sm), "de-staircased drying must still cover the band"
+    assert not any(g.covers(land_pt) for g in sm), "de-staircased drying must still exclude land"
+
     def axis_frac(gs):
         segs = []
         for g in gs:
             for p in (g.geoms if g.geom_type == "MultiPolygon" else [g]):
-                c = np.asarray(p.exterior.coords)
-                d = np.diff(c, axis=0)
+                d = np.diff(np.asarray(p.exterior.coords), axis=0)
                 segs += list((np.abs(d[:, 0]) < 1e-6) | (np.abs(d[:, 1]) < 1e-6))
         return np.mean(segs) if segs else 0.0
-    sm = smooth_polygons(geoms, tol=abs(transform.a) * 1.5)
-    assert any(g.covers(band_pt) for g in sm), "smoothed drying must still cover the band"
-    assert not any(g.covers(land_pt) for g in sm), "smoothed drying must still exclude land"
-    assert axis_frac(geoms) > 0.9 and axis_frac(sm) < 0.5, \
-        f"smoothing should de-staircase the edges (raw {axis_frac(geoms):.2f} -> {axis_frac(sm):.2f})"
+    # A real 45° pixel staircase must collapse to a near-diagonal (few axis-aligned segments),
+    # where Chaikin's failure mode (thin-neck self-intersection) also lived.
+    diag = np.array([[1 if 10 <= i + j <= 14 else 0 for j in range(30)] for i in range(30)], "uint8")
+    dgeoms = polygons(diag, from_origin(0, 3000, 100, 100))
+    draw, dsm = axis_frac(dgeoms), axis_frac(smooth_polygons(dgeoms, tol=150))
+    assert draw > 0.9 and dsm < 0.6, f"a staircase must de-stair (axis-aligned {draw:.2f} -> {dsm:.2f})"
 
-    print(f"drying_run self-check ok (foreshore pixels {int(arr.sum())}, {len(geoms)} polygons, "
-          f"axis-aligned {axis_frac(geoms):.2f} -> {axis_frac(sm):.2f} after smoothing)")
+    # Regression for the planet-build OGR "Mismatched geometry type": a self-touching ring (which
+    # smoothing can produce) clipped to the tile bbox must reduce to clean, writable polygons via
+    # make_valid + _polys, not a GeometryCollection a (multi)polygon layer refuses.
+    from shapely import make_valid
+    from shapely.geometry import Polygon, box
+    bowtie = Polygon([(0, 0), (4, 4), (0, 4), (4, 0), (0, 0)])  # self-intersecting
+    parts = _polys(make_valid(bowtie).intersection(box(-1, -1, 5, 5)))
+    assert parts and all(p.geom_type == "Polygon" and p.is_valid and not p.is_empty for p in parts), \
+        "a self-touching ring must reduce to valid, writable polygons"
+
+    print(f"drying_run self-check ok (foreshore pixels {int(arr.sum())}, {len(geoms)} polygons; "
+          f"staircase de-staired axis-aligned {draw:.2f} -> {dsm:.2f})")
 
 
 if __name__ == "__main__":
