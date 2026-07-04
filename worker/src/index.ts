@@ -7,7 +7,7 @@
  * Extension picks the representation: webp/png → raster, pbf/mvt → vector.
  *
  * Reads the bundles published to R2 (planet.pmtiles + one overlay-{cell}.pmtiles
- * per populated grid cell + contours.pmtiles + manifest.json) and resolves per tile:
+ * per populated grid cell + vector.pmtiles + manifest.json) and resolves per tile:
  *   - z ≤ planet.max_zoom        → planet tile
  *   - z > planet.max_zoom, the tile's grid cell is populated → that cell's tile
  *     (or the overzoomed deepest ancestor present in the cell)
@@ -308,7 +308,7 @@ export default {
     }
     if (rel === "/vector.json") {
       const mf = await manifest(env);
-      const h = await pm(env, "contours.pmtiles").getHeader();
+      const h = await pm(env, "vector.pmtiles").getHeader();
       return json({
         tilejson: "3.0.0",
         name: "Open Waters Bathymetry",
@@ -376,7 +376,7 @@ export default {
       return isVector ? noTile() : send(await transparentBytes(), WEBP);
 
     if (isVector) {
-      const t = await tile(env, "contours.pmtiles", z, x, y);
+      const t = await tile(env, "vector.pmtiles", z, x, y);
       return t ? send(t, MVT) : noTile();
     }
 

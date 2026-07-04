@@ -195,17 +195,17 @@ def bundle():
 
 
 def fold():
-    """Fold soundings.pmtiles into contours.pmtiles as the `soundings` layer, so the Worker
+    """Fold soundings.pmtiles into vector.pmtiles as the `soundings` layer, so the Worker
     serves it from the one vector source (contours + coverage + soundings). tile-join -pk keeps
     every feature of every layer. Runs after both bundles; no-op if either is missing."""
-    cont, snd = "store/bundle/contours.pmtiles", "store/bundle/soundings.pmtiles"
+    cont, snd = "store/bundle/vector.pmtiles", "store/bundle/soundings.pmtiles"
     if not (os.path.isfile(cont) and os.path.isfile(snd)):
-        print("soundings fold: need both contours.pmtiles and soundings.pmtiles")
+        print("soundings fold: need both vector.pmtiles and soundings.pmtiles")
         return
-    tmp = "store/bundle/contours-with-soundings.pmtiles"  # tile-join can't -o over an input
+    tmp = "store/bundle/vector-with-soundings.pmtiles"  # tile-join can't -o over an input
     subprocess.run(["tile-join", "-o", tmp, "-f", "-pk", cont, snd], check=True)
     os.replace(tmp, cont)
-    print("soundings fold: folded soundings layer into contours.pmtiles")
+    print("soundings fold: folded soundings layer into vector.pmtiles")
 
 
 def _check():

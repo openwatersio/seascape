@@ -74,7 +74,7 @@ just test-engine     # offline aggregation/bundle self-check (priority, zoom cap
 
 - `planet.pmtiles` — the all-sources-merged base, z0–`macrotile_z` (z8 = GEBCO native, no upsampling).
 - `overlay-{z}-{x}-{y}.pmtiles` — one per populated `OVERLAY_SPLIT_Z` grid cell (default z5), z`macrotile_z+1`→cell-max, carrying the GEBCO-filled merged mosaic under that cell.
-- `contours.pmtiles` — MVT vector source: `contours` (GEBCO baked to the deepest zoom by tippecanoe) plus the folded-in `soundings`, `drying` (green-foreshore polygons), and `coverage` layers.
+- `vector.pmtiles` — MVT vector source: `contours` (GEBCO baked to the deepest zoom by tippecanoe) plus the folded-in `soundings`, `drying` (green-foreshore polygons), and `coverage` layers.
 - `manifest.json` — planet metadata + `overlay.cells` ({cell: max_zoom}) for the Worker.
 
 Key knobs (env vars, read by `pipelines/utils.py` / `bundle.py`):
@@ -121,7 +121,7 @@ The Worker presents one endpoint per layer and resolves per tile:
 
 ```
 GET /seascape/{z}/{x}/{y}.webp   raster: z≤8 → planet · z>8 in a populated grid cell → that cell's overlay · else → overzoom the planet · miss → transparent
-GET /seascape/{z}/{x}/{y}.pbf    vector: contours.pmtiles passthrough (contours, soundings, drying, coverage layers)
+GET /seascape/{z}/{x}/{y}.pbf    vector: vector.pmtiles passthrough (contours, soundings, drying, coverage layers)
 GET /seascape/raster.json        TileJSON (terrarium raster)
 GET /seascape/vector.json        TileJSON (vector layers)
 ```

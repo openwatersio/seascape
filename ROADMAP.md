@@ -141,7 +141,7 @@ A chart is more than shaded relief + decorative contours. Landed on branch
 `milestone-4-chart-data-model` (PR #8) — the three additions plus feet/fathom units:
 
 1. **Soundings.** ✅ New `soundings` vector layer (`pipelines/soundings_run.py`),
-   forked off each aggregation tile's merged DEM and folded into `contours.pmtiles`.
+   forked off each aggregation tile's merged DEM and folded into `vector.pmtiles`.
    The shoalest wet pixel per grid cell (floored toward shallower — never charts a
    depth deeper than reality), placed on a jittered quincunx that restaggers per zoom
    (a shoalest-per-block pyramid via tippecanoe `minzoom==maxzoom`) so every zoom is an

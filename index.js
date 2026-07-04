@@ -43,7 +43,7 @@ const contourMax = manifest
 const RASTER_MAX_ZOOM = contourMax + 3;
 
 // ─── Source coverage (provenance) ───────────────────────────────────────────
-// The `coverage` layer baked into contours.pmtiles (source footprints, props
+// The `coverage` layer baked into vector.pmtiles (source footprints, props
 // source_id / source_name / source_maxzoom). Drawn as polygons and queried on click to
 // report which source a depth came from. Colour each source by id off the manifest's
 // source_ids (a match expression); ids not in the manifest fall back to grey.

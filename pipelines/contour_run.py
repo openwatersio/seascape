@@ -302,11 +302,11 @@ def _coverage_pmtiles(maxz):
 
 def _finalize_contours(contour_pmtiles, maxz):
     """tile-join the contour pmtiles (one local build or the CI shards) + the coverage
-    layer into store/bundle/contours.pmtiles. -pk keeps every feature of both layers;
+    layer into store/bundle/vector.pmtiles. -pk keeps every feature of both layers;
     coverage is dropped from the join when no footprints are present locally."""
     cov = _coverage_pmtiles(maxz)
     inputs = list(contour_pmtiles) + ([cov] if cov else [])
-    subprocess.run(["tile-join", "-o", "store/bundle/contours.pmtiles", "-f", "-pk", *inputs],
+    subprocess.run(["tile-join", "-o", "store/bundle/vector.pmtiles", "-f", "-pk", *inputs],
                    check=True)
     return cov is not None
 
@@ -334,7 +334,7 @@ def _live_fgbs(fgbs, stems):
 
 
 def bundle(shard=None):
-    """tippecanoe the local contour FGBs into pmtiles. Whole set (contours.pmtiles)
+    """tippecanoe the local contour FGBs into pmtiles. Whole set (vector.pmtiles)
     by default; with a shard index → contours-shard-{shard}.pmtiles, which
     bundle_merge() tile-joins (a single global tippecanoe blows the 6 h job cap at
     planet scale). The CI pulls only this shard's FGB slice and writes the GLOBAL maxz
@@ -357,13 +357,13 @@ def bundle(shard=None):
     _tippecanoe(fgbs, 0, maxz, lines)
     cov = _finalize_contours([lines], maxz)
     os.remove(lines)
-    print(f"contour bundle: store/bundle/contours.pmtiles (z0-{maxz}, {len(fgbs)} FGBs"
+    print(f"contour bundle: store/bundle/vector.pmtiles (z0-{maxz}, {len(fgbs)} FGBs"
           f"{', + coverage layer' if cov else ''})")
 
 
 def bundle_merge():
     """tile-join the per-shard contour pmtiles + the coverage layer into one
-    contours.pmtiles (-pk keeps every feature; the shards are disjoint FGB slices
+    vector.pmtiles (-pk keeps every feature; the shards are disjoint FGB slices
     unioned per tile)."""
     shards = sorted(glob("store/bundle/contours-shard-*.pmtiles"))
     if not shards:
@@ -373,7 +373,7 @@ def bundle_merge():
     if not os.path.isfile(maxzfile):
         raise SystemExit("contour merge: store/contour-maxz.txt missing (the shard jobs write it)")
     cov = _finalize_contours(shards, int(open(maxzfile).read().strip()))
-    print(f"contour merge: store/bundle/contours.pmtiles ({len(shards)} shards"
+    print(f"contour merge: store/bundle/vector.pmtiles ({len(shards)} shards"
           f"{', + coverage layer' if cov else ''})")
 
 

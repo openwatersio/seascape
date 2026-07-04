@@ -98,12 +98,12 @@ bundle-merge:
 contours:
     uv run python contour_run.py bundle
 
-# Soundings: bundle the per-tile points, then fold them into contours.pmtiles (one vector source).
+# Soundings: bundle the per-tile points, then fold them into vector.pmtiles (one vector source).
 soundings:
     uv run python soundings_run.py bundle
     uv run python soundings_run.py fold
 
-# Drying areas (green foreshore): bundle the per-tile polygons, then fold into contours.pmtiles.
+# Drying areas (green foreshore): bundle the per-tile polygons, then fold into vector.pmtiles.
 drying:
     uv run python drying_run.py bundle
     uv run python drying_run.py fold
@@ -113,7 +113,7 @@ drying:
 contour-shard i:
     uv run python contour_run.py bundle-shard {{i}}
 
-# tile-join the per-shard contour pmtiles into contours.pmtiles.
+# tile-join the per-shard contour pmtiles into vector.pmtiles.
 contour-merge:
     uv run python contour_run.py bundle-merge
 

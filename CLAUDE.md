@@ -12,7 +12,7 @@ Cloudflare Worker endpoint, with a small Vite/MapLibre(/Mapbox) viewer. Each sou
 is an independent build step; a planet build *combines* them. Two tile layers:
 
 - **terrain** — Terrarium-encoded raster (depth shading, hillshade, 3D), per-zoom quantized.
-- **vector** — one `contours.pmtiles`: `contours` (metric + feet/fathom isobaths at non-uniform intervals), `soundings` (shoalest-per-cell spot depths), and `drying`/`coverage` (foreshore + data-extent polygons).
+- **vector** — one `vector.pmtiles`: `contours` (metric + feet/fathom isobaths at non-uniform intervals), `soundings` (shoalest-per-cell spot depths), and `drying`/`coverage` (foreshore + data-extent polygons).
 
 The engine is Python (`uv` project under `pipelines/`) driving GDAL/tippecanoe as
 CLI subprocesses; `just` is the task runner. There's no compiled app code. The
@@ -34,7 +34,7 @@ just test-engine   # offline aggregation/bundle self-check (priority, zoom cap, 
 ```
 
 Outputs land in `pipelines/store/bundle/`: `planet.pmtiles`, one
-`overlay-{z}-{x}-{y}.pmtiles` per populated grid cell, `contours.pmtiles`, and
+`overlay-{z}-{x}-{y}.pmtiles` per populated grid cell, `vector.pmtiles`, and
 `manifest.json`. Inspect a `.pmtiles` by dragging it into
 https://protomaps.github.io/PMTiles/.
 
@@ -52,9 +52,9 @@ not an expensive operation; use it whenever you touch shading, contours, or the 
 `store/aggregation`, `store/pmtiles`, `store/contour`, `store/bundle`, …).
 
 - **source** (`source_*.py`, per `sources/<id>/`): fetch → datum offset → normalize to a 4326 COG → `bounds.csv` → coverage polygon → tarball. Each source owns its recipe (`sources/<id>/Justfile`) composing the shared steps; `metadata.json` is attribution + an optional `max_zoom` cap. Priority derives from `(maxzoom, id)` — GEBCO loses (smallest maxzoom), so regional sources win in overlap.
-- **aggregation** (`aggregation_*.py`): `cover` slices the planet into source-aware aggregation tiles (one CSV each); `run` reprojects each source by priority into a merged Float32 DEM (Gaussian seam feather), slope-smooths it (`smooth.py`), encodes Terrarium raster tiles, and forks contours (`contour_run.py`) and soundings (`soundings_run.py`) off the same merged DEM. Sources flagged `land_clamp` (GEBCO/EMODnet — coarse, no land/water concept) get their negative land pixels clamped to 0 against the OSM land mask (`landmask.py`, prep once with `just landmask`) right after warp, so shoreline cells don't paint false water/contours/soundings over land. The same mask feeds a `drying_run.py` fork: it polygonizes the green foreshore (elevation in `[0, DRYING_CAP]` seaward of the land line — chart drying areas) into a `drying` layer folded into `contours.pmtiles`.
+- **aggregation** (`aggregation_*.py`): `cover` slices the planet into source-aware aggregation tiles (one CSV each); `run` reprojects each source by priority into a merged Float32 DEM (Gaussian seam feather), slope-smooths it (`smooth.py`), encodes Terrarium raster tiles, and forks contours (`contour_run.py`) and soundings (`soundings_run.py`) off the same merged DEM. Sources flagged `land_clamp` (GEBCO/EMODnet — coarse, no land/water concept) get their negative land pixels clamped to 0 against the OSM land mask (`landmask.py`, prep once with `just landmask`) right after warp, so shoreline cells don't paint false water/contours/soundings over land. The same mask feeds a `drying_run.py` fork: it polygonizes the green foreshore (elevation in `[0, DRYING_CAP]` seaward of the land line — chart drying areas) into a `drying` layer folded into `vector.pmtiles`.
 - **downsampling**: 2×2-average overview pyramid below each source's native maxzoom.
-- **bundle** (`bundle.py`): concat single-zoom pmtiles into `planet.pmtiles` (z0..`PLANET_MAX_ZOOM` = `macrotile_z`) + one `overlay-{cell}.pmtiles` per populated `OVERLAY_SPLIT_Z` grid cell (default z5) + `manifest.json`. Contours, soundings, and drying/coverage layers bundle into `contours.pmtiles` via tippecanoe.
+- **bundle** (`bundle.py`): concat single-zoom pmtiles into `planet.pmtiles` (z0..`PLANET_MAX_ZOOM` = `macrotile_z`) + one `overlay-{cell}.pmtiles` per populated `OVERLAY_SPLIT_Z` grid cell (default z5) + `manifest.json`. Contours, soundings, and drying/coverage layers bundle into `vector.pmtiles` via tippecanoe.
 
 ### Why a planet cap + grid overlays + Worker (the serving model)
 

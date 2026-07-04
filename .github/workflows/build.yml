@@ -591,7 +591,7 @@ jobs:
           # it to tile the coverage layer to the same depth as the contours.
           aws s3 cp store/contour-maxz.txt "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/contour-maxz.txt"
 
-  # tile-join the per-shard pmtiles into one contours.pmtiles.
+  # tile-join the per-shard pmtiles into one vector.pmtiles.
   contour-bundle:
     needs: contours
     if: ${{ !cancelled() && needs.contours.result == 'success' }}
@@ -609,14 +609,14 @@ jobs:
           aws s3 sync "s3://$DATA_BUCKET/bathymetry/drying" store/drying
       - name: Merge contours
         run: docker run --rm -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just contour-merge
-      # Soundings + drying aren't sharded (sparse) — bundle them here and fold into contours.pmtiles.
+      # Soundings + drying aren't sharded (sparse) — bundle them here and fold into vector.pmtiles.
       - name: Fold in soundings
         run: docker run --rm -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just soundings
       - name: Fold in drying
         run: docker run --rm -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just drying
-      - name: Push contours.pmtiles to R2 build
+      - name: Push vector.pmtiles to R2 build
         run: |
-          aws s3 cp store/bundle/contours.pmtiles "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/contours.pmtiles" \
+          aws s3 cp store/bundle/vector.pmtiles "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/vector.pmtiles" \
             --content-type application/octet-stream
 
   # A complete build (terrain manifest + contours both landed) auto-promotes itself:

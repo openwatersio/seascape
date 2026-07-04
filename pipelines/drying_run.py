@@ -13,7 +13,7 @@ land-mask raster the reproject clamp already rasterized for this tile. Per tile:
 drying mask off (DEM, land mask) -> polygonize -> clip to the unbuffered tile bbox -> 4326 ->
 store/drying/{stem}.fgb. Same seam contract as contours: the mask and DEM are deterministic on
 the buffered grid, so neighbouring tiles' halos polygonize identically and polygon edges meet at
-the clip. bundle() tippecanoes them into a `drying` layer; fold() joins it into contours.pmtiles.
+the clip. bundle() tippecanoes them into a `drying` layer; fold() joins it into vector.pmtiles.
 """
 
 import os
@@ -187,17 +187,17 @@ def bundle():
 
 
 def fold():
-    """Fold drying.pmtiles into contours.pmtiles as the `drying` layer, so the Worker serves it
+    """Fold drying.pmtiles into vector.pmtiles as the `drying` layer, so the Worker serves it
     from the one vector source. tile-join -pk keeps every layer's features. Runs after both
     bundles; no-op if either is missing."""
-    cont, dry = "store/bundle/contours.pmtiles", "store/bundle/drying.pmtiles"
+    cont, dry = "store/bundle/vector.pmtiles", "store/bundle/drying.pmtiles"
     if not (os.path.isfile(cont) and os.path.isfile(dry)):
-        print("drying fold: need both contours.pmtiles and drying.pmtiles")
+        print("drying fold: need both vector.pmtiles and drying.pmtiles")
         return
-    tmp = "store/bundle/contours-with-drying.pmtiles"  # tile-join can't -o over an input
+    tmp = "store/bundle/vector-with-drying.pmtiles"  # tile-join can't -o over an input
     subprocess.run(["tile-join", "-o", tmp, "-f", "-pk", cont, dry], check=True)
     os.replace(tmp, cont)
-    print("drying fold: folded drying layer into contours.pmtiles")
+    print("drying fold: folded drying layer into vector.pmtiles")
 
 
 def _check():

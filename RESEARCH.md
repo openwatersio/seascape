@@ -101,7 +101,7 @@ GEBCO DEM
   ├─ Light smoothing (5×5 kernel) → gdal_contour -fl [shallow levels] → shallow.fgb
   ├─ Heavy smoothing (9×9 kernel) → gdal_contour -fl [deep levels]   → deep.fgb
   └─ ogr2ogr merge + enrich → all_contours.fgb
-                                   └─ tippecanoe -j (zoom filter) → contours.pmtiles
+                                   └─ tippecanoe -j (zoom filter) → vector.pmtiles
 ```
 
 **Non-uniform contour intervals via `gdal_contour -fl`:**
