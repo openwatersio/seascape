@@ -38,13 +38,17 @@ from whatever's on `PATH` — no version pinning to the Python ABI.
 
 ## Quick start
 
-Builds a real GEBCO + CUDEM mosaic and serves it locally. Needs the GEBCO grid
-extracted in `data/` (the recipe clips it locally — no 4 GB fetch).
+Builds a real multi-source harbor mosaic and serves it locally — **no dataset
+download**. Run it whenever you make a visual change; it's the fast feedback loop.
 
 ```bash
 uv sync --project pipelines   # once
-just preview                  # build the harbor demo + seed the local Worker R2
+just preview                  # stream sources from R2 → build the harbor demo → seed the local Worker R2
 ```
+
+`just preview` range-reads each prepared source's COG (and the land mask) straight
+from R2 — no local source prep, no multi-GB fetch. `just preview-local` builds the
+same demo from already-prepared sources in `pipelines/store/source/` (fully offline).
 
 Then run the two dev servers in separate terminals:
 
@@ -60,7 +64,8 @@ Open <http://localhost:5173/#12/40.55/-73.96>.
 ```bash
 just source <id>     # prepare one source (fetch → datum → normalize → bounds → polygon → tarball)
 just sources         # prepare every source under sources/
-just planet          # cover → aggregate → downsample → bundle  (set BBOX="W,S,E,N" for a region)
+just landmask        # prepare the OSM land mask once (coarse sources clamp land negatives to it)
+just planet          # cover → aggregate → downsample → bundle → contours → soundings  (set BBOX="W,S,E,N" for a region)
 just test-sources    # offline source-stage self-check (synthetic, no network)
 just test-engine     # offline aggregation/bundle self-check (priority, zoom cap, pyramid)
 ```
@@ -69,7 +74,7 @@ just test-engine     # offline aggregation/bundle self-check (priority, zoom cap
 
 - `planet.pmtiles` — the all-sources-merged base, z0–`macrotile_z` (z8 = GEBCO native, no upsampling).
 - `overlay-{z}-{x}-{y}.pmtiles` — one per populated `OVERLAY_SPLIT_Z` grid cell (default z5), z`macrotile_z+1`→cell-max, carrying the GEBCO-filled merged mosaic under that cell.
-- `contours.pmtiles` — MVT contours (GEBCO baked to the deepest zoom by tippecanoe).
+- `contours.pmtiles` — MVT vector source: `contours` (GEBCO baked to the deepest zoom by tippecanoe) plus the folded-in `soundings`, `drying` (green-foreshore polygons), and `coverage` layers.
 - `manifest.json` — planet metadata + `overlay.cells` ({cell: max_zoom}) for the Worker.
 
 Key knobs (env vars, read by `pipelines/utils.py` / `bundle.py`):
@@ -77,9 +82,10 @@ Key knobs (env vars, read by `pipelines/utils.py` / `bundle.py`):
 cell zoom, default 5 — raise it if a cell's bundle ever outgrows a CI runner),
 `NUM_OVERVIEWS`, `BBOX`,
 `SMOOTH_DEM_SIGMA`/`SMOOTH_SLOPE_LOW`/`SMOOTH_SLOPE_HIGH`, `SKIP_SMOOTH`,
-`SKIP_CONTOURS`, `SKIP_SOUNDINGS`, `CONTOUR_NAV_SMOOTH_MAX` (navigable-band
+`SKIP_CONTOURS`, `SKIP_SOUNDINGS`, `SKIP_DRYING`, `CONTOUR_NAV_SMOOTH_MAX` (navigable-band
 contour-smoothing gate; replaces the retired `SKIP_CONTOUR_SMOOTH`),
-`SOUND_CELL_PX`/`SOUND_MIN_DEPTH_M` (sounding spacing / min charted depth).
+`SOUND_CELL_PX`/`SOUND_MIN_DEPTH_M` (sounding spacing / min charted depth),
+`DRYING_CAP` (max elevation, m, tinted as drying foreshore).
 
 ## In the container
 
@@ -100,7 +106,7 @@ Set `BBOX="W,S,E,N"` for a regional build; `just --list` shows all recipes.
    - `metadata.json` — `name`, `producer`, `website`, `license`, and an optional `max_zoom` cap (omit to use the source's native resolution; cap it for high-res lidar like CUDEM).
    - `file_list.txt` — source URL(s): `https://…`, `s3://…` (read via `/vsis3/`), an ERDDAP `…/griddap/…` base, a `.zip`, or a local path.
    - `Justfile` — compose the shared `pipelines/source_*.py` steps the source needs. Copy an existing recipe and adjust:
-     - http GeoTIFF → `source_download`; ERDDAP → `source_download_erddap --bbox …`; public COG tiles → `source_register_remote_urllist` (flat urllist, e.g. CUDEM) or `source_register_remote_geopkg` (GeoPackage tile index, e.g. NOAA S-102) — streaming `/vsicurl` refs, no download; zip → `source_download` + `source_unzip`.
+     - http GeoTIFF → `source_download`; public COG tiles → `source_register_remote_urllist` (flat urllist, e.g. CUDEM) or `source_register_remote_geopkg` (GeoPackage tile index, e.g. NOAA S-102) — streaming `/vsicurl` refs, no download; zip → `source_download` + `source_unzip`. Oddball fetches (ERDDAP griddap, portal APIs) get their own `source_download_<id>.py` — copy one.
      - positive-down depths or a datum offset → `source_datum --negate --offset N`.
      - always: `source_normalize --crs EPSG:… [--nodata N]` → `source_bounds` → `source_polygonize <id> 8` → `source_create_tarball`.
 2. `just source <id>` (verify it lands in `pipelines/store/source/<id>/`).
@@ -115,13 +121,14 @@ The Worker presents one endpoint per layer and resolves per tile:
 
 ```
 GET /seascape/{z}/{x}/{y}.webp   raster: z≤8 → planet · z>8 in a populated grid cell → that cell's overlay · else → overzoom the planet · miss → transparent
-GET /seascape/{z}/{x}/{y}.pbf    vector: contours.pmtiles passthrough
+GET /seascape/{z}/{x}/{y}.pbf    vector: contours.pmtiles passthrough (contours, soundings, drying, coverage layers)
 GET /seascape/raster.json        TileJSON (terrarium raster)
 GET /seascape/vector.json        TileJSON (vector layers)
 ```
 
-This keeps the base at native z8 (no global upsampling) while presenting a single
-maxzoom-13 source — the Worker synthesizes the high-zoom GEBCO fallback on demand
+This keeps the base at native z8 (no global upsampling) while presenting one
+source whose served maxzoom tracks the deepest overlay cell — the Worker
+synthesizes the high-zoom GEBCO fallback on demand
 and caches it. Overlays carry GEBCO-fill (Terrarium has no transparency, so a
 source's nodata would otherwise punch holes over the base).
 
@@ -134,7 +141,7 @@ source's nodata would otherwise punch holes over the base).
 
 - **Every push** (ci.yml) builds the toolchain image and runs the offline self-checks (`test-sources`, `test-engine`); the viewer builds too.
 - **Manual dispatch** (build.yml) runs the full build: prepare each source (matrix) → plan the covering and diff it against the previous run → aggregate the changed tiles (sharded across runners) → bundle planet + overlays + contours + manifest. Build state and per-commit bundles persist in the public **data bucket** (`data.openwaters.io`) under `bathymetry/`, so rebuilds are incremental. Manual runs (Actions → Build → Run workflow) accept an optional `bbox` and shard count.
-- **On a published release** the build for that commit is promoted from the data bucket into the Worker-fronted **serving bucket** (`tiles.openwaters.io`) at `bathymetry/<sha>/`, the Worker is deployed pointing at that release (`RELEASE_PREFIX`), and the viewer ships to GitHub Pages. Re-dispatching `release.yml` with a prior built sha republishes it with no rebuild.
+- **On a published release** the build for that commit (`bathymetry/build/<sha>/` in the data bucket) is promoted into the Worker-fronted **serving bucket** (`tiles.openwaters.io`) at `seascape/<sha>/`, the Worker is deployed pointing at it (`RELEASE_PREFIX=seascape/<sha>/`), and the viewer ships to GitHub Pages. Re-dispatching `release.yml` with a prior built sha republishes it with no rebuild.
 
 Two R2 buckets — `data` (public, all build state) and the serving bucket. Required
 repository secrets: `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`,
