@@ -2,5 +2,6 @@
     "name": "EMODnet Bathymetry 2024 DTM",
     "producer": "EMODnet Bathymetry Consortium",
     "website": "https://emodnet.ec.europa.eu/en/bathymetry",
-    "license": "CC-BY 4.0"
+    "license": "CC-BY 4.0",
+    "land_clamp": true
 }

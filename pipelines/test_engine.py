@@ -32,23 +32,29 @@ PIPE = os.path.dirname(os.path.abspath(__file__))
 def run(tmp, *args):
     # Small macrotile_z / num_overviews keep the synthetic rasters tiny.
     # SKIP_CONTOURS/SKIP_SMOOTH: this is the raster priority test (both have/need none).
+    # SKIP_DRYING: this synthetic world has no land mask, so drying (which needs one) is off here;
+    # check_drying exercises it directly against a mask.
     env = {**os.environ, "SOURCES_DIR": "sources", "PYTHONPATH": PIPE,
-           "MACROTILE_Z": "10", "NUM_OVERVIEWS": "2", "SKIP_CONTOURS": "1", "SKIP_SMOOTH": "1"}
+           "MACROTILE_Z": "10", "NUM_OVERVIEWS": "2", "SKIP_CONTOURS": "1", "SKIP_SMOOTH": "1",
+           "SKIP_DRYING": "1"}
     subprocess.run([sys.executable, os.path.join(PIPE, args[0]), *args[1:]],
                    cwd=tmp, env=env, check=True)
 
 
-def make_source(tmp, sid, west, north, deg, px, value, max_zoom):
+def make_source(tmp, sid, west, north, deg, px, value, max_zoom, extra_meta=None, deg_ns=None):
+    """A constant-value EPSG:4326 source COG + metadata.json. Square (deg x deg) by default;
+    pass deg_ns for a rectangle (north-south degrees). extra_meta merges extra metadata keys."""
     os.makedirs(f"{tmp}/sources/{sid}", exist_ok=True)
     os.makedirs(f"{tmp}/store/source/{sid}", exist_ok=True)
     arr = np.full((px, px), value, dtype="float32")
-    res = deg / px
+    res_x, res_y = deg / px, (deg if deg_ns is None else deg_ns) / px
     with rasterio.open(f"{tmp}/store/source/{sid}/{sid}_0.tif", "w", driver="GTiff",
                        height=px, width=px, count=1, dtype="float32", nodata=-9999,
-                       crs="EPSG:4326", transform=from_origin(west, north, res, res)) as d:
+                       crs="EPSG:4326", transform=from_origin(west, north, res_x, res_y)) as d:
         d.write(arr, 1)
+    meta = {"name": sid, "max_zoom": max_zoom, **(extra_meta or {})}
     with open(f"{tmp}/sources/{sid}/metadata.json", "w") as f:
-        json.dump({"name": sid, "max_zoom": max_zoom}, f)
+        json.dump(meta, f)
 
 
 def decode_bundles(tmp):
@@ -252,6 +258,148 @@ def check_grid_split():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def check_land_clamp():
+    """The flag-gated post-warp land clamp, through the REAL reproject(): a `land_clamp`
+    coarse source's negatives under the land mask go to 0, an unflagged finer source's
+    negatives survive (provenance by construction), and the mask rasterizes onto the exact
+    buffered -te/-tr the warp uses (alignment → seam determinism; a mismatch would raise).
+
+    Not covered here (holds by construction, so not worth standing up the vector stages):
+    clamped land reads 0, so gdal_contour's negative levels and soundings' negative-only
+    candidate search both find nothing on it — the terrain assertion is the load-bearing one.
+    """
+    import mercantile
+    import config
+    import aggregation_reproject
+
+    tmp = tempfile.mkdtemp()
+    cwd, saved_dir = os.getcwd(), config.SOURCES_DIR
+    saved_landmask = os.environ.pop("LANDMASK", None)  # else an exported dev mask overrides the
+    try:                                               # synthetic one → geography-dependent failure
+        os.chdir(tmp)
+        config.SOURCES_DIR = "sources"  # in-process reproject() reads config.SOURCES_DIR directly
+
+        tile = mercantile.Tile(x=75, y=96, z=8)  # the plan's NY-harbor example tile
+        w, s, e, n = mercantile.bounds(tile)
+        mid_lon, mid_lat = (w + e) / 2, (s + n) / 2
+
+        # coarse flagged (-5) fills the whole tile; fine unflagged (-8) covers only the west half.
+        # (make_source builds each source COG + metadata on the shared source-store contract.)
+        make_source(tmp, "cbase", w, n, e - w, 256, -5.0, 10, extra_meta={"land_clamp": True}, deg_ns=n - s)
+        make_source(tmp, "cfine", w, n, mid_lon - w, 256, -8.0, 11, deg_ns=n - s)
+
+        # land = the north half of the tile (+ generous halo), water = the south half.
+        gj = "land.geojson"
+        with open(gj, "w") as f:
+            json.dump({"type": "FeatureCollection", "features": [{"type": "Feature", "properties": {},
+                       "geometry": {"type": "Polygon", "coordinates": [[[w - 1, mid_lat], [e + 1, mid_lat],
+                                    [e + 1, n + 1], [w - 1, n + 1], [w - 1, mid_lat]]]}}]}, f)
+        os.makedirs("store/landmask", exist_ok=True)
+        subprocess.run(["ogr2ogr", "-f", "FlatGeobuf", "-t_srs", "EPSG:3857", "-overwrite",
+                        "store/landmask/land.fgb", gj], check=True)
+
+        aid = "01CLAMPCLAMPCLAMPCLAMPCLAMP"
+        os.makedirs(f"store/aggregation/{aid}")
+        csv = f"store/aggregation/{aid}/8-75-96-11-aggregation.csv"
+        with open(csv, "w") as f:
+            f.write("source,filename,maxzoom\ncfine,cfine_0.tif,11\ncbase,cbase_0.tif,10\n")
+
+        aggregation_reproject.reproject(csv)
+
+        tdir = f"store/aggregation/{aid}/8-75-96-11-tmp"
+
+        def sample(tiff, row_frac, col_frac):
+            with rasterio.open(tiff) as r:
+                arr = r.read(1)
+            return float(arr[int(r.height * row_frac), int(r.width * col_frac)])
+
+        # cbase (group 1, flagged): north interior clamped to 0, south interior still -5.
+        assert sample(f"{tdir}/1-3857.tiff", 0.25, 0.5) == 0.0, "coarse land negative must clamp to 0"
+        assert sample(f"{tdir}/1-3857.tiff", 0.75, 0.5) == -5.0, "coarse water must survive the clamp"
+        # cfine (group 0, unflagged): its negatives survive even under land (provenance).
+        assert sample(f"{tdir}/0-3857.tiff", 0.25, 0.25) == -8.0, "unflagged fine source must be untouched"
+        print("land-clamp ok — flagged coarse land→0, unflagged fine survives, mask aligned to warp")
+    finally:
+        config.SOURCES_DIR = saved_dir
+        if saved_landmask is not None:
+            os.environ["LANDMASK"] = saved_landmask
+        os.chdir(cwd)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def check_drying():
+    """The drying fork through the REAL drying_run.generate(): off a merged DEM + the tile's land
+    mask it polygonizes the foreshore (0 <= elev <= DRYING_CAP, seaward of land) into a `drying`
+    layer. Two adjacent tiles carry the same world band across their shared edge, so the assertions
+    cover: polygons over the band, none under land, none over above-cap topo, and — the seam
+    contract — the two tiles' polygons meet at the boundary (each clipped exactly to its bbox)."""
+    import geopandas as gpd
+    import mercantile
+    from pyproj import Transformer
+    from shapely.geometry import Point
+
+    import config
+    import drying_run
+    from aggregation_reproject import get_resolution
+
+    tmp = tempfile.mkdtemp()
+    cwd = os.getcwd()
+    cap = config.DRYING_CAP
+    aid = "01DRYINGDRYINGDRYINGDRYING"
+    try:
+        os.chdir(tmp)
+        to4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
+
+        def build(tile):
+            """Write a merged DEM + land mask for `tile` on its native 3857 grid, run generate()."""
+            stem = f"{tile.z}-{tile.x}-{tile.y}-{tile.z}"  # child_z == z: a native 512 px tile
+            tdir = f"store/aggregation/{aid}/{stem}-tmp"
+            os.makedirs(tdir, exist_ok=True)
+            b = mercantile.xy_bounds(tile)
+            res = get_resolution(tile.z)
+            px = round((b.right - b.left) / res)
+            tr = from_origin(b.left, b.top, res, res)
+            q = px // 5
+            dem = np.full((px, px), -50.0, dtype="float32")  # deep water baseline
+            dem[:q, :] = 2.0            # north band, in-band value but UNDER land -> excluded
+            dem[q:2 * q, :] = cap + 50  # water above the cap -> not drying
+            dem[2 * q:3 * q, :] = 2.0   # water in-band -> DRYING
+            land = np.zeros((px, px), dtype="uint8")
+            land[:q, :] = 1             # land = the north fifth
+            with rasterio.open(f"{tdir}/0-3857.tiff", "w", driver="GTiff", height=px, width=px,
+                               count=1, dtype="float32", nodata=-9999, crs="EPSG:3857",
+                               transform=tr) as d:
+                d.write(dem, 1)
+            with rasterio.open(f"{tdir}/landmask.tif", "w", driver="GTiff", height=px, width=px,
+                               count=1, dtype="uint8", nodata=0, crs="EPSG:3857", transform=tr) as d:
+                d.write(land, 1)
+            drying_run.generate(f"store/aggregation/{aid}/{stem}-aggregation.csv")
+            row_lonlat = lambda r: to4326.transform(*(tr * (px // 2 + 0.5, r + 0.5)))
+            return (gpd.read_file(f"store/drying/{stem}.fgb"),
+                    {"band": Point(row_lonlat(2 * q + q // 2)),   # water in-band cell centre
+                     "land": Point(row_lonlat(q // 2)),           # in-band cell under land
+                     "cap": Point(row_lonlat(q + q // 2))})       # above-cap water cell
+
+        left = mercantile.Tile(x=301, y=384, z=10)
+        right = mercantile.Tile(x=302, y=384, z=10)          # shares left's east edge
+        gL, pts = build(left)
+        gR, _ = build(right)
+        assert len(gL) > 0, "drying must produce foreshore polygons"
+        assert gL.covers(pts["band"]).any(), "a drying polygon must cover the water foreshore band"
+        assert not gL.covers(pts["land"]).any(), "no drying polygon may cover land"
+        assert not gL.covers(pts["cap"]).any(), "no drying polygon may cover above-cap topo"
+
+        # Seam: left's polygons reach its east edge, right's reach its west edge, and they are the
+        # same longitude (each clipped exactly to its bbox) — so the fills meet across the boundary.
+        seam = mercantile.bounds(left).east
+        assert abs(gL.total_bounds[2] - seam) < 1e-4, f"left drying stops short of the seam: {gL.total_bounds[2]}"
+        assert abs(gR.total_bounds[0] - seam) < 1e-4, f"right drying stops short of the seam: {gR.total_bounds[0]}"
+        print("drying ok — foreshore band tinted, land/above-cap excluded, tiles meet at the seam")
+    finally:
+        os.chdir(cwd)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     tmp = tempfile.mkdtemp()
     try:
@@ -378,8 +526,14 @@ def main():
 
 
 if __name__ == "__main__":
+    import drying_run
+    import landmask
+    landmask._check()
+    drying_run._check()
     check_priority()
     check_shard_partition()
     check_stale_overview()
     check_grid_split()
+    check_land_clamp()
+    check_drying()
     main()

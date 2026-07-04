@@ -9,6 +9,12 @@ set working-directory := 'pipelines'
 source id:
     just ../sources/{{id}}/
 
+# Prepare the OSM land mask once (download -> unzip -> EPSG:3857 FlatGeobuf at
+# store/landmask/land.fgb). Flagged coarse sources (GEBCO/EMODnet) clamp negative
+# land pixels against it during aggregation. LANDMASK overrides the output path.
+landmask:
+    uv run python landmask.py prep
+
 # Prepare every source under sources/.
 sources:
     #!/usr/bin/env bash
@@ -25,6 +31,7 @@ planet:
     just combine
     just contours
     just soundings
+    just drying
 
 # Plan the covering: slice the planet into aggregation tiles (BBOX="W,S,E,N" for a region).
 cover:
@@ -96,6 +103,11 @@ soundings:
     uv run python soundings_run.py bundle
     uv run python soundings_run.py fold
 
+# Drying areas (green foreshore): bundle the per-tile polygons, then fold into contours.pmtiles.
+drying:
+    uv run python drying_run.py bundle
+    uv run python drying_run.py fold
+
 # tippecanoe this shard's local FGBs -> contours-shard-{i}.pmtiles (CI pulls only the
 # shard's slice + writes store/contour-maxz.txt; merged by contour-merge).
 contour-shard i:
@@ -111,6 +123,8 @@ contour-merge:
 # sources) / NOAA (streaming) via SOURCE_VSI_BASE — the same read path as CI's aggregate, so
 # no local source prep. `just preview-local` instead builds from already-prepared sources in
 # store/source (no R2; SOURCE_VSI_BASE unset). Override SOURCE_VSI_BASE/BOUNDS_BASE for a mirror.
+# The coarse-source land clamp needs the land mask: streamed from R2 when published, else built
+# locally once (a 700 MB OSM download; override with LANDMASK to reuse an existing copy).
 # View with the two dev servers in separate terminals:
 #   cd worker && npm install && npm run dev               # tile Worker on :8787
 #   VITE_TILES_BASE=http://localhost:8787 npm run dev     # Vite on :5173 (repo root)
@@ -128,10 +142,21 @@ preview bbox="-74.30,40.40,-73.75,40.80" local="":
         done
         # S-102 re-registers from a live catalog (and may not be in R2 yet), so re-sync it
         just source noaa_s102
+        # Land mask for the coarse-source clamp: prefer a local copy if it's already there,
+        # else stream it from R2 like the sources; if neither exists, it's built locally (below).
+        r2mask="https://data.openwaters.io/bathymetry/landmask/land.fgb"
+        if [ ! -f store/landmask/land.fgb ] && curl -fsI "$r2mask" >/dev/null 2>&1; then
+            export LANDMASK="${LANDMASK:-/vsicurl/$r2mask}"
+        else
+            export LANDMASK="${LANDMASK:-store/landmask/land.fgb}"
+        fi
     else
         unset SOURCE_VSI_BASE  # read prepared COGs from store/source on disk
+        export LANDMASK="${LANDMASK:-store/landmask/land.fgb}"
     fi
-    rm -rf store/aggregation store/pmtiles store/bundle store/meta store/contour store/soundings
+    # Build the mask locally (one-time OSM download) if we're pointed at a local path with no file.
+    case "$LANDMASK" in /vsicurl/*) : ;; *) [ -f "$LANDMASK" ] || just landmask ;; esac
+    rm -rf store/aggregation store/pmtiles store/bundle store/meta store/contour store/soundings store/drying
     just planet
     ../worker/seed.sh
 

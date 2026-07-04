@@ -25,6 +25,8 @@ import aggregation_merge
 import aggregation_reproject
 import aggregation_tile
 import contour_run
+import drying_run
+import landmask
 import smooth
 import soundings_run
 import utils
@@ -32,6 +34,7 @@ import utils
 # The forks share the merged DEM; set these to 1 for raster-only / no-smooth runs.
 SKIP_CONTOURS = os.environ.get("SKIP_CONTOURS", "")
 SKIP_SOUNDINGS = os.environ.get("SKIP_SOUNDINGS", "")
+SKIP_DRYING = os.environ.get("SKIP_DRYING", "")
 SKIP_SMOOTH = os.environ.get("SKIP_SMOOTH", "")
 
 
@@ -43,11 +46,20 @@ def run(filepath):
     tmp_folder = filepath.replace("-aggregation.csv", "-tmp")
     if not SKIP_SMOOTH:
         smooth.smooth_merged(tmp_folder)     # slope-selective blur, shared by both
+    mask_tif = f"{tmp_folder}/landmask.tif"
+    if os.path.isfile(mask_tif):
+        # A flagged coarse source was land-clamped here; the merge seam feather re-bleeds
+        # negative water onto that clamped land (and smooth widens it). Re-clamp the final
+        # merged DEM so every fork below sees a crisp land=0 shoreline, not a soft blue rim.
+        dem = f"{tmp_folder}/{len(glob(f'{tmp_folder}/*.tiff')) - 1}-3857.tiff"
+        landmask.clamp_merged(dem, mask_tif)
     aggregation_tile.main(filepath)          # raster Terrain-RGB tiles
     if not SKIP_CONTOURS:
         contour_run.generate(filepath)       # vector contours off the merged DEM
     if not SKIP_SOUNDINGS:
         soundings_run.generate(filepath)     # vector soundings off the same merged DEM
+    if not SKIP_DRYING:
+        drying_run.generate(filepath)        # green-foreshore polygons off the DEM + land mask
     if not os.environ.get("KEEP_TMP"):       # KEEP_TMP=1 preserves the merged DEM for re-running a fork
         shutil.rmtree(tmp_folder)
     utils.run_command(f'touch {filepath.replace("-aggregation.csv", "-aggregation.done")}')
@@ -129,6 +141,8 @@ def run_all(filepaths):
     if not filepaths:
         print("nothing to do.")
         return
+    landmask.require()  # fail fast + actionably if a flagged source needs the mask and it's
+                        # missing, not per-tile deep in the pool with an opaque ogr2ogr error
     print(f"start aggregating {len(filepaths)} items...")
     # Each tile holds a multi-GB merged DEM (a max 32768px tile ≈ 4 GB float32, more
     # with the halo + smooth) so peak RAM ≈ workers × DEM. Cap workers in CI via

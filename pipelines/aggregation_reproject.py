@@ -21,6 +21,7 @@ import numpy as np
 import rasterio
 
 import config
+import landmask
 import utils
 
 # Streaming sources (CUDEM off NOAA, the locally-prepared sources off public R2) are
@@ -107,8 +108,7 @@ def warp_mixed(inputs, out_tif, zoom, aggregation_tile, buffer):
     is reprojected from its own UTM zone, so a zone-crossing tile keeps every source.
     No value transform: streamed sources skip source_datum, MLLW->MSL is the Phase 5
     VDatum job; nan source-nodata maps to NODATA via -dstnodata."""
-    left, bottom, right, top = mercantile.xy_bounds(aggregation_tile)
-    left, bottom, right, top = left - buffer, bottom - buffer, right + buffer, top + buffer
+    left, bottom, right, top = buffered_bounds(aggregation_tile, buffer)
     res = get_resolution(zoom)
     # ZSTD+predictor3 (single-band Float32) shrinks this transient ~4x; SPARSE_OK skips
     # all-nodata blocks. Cuts the disk a deep z->z14 tile needs (a 32768px tile is ~4 GB
@@ -123,6 +123,14 @@ def warp_mixed(inputs, out_tif, zoom, aggregation_tile, buffer):
 def get_resolution(zoom):
     bounds = mercantile.xy_bounds(mercantile.Tile(x=0, y=0, z=zoom))
     return (bounds.right - bounds.left) / 512
+
+
+def buffered_bounds(aggregation_tile, buffer):
+    """The tile's EPSG:3857 bounds expanded by `buffer` on every side — the halo -te the warp
+    builds on. The land-mask rasterize must reuse this so its grid matches the warp pixel-for-
+    pixel, so it's one definition here rather than three inline copies that must stay in sync."""
+    left, bottom, right, top = mercantile.xy_bounds(aggregation_tile)
+    return left - buffer, bottom - buffer, right + buffer, top + buffer
 
 
 def _run(cmd, what, tries=3):
@@ -148,8 +156,7 @@ def _run(cmd, what, tries=3):
 
 
 def create_warp(vrt, vrt_3857, zoom, aggregation_tile, buffer):
-    left, bottom, right, top = mercantile.xy_bounds(aggregation_tile)
-    left, bottom, right, top = left - buffer, bottom - buffer, right + buffer, top + buffer
+    left, bottom, right, top = buffered_bounds(aggregation_tile, buffer)
     res = get_resolution(zoom)
     _run(f"gdalwarp -of vrt -overwrite -t_srs EPSG:3857 -tr {res} {res} "
          f"-te {left} {bottom} {right} {top} -r {RESAMPLE} -dstnodata {NODATA} {vrt} {vrt_3857}",
@@ -208,8 +215,9 @@ def reproject(filepath):
     buffer_3857_rounded = buffer_pixels * resolution
 
     for i, source_items in enumerate(grouped):
+        meta = config.load_metadata(source_items[0]["source"])
         out_tiff = f"{tmp_folder}/{i}-3857.tiff"
-        if config.load_metadata(source_items[0]["source"]).get("mixed_crs"):
+        if meta.get("mixed_crs"):
             # Per-tile UTM zones: warp the per-tile VRTs straight to a raster (gdalwarp
             # reprojects each input), then the same translate makes the COG.
             merged = f"{tmp_folder}/{i}-3857-merged.tif"
@@ -223,8 +231,21 @@ def reproject(filepath):
             vrt_3857 = f"{tmp_folder}/{i}-3857.vrt"
             create_warp(vrt, vrt_3857, maxzoom, aggregation_tile, buffer_3857_rounded)
             translate(vrt_3857, out_tiff)
-        if config.load_metadata(source_items[0]["source"]).get("negate"):
+        if meta.get("negate"):
             negate_band1(out_tiff)  # streamed positive-down source (S-102 depth) -> elevation
+        if meta.get("land_clamp"):
+            # Coarse source (GEBCO/EMODnet) with no land/water concept: its shoreline cells
+            # read negative on land. Clamp valid ^ land ^ <0 -> 0 right after warp, so the
+            # merge/contour/soundings never see the false water. The mask rasterizes onto the
+            # SAME buffered -te/-tr the warp used (all groups warp at `maxzoom`), so it aligns
+            # pixel-for-pixel and tile halos clamp identically. Rasterize once per tile (atomic,
+            # so a crashed rasterize can't leave a truncated mask this cache would trust), reuse
+            # across flagged sources. Fails loudly if LANDMASK is unreadable (ogr2ogr raises).
+            mask_tif = f"{tmp_folder}/landmask.tif"
+            if not os.path.isfile(mask_tif):
+                landmask.rasterize(buffered_bounds(aggregation_tile, buffer_3857_rounded),
+                                   resolution, mask_tif)
+            landmask.clamp(out_tiff, mask_tif)
         if len(grouped) > 1 and not contains_nodata_pixels(out_tiff):
             break
 

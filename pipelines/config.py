@@ -20,6 +20,13 @@ CONTOUR_LEVELS = [int(x) for x in (
     "-100 -50 -30 -20 -10 -5 -2"
 ).split()]
 
+# Drying areas (green foreshore): seabed above chart datum that covers/uncovers with the tide —
+# elevation in [0, DRYING_CAP] seaward of the OSM land line. The cap (metres, ~the Bay of Fundy
+# tidal range) keeps S-102's above-MHW shoreline topo (piers, bluff toes reach +20..+30 m) out of
+# the foreshore tint. Ceiling: a fixed global cap over-includes steep coastal topo just seaward of
+# the land line; upgrade path is a spatially-varying MHW surface (VDatum et al.).
+DRYING_CAP = float(os.environ.get("DRYING_CAP", "16"))
+
 # Feet/fathom isobaths: a second contour set at the classic fathom curves. Friendly feet depths
 # (6, 12, 18, 30, 60, 120, 180, 300, 600 ft …) are exactly whole fathoms in feet, so one geometry
 # labels as either — the viewer picks feet or fathoms. In metres (negative, positive-down) for

@@ -321,6 +321,20 @@ export default {
               depth_fm: "Number",
             },
           },
+          {
+            // Green-foreshore polygons (drying areas) — geometry only, no attributes.
+            id: "drying",
+            fields: {},
+          },
+          {
+            // Per-source data-extent polygons (provenance / click-to-identify).
+            id: "coverage",
+            fields: {
+              source_id: "String",
+              source_name: "String",
+              source_maxzoom: "Number",
+            },
+          },
         ],
         attribution: mf.attribution ?? "",
       });

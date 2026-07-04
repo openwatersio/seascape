@@ -146,6 +146,34 @@ jobs:
           # (not into the root-owned dir); --exclude above keeps --delete off it.
           printf '%s' "${{ steps.check.outputs.hash }}" | aws s3 cp - "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/.recipe-hash"
 
+  # Mirror the OSM land mask to R2, rebuilding when landmask.py's recipe changes — same
+  # recipe-hash marker the sources use (a new OSM snapshot, MERC_LAT, or the inland-water
+  # upgrade all live in landmask.py, so hashing it catches every refresh; the pinned URL
+  # means the data can't drift underneath an unchanged recipe). Flagged coarse sources
+  # (GEBCO/EMODnet) clamp negative land pixels against it. The covering diff can't see the
+  # mask (it isn't in the aggregation CSVs), so a refresh still needs a force=true dispatch
+  # to re-aggregate the flagged tiles — the marker only automates the R2 mirror, not the diff.
+  landmask:
+    needs: image
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: read }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/ghcr-login
+      - name: Ensure land mask in R2
+        env:
+          RECIPE_HASH: ${{ hashFiles('pipelines/landmask.py') }}
+        run: |
+          have=$(aws s3 cp "s3://$DATA_BUCKET/bathymetry/landmask/.recipe-hash" - 2>/dev/null || true)
+          if [ -n "$RECIPE_HASH" ] && [ "$have" = "$RECIPE_HASH" ]; then
+            echo "land mask current in R2 (recipe unchanged)"; exit 0
+          fi
+          echo "land mask stale or missing (recipe=$RECIPE_HASH r2=${have:-none}) — rebuilding"
+          mkdir -p store
+          docker run --rm -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just landmask
+          aws s3 cp store/landmask/land.fgb "s3://$DATA_BUCKET/bathymetry/landmask/land.fgb"
+          printf '%s' "$RECIPE_HASH" | aws s3 cp - "s3://$DATA_BUCKET/bathymetry/landmask/.recipe-hash"
+
   # Cover the planet into aggregation tiles, diff against the previous covering,
   # and emit the shard matrix sized to the dirty count.
   plan:
@@ -220,9 +248,9 @@ jobs:
               aws s3 rm "s3://$DATA_BUCKET/bathymetry/aggregation/$id" --recursive
             }
           done
-      - name: Prune orphaned contour FGBs + soundings (covering re-tiled)
+      - name: Prune orphaned contour FGBs + soundings + drying (covering re-tiled)
         run: |
-          # store/contour FGBs (and store/soundings geojson) are keyed {z}-{x}-{y}-{child_z},
+          # store/contour FGBs (and store/soundings geojson, store/drying FGBs) are keyed {z}-{x}-{y}-{child_z},
           # same as the covering's aggregation tiles. A source's footprint/maxzoom shift
           # re-tiles its area, but the sync (line ~270) has no --delete, so the superseded
           # file lingers in R2 and bundle globs EVERY one → two sets overlap. Drop any R2
@@ -245,6 +273,14 @@ jobs:
               aws s3 rm "s3://$DATA_BUCKET/$key"
             }
           done < /tmp/r2-snd.txt
+          aws s3 ls "s3://$DATA_BUCKET/bathymetry/drying/" --recursive | awk '{print $NF}' | grep '\.fgb$' > /tmp/r2-dry.txt || true
+          while read -r key; do
+            [ -n "$key" ] || continue
+            grep -qx "$(basename "$key" .fgb)" /tmp/valid-stems.txt || {
+              echo "pruning orphan drying $key"
+              aws s3 rm "s3://$DATA_BUCKET/$key"
+            }
+          done < /tmp/r2-dry.txt
       - name: Prune orphaned pmtiles (covering re-tiled)
         run: |
           # Same orphan class as the contour prune: a re-tiled covering leaves the old
@@ -281,7 +317,7 @@ jobs:
   # Shards re-derive the same sorted dirty list and never overlap, so each pushes
   # disjoint tile keys back to the store.
   aggregate:
-    needs: [image, sources, plan]
+    needs: [image, sources, plan, landmask]
     # Like plan: a red source job must not skip the build (see the sources comment).
     if: ${{ !cancelled() && needs.plan.result == 'success' }}
     runs-on: ubuntu-latest
@@ -302,7 +338,7 @@ jobs:
           # No R2 listing here: the shard reads its work from the plan's frozen dirty list
           # (shipped in the covering tarball, pulled above), so every shard partitions the
           # SAME list. Reproject range-reads sources via /vsicurl, so no pmtiles are pulled.
-          mkdir -p store/pmtiles store/contour store/soundings
+          mkdir -p store/pmtiles store/contour store/soundings store/drying
       - name: Aggregate shard ${{ matrix.shard.i }}/${{ matrix.shard.n }}
         run: |
           # SOURCE_VSI_BASE → reproject resolves each source tile to a public /vsicurl
@@ -311,8 +347,12 @@ jobs:
           # a heavy shard doesn't OOM the runner; GDAL_CACHEMAX trims the block cache
           # the /vsicurl reads accumulate (per worker). GDAL HTTP retry is set globally
           # in the Dockerfile (GDAL_HTTP_MAX_RETRY/RETRY_DELAY), so no per-run flag here.
+          # LANDMASK → flagged coarse sources (GEBCO/EMODnet) range-read the land mask FGB
+          # over /vsicurl and clamp negative land pixels; only the polygons each tile touches
+          # are read (FGB spatial index), so no per-shard download.
           docker run --rm -v "$PWD/store:/app/pipelines/store" \
             -e SOURCE_VSI_BASE="/vsicurl/https://data.openwaters.io/bathymetry/source" \
+            -e LANDMASK="/vsicurl/https://data.openwaters.io/bathymetry/landmask/land.fgb" \
             -e AGG_PROCESSES=2 -e GDAL_CACHEMAX=256 -e FORCE_REBUILD \
             "$IMAGE:${{ github.sha }}" just aggregate ${{ matrix.shard.i }} ${{ matrix.shard.n }}
       - name: Push tiles + contours + done-markers to R2
@@ -320,6 +360,7 @@ jobs:
           aws s3 sync store/pmtiles "s3://$DATA_BUCKET/bathymetry/pmtiles"
           aws s3 sync store/contour "s3://$DATA_BUCKET/bathymetry/contour"
           aws s3 sync store/soundings "s3://$DATA_BUCKET/bathymetry/soundings"
+          aws s3 sync store/drying "s3://$DATA_BUCKET/bathymetry/drying"
           # Markers only — the covering tarball is immutable (plan owns it) and the
           # untarred CSVs must not be re-uploaded as the loose files we just collapsed.
           aws s3 sync store/aggregation "s3://$DATA_BUCKET/bathymetry/aggregation" --exclude '*' --include '*.done'
@@ -559,17 +600,20 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/ghcr-login
-      - name: Pull shard pmtiles + soundings from R2
+      - name: Pull shard pmtiles + soundings + drying from R2
         run: |
-          mkdir -p store/bundle store/soundings
+          mkdir -p store/bundle store/soundings store/drying
           aws s3 sync "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/contour-shards" store/bundle
           aws s3 cp "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/contour-maxz.txt" store/contour-maxz.txt
           aws s3 sync "s3://$DATA_BUCKET/bathymetry/soundings" store/soundings
+          aws s3 sync "s3://$DATA_BUCKET/bathymetry/drying" store/drying
       - name: Merge contours
         run: docker run --rm -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just contour-merge
-      # Soundings aren't sharded (sparse) — bundle them here and fold into contours.pmtiles.
+      # Soundings + drying aren't sharded (sparse) — bundle them here and fold into contours.pmtiles.
       - name: Fold in soundings
         run: docker run --rm -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just soundings
+      - name: Fold in drying
+        run: docker run --rm -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just drying
       - name: Push contours.pmtiles to R2 build
         run: |
           aws s3 cp store/bundle/contours.pmtiles "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/contours.pmtiles" \

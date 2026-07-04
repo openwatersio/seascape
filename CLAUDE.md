@@ -12,7 +12,7 @@ Cloudflare Worker endpoint, with a small Vite/MapLibre(/Mapbox) viewer. Each sou
 is an independent build step; a planet build *combines* them. Two tile layers:
 
 - **terrain** — Terrarium-encoded raster (depth shading, hillshade, 3D), per-zoom quantized.
-- **contours** — bathymetric vector contours at non-uniform depth intervals.
+- **vector** — one `contours.pmtiles`: `contours` (metric + feet/fathom isobaths at non-uniform intervals), `soundings` (shoalest-per-cell spot depths), and `drying`/`coverage` (foreshore + data-extent polygons).
 
 The engine is Python (`uv` project under `pipelines/`) driving GDAL/tippecanoe as
 CLI subprocesses; `just` is the task runner. There's no compiled app code. The
@@ -27,8 +27,8 @@ through it if deps aren't installed locally.
 ```bash
 just source <id>   # prepare one source (fetch → datum → normalize → bounds → polygon → tarball)
 just sources       # prepare every source under ../sources/
-just planet        # cover → aggregate → downsample → bundle  (BBOX="W,S,E,N" for a region)
-just preview       # build the NY-harbor demo + seed the local Worker R2 (needs GEBCO in ../data/)
+just planet        # cover → aggregate → downsample → bundle → contours → soundings  (BBOX="W,S,E,N")
+just preview       # build the NY-harbor demo + seed the local Worker R2 (streams sources from R2 — no local data)
 just test-sources  # offline source-stage self-check (synthetic, no network)
 just test-engine   # offline aggregation/bundle self-check (priority, zoom cap, pyramid)
 ```
@@ -37,6 +37,11 @@ Outputs land in `pipelines/store/bundle/`: `planet.pmtiles`, one
 `overlay-{z}-{x}-{y}.pmtiles` per populated grid cell, `contours.pmtiles`, and
 `manifest.json`. Inspect a `.pmtiles` by dragging it into
 https://protomaps.github.io/PMTiles/.
+
+**Preview freely.** Run `just preview` (or `just preview-local`) to eyeball any
+visual change — it streams sources from R2 (or reads already-prepared COGs in
+`store/source`) and downloads no datasets. It's the intended fast feedback loop,
+not an expensive operation; use it whenever you touch shading, contours, or the viewer.
 
 ## Architecture
 
@@ -47,9 +52,9 @@ https://protomaps.github.io/PMTiles/.
 `store/aggregation`, `store/pmtiles`, `store/contour`, `store/bundle`, …).
 
 - **source** (`source_*.py`, per `sources/<id>/`): fetch → datum offset → normalize to a 4326 COG → `bounds.csv` → coverage polygon → tarball. Each source owns its recipe (`sources/<id>/Justfile`) composing the shared steps; `metadata.json` is attribution + an optional `max_zoom` cap. Priority derives from `(maxzoom, id)` — GEBCO loses (smallest maxzoom), so regional sources win in overlap.
-- **aggregation** (`aggregation_*.py`): `cover` slices the planet into source-aware aggregation tiles (one CSV each); `run` reprojects each source by priority into a merged Float32 DEM (Gaussian seam feather), slope-smooths it (`smooth.py`), encodes Terrarium raster tiles, and forks contours (`contour_run.py`) off the same merged DEM.
+- **aggregation** (`aggregation_*.py`): `cover` slices the planet into source-aware aggregation tiles (one CSV each); `run` reprojects each source by priority into a merged Float32 DEM (Gaussian seam feather), slope-smooths it (`smooth.py`), encodes Terrarium raster tiles, and forks contours (`contour_run.py`) and soundings (`soundings_run.py`) off the same merged DEM. Sources flagged `land_clamp` (GEBCO/EMODnet — coarse, no land/water concept) get their negative land pixels clamped to 0 against the OSM land mask (`landmask.py`, prep once with `just landmask`) right after warp, so shoreline cells don't paint false water/contours/soundings over land. The same mask feeds a `drying_run.py` fork: it polygonizes the green foreshore (elevation in `[0, DRYING_CAP]` seaward of the land line — chart drying areas) into a `drying` layer folded into `contours.pmtiles`.
 - **downsampling**: 2×2-average overview pyramid below each source's native maxzoom.
-- **bundle** (`bundle.py`): concat single-zoom pmtiles into `planet.pmtiles` (z0..`PLANET_MAX_ZOOM` = `macrotile_z`) + one `overlay-{cell}.pmtiles` per populated `OVERLAY_SPLIT_Z` grid cell (default z5) + `manifest.json`. Contours bundle via tippecanoe.
+- **bundle** (`bundle.py`): concat single-zoom pmtiles into `planet.pmtiles` (z0..`PLANET_MAX_ZOOM` = `macrotile_z`) + one `overlay-{cell}.pmtiles` per populated `OVERLAY_SPLIT_Z` grid cell (default z5) + `manifest.json`. Contours, soundings, and drying/coverage layers bundle into `contours.pmtiles` via tippecanoe.
 
 ### Why a planet cap + grid overlays + Worker (the serving model)
 
@@ -88,8 +93,10 @@ only changed aggregation tiles rebuild; clean tiles' pmtiles/contours are reused
 The build runs on `workflow_dispatch` only (a shared store shouldn't be mutated by
 routine pushes). Releasing a commit promotes the
 build a dispatch produced for it — so dispatch a build before you release that commit.
-On release, bundles promote to `bathymetry/<year>/`, the Worker deploys (`wrangler`),
-and the viewer ships to Pages.
+On release (`release.yml`), the commit's build promotes from the data bucket
+(`bathymetry/build/<sha>/`) to the serving bucket at `seascape/<sha>/`, the Worker
+deploys pointed at it (`RELEASE_PREFIX=seascape/<sha>/`, `wrangler`), and the viewer
+ships to Pages.
 
 ## Conventions
 

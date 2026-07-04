@@ -16,20 +16,31 @@ const tilesBase = (
 ).replace(/\/$/, "");
 const terrainTiles = `${tilesBase}/{z}/{x}/{y}.webp`;
 const contourTiles = `${tilesBase}/{z}/{x}/{y}.pbf`;
-const MAX_ZOOM = 13; // deepest source; the Worker overzooms the base for the rest
+const MAX_ZOOM = 13; // fallback deepest zoom when the manifest is unreachable
 
-// The Worker overzooms the raster terrain server-side up to MAX_ZOOM, but vector
-// contours are a plain passthrough — so tell MapLibre their true max zoom (the
-// deepest overlay cell in the manifest) and it overzooms them client-side above that.
-const manifest = await fetch(`${tilesBase}/manifest.json`)
+// Fetch the manifest with no-store: it's a tiny, mutable pointer that decides the served max
+// zoom, and the Worker serves it with stale-while-revalidate + a per-release ETag (constant
+// "dev" locally), so a cached copy would silently pin an old max zoom across builds/releases.
+const manifest = await fetch(`${tilesBase}/manifest.json`, {
+  cache: "no-store",
+})
   .then((r) => r.json())
   .catch(() => null);
+// Deepest zoom with real data — the deepest overlay cell (vectors are baked to this; the raster
+// has native tiles to here).
 const contourMax = manifest
   ? Math.max(
       manifest.planet.max_zoom,
       ...Object.values(manifest.overlay?.cells ?? {}),
     )
   : MAX_ZOOM;
+// Raster DEM: the Worker cubic-B-spline-overzooms the Terrarium raster PAST native data — that's
+// its whole purpose (smooth iso-depth band edges + shorelines at high zoom). Advertise the source
+// a few levels past the real-data ceiling so MapLibre fetches those smooth server tiles. Left to
+// its own overzoom MapLibre bilinearly stretches the last native tile, and bilinear is only C0, so
+// iso-depth band edges + shorelines facet into steps the further it is stretched; the Worker's
+// cubic B-spline is C2 (no faceting). Beyond a few levels it only blurs, so keep the margin small.
+const RASTER_MAX_ZOOM = contourMax + 3;
 
 // ─── Source coverage (provenance) ───────────────────────────────────────────
 // The `coverage` layer baked into contours.pmtiles (source footprints, props
@@ -131,6 +142,11 @@ const BAND_EDGES = {
 // Land above datum: translucent buff wash (paper-chart figure-ground — white stays
 // unambiguously "deep water"); OSM streets/names read through it.
 const LAND_COLOR = "rgba(247,240,221,0.66)";
+// Drying areas (INT-1 foreshore green): seabed above chart datum, seaward of the land line,
+// that covers/uncovers with the tide. A vector fill from the `drying` layer (the DEM ramp can't
+// tell it from dry land); sits above depth-shading, below the contour lines, at partial opacity
+// so it reads green over the buff land wash without hiding the OSM base.
+const DRYING_COLOR = "#a8d5ba";
 const depthRamp = (edges) => {
   const stops = [-10000, BAND_COLORS[0]];
   edges.forEach((d, i) =>
@@ -198,7 +214,7 @@ const style = {
       type: "raster-dem",
       tiles: [terrainTiles],
       tileSize: 512,
-      maxzoom: MAX_ZOOM, // Worker overzooms the z8 base for z>8 where no overlay exists
+      maxzoom: RASTER_MAX_ZOOM, // request the Worker's cubic overzoom, not client block-upsampling
       encoding: "terrarium",
       attribution: "&copy; <a href='https://www.gebco.net'>GEBCO</a>",
     },
@@ -242,6 +258,17 @@ const style = {
         "hillshade-highlight-color": "#ffffff",
         "hillshade-illumination-direction": 315,
       },
+    },
+    {
+      // Green foreshore fill, above depth-shading and below the contour lines. Where no drying
+      // polygon covers a >=0 pixel the DEM ramp still paints LAND_COLOR, so a mask miss degrades
+      // to today's land rendering, never to water-over-land. Below ~z10 the polygons speckle, so
+      // the layer only shows from z10 (generation stays full-range; this is the cheap viewer cap).
+      id: "drying-areas",
+      type: "fill",
+      source: "contours",
+      "source-layer": "drying",
+      paint: { "fill-color": DRYING_COLOR, "fill-opacity": 0.55 },
     },
     {
       id: "contour-lines",
@@ -381,6 +408,7 @@ const toggles = {
   "toggle-contours": ["contour-lines"],
   "toggle-labels": ["contour-labels"],
   "toggle-soundings": ["soundings"],
+  "toggle-drying": ["drying-areas"],
   "toggle-sources": [
     "source-fill",
     "source-highlight",

@@ -169,10 +169,15 @@ def attribution():
     Lists all configured sources, not just those a regional BBOX actually touched —
     filter by manifest bbox intersection if a partial build ever needs exact credit."""
     parts = [utils.ATTRIBUTION]
+    uses_landmask = False
     for sid in config.sources():
         m = config.load_metadata(sid)
+        uses_landmask = uses_landmask or bool(m.get("land_clamp"))
         web, name = m.get("website"), m.get("name", sid)
         parts.append(f'<a href="{web}">{name}</a>' if web else name)
+    if uses_landmask:  # OSM land polygons (ODbL) — the mask that clamps coarse land bleed
+        parts.append('<a href="https://osmdata.openstreetmap.de/data/land-polygons.html">'
+                     'OpenStreetMap land polygons (ODbL)</a>')
     return " | ".join(parts)
 
 
