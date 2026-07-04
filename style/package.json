@@ -1,0 +1,37 @@
+{
+  "name": "@openwaters/seascape",
+  "version": "0.1.0",
+  "description": "MapLibre GL style for Open Waters bathymetry tiles — depth shading, contours, soundings, drying areas",
+  "license": "BSD-3-Clause",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "development": "./index.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "index.ts"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/openwatersio/seascape.git",
+    "directory": "style"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepare": "tsc -p tsconfig.build.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@maplibre/maplibre-gl-style-spec": "^25.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "vitest": "^4.1.9"
+  }
+}

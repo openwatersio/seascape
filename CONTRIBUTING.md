@@ -19,6 +19,7 @@ sources/<id>/   →  pipelines/  →  store/bundle/        →  worker/        �
 | `pipelines/`                              | The Python engine (`uv` project) + `Justfile`. Stages: source → aggregation → downsampling → bundle.          |
 | `worker/`                                 | Cloudflare Worker (TypeScript) that serves the unified tile endpoint from R2.                                 |
 | `index.js`, `index.html`                  | Vite/MapLibre viewer (repo root).                                                                             |
+| `style/`                                  | `@openwaters/seascape` (npm workspace): the MapLibre style as a library — flavor + `sources()`/`layers()`; the Worker serves it assembled at `/style.json`. Tests: `npm test`. |
 | `data/`, `pipelines/store/`, `dist/`      | Build artifacts (gitignored). All pipeline stages write under `pipelines/store/`.                              |
 | `ROADMAP.md`                              | Roadmap: goal, workstreams, source/coverage, build scaling. Port plan lives in the Claude plan file referenced in commits. |
 

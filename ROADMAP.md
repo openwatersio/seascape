@@ -426,6 +426,14 @@ need/effort justifies; the inline notes above point here):
   from the tree (recoverable at git `9f93ad3`). Revisit for the Milestone-4 **soundings** layer,
   where sparse Chart-Datum points fit naturally — that, plus a resilient harvester and tile-bbox
   (not pixel-exact) coverage, is what it would need.
+- **GEBCO false-land over inland water** — where GEBCO lacks lake bathymetry it leaves the
+  underlying land DEM in place, so open inland water reads *positive* (+15 to +135 m observed
+  over Lake Huron) and the ≥0 depth ramp paints it tan/grey. A dedicated hi-res source fixes it
+  by overriding (great_lakes did, for the Great Lakes), but any lake/reservoir without one shows
+  the same. Global fix: mirror the existing `land_clamp` (which clamps GEBCO/EMODnet *negative
+  land*→0 against the OSM mask) with the inverse — clamp GEBCO *positive elevations*→nodata where
+  the mask says water — so GEBCO can't paint false land over any water body. Low effort (one more
+  masked-clamp in `landmask.py`); revisit when an inland gap without a dedicated source matters.
 
 (Concrete source candidates — marine and inland, with resolution/license/datum and
 BUILD/SKIP verdicts — live in [Source expansion](#source-expansion--worldwide-coverage-candidates) above. GLOBathy and the

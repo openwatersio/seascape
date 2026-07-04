@@ -25,6 +25,7 @@
  */
 
 import { PMTiles, Source, RangeResponse } from "pmtiles";
+import { style as seascapeStyle } from "@openwaters/seascape";
 import { unpackTerrarium, packTerrariumInto, cubicBSpline } from "./terrarium";
 import { OverlayIndex, overlayFor } from "./overlay";
 // jSquash on Workers: WASM must be imported as a module and passed to init()
@@ -283,9 +284,49 @@ export default {
       base !== "" && (path === base || path.startsWith(base + "/"));
     const rel = mounted ? path.slice(base.length) : path;
     const mount = mounted ? base : "";
+    // Absolute endpoint base echoed into TileJSON/style URLs. `wrangler dev`
+    // rewrites the request URL *and* Host header to the configured route host
+    // (tiles.openwaters.io), leaving no truthful origin in a local request —
+    // so dev pins localhost at the port the dev script binds
+    // (worker/package.json); prod trusts the request origin.
+    const tilesBase = dev
+      ? `http://localhost:8787${mount}`
+      : `${url.origin}${mount}`;
 
     if (rel === "/manifest.json") {
       return json(await manifest(env));
+    }
+    // Drop-in MapLibre style for these tiles — the same style the viewer
+    // renders (assembled by @openwaters/seascape); the endpoint base is derived
+    // from the request. Point MapLibre's `style:` (or Maputnik) at this URL
+    // directly. ?unit=m|ft|fm and ?safety=<metres> bake mariner defaults into
+    // the served style (the depth ramp can't read runtime state, so zero-build
+    // consumers parameterize here instead).
+    if (rel === "/style.json") {
+      const unitParam = url.searchParams.get("unit");
+      const unit =
+        unitParam === null
+          ? undefined
+          : (["m", "ft", "fm"] as const).find((u) => u === unitParam);
+      if (unitParam !== null && unit === undefined)
+        return new Response("unit must be m, ft, or fm", {
+          status: 400,
+          headers: CORS,
+        });
+      const safetyParam = url.searchParams.get("safety");
+      const safety = safetyParam === null ? undefined : Number(safetyParam);
+      if (safety !== undefined && !(Number.isFinite(safety) && safety >= 0))
+        return new Response("safety must be a non-negative number (metres)", {
+          status: 400,
+          headers: CORS,
+        });
+      return json(
+        seascapeStyle({
+          tilesBase,
+          ...(unit !== undefined ? { unit } : {}),
+          ...(safety !== undefined ? { safety } : {}),
+        }),
+      );
     }
     // TileJSON per representation — point MapLibre/Mapbox at these directly.
     // A TileJSON is single-format, so raster and vector get separate docs.
@@ -294,13 +335,17 @@ export default {
       return json({
         tilejson: "3.0.0",
         name: "Open Waters Bathymetry (raster)",
-        tiles: [`${url.origin}${mount}/{z}/{x}/{y}.webp`],
+        tiles: [`${tilesBase}/{z}/{x}/{y}.webp`],
         minzoom: mf.planet.min_zoom,
-        // Worker overzooms past native data, so the served ceiling is the deepest cell.
-        maxzoom: Math.max(
-          mf.planet.max_zoom,
-          ...Object.values(mf.overlay.cells),
-        ),
+        // Advertise a few levels past the deepest real data: the Worker
+        // cubic-B-spline-overzooms the Terrarium raster PAST native tiles —
+        // its whole purpose (smooth iso-depth band edges + shorelines at high
+        // zoom). A renderer left to its own overzoom bilinearly stretches the
+        // last native tile, and bilinear is only C0, so band edges facet into
+        // steps; the Worker's B-spline is C2. Beyond a few levels it only
+        // blurs, so the margin stays small.
+        maxzoom:
+          Math.max(mf.planet.max_zoom, ...Object.values(mf.overlay.cells)) + 3,
         bounds: mf.planet.bbox,
         encoding: "terrarium",
         attribution: mf.attribution ?? "",
@@ -312,7 +357,7 @@ export default {
       return json({
         tilejson: "3.0.0",
         name: "Open Waters Bathymetry",
-        tiles: [`${url.origin}${mount}/{z}/{x}/{y}.pbf`],
+        tiles: [`${tilesBase}/{z}/{x}/{y}.pbf`],
         minzoom: h.minZoom,
         maxzoom: h.maxZoom,
         bounds: [h.minLon, h.minLat, h.maxLon, h.maxLat],

@@ -58,9 +58,16 @@ jobs:
         run: |
           npm ci
           npm run build
+      - name: Style package tests (validate against the MapLibre style spec)
+        run: npm test
       - name: Worker self-checks
         run: |
           # The .mjs checks import .ts directly — needs Node >= 22.18 (default type
           # stripping); "node-version: 22" above resolves the latest 22.x, which is past it.
           node worker/src/terrarium.test.mjs
           node worker/src/overlay.test.mjs
+      - name: Worker type-check (imports @openwaters/seascape across packages)
+        working-directory: worker
+        run: |
+          npm ci
+          npx tsc --noEmit

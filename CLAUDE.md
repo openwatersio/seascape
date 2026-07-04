@@ -71,7 +71,15 @@ archives on purpose: a cell is a fixed fraction of the globe, so a new source ad
 *cells* instead of growing any single archive (a per-source overlay's size tracked
 its footprint and outgrew CI runner disks). Reads all pmtiles from R2 over HTTP
 range. The viewer (`index.js`) points at the Worker; `VITE_TILES_BASE` selects the
-endpoint (empty → `localhost:8787` dev).
+endpoint (empty → `localhost:8787` dev). The MapLibre style itself lives in
+**`style/`** (`@openwaters/seascape`, an npm workspace): flavor + `sources()` /
+`layers()` / `depthRelief()` in the protomaps-basemaps shape, consumed by the
+viewer and served assembled by the Worker at `/style.json` (`?unit=`/`?safety=`
+bake mariner defaults). Sources point at the Worker's TileJSON, so the style
+needs no manifest. TypeScript: `tsc` emits `style/dist/` on install (prepare);
+Vite dev reads `index.ts` directly (development export condition), but wrangler
+dev and `vite build` read `dist/` — rebuild after style edits. Tests: `npm test`
+(vitest).
 
 ### Contours (the custom vector layer)
 
