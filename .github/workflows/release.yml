@@ -135,6 +135,10 @@ jobs:
       - id: deployment
         uses: actions/deploy-pages@v5
 
+  # No cache purge on release: the Worker's edge-cache keys embed
+  # RELEASE_PREFIX, so the deploy itself switches cache namespaces and the
+  # old release's entries LRU out — nothing else on the zone is affected.
+
   # Probe the live endpoint after cutover — a broken route, missing bundle, or a
   # detached bucket fails the release loudly instead of 404ing silently. The Worker is
   # already live by here (deploy is the atomic cutover), so a failure means roll back:

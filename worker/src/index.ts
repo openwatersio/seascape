@@ -26,6 +26,7 @@
 
 import { PMTiles, Source, RangeResponse } from "pmtiles";
 import { style as seascapeStyle } from "@openwaters/seascape";
+import { CachedSource, contentEtag, OVERZOOM_TAG_VERSION } from "./cache";
 import { unpackTerrarium, packTerrariumInto, cubicBSpline } from "./terrarium";
 import { OverlayIndex, overlayFor } from "./overlay";
 // jSquash on Workers: WASM must be imported as a module and passed to init()
@@ -93,7 +94,15 @@ function pm(env: Env, file: string): PMTiles {
   if (!env.RELEASE_PREFIX) return new PMTiles(new R2Source(env.TILES, key));
   let p = pmCache.get(key);
   if (!p) {
-    p = new PMTiles(new R2Source(env.TILES, key));
+    // Range reads go through the colo cache (CachedSource) so directory walks
+    // are shared across isolates. The release prefix in the key makes entries
+    // self-invalidating across releases (superseded ones LRU out).
+    p = new PMTiles(
+      new CachedSource(
+        new R2Source(env.TILES, key),
+        `https://tiles.openwaters.io/__pmtiles/${key}`,
+      ),
+    );
     pmCache.set(key, p);
   }
   return p;
@@ -131,23 +140,23 @@ async function tile(
 // overshoot a sharp shelf edge into a halo and leaves no stairstep — the trade is that it
 // smooths rather than interpolating. Sampling clamps to the ancestor's edge: seams at
 // ancestor-tile boundaries flatten slightly — invisible.
-async function overzoom(
-  env: Env,
-  srcFile: string,
+// The synthesis half of overzoom, split from the ancestor fetch so the
+// handler can derive the tile's validator from the ancestor bytes (the output
+// is a pure function of them) and skip this work entirely on a matching
+// revalidation.
+async function synthesize(
+  parent: ArrayBuffer,
   srcMax: number,
   z: number,
   x: number,
   y: number,
-): Promise<ArrayBuffer | null> {
+): Promise<ArrayBuffer> {
   const levels = z - srcMax;
   const span = 1 << levels; // sub-tiles per axis within the ancestor
   const px = x >> levels,
     py = y >> levels; // ancestor tile at srcMax
   const subX = x - (px << levels),
     subY = y - (py << levels);
-
-  const parent = await tile(env, srcFile, srcMax, px, py);
-  if (!parent) return null; // ancestor missing in this source; caller tries the next
 
   await ensureCodec();
   const img = await decodeWebp(parent); // {data: Uint8ClampedArray RGBA, width, height}
@@ -201,6 +210,12 @@ async function overzoom(
   });
 }
 
+let seaEtagCache: string | undefined;
+async function seaLevelEtag(): Promise<string> {
+  if (!seaEtagCache) seaEtagCache = await contentEtag(await seaLevelBytes());
+  return seaEtagCache;
+}
+
 let seaLevelCache: ArrayBuffer | undefined;
 async function _makeSeaLevelTile(): Promise<ArrayBuffer> {
   // Terrarium 0 m — the land value, which the depth ramp paints as the land
@@ -224,8 +239,11 @@ async function seaLevelBytes(): Promise<ArrayBuffer> {
 const CORS = { "access-control-allow-origin": "*" };
 // Stable tile URLs: a deploy never orphans cached tiles, and stale-while-revalidate/-if-error keep
 // serving them (refreshing in the background) so a nav app shows stale bathymetry over a blank tile.
+// s-maxage governs the colo cache: entries live long because cache keys are
+// release-scoped — a deploy switches namespaces, so freshness comes from the
+// key, not the TTL. Browsers ignore s-maxage and keep the 1 h max-age.
 const TILE_CACHE =
-  "public, max-age=3600, stale-while-revalidate=31536000, stale-if-error=31536000";
+  "public, max-age=3600, s-maxage=2592000, stale-while-revalidate=31536000, stale-if-error=31536000";
 const WEBP = {
   "content-type": "image/webp",
   "cache-control": TILE_CACHE,
@@ -238,20 +256,49 @@ const MVT = {
 };
 
 export default {
-  async fetch(req: Request, env: Env): Promise<Response> {
+  async fetch(
+    req: Request,
+    env: Env,
+    ctx: ExecutionContext,
+  ): Promise<Response> {
     const noTile = () => new Response(null, { status: 204, headers: CORS });
     const url = new URL(req.url);
     const path = url.pathname;
-    // ETag = release id (from RELEASE_PREFIX): every resource the worker serves is deterministic
-    // within a release, so one id validates all of them. A revalidation that still matches gets a
-    // bodyless 304 — cheap refresh for stale-while-revalidate/-if-error. (ETag is per release, so a
-    // deploy re-downloads even unchanged tiles; a per-tile content hash would avoid that, at the
-    // cost of hashing every response.)
+    // Two validator schemes. JSON endpoints (manifest/TileJSON/style) use
+    // ETag = release id: they derive from the manifest, so they SHOULD change
+    // every release. Tiles use a content hash (see the tile section below):
+    // most releases leave most tiles byte-identical, and a content validator
+    // lets every unchanged tile revalidate to a bodyless 304 across releases
+    // instead of re-downloading.
     // Dev (no RELEASE_PREFIX): serve uncacheable and drop the validator — a local reseed must
     // show up immediately, but the ETag would be a constant "dev" that 304s stale bodies across
     // reseeds (browser cache), and long stale-while-revalidate would keep serving them. Prod
     // keeps the per-release ETag + long cache (every resource is deterministic within a release).
     const dev = !env.RELEASE_PREFIX;
+    // Colo cache: repeat tiles are served without touching R2 or the codecs.
+    // Only tile responses are put (below) — the JSON endpoints stay
+    // release-validated. The key embeds the release, so a deploy atomically
+    // switches namespaces (no purge, nothing else on the zone touched, and
+    // old isolates racing the rollout write only into the old namespace);
+    // superseded entries LRU out. Same-zone host so a manual dashboard
+    // purge-everything remains an escape hatch.
+    const cacheKey = `https://tiles.openwaters.io/__cache/${env.RELEASE_PREFIX}${path}`;
+    if (!dev && req.method === "GET") {
+      const hit = await caches.default.match(cacheKey);
+      if (hit) {
+        const hitTag = hit.headers.get("etag");
+        return hitTag && req.headers.get("If-None-Match") === hitTag
+          ? new Response(null, {
+              status: 304,
+              headers: {
+                etag: hitTag,
+                "cache-control": hit.headers.get("cache-control") ?? TILE_CACHE,
+                ...CORS,
+              },
+            })
+          : hit;
+      }
+    }
     const etag = `"${(env.RELEASE_PREFIX ?? "").split("/").filter(Boolean).pop() ?? "dev"}"`;
     const fresh = !dev && req.headers.get("If-None-Match") === etag;
     const send = (
@@ -417,19 +464,62 @@ export default {
       y = +m[3];
     const ext = m[4];
 
-    // Tile revalidation that still matches the deployed release → 304, skip the R2 read entirely.
-    if (fresh) return send(null, WEBP);
+    // Tiles validate by CONTENT, not release: ETag = hash of the tile bytes
+    // (or of the native ancestor a synthesized tile is a pure function of).
+    // An unchanged tile keeps its validator across releases, so clients
+    // revalidate to bodyless 304s instead of re-downloading.
+    const inm = req.headers.get("If-None-Match");
+    const notModified = (tag: string) =>
+      new Response(null, {
+        status: 304,
+        headers: { etag: tag, "cache-control": TILE_CACHE, ...CORS },
+      });
+    const sendTile = (
+      bytes: ArrayBuffer,
+      headers: Record<string, string>,
+      tag: string,
+      cache = true,
+    ): Response => {
+      const res = new Response(bytes, {
+        headers: {
+          ...headers,
+          etag: tag,
+          ...(dev ? { "cache-control": "no-store" } : {}),
+          ...CORS,
+        },
+      });
+      if (cache && !dev && req.method === "GET")
+        ctx.waitUntil(caches.default.put(cacheKey, res.clone()));
+      return inm === tag ? notModified(tag) : res;
+    };
+    // Overzoom: resolve the ancestor first — the validator derives from it, so
+    // a matching revalidation skips the decode → B-spline → encode entirely.
+    // (The 304 path doesn't populate the colo cache; the next full GET does.)
+    const overzoomTile = async (
+      srcFile: string,
+      srcMax: number,
+    ): Promise<Response | null> => {
+      const levels = z - srcMax;
+      const parent = await tile(env, srcFile, srcMax, x >> levels, y >> levels);
+      if (!parent) return null; // ancestor missing; caller tries the next source
+      const tag = await contentEtag(parent, OVERZOOM_TAG_VERSION + "-");
+      if (inm === tag) return notModified(tag);
+      return sendTile(await synthesize(parent, srcMax, z, x, y), WEBP, tag);
+    };
 
     const isVector = ext === "pbf" || ext === "mvt";
 
-    // Out-of-range x/y (the pmtiles coord check throws on these) → blank tile, not a 500.
+    // Out-of-range x/y (the pmtiles coord check throws on these) → blank tile,
+    // not a 500. Uncached: the address space is unbounded junk.
     const n = 2 ** z;
     if (x >= n || y >= n)
-      return isVector ? noTile() : send(await seaLevelBytes(), WEBP);
+      return isVector
+        ? noTile()
+        : sendTile(await seaLevelBytes(), WEBP, await seaLevelEtag(), false);
 
     if (isVector) {
       const t = await tile(env, "vector.pmtiles", z, x, y);
-      return t ? send(t, MVT) : noTile();
+      return t ? sendTile(t, MVT, await contentEtag(t)) : noTile();
     }
 
     // Terrain always returns a valid 512px tile (sea-level/land on a miss)
@@ -437,7 +527,9 @@ export default {
     const mf = await manifest(env);
     if (z <= mf.planet.max_zoom) {
       const t = await tile(env, "planet.pmtiles", z, x, y);
-      return t ? send(t, WEBP) : send(await seaLevelBytes(), WEBP);
+      return t
+        ? sendTile(t, WEBP, await contentEtag(t))
+        : sendTile(await seaLevelBytes(), WEBP, await seaLevelEtag());
     }
     // The tile's grid cell, if populated: serve it directly, else overzoom the
     // deepest ancestor present in the cell — the cell's max_zoom is only its
@@ -450,7 +542,7 @@ export default {
       if (z <= ov.maxZoom) {
         try {
           const t = await tile(env, ov.file, z, x, y);
-          if (t) return send(t, WEBP);
+          if (t) return sendTile(t, WEBP, await contentEtag(t));
         } catch (e) {
           console.log(`overlay ${ov.file} failed at ${z}/${x}/${y}: ${e}`);
         }
@@ -461,8 +553,8 @@ export default {
         sm--
       ) {
         try {
-          const t = await overzoom(env, ov.file, sm, z, x, y);
-          if (t) return send(t, WEBP);
+          const r = await overzoomTile(ov.file, sm);
+          if (r) return r;
         } catch (e) {
           console.log(
             `overlay ${ov.file} overzoom z${sm} failed at ${z}/${x}/${y}: ${e}`,
@@ -471,14 +563,9 @@ export default {
       }
     }
     // Nothing in the cell: overzoom the planet, or sea-level if even that's absent.
-    const planetOz = await overzoom(
-      env,
-      "planet.pmtiles",
-      mf.planet.max_zoom,
-      z,
-      x,
-      y,
+    const planetOz = await overzoomTile("planet.pmtiles", mf.planet.max_zoom);
+    return (
+      planetOz ?? sendTile(await seaLevelBytes(), WEBP, await seaLevelEtag())
     );
-    return send(planetOz ?? (await seaLevelBytes()), WEBP);
   },
 };
