@@ -202,12 +202,70 @@ export function sources({
   };
 }
 
+// ─── Client-side contours (maplibre-contour) ─────────────────────────────────
+// Alternative to the embedded contour tiles: generate isolines in the browser
+// from the Terrarium DEM with the openwatersio/maplibre-contour fork (the fork
+// adds fixed `lineLevels` — stock only does uniform intervals, which can't
+// express the INT ladder). Fidelity trade vs embedded: no Chaikin smoothing,
+// no fathom-curve geometry set (ft/fm labels are unit-converted from the
+// metric levels), soundings/drying/coverage still come from the embedded
+// vector source. In exchange: contours at any zoom and instant level changes
+// with no pipeline rebuild.
+
+// Standard INT isobaths (IHO S-4 B-411), metres positive-down. Keep in sync
+// with CONTOUR_LEVELS in pipelines/config.py (the embedded tiles' levels).
+export const INT_ISOBATHS_M = [
+  2, 5, 10, 20, 30, 50, 100, 200, 300, 500, 1000, 2000, 3000, 4000, 5000, 6000,
+  8000, 10000,
+];
+
+// The subset of maplibre-contour's DemSource this needs (structural — the
+// consumer constructs it and calls setupMaplibre; the lib stays out of this
+// package's dependencies).
+export interface ClientDemSource {
+  contourProtocolUrl(options: object): string;
+}
+
+// Vector source spec for client-generated contours. The consumer owns the
+// DemSource:
+//   const dem = new mlcontour.DemSource({ url: `${tilesBase}/{z}/{x}/{y}.webp`,
+//     encoding: "terrarium", maxzoom, worker: true });
+//   dem.setupMaplibre(maplibregl);
+//   style({ tilesBase, clientContours: clientContourSource(dem) });
+export function clientContourSource(
+  demSource: ClientDemSource,
+  { levels = INT_ISOBATHS_M, maxzoom = 15 }: {
+    levels?: number[];
+    maxzoom?: number;
+  } = {},
+): SourceSpecification {
+  return {
+    type: "vector",
+    tiles: [
+      demSource.contourProtocolUrl({
+        multiplier: -1, // DEM is negative below datum; flip to positive depth
+        contourLayer: "contours",
+        elevationKey: "ele",
+        levelKey: "level",
+        lineLevels: { 0: levels }, // fixed INT levels at every zoom
+        overzoom: 1,
+      }),
+    ],
+    maxzoom,
+  };
+}
+
 // ─── Layers ──────────────────────────────────────────────────────────────────
 export function layers(
   flavor: Flavor = day,
   {
     dem = "seascape-dem",
     vector = "seascape-vector",
+    // "client": contour lines/labels read client-generated isolines (see
+    // clientContourSource) from `clientVector`; everything else (soundings,
+    // drying, coverage) stays on the embedded vector source.
+    contours = "embedded",
+    clientVector = "seascape-contours",
     // Baked into the initial depth-shading ramp; keep in sync with the state
     // defaults (runtime changes go through depthRelief() + setPaintProperty).
     unit = state.unit.default,
@@ -215,10 +273,13 @@ export function layers(
   }: {
     dem?: string;
     vector?: string;
+    contours?: "embedded" | "client";
+    clientVector?: string;
     unit?: Unit;
     safety?: number;
   } = {},
 ): LayerSpecification[] {
+  const client = contours === "client";
   // One global-state variable — `unit` — drives every sounding/contour label
   // and which isobaths show.
   //
@@ -257,6 +318,18 @@ export function layers(
     ["concat", ["to-string", ["get", "depth_fm"]], "fm"],
     ["concat", ["to-string", ["get", "depth_abs_m"]], "m"],
   ];
+  // Client isolines carry only `ele` (metres positive-down, no fathom-curve
+  // set), so ft/fm labels unit-convert the metric levels instead of switching
+  // to fathom-curve geometries.
+  const clientLabelText: ExpressionSpecification = [
+    "case",
+    ["==", UNIT, "ft"],
+    ["concat", ["to-string", ["round", ["*", ["get", "ele"], 3.28084]]], "ft"],
+    ["==", UNIT, "fm"],
+    ["concat", ["to-string", ["round", ["/", ["get", "ele"], 1.8288]]], "fm"],
+    ["concat", ["to-string", ["get", "ele"]], "m"],
+  ];
+  const contourSource = client ? clientVector : vector;
 
   // Shared label styling so soundings and contour labels read as one chart.
   const labelSize: ExpressionSpecification = [
@@ -307,9 +380,10 @@ export function layers(
     {
       id: "contour-lines",
       type: "line",
-      source: vector,
+      source: contourSource,
       "source-layer": "contours",
-      filter: contourLineFilter,
+      // Client isolines are one metric set — no sys filter to apply.
+      ...(client ? {} : { filter: contourLineFilter }),
       // Presentation floor, not a data limit: below z6 isobaths read as clutter over depth shading.
       minzoom: 6,
       paint: {
@@ -321,13 +395,13 @@ export function layers(
     {
       id: "contour-labels",
       type: "symbol",
-      source: vector,
+      source: contourSource,
       "source-layer": "contours",
-      filter: contourLineFilter,
+      ...(client ? {} : { filter: contourLineFilter }),
       minzoom: 8,
       layout: {
         "symbol-placement": "line",
-        "text-field": contourLabelText,
+        "text-field": client ? clientLabelText : contourLabelText,
         "text-size": labelSize,
         "text-font": flavor.font,
         "text-letter-spacing": 0.1,
@@ -425,11 +499,15 @@ export function layers(
 // layers-only over your own basemap) + the bathymetry sources and layers.
 // `unit`/`safety` bake mariner defaults into both the depth ramp and the
 // style's global-state defaults, so labels and tint always agree.
+// `clientContours` (a clientContourSource() spec) switches the contour layers
+// to client-generated isolines — a JS-consumer feature; the hosted /style.json
+// can't register the DEM protocol, so it always serves embedded contours.
 export function style({
   tilesBase,
   flavor = day,
   glyphs = DEFAULT_GLYPHS,
   osm = true,
+  clientContours,
   unit = state.unit.default,
   safety = state.safety.default,
 }: {
@@ -437,6 +515,7 @@ export function style({
   flavor?: Flavor;
   glyphs?: string;
   osm?: boolean;
+  clientContours?: SourceSpecification;
   unit?: Unit;
   safety?: number;
 }): StyleSpecification {
@@ -459,8 +538,19 @@ export function style({
     name: "Open Waters Seascape",
     glyphs,
     state: { unit: { default: unit }, safety: { default: safety } },
-    sources: { ...osmSource, ...sources({ tilesBase }) },
-    layers: [...osmBase, ...layers(flavor, { unit, safety })],
+    sources: {
+      ...osmSource,
+      ...sources({ tilesBase }),
+      ...(clientContours ? { "seascape-contours": clientContours } : {}),
+    },
+    layers: [
+      ...osmBase,
+      ...layers(flavor, {
+        unit,
+        safety,
+        contours: clientContours ? "client" : "embedded",
+      }),
+    ],
   };
 }
 

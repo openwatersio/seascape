@@ -2,7 +2,9 @@ import { expect, test } from "vitest";
 import { validateStyleMin } from "@maplibre/maplibre-gl-style-spec";
 import {
   applyState,
+  clientContourSource,
   day,
+  INT_ISOBATHS_M,
   state,
   depthRelief,
   sources,
@@ -89,6 +91,44 @@ test("layers reference only the caller's source names", () => {
   expect(
     [...new Set(named.map((l) => (l as { source: string }).source))].sort(),
   ).toEqual(["bathy", "bathy-dem"]);
+});
+
+test("client contour mode swaps only the contour layers", () => {
+  const byId = Object.fromEntries(
+    layers(day, { contours: "client" }).map((l) => [
+      l.id,
+      l as { source?: string; filter?: unknown; minzoom?: number },
+    ]),
+  );
+  expect(byId["contour-lines"].source).toBe("seascape-contours");
+  expect(byId["contour-labels"].source).toBe("seascape-contours");
+  expect(byId["contour-lines"].filter).toBeUndefined(); // no sys filter on client isolines
+  expect(byId["contour-lines"].minzoom).toBe(6); // presentation floor applies in both modes
+  expect(byId["soundings"].source).toBe("seascape-vector"); // embedded carries the rest
+  expect(byId["drying-areas"].source).toBe("seascape-vector");
+});
+
+test("clientContourSource wires a DemSource into a validating style", () => {
+  let opts: Record<string, unknown> = {};
+  const dem = {
+    contourProtocolUrl: (o: object) => {
+      opts = o as Record<string, unknown>;
+      return "dem-contour://tiles/{z}/{x}/{y}";
+    },
+  };
+  const src = clientContourSource(dem) as {
+    type: string;
+    tiles: string[];
+  };
+  expect(src.tiles).toEqual(["dem-contour://tiles/{z}/{x}/{y}"]);
+  expect(opts.multiplier).toBe(-1); // positive-down depths
+  expect(opts.lineLevels).toEqual({ 0: INT_ISOBATHS_M }); // fixed INT levels
+  const s = style({
+    tilesBase: "https://t.example",
+    clientContours: clientContourSource(dem),
+  });
+  expect(validateStyleMin(s)).toEqual([]);
+  expect(Object.keys(s.sources)).toContain("seascape-contours");
 });
 
 test("contour lines floor at z6 — depth shading carries lower zooms", () => {
