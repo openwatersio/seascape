@@ -261,6 +261,22 @@ export default {
     env: Env,
     ctx: ExecutionContext,
   ): Promise<Response> {
+    // An uncaught throw becomes the runtime's bare 500 with no CORS headers,
+    // which browsers report as a CORS block (masking the real status) and
+    // MapLibre then won't retry cleanly. Catch everything and answer with CORS.
+    return this.handle(req, env, ctx).catch((e: unknown) => {
+      console.log(`unhandled: ${e}`);
+      return new Response("internal error", {
+        status: 500,
+        headers: { "cache-control": "no-store", ...CORS },
+      });
+    });
+  },
+  async handle(
+    req: Request,
+    env: Env,
+    ctx: ExecutionContext,
+  ): Promise<Response> {
     const noTile = () => new Response(null, { status: 204, headers: CORS });
     const url = new URL(req.url);
     const path = url.pathname;
