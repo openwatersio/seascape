@@ -16,6 +16,7 @@ Run from pipelines/:  uv run python test_engine.py
 """
 
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -144,6 +145,46 @@ def check_shard_partition():
         shutil.rmtree(tmp, ignore_errors=True)
         if env_force is not None:
             os.environ["FORCE_REBUILD"] = env_force
+
+
+def check_weighted_shards():
+    """Downsample deep shards bin-pack ancestors by work (parent-webp count), not
+    ancestor count: the count-sized stride left a 77-minute straggler shard next to
+    hundreds of spin-up-only ones. The partition must stay complete + disjoint (every
+    consumer derives the same bins from the frozen list), n must self-size to
+    total/heaviest, and no bin may exceed 2x the heaviest ancestor (the LPT bound)."""
+    import downsampling
+    import utils
+    tmp = tempfile.mkdtemp()
+    cwd = os.getcwd()
+    try:
+        os.chdir(tmp)
+        aid = "01CCCCCCCCCCCCCCCCCCCCCCCC"
+        os.makedirs(f"store/aggregation/{aid}")
+        rz = downsampling.SHARD_ROOT_Z
+        # 3 deep subtrees (extent -> extent+3: 4**3 = 64 parent webps each) among 40
+        # couple-of-overview ancestors (weight 1) — the planet build's shape in miniature.
+        heavies = [f"store/aggregation/{aid}/{rz}-{x}-0-{rz + 3}-downsampling.csv" for x in range(3)]
+        lights = [f"store/aggregation/{aid}/{rz}-{x}-{y}-{rz}-downsampling.csv"
+                  for x in range(8) for y in range(1, 6)]
+        with open(f"store/aggregation/{aid}/{downsampling.FROZEN}", "w") as f:
+            f.write("".join(fp + "\n" for fp in heavies + lights))
+        w = downsampling.ancestor_weights()
+        assert len(w) == 43 and sorted(w.values(), reverse=True)[:3] == [64, 64, 64], w
+        # matrix sizing: enough bins that each ~= the heaviest subtree — not one per ancestor
+        n = math.ceil(sum(w.values()) / max(w.values()))
+        assert n == 4, f"expected 4 work-sized bins for 43 ancestors, got {n}"
+        owned = [downsampling.owned_ancestors(i, n) for i in range(n)]
+        flat = [a for s in owned for a in s]
+        assert len(flat) == len(set(flat)) == len(w), "bins must partition the ancestors"
+        loads = [sum(w[a] for a in s) for s in owned]
+        assert max(loads) < 2 * max(w.values()), f"a bin exceeds the LPT bound: {loads}"
+        # the pure packer (also chunks the bundle groups): heaviest first into lightest bin
+        assert utils.lpt_bins({"a": 5, "b": 3, "c": 3, "d": 1}, 2) == [["a", "d"], ["b", "c"]]
+        print(f"weighted-shards ok — {len(w)} ancestors -> {n} bins, loads {sorted(loads, reverse=True)}")
+    finally:
+        os.chdir(cwd)
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def check_stale_overview():
@@ -532,6 +573,7 @@ if __name__ == "__main__":
     drying_run._check()
     check_priority()
     check_shard_partition()
+    check_weighted_shards()
     check_stale_overview()
     check_grid_split()
     check_land_clamp()

@@ -23,7 +23,7 @@ on:
         required: false
         default: ""
       shards:
-        description: "Aggregate matrix shards (<= 256)"
+        description: "Fan-out ceiling (<= 256): aggregate shard count; the other phases self-size to their work below it"
         required: false
         default: "24"
       force:
@@ -366,10 +366,13 @@ jobs:
           aws s3 sync store/aggregation "s3://$DATA_BUCKET/bathymetry/aggregation" --exclude '*' --include '*.done'
 
   # Overview pyramid, sharded. The deep levels partition into read-closed subtrees
-  # (one per ancestor at the covering's seed zoom) so they fan out with no
-  # coordination, exactly like aggregate; the coarse global tail (a few cheap levels
-  # whose tiles span subtrees) is finished on the single bundle runner below. The
-  # level barrier stays inside each runner. A clean rebuild still spins one no-op shard.
+  # (one per ancestor at the covering's seed zoom), bin-packed by work into the shards
+  # (a shard ≈ the heaviest single subtree — sizing to ancestor *count* left one
+  # 77-minute straggler blocking bundle-plan next to hundreds of spin-up-only shards),
+  # so they fan out with no coordination, exactly like aggregate; the coarse global
+  # tail (a few cheap levels whose tiles span subtrees) is finished on the single
+  # bundle runner below. The level barrier stays inside each runner. A clean rebuild
+  # still spins one no-op shard.
   downsample:
     needs: [image, aggregate, plan]
     if: ${{ !cancelled() && needs.aggregate.result == 'success' }}
@@ -419,9 +422,11 @@ jobs:
   # whose footprint-sized archives outgrew a runner as sources accumulated. bundle-plan
   # finishes the coarse pyramid tail (it spans ancestors, so it can't be a deep shard),
   # verifies the pyramid is whole, and emits the matrix: each entry is a comma-joined
-  # CHUNK of group names (the partition rides in the matrix, so jobs can't drift from the
-  # plan's store view). A matrix job loops its chunk pull→bundle→push→clean one group at
-  # a time; bundle-merge stitches the fragments. Contours are built separately (below).
+  # CHUNK of group names, bin-packed by pmtiles bytes so a chunk ≈ the biggest single
+  # group (one-group chunks spent more runner time on setup than bundling). The
+  # partition rides in the matrix, so jobs can't drift from the plan's store view. A
+  # matrix job loops its chunk pull→bundle→push→clean one group at a time;
+  # bundle-merge stitches the fragments. Contours are built separately (below).
   bundle-plan:
     needs: downsample
     if: ${{ !cancelled() && needs.downsample.result == 'success' }}
@@ -538,7 +543,7 @@ jobs:
             --content-type application/json
 
   # ─── Contours (sharded — one global tippecanoe blows the 6 h cap at planet scale) ─
-  # Size the fan-out to the FGB count (no download — just an R2 listing).
+  # Size the fan-out to the work (no download — just an R2 listing).
   contour-plan:
     needs: aggregate
     if: ${{ !cancelled() && needs.aggregate.result == 'success' }}
@@ -549,7 +554,10 @@ jobs:
       - id: m
         run: |
           count=$(aws s3 ls "s3://$DATA_BUCKET/bathymetry/contour/" --recursive | grep -c '\.fgb$' || true)
-          shards=$(python3 -c "import json,sys; c=int(sys.argv[1]); n=min(${AGG_SHARDS}, max(c,1)); print(json.dumps([{'i':i,'n':n} for i in range(n)]))" "$count")
+          # ~200 FGBs ≈ 10 min of tippecanoe per shard (observed ~3 s/FGB planet-wide);
+          # sizing to the raw count spun one runner per ~1 min of work. Retune the divisor
+          # if shard runtimes drift past ~30 min. AGG_SHARDS stays the ceiling.
+          shards=$(python3 -c "import json,sys; c=int(sys.argv[1]); n=min(${AGG_SHARDS}, max((c + 199) // 200, 1)); print(json.dumps([{'i':i,'n':n} for i in range(n)]))" "$count")
           echo "shards=$shards" >> "$GITHUB_OUTPUT"
           echo "contour FGBs: $count → matrix $shards"
 
@@ -591,7 +599,10 @@ jobs:
           # it to tile the coverage layer to the same depth as the contours.
           aws s3 cp store/contour-maxz.txt "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/contour-maxz.txt"
 
-  # tile-join the per-shard pmtiles into one vector.pmtiles.
+  # tile-join the per-shard pmtiles + soundings + drying + coverage into one vector.pmtiles,
+  # in ONE join: tile-join rewrites every tile of the whole archive, so the old
+  # merge-then-fold-per-layer shape re-paid the planet-wide join per layer (~90 min each,
+  # serial, as the only job left running — the last 2 h 40 of the build).
   contour-bundle:
     needs: contours
     if: ${{ !cancelled() && needs.contours.result == 'success' }}
@@ -607,13 +618,14 @@ jobs:
           aws s3 cp "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/contour-maxz.txt" store/contour-maxz.txt
           aws s3 sync "s3://$DATA_BUCKET/bathymetry/soundings" store/soundings
           aws s3 sync "s3://$DATA_BUCKET/bathymetry/drying" store/drying
-      - name: Merge contours
+      # Soundings + drying aren't sharded (sparse); their pmtiles must exist before the
+      # merge so its tile-join folds them in.
+      - name: Bundle soundings + drying
+        run: |
+          docker run --rm -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just soundings
+          docker run --rm -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just drying
+      - name: Merge contours + fold layers
         run: docker run --rm -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just contour-merge
-      # Soundings + drying aren't sharded (sparse) — bundle them here and fold into vector.pmtiles.
-      - name: Fold in soundings
-        run: docker run --rm -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just soundings
-      - name: Fold in drying
-        run: docker run --rm -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just drying
       - name: Push vector.pmtiles to R2 build
         run: |
           aws s3 cp store/bundle/vector.pmtiles "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/vector.pmtiles" \

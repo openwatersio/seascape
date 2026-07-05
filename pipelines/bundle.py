@@ -226,16 +226,19 @@ def _manifest_from_fragments(frags):
 
 
 def groups_matrix(maxn):
-    """Verify the pyramid is whole, then print the CI bundle matrix: <= maxn chunks,
-    each a comma-joined strided slice of the group names. The partition rides IN the
-    matrix (not re-derived per job from a live R2 listing), so every job bundles the
-    exact set this full-store runner saw — the same freeze-the-plan reasoning as the
-    aggregate/downsample shards."""
+    """Verify the pyramid is whole, then print the CI bundle matrix: <= maxn chunks
+    of comma-joined group names, bin-packed by each group's local pmtiles bytes so
+    every chunk carries about the biggest single group (one-group chunks meant 235
+    runners each spending longer on spin-up than on bundling). The partition rides
+    IN the matrix (not re-derived per job from a live R2 listing), so every job
+    bundles the exact set this full-store runner saw — the same freeze-the-plan
+    reasoning as the aggregate/downsample shards."""
     aggregation_id = utils.get_aggregation_ids()[-1]
     verify_complete(aggregation_id)
-    names = sorted(group_filepaths(aggregation_id))
-    n = min(maxn, max(len(names), 1))
-    print(json.dumps([{"cells": ",".join(names[i::n])} for i in range(n)]))
+    groups = group_filepaths(aggregation_id)
+    weights = {name: sum(os.path.getsize(fp) for fp in fps) for name, fps in groups.items()}
+    n = min(maxn, math.ceil(sum(weights.values()) / max(max(weights.values()), 1))) if weights else 1
+    print(json.dumps([{"cells": ",".join(sorted(chunk))} for chunk in utils.lpt_bins(weights, n)]))
 
 
 def group_keys(name):
