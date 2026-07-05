@@ -133,14 +133,15 @@ The build pipeline, local development, container usage, and CI/deploy live in
 
 ## License
 
-Code: BSD-3-Clause (see [LICENSE](LICENSE)). The `pipelines/*.py` vendored/adapted
-from [mapterhorn](https://github.com/mapterhorn/mapterhorn) also carry its BSD-3
-copyright (`pipelines/LICENSE.mapterhorn`).
+**Code** — [BSD-3-Clause](LICENSE). The `pipelines/*.py` vendored/adapted from [mapterhorn](https://github.com/mapterhorn/mapterhorn) also carry its [BSD-3 copyright](pipelines/LICENSE.mapterhorn).
 
-Output data inherits GEBCO's terms (public domain, attribution required):
+**Tiles** — the tile compilation published at `tiles.openwaters.io/seascape` is licensed [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/): free for any use with the following attribution:
 
-> _GEBCO Bathymetric Compilation Group 2026 (2026) The GEBCO_2026 Grid
-> (doi:10.5285/4f68d5c7-45eb-f999-e063-7086abc036fa)_
+```
+© Open Water Software, LLC (https://openwaters.io/charts/seascape#license)
+```
+
+The underlying data remains under each source's own open terms. The full attribution list is available in the `attribution` field of the TileJSON endpoints ([raster.json](https://tiles.openwaters.io/seascape/raster.json), [vector.json](https://tiles.openwaters.io/seascape/vector.json)). It is displayed by MapLibre's attribution control automatically, which satisfies each source's terms.
 
 ## Prior art
 

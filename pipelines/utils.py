@@ -27,7 +27,7 @@ macrotile_z = int(os.environ.get("MACROTILE_Z", "8"))
 macrotile_buffer_3857 = 150
 num_overviews = int(os.environ.get("NUM_OVERVIEWS", "4"))
 
-ATTRIBUTION = '<a href="https://openwaters.io">© Open Water Software, LLC</a>'
+ATTRIBUTION = '<a href="https://openwaters.io/charts/seascape#license">© Open Water Software, LLC</a> '
 
 X_MIN_3857, _, X_MAX_3857, __ = transform_bounds('EPSG:4326', 'EPSG:3857', -180, 0, 180, 0)
 

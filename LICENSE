@@ -1,6 +1,6 @@
 BSD 3-Clause License
 
-Copyright (c) 2026, Open Water Software, LLC
+Copyright (c) 2026, Open Water Software, LLC (https://openwaters.io)
 
 Portions (Terrarium encoding, per-zoom vertical quantization, the
 aggregation/downsampling/bundle engine, and the source-normalization steps) are
