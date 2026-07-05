@@ -76,6 +76,36 @@ map.on("click", async (e) => {
 });
 ```
 
+## Client-side contours
+
+Instead of the embedded contour tiles, the contour layers can read isolines
+generated in the browser from the DEM, via the
+[openwatersio/maplibre-contour](https://github.com/openwatersio/maplibre-contour)
+fork (it adds fixed `lineLevels` — stock maplibre-contour only supports uniform
+intervals, which can't express the INT isobath ladder):
+
+```js
+import mlcontour from "maplibre-contour"; // github:openwatersio/maplibre-contour
+import { clientContourSource, style } from "@openwaters/seascape";
+
+const dem = new mlcontour.DemSource({
+  url: `${tilesBase}/{z}/{x}/{y}.webp`,
+  encoding: "terrarium",
+  maxzoom: 13,
+  worker: true,
+});
+dem.setupMaplibre(maplibregl);
+style({ tilesBase, clientContours: clientContourSource(dem) });
+```
+
+Soundings, drying, and coverage still come from the embedded vector source —
+only the contour lines/labels switch. Trade-offs vs embedded: no Chaikin
+smoothing and no fathom-curve geometry set (ft/fm labels unit-convert the
+metric `INT_ISOBATHS_M` levels); in exchange, contours render at any zoom and
+level changes need no pipeline rebuild. JS consumers only — the hosted
+`/style.json` can't register the DEM protocol, so it always serves embedded
+contours.
+
 ## Flavors
 
 A flavor is a plain object of colors/fonts (`day` is the only built-in so

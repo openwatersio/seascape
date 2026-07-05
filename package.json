@@ -13,6 +13,7 @@
   },
   "devDependencies": {
     "@openwaters/seascape": "*",
+    "maplibre-contour": "github:openwatersio/maplibre-contour#36f8207",
     "maplibre-gl": "^5.21.1",
     "pmtiles": "^4.4.0",
     "vite": "^8.0.2"

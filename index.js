@@ -1,6 +1,12 @@
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
-import { applyState, readDepth, style } from "@openwaters/seascape";
+import mlcontour from "maplibre-contour";
+import {
+  applyState,
+  clientContourSource,
+  readDepth,
+  style,
+} from "@openwaters/seascape";
 
 // The style itself (sources, layers, depth ramp, unit/safety expressions) lives
 // in the @openwaters/seascape package (style/) — this file is the demo app:
@@ -17,12 +23,26 @@ const tilesBase = (
 ).replace(/\/$/, "");
 const MAX_ZOOM = 13; // deepest zoom readDepth fetches (the Worker overzooms past it)
 
+// ?contours=client — A/B the embedded contour tiles against isolines generated
+// in the browser from the DEM (openwatersio/maplibre-contour fork).
+let clientContours;
+if (new URLSearchParams(location.search).get("contours") === "client") {
+  const dem = new mlcontour.DemSource({
+    url: `${tilesBase}/{z}/{x}/{y}.webp`,
+    encoding: "terrarium",
+    maxzoom: MAX_ZOOM,
+    worker: true,
+  });
+  dem.setupMaplibre(maplibregl);
+  clientContours = clientContourSource(dem);
+}
+
 // ─── Create map ───────────────────────────────────────────────────────────
 // The style is self-contained: zooms/bounds/attribution come from the
 // endpoint's TileJSON, so there's nothing to fetch before creating the map.
 const map = new maplibregl.Map({
   container: "map",
-  style: style({ tilesBase }),
+  style: style({ tilesBase, clientContours }),
   bounds: BBOX,
   hash: true,
   dragRotate: false,
