@@ -326,12 +326,16 @@ def _coverage_pmtiles(maxz):
 
 def _finalize_contours(contour_pmtiles, maxz):
     """tile-join the contour pmtiles (one local build or the CI shards) + the coverage
-    layer into store/bundle/vector.pmtiles. -pk keeps every feature of both layers;
-    coverage is dropped from the join when no footprints are present locally."""
+    layer + the prebuilt soundings/drying pmtiles (when their bundles ran first) into
+    store/bundle/vector.pmtiles. ONE join: tile-join rewrites every tile of the whole
+    archive, so folding each sparse layer in afterwards re-paid the planet-wide join
+    per layer (~90 min each in CI). -pk keeps every feature of every layer; a layer
+    whose pmtiles isn't present locally is simply not joined."""
     cov = _coverage_pmtiles(maxz)
-    inputs = list(contour_pmtiles) + ([cov] if cov else [])
-    subprocess.run(["tile-join", "-o", "store/bundle/vector.pmtiles", "-f", "-pk", *inputs],
-                   check=True)
+    layers = [p for p in [cov, "store/bundle/soundings.pmtiles", "store/bundle/drying.pmtiles"]
+              if p and os.path.isfile(p)]
+    subprocess.run(["tile-join", "-o", "store/bundle/vector.pmtiles", "-f", "-pk",
+                    *contour_pmtiles, *layers], check=True)
     return cov is not None
 
 

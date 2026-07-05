@@ -208,20 +208,6 @@ def bundle():
     print(f"soundings bundle: store/bundle/soundings.pmtiles (z0-{maxz}, {len(gj)} tiles)")
 
 
-def fold():
-    """Fold soundings.pmtiles into vector.pmtiles as the `soundings` layer, so the Worker
-    serves it from the one vector source (contours + coverage + soundings). tile-join -pk keeps
-    every feature of every layer. Runs after both bundles; no-op if either is missing."""
-    cont, snd = "store/bundle/vector.pmtiles", "store/bundle/soundings.pmtiles"
-    if not (os.path.isfile(cont) and os.path.isfile(snd)):
-        print("soundings fold: need both vector.pmtiles and soundings.pmtiles")
-        return
-    tmp = "store/bundle/vector-with-soundings.pmtiles"  # tile-join can't -o over an input
-    subprocess.run(["tile-join", "-o", tmp, "-f", "-pk", cont, snd], check=True)
-    os.replace(tmp, cont)
-    print("soundings fold: folded soundings layer into vector.pmtiles")
-
-
 def _check():
     """Grid shoalest per cell; <min_depth dropped; 2x2 reduction keeps the shoalest; the pyramid
     staggers each zoom into a quincunx and carries a block's shoal up to coarse zoom; depth floors
@@ -282,9 +268,7 @@ if __name__ == "__main__":
     a = sys.argv[1:]
     if a[:1] == ["bundle"]:
         bundle()
-    elif a[:1] == ["fold"]:
-        fold()
     elif a[:1] == ["check"]:
         _check()
     else:
-        sys.exit("usage: soundings_run.py bundle | fold | check")
+        sys.exit("usage: soundings_run.py bundle | check")
