@@ -27,6 +27,7 @@ const map = new maplibregl.Map({
   hash: true,
   dragRotate: false,
   pitchWithRotate: false,
+  dragRotate: false,
   attributionControl: { compact: true },
 });
 window.map = map; // exposed for debugging / verification
