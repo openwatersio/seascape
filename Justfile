@@ -112,12 +112,17 @@ soundings:
 drying:
     uv run python drying_run.py bundle
 
-# tippecanoe this shard's local FGBs -> contours-shard-{i}.pmtiles (CI pulls only the
-# shard's slice + writes store/contour-maxz.txt; merged by contour-merge).
-contour-shard i:
+# tippecanoe this shard's local slice of every vector layer -> {contours,soundings,
+# drying}-shard-{i}.pmtiles (CI pulls only the shard's slices + writes
+# store/contour-maxz.txt so all layers tile to one depth; merged by contour-merge).
+# Three invocations, not one -L run: the layers need different tippecanoe flags
+# (soundings -r1, drying --drop-densest-as-needed, contours' per-zoom filter).
+vector-shard i:
     uv run python contour_run.py bundle-shard {{i}}
+    uv run python soundings_run.py bundle-shard {{i}}
+    uv run python drying_run.py bundle-shard {{i}}
 
-# tile-join the per-shard contour pmtiles + coverage + soundings/drying into vector.pmtiles.
+# tile-join the per-shard pmtiles (all layers) + coverage into vector.pmtiles.
 contour-merge:
     uv run python contour_run.py bundle-merge
 

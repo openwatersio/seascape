@@ -554,8 +554,10 @@ jobs:
           aws s3 cp store/bundle/manifest.json "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/manifest.json" \
             --content-type application/json
 
-  # ─── Contours (sharded — one global tippecanoe blows the 6 h cap at planet scale) ─
-  # Size the fan-out to the work (no download — just an R2 listing).
+  # ── Vector layers (sharded — one global tippecanoe blows the 6 h cap at planet scale) ─
+  # Size the fan-out to the contour work — the dominant layer; soundings + drying
+  # slices ride the same shards for ~20% more per-shard time (no download — just an
+  # R2 listing).
   contour-plan:
     needs: aggregate
     if: ${{ !cancelled() && needs.aggregate.result == 'success' }}
@@ -573,7 +575,11 @@ jobs:
           echo "shards=$shards" >> "$GITHUB_OUTPUT"
           echo "contour FGBs: $count → matrix $shards"
 
-  # tippecanoe one strided FGB slice per runner → a per-shard contours pmtiles.
+  # tippecanoe one strided slice of every vector layer per runner → per-shard
+  # contours/soundings/drying pmtiles. Soundings + drying ride the contour shards
+  # (separately they held contour-bundle's tile-join back ~26 min while the rest of
+  # the build sat finished); the slices stride each layer's own sorted list — no
+  # geographic alignment needed, the merge unions everything per tile anyway.
   contours:
     needs: [aggregate, contour-plan]
     if: ${{ !cancelled() && needs.contour-plan.result == 'success' }}
@@ -586,35 +592,41 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/ghcr-login
-      # Pull ONLY this shard's FGB slice (not the whole set). List the FGB keys
-      # (sorted = the order Python globs), derive the global maxz (so every shard
-      # tiles to the same depth and tile-joins cleanly), and parallel-copy the
-      # strided slice this shard owns.
-      - name: Pull this shard's FGB slice from R2
+      # Pull ONLY this shard's slices (not the whole sets). List each layer's keys
+      # (sorted = the order Python globs), derive the global maxz from the contour
+      # list (so every shard and layer tiles to the same depth and tile-joins
+      # cleanly), and parallel-copy the strided slices this shard owns.
+      - name: Pull this shard's layer slices from R2
         run: |
-          mkdir -p store/contour store/bundle
-          aws s3 ls "s3://$DATA_BUCKET/bathymetry/contour/" --recursive | awk '{print $NF}' | grep '\.fgb$' | sort > /tmp/all.txt
-          sed 's#.*/##; s/\.fgb$//' /tmp/all.txt | awk -F- '{print $4}' | sort -n | tail -1 > store/contour-maxz.txt
+          mkdir -p store/contour store/soundings store/drying store/bundle
+          aws s3 ls "s3://$DATA_BUCKET/bathymetry/contour/" --recursive | awk '{print $NF}' | grep '\.fgb$' | sort > /tmp/all-contour.txt
+          sed 's#.*/##; s/\.fgb$//' /tmp/all-contour.txt | awk -F- '{print $4}' | sort -n | tail -1 > store/contour-maxz.txt
+          aws s3 ls "s3://$DATA_BUCKET/bathymetry/soundings/" --recursive | awk '{print $NF}' | grep '\.geojson$' | sort > /tmp/all-soundings.txt
+          aws s3 ls "s3://$DATA_BUCKET/bathymetry/drying/" --recursive | awk '{print $NF}' | grep '\.fgb$' | sort > /tmp/all-drying.txt
           # Bounded outer retry + visible errors — see the downsample pull above.
-          awk -v i="${{ matrix.shard.i }}" -v n="${{ matrix.shard.n }}" 'NR % n == (i + 1) % n' /tmp/all.txt \
-            | xargs -P 8 -I{} sh -c 'for a in 1 2 3 4 5; do aws s3 cp "s3://$DATA_BUCKET/$1" store/contour/ --only-show-errors && exit 0; sleep "$a"; done; echo "giving up on $1 after 5 attempts" >&2; exit 1' _ {}
-          echo "shard ${{ matrix.shard.i }}/${{ matrix.shard.n }}: $(ls store/contour/*.fgb 2>/dev/null | wc -l) FGBs, global maxz $(cat store/contour-maxz.txt)"
-      - name: Contour shard ${{ matrix.shard.i }}
+          for spec in "/tmp/all-contour.txt store/contour" "/tmp/all-soundings.txt store/soundings" "/tmp/all-drying.txt store/drying"; do
+            set -- $spec
+            awk -v i="${{ matrix.shard.i }}" -v n="${{ matrix.shard.n }}" 'NR % n == (i + 1) % n' "$1" \
+              | xargs -P 8 -I{} sh -c 'for a in 1 2 3 4 5; do aws s3 cp "s3://$DATA_BUCKET/$1" "$2/" --only-show-errors && exit 0; sleep "$a"; done; echo "giving up on $1 after 5 attempts" >&2; exit 1' _ {} "$2"
+          done
+          echo "shard ${{ matrix.shard.i }}/${{ matrix.shard.n }}: $(ls store/contour/*.fgb 2>/dev/null | wc -l) contour FGBs, $(ls store/soundings/*.geojson 2>/dev/null | wc -l) soundings, $(ls store/drying/*.fgb 2>/dev/null | wc -l) drying, global maxz $(cat store/contour-maxz.txt)"
+      - name: Vector shard ${{ matrix.shard.i }}
         run: |
           docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" \
-            "$IMAGE:$IMAGE_TAG" just contour-shard ${{ matrix.shard.i }}
+            "$IMAGE:$IMAGE_TAG" just vector-shard ${{ matrix.shard.i }}
       - name: Push shard pmtiles to R2
         run: |
           aws s3 cp store/bundle "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/contour-shards/" \
-            --recursive --exclude '*' --include 'contours-shard-*.pmtiles' --content-type application/octet-stream
+            --recursive --exclude '*' --include '*-shard-*.pmtiles' --content-type application/octet-stream
           # Global contour maxz (identical from every shard) — contour-bundle's merge needs
           # it to tile the coverage layer to the same depth as the contours.
           aws s3 cp store/contour-maxz.txt "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/contour-maxz.txt"
 
-  # tile-join the per-shard pmtiles + soundings + drying + coverage into one vector.pmtiles,
-  # in ONE join: tile-join rewrites every tile of the whole archive, so the old
-  # merge-then-fold-per-layer shape re-paid the planet-wide join per layer (~90 min each,
-  # serial, as the only job left running — the last 2 h 40 of the build).
+  # tile-join the per-shard pmtiles (contours + soundings + drying slices) + coverage
+  # into one vector.pmtiles, in ONE join: tile-join rewrites every tile of the whole
+  # archive, so the old merge-then-fold-per-layer shape re-paid the planet-wide join
+  # per layer (~90 min each, serial, as the only job left running — the last 2 h 40
+  # of the build).
   contour-bundle:
     needs: contours
     if: ${{ !cancelled() && needs.contours.result == 'success' }}
@@ -623,20 +635,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/ghcr-login
-      - name: Pull shard pmtiles + soundings + drying from R2
+      - name: Pull shard pmtiles from R2
         run: |
-          mkdir -p store/bundle store/soundings store/drying
+          mkdir -p store/bundle
           aws s3 sync "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/contour-shards" store/bundle
           aws s3 cp "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/contour-maxz.txt" store/contour-maxz.txt
-          aws s3 sync "s3://$DATA_BUCKET/bathymetry/soundings" store/soundings
-          aws s3 sync "s3://$DATA_BUCKET/bathymetry/drying" store/drying
-      # Soundings + drying aren't sharded (sparse); their pmtiles must exist before the
-      # merge so its tile-join folds them in.
-      - name: Bundle soundings + drying
-        run: |
-          docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just soundings
-          docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just drying
-      - name: Merge contours + fold layers
+      - name: Merge shards + fold coverage
         run: docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just contour-merge
       - name: Push vector.pmtiles to R2 build
         run: |
