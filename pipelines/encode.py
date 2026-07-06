@@ -40,9 +40,10 @@ step shallow bias, which is sub-perceptual at the zoom each step is applied
 One exception to the pure rounding: water never quantizes to 0. Elevation 0 is
 the land value (the land mask clamps land pixels to it, and the depth ramp
 draws it as land), so a negative input that would round to >= 0 — water
-shallower than the local step, i.e. shallower than SHALLOW_MIN_STEP — is
-capped at -LSB instead. Still shoal-biased; the only inputs it deepens are
-true depths shallower than the ~4 mm LSB, which are noise.
+shallower than its local per-pixel step, i.e. min(zoom step, depth cap), at
+most SHALLOW_MIN_STEP and smaller still at fine zooms — is capped at -LSB
+instead. Still shoal-biased; the only inputs it deepens are true depths
+shallower than the ~4 mm LSB, which are noise.
 """
 
 import numpy as np

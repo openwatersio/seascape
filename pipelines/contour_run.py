@@ -244,7 +244,8 @@ def bundle_maxz(own_max):
     own files' max."""
     maxzfile = "store/contour-maxz.txt"
     if os.path.isfile(maxzfile):
-        return max(int(open(maxzfile).read().strip()), own_max)
+        with open(maxzfile) as f:
+            return max(int(f.read().strip()), own_max)
     stems = _current_stems()
     if stems:
         return max(own_max, _stems_maxz(stems))
