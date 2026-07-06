@@ -95,9 +95,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
-      - name: Build style package
-        # Root install runs the style workspace's prepare (tsc → style/dist);
-        # the worker's own `npm ci` only symlinks file:../style without building.
+      - name: Install workspace (runs the style package's prepare — tsc → style/dist)
         run: npm ci
       - name: wrangler deploy
         working-directory: worker
@@ -106,7 +104,6 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           TILES_BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
-          npm ci
           # Bind the same bucket the build writes to; wrangler.toml can't read env vars,
           # so overwrite the placeholder name at deploy (keeps worker + build in sync).
           sed -i "s|^bucket_name = .*|bucket_name = \"$TILES_BUCKET\"|" wrangler.toml

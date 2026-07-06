@@ -125,9 +125,7 @@ contour-merge:
 # store/source (no R2; SOURCE_VSI_BASE unset). Override SOURCE_VSI_BASE/BOUNDS_BASE for a mirror.
 # The coarse-source land clamp needs the land mask: streamed from R2 when published, else built
 # locally once (a 700 MB OSM download; override with LANDMASK to reuse an existing copy).
-# View with the two dev servers in separate terminals:
-#   cd worker && npm install && npm run dev               # tile Worker on :8787
-#   VITE_TILES_BASE=http://localhost:8787 npm run dev     # Vite on :5173 (repo root)
+# View with `just dev` (tile Worker on :8787 + Vite viewer on :5173).
 preview bbox="-74.30,40.40,-73.75,40.80" local="":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -162,6 +160,23 @@ preview bbox="-74.30,40.40,-73.75,40.80" local="":
 
 # Preview from already-prepared sources in store/source (no R2/network for prepared sources).
 preview-local bbox="-74.30,40.40,-73.75,40.80": (preview bbox "local")
+
+# Run both dev servers in one terminal: tile Worker on :8787 + Vite viewer on :5173
+# (the viewer defaults to localhost:8787, so no VITE_TILES_BASE needed). Ctrl-C stops both.
+# Works in the container too (`./docker.sh dev`): there the servers bind 0.0.0.0 so the
+# published ports reach them; on the host they stay on localhost.
+dev:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{justfile_directory()}}"
+    # -x check, not -d: in the container node_modules is a (possibly empty) named volume.
+    [ -x node_modules/.bin/vite ] || npm install
+    trap 'kill 0' EXIT
+    # Ctrl-C is the intended way to stop the servers — exit 0 so just doesn't
+    # report a failed recipe (the trap also makes the EXIT cleanup fire).
+    trap 'exit 0' INT TERM
+    npm run dev -w worker -- --ip 0.0.0.0 &
+    npm run dev -- --host
 
 # Offline self-checks (synthetic data, no network).
 test-sources:

@@ -28,14 +28,24 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh \
       | bash -s -- --to /usr/local/bin
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
 
-# The Python engine (rasterio/scipy/pmtiles/geopandas/… from wheels; GDAL stays CLI).
+# Node 22 — lets the dev servers (`just dev`) and the preview seed step run in-container,
+# so Docker is the only local dependency needed to see the map (`./docker.sh dev`).
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+  && apt-get install -y --no-install-recommends nodejs \
+  && rm -rf /var/lib/apt/lists/*
+
+# Python deps only (rasterio/scipy/pmtiles/geopandas/… from wheels; GDAL stays CLI).
+# The code (pipelines/, sources/, Justfile) is NOT baked in — mount the repo at /app
+# at runtime (`./docker.sh <recipe>` locally; CI mounts its checkout), so code changes
+# never rebuild the image. The venv lives outside /app so the mount can't shadow it;
+# `uv run` finds it via UV_PROJECT_ENVIRONMENT (and self-syncs if the mounted lock
+# ever drifts from the baked env).
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 WORKDIR /app
-COPY pipelines/ /app/pipelines/
-COPY sources/ /app/sources/
-COPY Justfile /app/Justfile
-RUN cd pipelines && uv sync --frozen
-ENV PATH="/app/pipelines/.venv/bin:${PATH}"
+COPY pipelines/pyproject.toml pipelines/uv.lock /app/pipelines/
+RUN cd pipelines && uv sync --frozen --no-install-project
+ENV PATH="/opt/venv/bin:${PATH}"
 
 # Recipes run from /app; the Justfile redirects into pipelines/ itself. e.g.
-# `docker run img just planet` (set BBOX=… for a region) or `… just source <id>`.
+# `docker run -v "$PWD:/app" img just planet` (set BBOX=… for a region).
 CMD ["just", "--list"]

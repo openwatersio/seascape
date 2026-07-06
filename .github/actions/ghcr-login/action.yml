@@ -1,8 +1,14 @@
 name: GHCR login (with retry)
-description: Log in to ghcr.io, retrying the occasionally-flaky token endpoint.
+description: >-
+  Log in to ghcr.io (retrying the occasionally-flaky token endpoint) and export
+  IMAGE_TAG — the toolchain image's deps-hash tag. The image contains only the
+  toolchain + Python deps (code is mounted at runtime), so it's keyed on the
+  files that define those deps, not the commit sha.
 runs:
   using: composite
   steps:
+    - shell: bash
+      run: echo "IMAGE_TAG=deps-${{ hashFiles('Dockerfile', 'pipelines/pyproject.toml', 'pipelines/uv.lock') }}" >> "$GITHUB_ENV"
     - shell: bash
       env:
         GHCR_TOKEN: ${{ github.token }}

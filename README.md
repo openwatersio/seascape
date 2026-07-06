@@ -1,10 +1,10 @@
 # Seascape
 
-Bathymetry as web map tiles for MapLibre / Mapbox GL, build from a mosaic of global and regional sources. Served as raster DEM tiles for depth shading and hillshade, and vector contour tiles for crisp lines and labels.
+Bathymetry as web map tiles for MapLibre / Mapbox GL, built from a mosaic of global and regional sources. Served as raster DEM tiles for depth shading and hillshade, and vector contour tiles for crisp lines and labels.
 
 Coverage is global through z8 (~15″) with regional detail to z14 (~0.25″) where high-res sources exist.
 
-### **[Preview](https://openwatersio.github.io/seascape/)**
+[![Seascape screenshot](https://github.com/user-attachments/assets/b503d5a1-9894-47f3-8fa2-ce3b6f86ad28)](https://openwatersio.github.io/seascape/#8.41/65.382/-23.2)
 
 > [!WARNING]
 > **Not for navigational use.** Do not use this bathymetry for navigation, or in any
@@ -53,8 +53,8 @@ safety depth, reading depth at a point).
 
 The bathymetry is available as XYZ tiles in two flavors:
 
-- **Raster** (Terrarium-encoded DEM) — [TileJSON](https://tiles.openwaters.io/seascape/raster.json) - depth per pixel, for depth shading (color-relief), hillshade, and 3D terrain.<br/>
-- **Vector** (MVT) - [TileJSON](https://tiles.openwaters.io/seascape/vector.json) — bathymetric contour lines at non-uniform depth intervals.<br\>
+- **Raster** (Terrarium-encoded DEM) — [TileJSON](https://tiles.openwaters.io/seascape/raster.json) - depth per pixel, for depth shading (color-relief), hillshade, and 3D terrain.
+- **Vector** (MVT) - [TileJSON](https://tiles.openwaters.io/seascape/vector.json) — bathymetric contour lines at non-uniform depth intervals.
 
 Point any mapping library that supports XYZ tiles at these URLs. The TileJSONs include attribution and metadata, so libraries that support TileJSON will credit the sources automatically.
 
@@ -122,8 +122,9 @@ Sources are merged by priority: resolution-derived (finer data wins where they o
 - **[EMODnet Bathymetry 2024](sources/emodnet/)** — ~115 m, European waters · EMODnet Bathymetry Consortium · CC-BY 4.0
 - **[GEBCO 2026 Grid](sources/gebco/)** — 15″ (~450 m), global base · GEBCO Compilation Group / BODC · public domain
 
-See [RESEARCH.md](./RESEARCH.md) for the wider source survey and
-[CONTRIBUTING.md](CONTRIBUTING.md) for adding one.
+…plus regional sources for Ireland, the Netherlands, England's intertidal zone, Canada's coasts, Australia, Indonesia, the SW Indian Ocean, US estuaries, and surveyed lakes (Great Lakes, African Great Lakes, Alpine lakes, Tahoe).
+
+See [sources/README.md](sources/README.md) for the full catalog, and to request a new source.
 
 ## Building & contributing
 
