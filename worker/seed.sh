@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 # Ensure wrangler is installed (fresh checkout, or the container's empty node_modules
 # volume) — otherwise npx would fetch an arbitrary latest wrangler from the registry.
-[ -x ../node_modules/.bin/wrangler ] || (cd .. && npm install)
+[ -x ../node_modules/.bin/wrangler ] || (cd .. && npm ci)
 B=../pipelines/store/bundle
 shopt -s nullglob
 for f in "$B"/*.pmtiles "$B"/manifest.json; do

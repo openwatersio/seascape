@@ -170,12 +170,14 @@ dev:
     set -euo pipefail
     cd "{{justfile_directory()}}"
     # -x check, not -d: in the container node_modules is a (possibly empty) named volume.
-    [ -x node_modules/.bin/vite ] || npm install
-    trap 'kill 0' EXIT
-    # Ctrl-C is the intended way to stop the servers — exit 0 so just doesn't
-    # report a failed recipe (the trap also makes the EXIT cleanup fire).
-    trap 'exit 0' INT TERM
+    [ -x node_modules/.bin/vite ] || npm ci
     npm run dev -w worker -- --ip 0.0.0.0 &
+    worker=$!
+    # Kill only the worker we spawned — `kill 0` would TERM the whole process group,
+    # including the parent `just`. Ctrl-C is the intended stop, so exit 0 keeps just
+    # from reporting a failed recipe; the EXIT trap then reaps the worker.
+    trap 'kill "$worker" 2>/dev/null || true' EXIT
+    trap 'exit 0' INT TERM
     npm run dev -- --host
 
 # Offline self-checks (synthetic data, no network).

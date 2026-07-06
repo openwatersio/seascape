@@ -6,7 +6,7 @@ Selection rule: **resolution sets the zoom cap, an openly-redistributable licens
 
 ## Access patterns
 
-- **Streamed** — range-read at build via `/vsicurl`//`/vsis3`, no download (CUDEM, S-102). Marked `volatile: true` in `metadata.json` so CI re-registers them every build as the upstream catalog drifts.
+- **Streamed** — range-read at build via `/vsicurl` / `/vsis3`, no download (CUDEM, S-102). Marked `volatile: true` in `metadata.json` so CI re-registers them every build as the upstream catalog drifts.
 - **Prepared** — download → normalize to a 4326 COG → R2 → stream from there (EMODnet, DDM, and most others). Gated upstreams get a `harvest.py` that refreshes an R2 mirror (BATNAS, UK SurfZone).
 
 ## Built sources
