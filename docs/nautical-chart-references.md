@@ -2,7 +2,7 @@
 
 Primary sources on how nautical charts represent depth (soundings, contours, safety
 depth, datums) and how bathymetry is generalized for charting. Compiled for the
-Milestone 3–5 chart-data-model work (see [ROADMAP.md](../ROADMAP.md)); useful to any
+chart-data-model work (chart datum [#16](https://github.com/openwatersio/seascape/issues/16), soundings/safety-depth, confidence & provenance [#17](https://github.com/openwatersio/seascape/issues/17)); useful to any
 agent touching `pipelines/soundings_run.py`, `pipelines/contour_run.py`, datum handling,
 or the viewer's chart styling.
 
@@ -20,7 +20,7 @@ or the viewer's chart styling.
 - **True position is the chart rule.** Soundings sit at their surveyed location; paper charts allow out-of-position _least-depth_ soundings only, flagged with a pointer/brackets (S-4 B-412 ✅); **ENC forbids out-of-position entirely** — "There is no 'sounding, out of position' in an ENC" (S-57 UOC B-412.2 ✅). A jittered/quincunx grid is a raster-derived "background sounding" approximation, not chart-authentic prime selection.
 - **Radius method, ~free via tippecanoe.** Pre-sort soundings shoalest-first, then `--drop-densest-as-needed` (spacing grows as needed) + `-pi` (preserve input order) keeps the shoalest and thins the dense deeper fill — the classic radius method, densifying with zoom (tippecanoe docs ✅; mechanism matches Zoraster "eliminate nearby soundings to avoid overcrowding" ✅ and Skopeliti's "buffer radius" ✅).
 - **Keep-shoalest on label collision.** MapLibre `symbol-sort-key = depth` (ascending) + `text-allow-overlap: false` → shallowest placed first, wins the collision (style spec ✅). We already do this.
-- **Safety depth (feeds ROADMAP M4.2).** S-52 emphasizes soundings ≤ the mariner-set safety depth and highlights the safety contour (◑).
+- **Safety depth (feeds the viewer's safety-depth shading).** S-52 emphasizes soundings ≤ the mariner-set safety depth and highlights the safety contour (◑).
 
 ## A. Primary standards (IHO / NOAA / NGA)
 

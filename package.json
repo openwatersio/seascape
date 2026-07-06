@@ -4,7 +4,8 @@
   "license": "BSD-3-Clause",
   "type": "module",
   "workspaces": [
-    "style"
+    "style",
+    "worker"
   ],
   "scripts": {
     "dev": "vite",

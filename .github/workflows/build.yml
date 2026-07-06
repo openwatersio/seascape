@@ -60,20 +60,31 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Build + push the toolchain image. buildx GHA cache → only recompiles when the
-  # Dockerfile changes (shared with ci.yml, so a push-built image is reused here).
+  # Ensure the deps-only toolchain image exists (code is mounted at runtime), keyed on
+  # the files that define the deps (IMAGE_TAG, exported by ghcr-login; shared with
+  # ci.yml, so a push-built image is reused here). Skipped when the tag is in GHCR.
   image:
     runs-on: ubuntu-latest
     permissions: { contents: read, packages: write }
     steps:
       - uses: actions/checkout@v6
-      - uses: docker/setup-buildx-action@v3
       - uses: ./.github/actions/ghcr-login
+      - name: Already in GHCR?
+        id: have
+        run: |
+          if docker manifest inspect "$IMAGE:$IMAGE_TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"; echo "image current: $IMAGE:$IMAGE_TAG"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: docker/setup-buildx-action@v3
+        if: steps.have.outputs.exists != 'true'
       - uses: docker/build-push-action@v6
+        if: steps.have.outputs.exists != 'true'
         with:
           context: .
           push: true
-          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          tags: ${{ env.IMAGE }}:${{ env.IMAGE_TAG }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -85,7 +96,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - id: l
-        run: echo "sources=$(ls -1 sources | jq -R -s -c 'split("\n")|map(select(length>0))')" >> "$GITHUB_OUTPUT"
+        # directories only — sources/ also holds README.md
+        run: echo "sources=$(ls -d sources/*/ | xargs -n1 basename | jq -R -s -c 'split("\n")|map(select(length>0))')" >> "$GITHUB_OUTPUT"
 
   # Prepare each source (fetch → datum → normalize → bounds → polygon → tarball)
   # and push its store/source/<id> to R2. One source failing doesn't sink the rest:
@@ -135,9 +147,9 @@ jobs:
         if: steps.check.outputs.current != 'true'
         run: |
           mkdir -p store
-          docker run --rm \
+          docker run --rm -v "$PWD:/app" \
             -v "$PWD/store:/app/pipelines/store" \
-            "$IMAGE:${{ github.sha }}" just source ${{ matrix.source }}
+            "$IMAGE:$IMAGE_TAG" just source ${{ matrix.source }}
       - name: Push source to R2
         if: steps.check.outputs.current != 'true'
         run: |
@@ -170,7 +182,7 @@ jobs:
           fi
           echo "land mask stale or missing (recipe=$RECIPE_HASH r2=${have:-none}) — rebuilding"
           mkdir -p store
-          docker run --rm -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just landmask
+          docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just landmask
           aws s3 cp store/landmask/land.fgb "s3://$DATA_BUCKET/bathymetry/landmask/land.fgb"
           printf '%s' "$RECIPE_HASH" | aws s3 cp - "s3://$DATA_BUCKET/bathymetry/landmask/.recipe-hash"
 
@@ -214,8 +226,8 @@ jobs:
         run: |
           # Aggregation covering, then the downsampling coverings (-downsampling.csv)
           # so the sharded downsample job downstream sees the same plan from R2.
-          docker run --rm -e BBOX -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just cover
-          docker run --rm -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just downsample-cover
+          docker run --rm -v "$PWD:/app" -e BBOX -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just cover
+          docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just downsample-cover
       - name: Freeze the dirty work lists
         run: |
           # Compute the aggregate + downsample dirty sets ONCE, from this single R2 listing
@@ -225,7 +237,7 @@ jobs:
           # drifted (earlier shards had already pushed tiles), which shifted the [i::n] stride
           # and left some self-heal tiles owned by no shard — silently never built, then
           # downsample aborted "pyramid incomplete: <tile> missing". One list = one partition.
-          docker run --rm -e FORCE_REBUILD -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just freeze-work
+          docker run --rm -v "$PWD:/app" -e FORCE_REBUILD -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just freeze-work
       - name: Push covering to R2
         run: |
           # One gzipped tar per covering (covering.tar.gz) instead of ~2k loose CSVs —
@@ -303,14 +315,14 @@ jobs:
       - id: m
         name: Emit aggregate shard matrix
         run: |
-          SHARDS=$(docker run --rm -e FORCE_REBUILD -v "$PWD/store:/app/pipelines/store" \
-            "$IMAGE:${{ github.sha }}" just shard-matrix "$AGG_SHARDS" | tail -n1)
+          SHARDS=$(docker run --rm -v "$PWD:/app" -e FORCE_REBUILD -v "$PWD/store:/app/pipelines/store" \
+            "$IMAGE:$IMAGE_TAG" just shard-matrix "$AGG_SHARDS" | tail -n1)
           echo "shards=$SHARDS" >> "$GITHUB_OUTPUT"
       - id: dm
         name: Emit downsample shard matrix
         run: |
-          SHARDS=$(docker run --rm -e FORCE_REBUILD -v "$PWD/store:/app/pipelines/store" \
-            "$IMAGE:${{ github.sha }}" just downsample-matrix "$AGG_SHARDS" | tail -n1)
+          SHARDS=$(docker run --rm -v "$PWD:/app" -e FORCE_REBUILD -v "$PWD/store:/app/pipelines/store" \
+            "$IMAGE:$IMAGE_TAG" just downsample-matrix "$AGG_SHARDS" | tail -n1)
           echo "shards=$SHARDS" >> "$GITHUB_OUTPUT"
 
   # Reproject → merge → tile → contour for one strided slice of the dirty tiles.
@@ -350,11 +362,11 @@ jobs:
           # LANDMASK → flagged coarse sources (GEBCO/EMODnet) range-read the land mask FGB
           # over /vsicurl and clamp negative land pixels; only the polygons each tile touches
           # are read (FGB spatial index), so no per-shard download.
-          docker run --rm -v "$PWD/store:/app/pipelines/store" \
+          docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" \
             -e SOURCE_VSI_BASE="/vsicurl/https://data.openwaters.io/bathymetry/source" \
             -e LANDMASK="/vsicurl/https://data.openwaters.io/bathymetry/landmask/land.fgb" \
             -e AGG_PROCESSES=2 -e GDAL_CACHEMAX=256 -e FORCE_REBUILD \
-            "$IMAGE:${{ github.sha }}" just aggregate ${{ matrix.shard.i }} ${{ matrix.shard.n }}
+            "$IMAGE:$IMAGE_TAG" just aggregate ${{ matrix.shard.i }} ${{ matrix.shard.n }}
       - name: Push tiles + contours + done-markers to R2
         run: |
           aws s3 sync store/pmtiles "s3://$DATA_BUCKET/bathymetry/pmtiles"
@@ -393,8 +405,8 @@ jobs:
           # whole tens-of-GB store: list the keys, let Python filter to the shard, then
           # parallel-copy preserving the z7-sharded layout.
           aws s3 ls "s3://$DATA_BUCKET/bathymetry/pmtiles/" --recursive | awk '{print $4}' > store/pmtiles-keys.txt
-          docker run --rm -e FORCE_REBUILD -v "$PWD/store:/app/pipelines/store" \
-            "$IMAGE:${{ github.sha }}" just downsample-shard-keys ${{ matrix.shard.i }} ${{ matrix.shard.n }}
+          docker run --rm -v "$PWD:/app" -e FORCE_REBUILD -v "$PWD/store:/app/pipelines/store" \
+            "$IMAGE:$IMAGE_TAG" just downsample-shard-keys ${{ matrix.shard.i }} ${{ matrix.shard.n }}
           echo "pulling $(wc -l < store/shard-keys.txt) of $(wc -l < store/pmtiles-keys.txt) pmtiles"
           # Outer retry: one transient R2 error (after aws's adaptive x10 internal retries)
           # must not fail the whole shard. --only-show-errors keeps the cause visible if a
@@ -402,8 +414,8 @@ jobs:
           xargs -P 8 -I{} sh -c 'k="$1"; d="store/${k#bathymetry/}"; mkdir -p "$(dirname "$d")"; for a in 1 2 3 4 5; do aws s3 cp "s3://$DATA_BUCKET/$k" "$d" --only-show-errors && exit 0; sleep "$a"; done; echo "giving up on $k after 5 attempts" >&2; exit 1' _ {} < store/shard-keys.txt
       - name: Downsample shard ${{ matrix.shard.i }}/${{ matrix.shard.n }}
         run: |
-          docker run --rm -e FORCE_REBUILD -v "$PWD/store:/app/pipelines/store" \
-            "$IMAGE:${{ github.sha }}" just downsample-shard ${{ matrix.shard.i }} ${{ matrix.shard.n }}
+          docker run --rm -v "$PWD:/app" -e FORCE_REBUILD -v "$PWD/store:/app/pipelines/store" \
+            "$IMAGE:$IMAGE_TAG" just downsample-shard ${{ matrix.shard.i }} ${{ matrix.shard.n }}
       - name: Push pyramid + done-markers to R2
         run: |
           # Disjoint tile keys + this shard's -downsampling.done markers (no --delete,
@@ -444,8 +456,8 @@ jobs:
       - name: Coarse tail + bundle matrix
         id: g
         run: |
-          docker run --rm -e FORCE_REBUILD -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just downsample-tail
-          docker run --rm -e FORCE_REBUILD -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just bundle-matrix "$AGG_SHARDS" > /tmp/chunks.txt
+          docker run --rm -v "$PWD:/app" -e FORCE_REBUILD -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just downsample-tail
+          docker run --rm -v "$PWD:/app" -e FORCE_REBUILD -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just bundle-matrix "$AGG_SHARDS" > /tmp/chunks.txt
           # Emit the JSON matrix via the heredoc form, NOT name=value: the runner's post-step
           # processing of `chunks=[...]` fails the step (every shell op here exits 0 — the
           # failure is in GitHub's output handling, not the script), and <<EOF is accepted.
@@ -502,13 +514,13 @@ jobs:
           B="s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}"
           for group in ${CELLS//,/ }; do
             echo "── group: $group ──"
-            docker run --rm -v "$PWD/store:/app/pipelines/store" \
-              "$IMAGE:${{ github.sha }}" just bundle-group-keys "$group"
+            docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" \
+              "$IMAGE:$IMAGE_TAG" just bundle-group-keys "$group"
             echo "pulling $(wc -l < store/keys.txt) of $(wc -l < store/pmtiles-keys.txt) pmtiles for $group"
             # Bounded outer retry + visible errors — see the downsample pull above.
             xargs -P 8 -I{} sh -c 'k="$1"; d="store/${k#bathymetry/}"; mkdir -p "$(dirname "$d")"; for a in 1 2 3 4 5; do aws s3 cp "s3://$DATA_BUCKET/$k" "$d" --only-show-errors && exit 0; sleep "$a"; done; echo "giving up on $k after 5 attempts" >&2; exit 1' _ {} < store/keys.txt
-            docker run --rm -v "$PWD/store:/app/pipelines/store" \
-              "$IMAGE:${{ github.sha }}" just bundle-group "$group"
+            docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" \
+              "$IMAGE:$IMAGE_TAG" just bundle-group "$group"
             # Archive name is deterministic from the group (see bundle.archive_filename).
             pm=$([ "$group" = planet ] && echo "planet.pmtiles" || echo "overlay-$group.pmtiles")
             aws s3 cp "store/bundle/$pm" "$B/$pm" --content-type application/octet-stream
@@ -533,7 +545,7 @@ jobs:
         run: |
           mkdir -p store/bundle
           aws s3 sync "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/bundle-frags" store/bundle
-          docker run --rm -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just bundle-merge
+          docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just bundle-merge
           aws s3 cp store/bundle/manifest.json "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/manifest.json" \
             --content-type application/json
 
@@ -581,8 +593,8 @@ jobs:
           echo "shard ${{ matrix.shard.i }}/${{ matrix.shard.n }}: $(ls store/contour/*.fgb 2>/dev/null | wc -l) FGBs, global maxz $(cat store/contour-maxz.txt)"
       - name: Contour shard ${{ matrix.shard.i }}
         run: |
-          docker run --rm -v "$PWD/store:/app/pipelines/store" \
-            "$IMAGE:${{ github.sha }}" just contour-shard ${{ matrix.shard.i }}
+          docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" \
+            "$IMAGE:$IMAGE_TAG" just contour-shard ${{ matrix.shard.i }}
       - name: Push shard pmtiles to R2
         run: |
           aws s3 cp store/bundle "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/contour-shards/" \
@@ -608,12 +620,12 @@ jobs:
           aws s3 sync "s3://$DATA_BUCKET/bathymetry/soundings" store/soundings
           aws s3 sync "s3://$DATA_BUCKET/bathymetry/drying" store/drying
       - name: Merge contours
-        run: docker run --rm -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just contour-merge
+        run: docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just contour-merge
       # Soundings + drying aren't sharded (sparse) — bundle them here and fold into vector.pmtiles.
       - name: Fold in soundings
-        run: docker run --rm -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just soundings
+        run: docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just soundings
       - name: Fold in drying
-        run: docker run --rm -v "$PWD/store:/app/pipelines/store" "$IMAGE:${{ github.sha }}" just drying
+        run: docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just drying
       - name: Push vector.pmtiles to R2 build
         run: |
           aws s3 cp store/bundle/vector.pmtiles "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/vector.pmtiles" \

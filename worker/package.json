@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "@jsquash/webp": "^1.5.0",
-    "@openwaters/seascape": "file:../style",
+    "@openwaters/seascape": "*",
     "pmtiles": "^4.4.0"
   },
   "devDependencies": {

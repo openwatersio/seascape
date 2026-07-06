@@ -15,20 +15,31 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Build + push the toolchain image. buildx GHA cache → only recompiles when the
-  # Dockerfile changes (shared with build.yml).
+  # Build + push the deps-only toolchain image (code is mounted at runtime), keyed on
+  # the files that define the deps (IMAGE_TAG, exported by ghcr-login). When that tag
+  # already exists in GHCR the build is skipped entirely — code-only pushes reuse it.
   image:
     runs-on: ubuntu-latest
     permissions: { contents: read, packages: write }
     steps:
       - uses: actions/checkout@v6
-      - uses: docker/setup-buildx-action@v3
       - uses: ./.github/actions/ghcr-login
+      - name: Already in GHCR?
+        id: have
+        run: |
+          if docker manifest inspect "$IMAGE:$IMAGE_TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"; echo "image current: $IMAGE:$IMAGE_TAG"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: docker/setup-buildx-action@v3
+        if: steps.have.outputs.exists != 'true'
       - uses: docker/build-push-action@v6
+        if: steps.have.outputs.exists != 'true'
         with:
           context: .
           push: true
-          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          tags: ${{ env.IMAGE }}:${{ env.IMAGE_TAG }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -43,8 +54,8 @@ jobs:
       - uses: ./.github/actions/ghcr-login
       - name: Engine + source self-checks
         run: |
-          docker run --rm "$IMAGE:${{ github.sha }}" just test-sources
-          docker run --rm "$IMAGE:${{ github.sha }}" just test-engine
+          docker run --rm -v "$PWD:/app" "$IMAGE:$IMAGE_TAG" just test-sources
+          docker run --rm -v "$PWD:/app" "$IMAGE:$IMAGE_TAG" just test-engine
 
   # Compile-check the viewer (it's built + deployed on release; see release.yml)
   # and run the Worker's dependency-free self-checks (plain node assert scripts).
@@ -69,6 +80,4 @@ jobs:
           node worker/src/cache.test.mjs
       - name: Worker type-check (imports @openwaters/seascape across packages)
         working-directory: worker
-        run: |
-          npm ci
-          npx tsc --noEmit
+        run: npx tsc --noEmit

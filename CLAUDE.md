@@ -1,115 +1,15 @@
 # CLAUDE.md
 
-Guidance for Claude Code working in this repository. Development flow, layout,
-and conventions are in [CONTRIBUTING.md](CONTRIBUTING.md) — this file is the
-orientation + the why.
+Guidance for Claude Code working in this repository. Everything substantive —
+the goal & principles, layout, commands, architecture, serving model, CI, and
+conventions — lives in [CONTRIBUTING.md](CONTRIBUTING.md); read it first.
+Agent-specific notes:
 
-## What this is
-
-A pipeline that turns [GEBCO](https://www.gebco.net/) global bathymetry plus
-regional high-res sources (CUDEM, EMODnet, …) into web tiles, served through one
-Cloudflare Worker endpoint, with a small Vite/MapLibre(/Mapbox) viewer. Each source
-is an independent build step; a planet build *combines* them. Two tile layers:
-
-- **terrain** — Terrarium-encoded raster (depth shading, hillshade, 3D), per-zoom quantized.
-- **vector** — one `vector.pmtiles`: `contours` (metric + feet/fathom isobaths at non-uniform intervals), `soundings` (shoalest-per-cell spot depths), and `drying`/`coverage` (foreshore + data-extent polygons).
-
-The engine is Python (`uv` project under `pipelines/`) driving GDAL/tippecanoe as
-CLI subprocesses; `just` is the task runner. There's no compiled app code. The
-predecessor pure-Bash pipeline (`scripts/`) has been **retired** — don't resurrect it.
-
-## Commands
-
-All recipes run from the repo root (the `Justfile` executes them in `pipelines/`).
-The container (`Dockerfile`) is the source of truth for the toolchain; run recipes
-through it if deps aren't installed locally.
-
-```bash
-just source <id>   # prepare one source (fetch → datum → normalize → bounds → polygon → tarball)
-just sources       # prepare every source under ../sources/
-just planet        # cover → aggregate → downsample → bundle → contours → soundings  (BBOX="W,S,E,N")
-just preview       # build the NY-harbor demo + seed the local Worker R2 (streams sources from R2 — no local data)
-just test-sources  # offline source-stage self-check (synthetic, no network)
-just test-engine   # offline aggregation/bundle self-check (priority, zoom cap, pyramid)
-```
-
-Outputs land in `pipelines/store/bundle/`: `planet.pmtiles`, one
-`overlay-{z}-{x}-{y}.pmtiles` per populated grid cell, `vector.pmtiles`, and
-`manifest.json`. Inspect a `.pmtiles` by dragging it into
-https://protomaps.github.io/PMTiles/.
-
-**Preview freely.** Run `just preview` (or `just preview-local`) to eyeball any
-visual change — it streams sources from R2 (or reads already-prepared COGs in
-`store/source`) and downloads no datasets. It's the intended fast feedback loop,
-not an expensive operation; use it whenever you touch shading, contours, or the viewer.
-
-## Architecture
-
-### Four stages
-
-`source → aggregation → downsampling → bundle`, all cwd-relative under a single
-`pipelines/store/` dir (gitignored), one subdir per stage (`store/source`,
-`store/aggregation`, `store/pmtiles`, `store/contour`, `store/bundle`, …).
-
-- **source** (`source_*.py`, per `sources/<id>/`): fetch → datum offset → normalize to a 4326 COG → `bounds.csv` → coverage polygon → tarball. Each source owns its recipe (`sources/<id>/Justfile`) composing the shared steps; `metadata.json` is attribution + an optional `max_zoom` cap. Priority derives from `(maxzoom, id)` — GEBCO loses (smallest maxzoom), so regional sources win in overlap.
-- **aggregation** (`aggregation_*.py`): `cover` slices the planet into source-aware aggregation tiles (one CSV each); `run` reprojects each source by priority into a merged Float32 DEM (Gaussian seam feather), slope-smooths it (`smooth.py`), encodes Terrarium raster tiles, and forks contours (`contour_run.py`) and soundings (`soundings_run.py`) off the same merged DEM. Sources flagged `land_clamp` (GEBCO/EMODnet — coarse, no land/water concept) get their negative land pixels clamped to 0 against the OSM land mask (`landmask.py`, prep once with `just landmask`) right after warp, so shoreline cells don't paint false water/contours/soundings over land. The same mask feeds a `drying_run.py` fork: it polygonizes the green foreshore (elevation in `[0, DRYING_CAP]` seaward of the land line — chart drying areas) into a `drying` layer folded into `vector.pmtiles`.
-- **downsampling**: 2×2-average overview pyramid below each source's native maxzoom.
-- **bundle** (`bundle.py`): concat single-zoom pmtiles into `planet.pmtiles` (z0..`PLANET_MAX_ZOOM` = `macrotile_z`) + one `overlay-{cell}.pmtiles` per populated `OVERLAY_SPLIT_Z` grid cell (default z5) + `manifest.json`. Contours, soundings, and drying/coverage layers bundle into `vector.pmtiles` via tippecanoe.
-
-### Why a planet cap + grid overlays + Worker (the serving model)
-
-GEBCO is ~z8 native; regional sources reach ~z14. Baking a full z0–14 pyramid
-means upsampling GEBCO globally (hundreds of GB, no new data). Instead: **planet
-capped at `macrotile_z`** (complete, all-sources-merged base, ~1–2 GB), **fixed-grid
-overlays** above it — one archive per populated `OVERLAY_SPLIT_Z` cell, each carrying
-the GEBCO-filled merged mosaic (Terrarium has no transparency, so an overlay must not
-punch holes) — and the **`worker/` Cloudflare Worker** resolves per tile: z≤cap →
-planet; z>cap in a populated cell → that cell's archive (the cell is computed from
-the tile address — no footprint search); else → overzoom the planet — one endpoint,
-no global upsampling, no holes. Overlays are grid cells rather than per-source
-archives on purpose: a cell is a fixed fraction of the globe, so a new source adds
-*cells* instead of growing any single archive (a per-source overlay's size tracked
-its footprint and outgrew CI runner disks). Reads all pmtiles from R2 over HTTP
-range. The viewer (`index.js`) points at the Worker; `VITE_TILES_BASE` selects the
-endpoint (empty → `localhost:8787` dev). The MapLibre style itself lives in
-**`style/`** (`@openwaters/seascape`, an npm workspace): flavor + `sources()` /
-`layers()` / `depthRelief()` in the protomaps-basemaps shape, consumed by the
-viewer and served assembled by the Worker at `/style.json` (`?unit=`/`?safety=`
-bake mariner defaults). Sources point at the Worker's TileJSON, so the style
-needs no manifest. TypeScript: `tsc` emits `style/dist/` on install (prepare);
-Vite dev reads `index.ts` directly (development export condition), but wrangler
-dev and `vite build` read `dist/` — rebuild after style edits. Tests: `npm test`
-(vitest).
-
-### Contours (the custom vector layer)
-
-A parallel consumer of each aggregation tile's merged DEM: `gdal_contour` at the
-non-uniform `CONTOUR_LEVELS` → Chaikin smooth (shapely) → clip to the unbuffered
-tile bbox → 4326. Seam continuity comes from **buffer the DEM input, restrict the
-tile output** (deterministic merge → byte-identical overlap → lines meet at the clip).
-Contour tiles are tile-keyed in `store/contour` so clean tiles persist across runs.
-
-### CI / incremental (`ci.yml` checks, `build.yml` build)
-
-`ci.yml` runs the light per-commit checks (image → check + web) on every push.
-The full build lives in `build.yml`:
-`image → sources (matrix) → plan (cover + dirty-diff) → aggregate (sharded fan-out)
-→ bundle → publish/worker/pages`. State persists in R2 under `store/`, so a rebuild
-diffs the new covering against the previous (`get_dirty_aggregation_filenames`) and
-only changed aggregation tiles rebuild; clean tiles' pmtiles/contours are reused.
-`aggregate` shards by strided slice of the dirty list (`aggregation_run.py shard i n`).
-The build runs on `workflow_dispatch` only (a shared store shouldn't be mutated by
-routine pushes). Releasing a commit promotes the
-build a dispatch produced for it — so dispatch a build before you release that commit.
-On release (`release.yml`), the commit's build promotes from the data bucket
-(`bathymetry/build/<sha>/`) to the serving bucket at `seascape/<sha>/`, the Worker
-deploys pointed at it (`RELEASE_PREFIX=seascape/<sha>/`, `wrangler`), and the viewer
-ships to Pages.
-
-## Conventions
-
-- Recipes are invoked from the repo root but execute in `pipelines/`; everything generated lives under `pipelines/store/` (gitignored). GDAL/tippecanoe are CLI subprocesses, not Python bindings.
-- `pipelines/*.py` vendored from mapterhorn keep its BSD-3 attribution (`pipelines/LICENSE.mapterhorn`).
-- Each non-trivial step ships a runnable self-check (`test_*.py`, `python encode.py`, `python smooth.py`).
-- Mark deliberate simplifications with a plain comment naming the ceiling + upgrade path (no special label).
-- Design docs: [ROADMAP.md](ROADMAP.md) (goal, workstreams, source/coverage, build scaling — where the work is going), [CONTRIBUTING.md](CONTRIBUTING.md) (dev flow), `RESEARCH.md`, [docs/nautical-chart-references.md](docs/nautical-chart-references.md) (IHO/NOAA chart standards + sounding-selection literature — for chart-data-model work), and the port plan referenced in commits.
+- **Preview freely.** `just preview` streams sources from R2 and downloads no
+  datasets — it's the intended fast feedback loop, not an expensive operation.
+  Use it whenever you touch shading, contours, or the viewer. Inspect any
+  `.pmtiles` by dragging it into https://protomaps.github.io/PMTiles/.
+- **Check [sources/README.md](sources/README.md) before researching any data
+  source** — it catalogs built, open, and ruled-out sources; the ruled-out table
+  exists precisely so nobody re-researches them.
+- Planned work lives in GitHub issues (`gh issue list`).
