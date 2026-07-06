@@ -159,7 +159,10 @@ def bundle():
     if not fgbs:
         print("drying bundle: no drying FGBs")
         return
-    maxz = max(int(f.split("/")[-1].replace(".fgb", "").split("-")[3]) for f in fgbs)
+    # Shared tileset maxzoom (see contour_run.bundle_maxz): tiling only to this
+    # layer's own regional max would truncate it out of deeper joined tiles.
+    maxz = contour_run.bundle_maxz(
+        max(int(f.split("/")[-1].replace(".fgb", "").split("-")[3]) for f in fgbs))
     utils.create_folder("store/bundle")
     subprocess.run(
         ["tippecanoe", "-o", "store/bundle/drying.pmtiles", "-f", "-l", "drying",

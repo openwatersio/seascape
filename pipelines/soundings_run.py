@@ -45,6 +45,17 @@ SOUND_CELL_PX = int(os.environ.get("SOUND_CELL_PX", "64"))
 SOUND_MIN_DEPTH_M = float(os.environ.get("SOUND_MIN_DEPTH_M", "1.0"))
 
 
+def _tc(minz, child_z):
+    """Per-feature tippecanoe zoom placement. Coarser levels swap out as the next
+    finer field arrives (maxzoom == their own zoom). The finest level (minz ==
+    child_z) declares NO maxzoom so it persists to the tileset max: child_z is the
+    LOCAL best-source ceiling (z10 in Danish waters, z13+ where CUDEM reaches),
+    and the global tileset tiles past it wherever any region goes deeper — capping
+    at child_z blanked the layer there (soundings gone at z11+ over Denmark while
+    contours carried on)."""
+    return {"minzoom": minz} if minz == child_z else {"minzoom": minz, "maxzoom": minz}
+
+
 def _depths(depth_pos):
     """Depth (metres, positive down) → chart labels, each floored toward shallower so the printed
     number is never deeper than the surface. Metres carry one decimal in the shoal band (< 6 m,
@@ -155,9 +166,9 @@ def generate(filepath):
     feats = []
     for d, x3857, y3857, minz in pts:
         lon, lat = to4326.transform(x3857, y3857)
-        # minzoom==maxzoom: each level shows at exactly one zoom, so every zoom is one clean
-        # staggered field (the deepest level, minz==child_z, overzooms above).
-        feats.append({"type": "Feature", "tippecanoe": {"minzoom": minz, "maxzoom": minz},
+        # Each level shows at exactly one zoom (one clean staggered field per zoom);
+        # the finest level rides uncapped to the tileset max — see _tc.
+        feats.append({"type": "Feature", "tippecanoe": _tc(minz, child_z),
                       "properties": _depths(d),
                       "geometry": {"type": "Point", "coordinates": [round(lon, 6), round(lat, 6)]}})
 
@@ -184,7 +195,10 @@ def bundle():
     if not gj:
         print("soundings bundle: no soundings")
         return
-    maxz = max(int(g.split("/")[-1].replace(".geojson", "").split("-")[3]) for g in gj)
+    # Shared tileset maxzoom (see contour_run.bundle_maxz): tiling only to this
+    # layer's own regional max would truncate it out of deeper joined tiles.
+    maxz = contour_run.bundle_maxz(
+        max(int(g.split("/")[-1].replace(".geojson", "").split("-")[3]) for g in gj))
     utils.create_folder("store/bundle")
     subprocess.run(
         ["tippecanoe", "-o", "store/bundle/soundings.pmtiles", "-f", "-l", "soundings",
@@ -256,6 +270,11 @@ def _check():
     paths = ["store/soundings/4-5-6-8.geojson", "store/soundings/11-300-400-13.geojson"]
     assert _live(paths, {"11-300-400-13"}) == ["store/soundings/11-300-400-13.geojson"]
     assert _live(paths, None) == paths
+
+    # zoom placement: coarser levels swap out at their own zoom; the finest level
+    # (minz == child_z) is uncapped so it persists above the local source ceiling
+    assert _tc(8, 10) == {"minzoom": 8, "maxzoom": 8}
+    assert _tc(10, 10) == {"minzoom": 10}
     print("soundings_run self-check ok")
 
 
