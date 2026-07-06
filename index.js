@@ -63,6 +63,7 @@ const toggles = {
   "toggle-labels": ["contour-labels"],
   "toggle-soundings": ["soundings"],
   "toggle-drying": ["drying-areas"],
+  "toggle-osm": ["osm-base"],
   "toggle-sources": [
     "source-fill",
     "source-highlight",
