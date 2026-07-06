@@ -176,22 +176,29 @@ def _live(paths, stems):
     return [p for p in paths if p.split("/")[-1].rsplit(".", 1)[0] in stems]
 
 
-def bundle():
+def bundle(shard=None):
     """tippecanoe the per-tile soundings into store/bundle/soundings.pmtiles (layer `soundings`).
     Per-feature tippecanoe.minzoom places each point from the zoom the grid decimation assigned,
-    so no density dropping is needed (-r1 keeps every surviving point)."""
+    so no density dropping is needed (-r1 keeps every surviving point). With a shard index →
+    soundings-shard-{shard}.pmtiles from this shard's local slice, tiled to the shared global
+    maxz (store/contour-maxz.txt, like the contour shards): a slice's own max child_z can
+    undershoot it, and the join would then drop the layer from tiles deeper than the slice."""
     gj = _live(sorted(glob("store/soundings/*.geojson")), contour_run._current_stems())
     if not gj:
         print("soundings bundle: no soundings")
         return
-    maxz = max(int(g.split("/")[-1].replace(".geojson", "").split("-")[3]) for g in gj)
+    maxzfile = "store/contour-maxz.txt"
+    maxz = int(open(maxzfile).read().strip()) if os.path.isfile(maxzfile) else \
+        max(int(g.split("/")[-1].replace(".geojson", "").split("-")[3]) for g in gj)
     utils.create_folder("store/bundle")
+    out = "store/bundle/soundings.pmtiles" if shard is None \
+        else f"store/bundle/soundings-shard-{shard}.pmtiles"
     subprocess.run(
-        ["tippecanoe", "-o", "store/bundle/soundings.pmtiles", "-f", "-l", "soundings",
+        ["tippecanoe", "-o", out, "-f", "-l", "soundings",
          "-n", "Bathymetric soundings", "-A", utils.ATTRIBUTION, "-Z", "0", "-z", str(maxz),
          "-P", "-q", "-r1", "-y", "depth_m", "-y", "depth_ft", "-y", "depth_fm",
          *gj], check=True)
-    print(f"soundings bundle: store/bundle/soundings.pmtiles (z0-{maxz}, {len(gj)} tiles)")
+    print(f"soundings bundle: {out} (z0-{maxz}, {len(gj)} tiles)")
 
 
 def _check():
@@ -249,7 +256,9 @@ if __name__ == "__main__":
     a = sys.argv[1:]
     if a[:1] == ["bundle"]:
         bundle()
+    elif a[:1] == ["bundle-shard"]:
+        bundle(int(a[1]))
     elif a[:1] == ["check"]:
         _check()
     else:
-        sys.exit("usage: soundings_run.py bundle | check")
+        sys.exit("usage: soundings_run.py bundle | bundle-shard <i> | check")

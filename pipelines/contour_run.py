@@ -300,9 +300,10 @@ def _coverage_pmtiles(maxz):
     return out
 
 
-def _finalize_contours(contour_pmtiles, maxz):
-    """tile-join the contour pmtiles (one local build or the CI shards) + the coverage
-    layer + the prebuilt soundings/drying pmtiles (when their bundles ran first) into
+def _finalize_contours(archives, maxz):
+    """tile-join the layer archives (a local build's contour pmtiles, or the CI shards —
+    which carry contours, soundings, AND drying slices) + the coverage layer + the
+    whole-set soundings/drying pmtiles (local path, when their bundles ran first) into
     store/bundle/vector.pmtiles. ONE join: tile-join rewrites every tile of the whole
     archive, so folding each sparse layer in afterwards re-paid the planet-wide join
     per layer (~90 min each in CI). -pk keeps every feature of every layer; a layer
@@ -311,7 +312,7 @@ def _finalize_contours(contour_pmtiles, maxz):
     layers = [p for p in [cov, "store/bundle/soundings.pmtiles", "store/bundle/drying.pmtiles"]
               if p and os.path.isfile(p)]
     subprocess.run(["tile-join", "-o", "store/bundle/vector.pmtiles", "-f", "-pk",
-                    *contour_pmtiles, *layers], check=True)
+                    *archives, *layers], check=True)
     return cov is not None
 
 
@@ -366,10 +367,10 @@ def bundle(shard=None):
 
 
 def bundle_merge():
-    """tile-join the per-shard contour pmtiles + the coverage layer into one
-    vector.pmtiles (-pk keeps every feature; the shards are disjoint FGB slices
-    unioned per tile)."""
-    shards = sorted(glob("store/bundle/contours-shard-*.pmtiles"))
+    """tile-join the per-shard pmtiles — contours, soundings, drying (each shard job
+    bundles its slice of all three) — + the coverage layer into one vector.pmtiles
+    (-pk keeps every feature; the shards are disjoint file slices unioned per tile)."""
+    shards = sorted(glob("store/bundle/*-shard-*.pmtiles"))
     if not shards:
         print("contour merge: no shard pmtiles")
         return
@@ -377,7 +378,7 @@ def bundle_merge():
     if not os.path.isfile(maxzfile):
         raise SystemExit("contour merge: store/contour-maxz.txt missing (the shard jobs write it)")
     cov = _finalize_contours(shards, int(open(maxzfile).read().strip()))
-    print(f"contour merge: store/bundle/vector.pmtiles ({len(shards)} shards"
+    print(f"contour merge: store/bundle/vector.pmtiles ({len(shards)} shard archives"
           f"{', + coverage layer' if cov else ''})")
 
 
