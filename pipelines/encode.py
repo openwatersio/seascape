@@ -19,6 +19,16 @@ so coarse zooms (deep abyssal plains, viewed small) cost few bits while fine
 zooms (shallow coastal detail) keep full precision. At z<=19 the rounded value
 is an exact multiple of the 1/256 LSB, so the RGB packing is lossless.
 
+Bathymetry adaptation — *depth-aware step cap*. The zoom schedule alone was
+tuned for terrain (kilometres of relief); applied to a shelf it terraces the
+shallows: a region whose best source tops out at z10 bakes 2 m steps into
+water that is itself only a few metres deep, and on a gentle seabed (1:1000)
+every step is a plateau hundreds of metres wide — blocky shorelines at the
+very zooms mariners use. So the step is capped per-pixel at SHALLOW_REL of the
+local depth (floored at SHALLOW_MIN_STEP, snapped up to a power of two so it
+stays a multiple of the LSB): deep water keeps the byte-saving coarse steps,
+shallow water keeps chart detail at every zoom.
+
 Bathymetry adaptation — *conservative rounding*. A chart must bias shallow:
 charted depth <= true depth. So by default we round the height
 *toward shallower* (ceil, i.e. toward the surface / less-negative), guaranteeing
@@ -29,8 +39,9 @@ step shallow bias, which is sub-perceptual at the zoom each step is applied
 
 One exception to the pure rounding: water never quantizes to 0. Elevation 0 is
 the land value (the land mask clamps land pixels to it, and the depth ramp
-draws it as land), so a negative input that would round to >= 0 — at z9 the
-step is 4 m, so that is ALL water shallower than 4 m — is capped at -LSB
+draws it as land), so a negative input that would round to >= 0 — water
+shallower than its local per-pixel step, i.e. min(zoom step, depth cap), at
+most SHALLOW_MIN_STEP and smaller still at fine zooms — is capped at -LSB
 instead. Still shoal-biased; the only inputs it deepens are true depths
 shallower than the ~4 mm LSB, which are noise.
 """
@@ -41,6 +52,13 @@ FULL_RESOLUTION_ZOOM = 19
 TERRARIUM_OFFSET = 32768.0
 LSB = 1.0 / 256.0  # Terrarium's vertical resolution (metres)
 
+# Depth-aware step cap: never quantize coarser than this fraction of the local
+# depth, floored at SHALLOW_MIN_STEP. 1/16 keeps the step within one ramp band
+# everywhere (band edges 2/5/10/20/50 m); 0.25 m matches the shoal-band label
+# precision (one decimal below 6 m).
+SHALLOW_REL = 1.0 / 16.0
+SHALLOW_MIN_STEP = 0.25  # metres; a power of two, so an exact multiple of LSB
+
 
 def quantization_factor(z):
     """Vertical step (metres) at zoom ``z``."""
@@ -48,7 +66,9 @@ def quantization_factor(z):
 
 
 def quantize(data, z, conservative=True):
-    """Round elevations (metres) to the per-zoom vertical step.
+    """Round elevations (metres) to the per-zoom vertical step, capped per-pixel
+    at SHALLOW_REL of the local depth (see module docstring) so shallow water
+    never terraces at coarse zooms.
 
     conservative=True rounds toward shallower (never deepens); False is
     round-to-nearest. Water stays water either way: a negative input that
@@ -56,8 +76,12 @@ def quantize(data, z, conservative=True):
     """
     factor = quantization_factor(z)
     data = np.asarray(data, dtype=np.float64)
-    scaled = data / factor
-    rounded = (np.ceil(scaled) if conservative else np.round(scaled)) * factor
+    # Snap the depth cap UP to a power of two so every step is a power-of-two
+    # multiple of the LSB and the RGB packing stays lossless.
+    depth_cap = 2.0 ** np.ceil(np.log2(np.maximum(np.abs(data) * SHALLOW_REL, SHALLOW_MIN_STEP)))
+    step = np.minimum(factor, depth_cap)
+    scaled = data / step
+    rounded = (np.ceil(scaled) if conservative else np.round(scaled)) * step
     return np.where((data < 0) & (rounded >= 0), -LSB, rounded)
 
 
@@ -123,14 +147,19 @@ def _check():
         assert np.all(back2[rnd < 0] < 0), z
 
     # Non-conservative round-to-nearest CAN deepen — confirms the modes differ.
-    e = np.array([-7.0])  # z9 step = 4 m; nearest -> -8 (deeper), ceil -> -4 (shallower)
+    e = np.array([-100.0 - 3.0])  # z9 step 4 m at ~100 m depth (cap 8 m > factor 4 m)
     assert decode(encode(e, 9, conservative=False))[0] < e[0]
     assert decode(encode(e, 9, conservative=True))[0] >= e[0]
 
-    # The water floor: shallow water that would round to 0 (land) caps at -LSB
-    # and survives the RGB round-trip exactly. -2.4 at z9 (4 m step) is the
-    # GEBCO shallow-shelf case; -0.001 is the sub-LSB deepen exception.
-    assert decode(encode(np.array([-2.4]), 9))[0] == -LSB
+    # Depth-aware cap: shallow water keeps fine steps at coarse zooms instead of
+    # terracing. -3.7 m at z10 (zoom step 2 m) quantizes at the 0.25 m floor;
+    # deep water is untouched by the cap (-1000 m at z6: 32 m zoom step wins).
+    assert decode(encode(np.array([-3.7]), 10))[0] == -3.5
+    assert decode(encode(np.array([-1000.0]), 6))[0] == -992.0  # ceil(-1000/32)*32
+
+    # The water floor: water shallower than the local step, which would round to
+    # 0 (land), caps at -LSB and survives the RGB round-trip exactly.
+    assert decode(encode(np.array([-0.2]), 9))[0] == -LSB
     assert decode(encode(np.array([-0.001]), 12))[0] == -LSB
 
     print("encode.py self-check ok")

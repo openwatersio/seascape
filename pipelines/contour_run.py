@@ -228,6 +228,30 @@ def _global_maxz(fgbs):
     return max(int(f.split("/")[-1].replace(".fgb", "").split("-")[3]) for f in fgbs)
 
 
+def _stems_maxz(stems):
+    """Max child_z across covering stems ({z}-{x}-{y}-{child_z})."""
+    return max(int(s.rsplit("-", 1)[1]) for s in stems)
+
+
+def bundle_maxz(own_max):
+    """The tileset maxzoom EVERY vector layer bundles to (contours, soundings,
+    drying). They tile-join into one vector.pmtiles, whose maxzoom is the max
+    across layers — a layer bundled only to its own regional max silently
+    vanishes from deeper tiles (drying stopped at z11 while contours ran to
+    z14, so the Æbelø flats rendered as bare land above z11). Use the shared
+    global contour maxz (store/contour-maxz.txt, written by the CI shard jobs)
+    when present, else the current covering's max child_z, else the caller's
+    own files' max."""
+    maxzfile = "store/contour-maxz.txt"
+    if os.path.isfile(maxzfile):
+        with open(maxzfile) as f:
+            return max(int(f.read().strip()), own_max)
+    stems = _current_stems()
+    if stems:
+        return max(own_max, _stems_maxz(stems))
+    return own_max
+
+
 # ── source coverage (provenance) layer ───────────────────────────────────────
 # Tile each source's union footprint (store/polygon/<id>.gpkg, from the source stage)
 # into a `coverage` layer alongside `contours` in the same pmtiles, so the viewer can
@@ -344,8 +368,7 @@ def bundle(shard=None):
     if not fgbs:
         print("contour bundle: no contour FGBs")
         return
-    maxzfile = "store/contour-maxz.txt"
-    maxz = int(open(maxzfile).read().strip()) if os.path.isfile(maxzfile) else _global_maxz(fgbs)
+    maxz = bundle_maxz(_global_maxz(fgbs))
     utils.create_folder("store/bundle")
     if shard is not None:  # CI: lines only; coverage joins once at the merge step
         out = f"store/bundle/contours-shard-{shard}.pmtiles"
@@ -392,6 +415,8 @@ def _check():
     fgbs = ["store/contour/4-5-6-8.fgb", "store/contour/11-300-400-13.fgb"]
     assert _live_fgbs(fgbs, {"11-300-400-13"}) == ["store/contour/11-300-400-13.fgb"]
     assert _live_fgbs(fgbs, None) == fgbs
+    # the shared bundle maxzoom reads child_z off covering stems
+    assert _stems_maxz({"4-5-6-8", "11-300-400-13"}) == 13
     # navigable-band contours skip Chaikin (never bow a shoal deeper); deeper ones smooth
     assert _chaikin_iters(10) == 0 and _chaikin_iters(NAV_SMOOTH_MAX_M) == 0
     assert _chaikin_iters(NAV_SMOOTH_MAX_M + 1) == CHAIKIN_ITERATIONS
