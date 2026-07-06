@@ -456,8 +456,17 @@ jobs:
           # The tail is finished here on one runner from the full store; the matrix jobs
           # below each pull only one group's slice at a time. Contours are bundled by the
           # separate sharded jobs, so store/contour is NOT pulled here.
+          # Outer retry, same reason as the per-key pulls elsewhere: one mid-body
+          # connection reset (after aws's internal retries) exits the whole ~50 GiB
+          # sync 1; sync is incremental, so a retry only re-fetches what's missing.
           mkdir -p store/pmtiles
-          aws s3 sync "s3://$DATA_BUCKET/bathymetry/pmtiles" store/pmtiles
+          for a in 1 2 3; do
+            aws s3 sync "s3://$DATA_BUCKET/bathymetry/pmtiles" store/pmtiles && exit 0
+            echo "pmtiles sync attempt $a failed; retrying in $((a * 10))s" >&2
+            sleep $((a * 10))
+          done
+          echo "pmtiles sync failed after 3 attempts" >&2
+          exit 1
       - name: Coarse tail + bundle matrix
         id: g
         run: |
