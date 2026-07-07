@@ -57,17 +57,37 @@ def create_folder(path):
 
 def http_download(url, dest, chunk=1 << 20, retries=5):
     '''Stream a URL to dest with requests (handles query-string URLs; no shell).
-    Retries with backoff on transient network errors — the public data servers
-    (EMODnet, SDFE, …) reset connections under load.'''
+    Downloads into dest.part and resumes it with a Range header (like curl -C -)
+    across retries and re-runs, renaming into place only when complete — so a
+    multi-GB fetch that dies at 90% doesn't restart from byte 0, and dest never
+    exists half-written. Retries with backoff on transient network errors — the
+    public data servers (EMODnet, SDFE, …) reset connections under load.'''
     import time
     import requests
+    part = dest + '.part'
     for attempt in range(retries):
         try:
-            with requests.get(url, stream=True, timeout=120) as r:
+            have = os.path.getsize(part) if os.path.exists(part) else 0
+            headers = {'Range': f'bytes={have}-'} if have else {}
+            with requests.get(url, stream=True, timeout=120, headers=headers) as r:
+                if r.status_code == 416:  # .part at/past EOF (crash before rename): restart clean
+                    os.remove(part)
+                    raise requests.exceptions.RequestException("stale .part (416)")
                 r.raise_for_status()
-                with open(dest, 'wb') as f:
-                    for part in r.iter_content(chunk):
-                        f.write(part)
+                # 206 appends the tail; anything else means the server ignored the
+                # Range (or none was sent) and is streaming the whole file
+                resumed = r.status_code == 206
+                if resumed:
+                    total = int(r.headers['Content-Range'].rsplit('/', 1)[-1])
+                else:
+                    total = int(r.headers.get('Content-Length') or 0)
+                with open(part, 'ab' if resumed else 'wb') as f:
+                    for piece in r.iter_content(chunk):
+                        f.write(piece)
+            if total and os.path.getsize(part) < total:  # connection died without an error
+                raise requests.exceptions.RequestException(
+                    f"short read: {os.path.getsize(part)}/{total} bytes")
+            os.replace(part, dest)
             return
         except requests.exceptions.RequestException as e:
             if attempt == retries - 1:

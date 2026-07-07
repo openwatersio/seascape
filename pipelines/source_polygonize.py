@@ -9,25 +9,51 @@ Note: shells out via utils.run_command; inputs are our own source ids/filenames
 (filenames are sanitized upstream), not untrusted input.
 """
 
+import math
 import sys
 import os
 from multiprocessing import Pool
 import shutil
 
+import rasterio
+
 import utils
 
 SILENT = True
 
+# Long-edge ceiling for the mask a file is polygonized from. Footprints only steer
+# the tile covering and the coverage layer — both far coarser than native pixels —
+# but a pixel-exact mask of a ragged swath grid (an AusSeabed transit corridor:
+# thousands of nodata holes) takes minutes per file and unions into a ~20 MB
+# polygon. Shrinking with `-r max` DILATES: any block with one valid pixel stays
+# covered, so the footprint over-approximates and coverage is never lost. The
+# ceiling costs fuzz of extent/1024 (~hundreds of m on an ocean corridor, a few
+# tile-pixels on a harbor survey); a per-source knob is the upgrade if a source
+# ever needs exact edges.
+MASK_MAX_PX = 1024
+
 
 def polygonize_tif(source, filename):
+    src = f"store/source/{source}/{filename}"
     mask = f"store/polygon/{source}/{filename}"
+    with rasterio.open(src) as r:
+        factor = math.ceil(max(r.width, r.height) / MASK_MAX_PX)
+        size = (max(1, r.width // factor), max(1, r.height // factor))
+    if factor > 1:
+        small = mask + ".small.tif"
+        utils.run_command(
+            f'GDAL_CACHEMAX=1024 gdalwarp -q -overwrite -ts {size[0]} {size[1]} '
+            f'-r max {src} {small}', silent=SILENT)
+        src = small
     utils.run_command(
-        f'GDAL_CACHEMAX=1024 gdal_calc.py -A store/source/{source}/{filename} '
+        f'GDAL_CACHEMAX=1024 gdal_calc.py -A {src} '
         f'--outfile={mask} --calc="A*0+1" --type=Byte --overwrite', silent=SILENT)
     utils.run_command(
         f'GDAL_CACHEMAX=1024 gdal_polygonize.py {mask} -b 1 -f "GPKG" '
         f'store/polygon/{source}/{filename}.gpkg -overwrite', silent=SILENT)
     os.remove(mask)
+    if factor > 1:
+        os.remove(src)
 
 
 def get_filenames(source):
@@ -78,5 +104,45 @@ def main():
     shutil.rmtree(f"store/polygon/{source}")
 
 
+def _check():
+    """A sparse raster wide enough to trigger the mask downsample keeps every
+    valid speck in its footprint (dilation, not erosion)."""
+    import json
+    import subprocess
+    import tempfile
+    import numpy as np
+    from rasterio.transform import from_origin
+    from shapely.geometry import shape, Point
+
+    tmp = tempfile.mkdtemp()
+    cwd = os.getcwd()
+    os.chdir(tmp)
+    try:
+        os.makedirs("store/source/_synth")
+        arr = np.full((3000, 3000), -9999.0, dtype="float32")
+        arr[10:13, 10:13] = -5.0        # speck near one corner
+        arr[2900:2903, 2900:2903] = -7.0  # speck near the other
+        with rasterio.open("store/source/_synth/_synth_0.tif", "w", driver="GTiff",
+                           height=3000, width=3000, count=1, dtype="float32",
+                           nodata=-9999.0, crs="EPSG:4326",
+                           transform=from_origin(0.0, 3.0, 0.001, 0.001)) as d:
+            d.write(arr, 1)
+        utils.create_folder("store/polygon/_synth/")
+        polygonize_tif("_synth", "_synth_0.tif")
+        geo = subprocess.run(
+            ["ogr2ogr", "-f", "GeoJSON", "/vsistdout/", "store/polygon/_synth/_synth_0.tif.gpkg"],
+            capture_output=True, check=True).stdout
+        polys = [shape(f["geometry"]) for f in json.loads(geo)["features"]]
+        for x, y in [(0.0115, 2.9885), (2.9015, 0.0985)]:  # speck centers in map coords
+            assert any(p.contains(Point(x, y)) for p in polys), (x, y)
+        print("source_polygonize.py self-check ok")
+    finally:
+        os.chdir(cwd)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:2] == ["--check"]:
+        _check()
+    else:
+        main()

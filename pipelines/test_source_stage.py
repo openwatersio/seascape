@@ -47,8 +47,78 @@ def check_remote_parsers():
     print("remote parsers ok")
 
 
+def check_http_download():
+    """utils.http_download resume semantics against a local Range-aware server:
+    fresh fetch, resume of a seeded .part (206 append), a server that ignores
+    Range (200 rewrite), a mid-stream cut (short read → retried with resume),
+    and a stale .part at EOF (416 → clean restart)."""
+    import http.server
+    import threading
+    import utils
+
+    payload = bytes(range(256)) * 200  # 51_200 bytes, position-dependent content
+    state = {"cut_next": False, "ignore_range": False}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            start = 0
+            rng = self.headers.get("Range")
+            if rng and not state["ignore_range"]:
+                start = int(rng.split("=")[1].rstrip("-"))
+                if start >= len(payload):
+                    self.send_response(416)
+                    self.end_headers()
+                    return
+                self.send_response(206)
+                self.send_header("Content-Range",
+                                 f"bytes {start}-{len(payload) - 1}/{len(payload)}")
+            else:
+                self.send_response(200)
+            body = payload[start:]
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if state["cut_next"]:
+                state["cut_next"] = False
+                self.wfile.write(body[:1000])  # lie, then hang up mid-stream
+                self.connection.close()
+                return
+            self.wfile.write(body)
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_port}/f"
+    tmp = tempfile.mkdtemp()
+    try:
+        def fetch(name, seed=None):
+            dest = f"{tmp}/{name}"
+            if seed is not None:
+                with open(dest + ".part", "wb") as f:
+                    f.write(seed)
+            utils.http_download(url, dest, chunk=4096, retries=3)
+            with open(dest, "rb") as f:
+                assert f.read() == payload, name
+            assert not os.path.exists(dest + ".part"), name
+
+        fetch("fresh")
+        fetch("resumed", seed=payload[:10_000])       # 206 appends the tail
+        state["ignore_range"] = True
+        fetch("range_ignored", seed=payload[:10_000])  # 200 rewrites from scratch
+        state["ignore_range"] = False
+        state["cut_next"] = True
+        fetch("cut_midstream")                         # short read → retry resumes
+        fetch("stale_part", seed=payload)              # 416 → clean restart
+        print("http_download resume ok")
+    finally:
+        srv.shutdown()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     check_remote_parsers()
+    check_http_download()
     tmp = tempfile.mkdtemp()
     try:
         sid = "_synth"

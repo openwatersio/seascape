@@ -1,0 +1,19 @@
+# AusSeabed per-survey L3 bathymetry grids (Geoscience Australia) — CC-BY 4.0.
+# Run from pipelines/:  just ../sources/ausseabed/
+# ~137 survey zips (~30 GB) from files.ausseabed.gov.au (anonymous CloudFront/S3), selected
+# from the Marine Data Register WFS by harvest.py (PUBLISHED + CC-BY + no embargo, SDB
+# excluded). Each zip holds the grid as Float32 COG(s) — negative-down elevation with an
+# embedded per-survey UTM (older: 4326) CRS → mixed_crs, normalize without --crs. Zips also
+# bundle *_hs.tif hillshades and (21 of them) a raw twin of each _cog grid — the unzip
+# member filters keep only the real data. Vertical datum is ~MSL (filename token; two LAT
+# surveys read shallower — the conservative direction). Survey resolutions span
+# 0.5 m–440 m; per-file native maxzoom from bounds.csv sets merge precedence, so the
+# metadata max_zoom=13 only caps the sub-metre surveys. Re-run harvest.py for new surveys.
+[no-cd]
+default:
+    uv run python source_download.py ausseabed
+    uv run python source_unzip.py ausseabed --exclude _hs.tif --prefer _cog.tif
+    uv run python source_normalize.py ausseabed
+    uv run python source_bounds.py ausseabed
+    uv run python source_polygonize.py ausseabed 8
+    uv run python source_create_tarball.py ausseabed

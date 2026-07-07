@@ -47,10 +47,10 @@ def main():
         if os.path.exists(dest):
             continue
         print(f"  [{i}/{len(urls)}] {url} -> {dest}")
-        # .part + rename so a crash mid-stream never leaves a file the skip above
-        # would treat as complete. No checksum — rm the dir to force a clean refetch.
-        utils.http_download(url, dest + ".part")
-        os.replace(dest + ".part", dest)
+        # http_download is atomic (.part + rename) and resumes a crashed fetch, so
+        # the skip above only ever sees complete files. No checksum — rm the dir to
+        # force a clean refetch.
+        utils.http_download(url, dest)
 
 
 if __name__ == "__main__":

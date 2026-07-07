@@ -1,0 +1,9 @@
+{
+    "name": "AusSeabed per-survey bathymetry grids (0.5 m–440 m, Australian waters)",
+    "producer": "Geoscience Australia / AusSeabed (surveys by multiple collecting organisations)",
+    "website": "https://portal.ga.gov.au/persona/marine",
+    "license": "CC BY 4.0 (per-survey; harvest.py keeps only CC-BY records). GA marks all surveys 'Not to be used for navigational purposes'.",
+    "max_zoom": 13,
+    "mixed_crs": true,
+    "datum": "MSL per filename token on modern grids (2 surveys LAT — reads shallower, conservative; older grids untagged) — elevation, seafloor negative, no transform"
+}

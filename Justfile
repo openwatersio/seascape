@@ -176,6 +176,9 @@ preview-local bbox="-74.30,40.40,-73.75,40.80": (preview bbox "local")
 test-sources:
     uv run python test_source_stage.py
     uv run python source_register_remote_geopkg.py --check
+    uv run python source_unzip.py --check
+    uv run python source_download.py --check
+    uv run python source_polygonize.py --check
 test-engine:
     uv run python test_engine.py
     uv run python aggregation_reproject.py --check

@@ -48,11 +48,21 @@ def main():
         sys.exit(f"no URLs in {config.SOURCES_DIR}/{source}/file_list.txt")
     os.makedirs(f"store/source/{source}", exist_ok=True)
     print(f"downloading {source}: {len(urls)} url(s)")
+    skipped = 0
     for i, url in enumerate(urls):
         dest = f"store/source/{source}/{source}_{i}.{ext_for(url)}"
+        # A finished file is skipped, so a re-run resumes instead of re-pulling
+        # everything (http_download is atomic — dest only exists complete; a zip
+        # sniffed by fix_archive_ext lands under the .zip name). No checksum —
+        # rm the dir to force a clean refetch.
+        if os.path.exists(dest) or os.path.exists(dest.rsplit(".", 1)[0] + ".zip"):
+            skipped += 1
+            continue
         print(f"  [{i}] {url} -> {dest}")
         utils.http_download(url, dest)
         fix_archive_ext(dest)
+    if skipped:
+        print(f"  skipped {skipped} already-downloaded file(s)")
 
 
 def _check():
