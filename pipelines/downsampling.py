@@ -17,6 +17,7 @@ Usage (from pipelines/):
 """
 
 import json
+import math
 import os
 import shutil
 import sys
@@ -199,12 +200,27 @@ def shard_ancestor(filepath):
     return ancestor_id(z, x, y)
 
 
+def ancestor_weights():
+    """Dirty deep work per SHARD_ROOT_Z ancestor: each -downsampling.csv at extent z
+    builds 4**(parent_zoom - z) parent webps of uniform cost. Striding by ancestor
+    *count* ignored this and put a deep hi-res subtree (77 min) next to hundreds of
+    couple-of-overview shards (~2 min, all runner spin-up)."""
+    weights = {}
+    for fp in work_list():
+        a = shard_ancestor(fp)
+        if a is None:
+            continue
+        z, _, _, parent_zoom = (int(v) for v in fp.split("/")[-1]
+                                .replace("-downsampling.csv", "").split("-"))
+        weights[a] = weights.get(a, 0) + 4 ** (parent_zoom - z)
+    return weights
+
+
 def owned_ancestors(i, n):
-    """The strided slice of dirty deep ancestors shard i of n owns (the same split
-    run() and matrix() use), so shard-keys and run agree on what a shard touches.
+    """The dirty deep ancestors shard i of n owns — the same weighted bin-packing
+    run() and matrix() use, so shard-keys and run agree on what a shard touches.
     Derived from the frozen work list, so every shard computes the identical split."""
-    ancestors = sorted({a for fp in work_list() if (a := shard_ancestor(fp)) is not None})
-    return set(ancestors[i::n])
+    return set(utils.lpt_bins(ancestor_weights(), n)[i])
 
 
 def shard_keys(i, n):
@@ -366,7 +382,7 @@ def run(shard=None, tail=False):
     """Build the dirty overview pyramid. Default = everything on one machine.
 
     Across CI runners (the cut keeps the level barrier inside one machine):
-      ``shard=(i, n)`` — only the deep levels under the i-th strided slice of
+      ``shard=(i, n)`` — only the deep levels under the i-th work-weighted bin of
         SHARD_ROOT_Z ancestors; each shard's subtree is read-closed, so they run
         concurrently with no coordination and push disjoint tiles.
       ``tail=True``    — only the coarse levels whose archives span ancestors
@@ -382,10 +398,11 @@ def run(shard=None, tail=False):
 
 
 def matrix(maxn):
-    """Print the CI deep-shard matrix JSON: <= maxn shards, >= 1, sized to the
-    number of distinct ancestors in the dirty deep set."""
-    ancestors = {a for fp in work_list() if (a := shard_ancestor(fp)) is not None}
-    n = min(maxn, max(len(ancestors), 1))
+    """Print the CI deep-shard matrix JSON: <= maxn shards, >= 1, with n sized so
+    each shard carries about the heaviest single ancestor — the wall-clock floor
+    anyway, since an ancestor's read-closed subtree can't split across shards."""
+    weights = ancestor_weights()
+    n = min(maxn, math.ceil(sum(weights.values()) / max(weights.values()))) if weights else 1
     print(json.dumps([{"i": i, "n": n} for i in range(n)]))
 
 

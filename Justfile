@@ -24,14 +24,16 @@ sources:
         just ../sources/"$id"/
     done
 
-# Planet build: cover -> aggregate -> downsample -> bundle -> contours (BBOX="W,S,E,N" for a region).
+# Planet build: cover -> aggregate -> downsample -> bundle -> vector layers (BBOX="W,S,E,N"
+# for a region). Soundings + drying bundle BEFORE contours: the contours tile-join folds
+# their pmtiles into vector.pmtiles in the same single pass.
 planet:
     just cover
     uv run python aggregation_run.py
     just combine
-    just contours
     just soundings
     just drying
+    just contours
 
 # Plan the covering: slice the planet into aggregation tiles (BBOX="W,S,E,N" for a region).
 cover:
@@ -94,26 +96,33 @@ bundle-group name:
 bundle-merge:
     uv run python bundle.py merge
 
-# Contours, whole set (local/regional). CI shards these across runners — see below.
+# Contours, whole set (local/regional); the final tile-join also folds in any
+# soundings/drying pmtiles already bundled. CI shards these across runners — see below.
 contours:
     uv run python contour_run.py bundle
 
-# Soundings: bundle the per-tile points, then fold them into vector.pmtiles (one vector source).
+# Soundings: bundle the per-tile points into soundings.pmtiles. Run BEFORE the contours
+# bundle/merge — its single tile-join folds the layer into vector.pmtiles (a separate
+# fold re-joined the whole planet archive per layer).
 soundings:
     uv run python soundings_run.py bundle
-    uv run python soundings_run.py fold
 
-# Drying areas (green foreshore): bundle the per-tile polygons, then fold into vector.pmtiles.
+# Drying areas (green foreshore): bundle the per-tile polygons into drying.pmtiles
+# (folded into vector.pmtiles by the contours tile-join, same as soundings).
 drying:
     uv run python drying_run.py bundle
-    uv run python drying_run.py fold
 
-# tippecanoe this shard's local FGBs -> contours-shard-{i}.pmtiles (CI pulls only the
-# shard's slice + writes store/contour-maxz.txt; merged by contour-merge).
-contour-shard i:
+# tippecanoe this shard's local slice of every vector layer -> {contours,soundings,
+# drying}-shard-{i}.pmtiles (CI pulls only the shard's slices + writes
+# store/contour-maxz.txt so all layers tile to one depth; merged by contour-merge).
+# Three invocations, not one -L run: the layers need different tippecanoe flags
+# (soundings -r1, drying --drop-densest-as-needed, contours' per-zoom filter).
+vector-shard i:
     uv run python contour_run.py bundle-shard {{i}}
+    uv run python soundings_run.py bundle-shard {{i}}
+    uv run python drying_run.py bundle-shard {{i}}
 
-# tile-join the per-shard contour pmtiles into vector.pmtiles.
+# tile-join the per-shard pmtiles (all layers) + coverage into vector.pmtiles.
 contour-merge:
     uv run python contour_run.py bundle-merge
 

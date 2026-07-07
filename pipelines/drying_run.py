@@ -13,7 +13,8 @@ land-mask raster the reproject clamp already rasterized for this tile. Per tile:
 drying mask off (DEM, land mask) -> polygonize -> clip to the unbuffered tile bbox -> 4326 ->
 store/drying/{stem}.fgb. Same seam contract as contours: the mask and DEM are deterministic on
 the buffered grid, so neighbouring tiles' halos polygonize identically and polygon edges meet at
-the clip. bundle() tippecanoes them into a `drying` layer; fold() joins it into vector.pmtiles.
+the clip. bundle() tippecanoes them into a `drying` layer pmtiles; the contour merge's single
+tile-join folds it into vector.pmtiles (run bundle before the merge).
 """
 
 import os
@@ -151,10 +152,13 @@ def generate(filepath):
 
 # ── bundle ───────────────────────────────────────────────────────────────────
 
-def bundle():
+def bundle(shard=None):
     """tippecanoe the per-tile drying FGBs into store/bundle/drying.pmtiles (layer `drying`).
-    Sparse coastal polygons (not sharded, like soundings); the orphan filter drops FGBs left
-    from a re-tiled covering, same as contours/soundings."""
+    The orphan filter drops FGBs left from a re-tiled covering, same as contours/soundings.
+    With a shard index → drying-shard-{shard}.pmtiles from this shard's local slice, tiled
+    to the shared global maxz (store/contour-maxz.txt, like the contour shards): a slice's
+    own max child_z can undershoot it, and the join would then drop the layer from tiles
+    deeper than the slice."""
     fgbs = contour_run._live_fgbs(sorted(glob("store/drying/*.fgb")), contour_run._current_stems())
     if not fgbs:
         print("drying bundle: no drying FGBs")
@@ -164,27 +168,15 @@ def bundle():
     maxz = contour_run.bundle_maxz(
         max(int(f.split("/")[-1].replace(".fgb", "").split("-")[3]) for f in fgbs))
     utils.create_folder("store/bundle")
+    out = "store/bundle/drying.pmtiles" if shard is None \
+        else f"store/bundle/drying-shard-{shard}.pmtiles"
     subprocess.run(
-        ["tippecanoe", "-o", "store/bundle/drying.pmtiles", "-f", "-l", "drying",
+        ["tippecanoe", "-o", out, "-f", "-l", "drying",
          "-n", "Drying areas", "-A", utils.ATTRIBUTION, "-Z", "0", "-z", str(maxz),
          "-P", "-q", "--drop-densest-as-needed",
          "--simplification", os.environ.get("DRYING_SIMPLIFICATION", "8"), *fgbs],
         check=True)
-    print(f"drying bundle: store/bundle/drying.pmtiles (z0-{maxz}, {len(fgbs)} FGBs)")
-
-
-def fold():
-    """Fold drying.pmtiles into vector.pmtiles as the `drying` layer, so the Worker serves it
-    from the one vector source. tile-join -pk keeps every layer's features. Runs after both
-    bundles; no-op if either is missing."""
-    cont, dry = "store/bundle/vector.pmtiles", "store/bundle/drying.pmtiles"
-    if not (os.path.isfile(cont) and os.path.isfile(dry)):
-        print("drying fold: need both vector.pmtiles and drying.pmtiles")
-        return
-    tmp = "store/bundle/vector-with-drying.pmtiles"  # tile-join can't -o over an input
-    subprocess.run(["tile-join", "-o", tmp, "-f", "-pk", cont, dry], check=True)
-    os.replace(tmp, cont)
-    print("drying fold: folded drying layer into vector.pmtiles")
+    print(f"drying bundle: {out} (z0-{maxz}, {len(fgbs)} FGBs)")
 
 
 def _check():
@@ -282,9 +274,9 @@ if __name__ == "__main__":
     a = sys.argv[1:]
     if a[:1] == ["bundle"]:
         bundle()
-    elif a[:1] == ["fold"]:
-        fold()
+    elif a[:1] == ["bundle-shard"]:
+        bundle(int(a[1]))
     elif a[:1] == ["check"]:
         _check()
     else:
-        sys.exit("usage: drying_run.py bundle | fold | check")
+        sys.exit("usage: drying_run.py bundle | bundle-shard <i> | check")
