@@ -28,7 +28,7 @@ The toolchain is heavy native tooling. There are two routes to get it running:
 2. **Local dependencies**: This is faster for iterative development but requires a lot of local setup, could be brittle, and is subject to change. You'll need:
    - **[uv](https://docs.astral.sh/uv/)** — Python env for `pipelines/` (synced automatically on the first `uv run`).
    - **[just](https://github.com/casey/just)** — task runner.
-   - **GDAL CLI** — `gdalwarp`, `gdal_translate`, `gdal_contour`, `ogr2ogr`, `gdalbuildvrt`, `ogrinfo`.
+   - **GDAL CLI** — `gdalwarp`, `gdal_translate`, `gdal_contour`, `ogr2ogr`, `gdalbuildvrt`, `ogrinfo`. Use a recent release (the container pins 3.13): 3.8-era polygon-contour mode mis-writes the deepest depth-area bucket's `amin`.
    - **tippecanoe** + **tile-join** — contour vector tiles.
    - **Node + npm** — the viewer, style, and Worker are one npm workspace; a single `npm install` at the root covers all three (including `wrangler`).
 

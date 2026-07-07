@@ -59,7 +59,10 @@ def partitions(dem, levels, raw_fgb):
         f"gdal_contour -q -p -amin amin -amax amax -fl {fl} -f FlatGeobuf {dem} {raw_fgb}",
         "gdal_contour -p")
     g = gpd.read_file(raw_fgb)
-    g = g[g["amin"] < 0].copy()
+    # Water = amax <= 0, NOT amin < 0: GDAL 3.8's polygon mode writes a garbage amin
+    # (0) on the deepest bucket, which then read as land and vanished — amax is correct
+    # on every version. drval2 off a buggy amin still trips _check's drval1 < drval2.
+    g = g[g["amax"] <= 0].copy()
     g["drval1"] = 0.0 - g["amax"]  # 0.0 - keeps the shoalest bound 0.0, not -0.0
     g["drval2"] = 0.0 - g["amin"]
     return g

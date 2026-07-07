@@ -1,13 +1,13 @@
-FROM ubuntu:24.04
+# Use Official OSGeo image (Ubuntu 24.04 + current GDAL with the HDF5/BAG drivers)
+FROM ghcr.io/osgeo/gdal:ubuntu-full-3.13.1
 
 LABEL org.opencontainers.image.source="https://github.com/openwatersio/seascape"
 LABEL org.opencontainers.image.description="Bathymetry → tile pipeline)"
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# GDAL CLI (invoked as a subprocess by the pipeline) + build deps for tippecanoe.
+# Build deps for tippecanoe (GDAL CLI comes with the base image).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gdal-bin \
     ca-certificates curl git \
     build-essential libsqlite3-dev zlib1g-dev \
   && rm -rf /var/lib/apt/lists/*
