@@ -127,21 +127,21 @@ map.on("load", () => {
 });
 
 // ─── Click to inspect ─────────────────────────────────────────────────────
-// Which source covers a clicked point: the deepest footprint wins (lex-first id on a
-// tie), matching the build's merge rule, so this names the source the depth came from.
-// undefined → coverage layer hidden (skip the line); null → no footprint here = GEBCO.
-function sourceAt(point) {
+// Which sources cover a clicked point, deepest footprint first (lex-first id on
+// a tie) — the build's merge rule, so [0] names the source the depth came from
+// and the rest are the overlapped alternates. Deduped by id: a footprint split
+// across tile boundaries hits once per fragment.
+// undefined → coverage layer hidden (skip the line); [] → no footprint = GEBCO.
+function sourcesAt(point) {
   if (map.getLayoutProperty("source-fill", "visibility") === "none")
     return undefined;
   const hits = map.queryRenderedFeatures(point, { layers: ["source-fill"] });
-  if (!hits.length) return null;
-  return hits
-    .map((f) => f.properties)
-    .sort(
-      (a, b) =>
-        b.source_maxzoom - a.source_maxzoom ||
-        (a.source_id < b.source_id ? -1 : 1),
-    )[0];
+  const byId = new Map(hits.map((f) => [f.properties.source_id, f.properties]));
+  return [...byId.values()].sort(
+    (a, b) =>
+      b.source_maxzoom - a.source_maxzoom ||
+      (a.source_id < b.source_id ? -1 : 1),
+  );
 }
 
 map.on("click", async (e) => {
@@ -150,12 +150,12 @@ map.on("click", async (e) => {
     e.lngLat,
     Math.min(map.getZoom(), MAX_ZOOM),
   );
-  const src = sourceAt(e.point);
+  const srcs = sourcesAt(e.point);
   if (map.getLayer("source-highlight"))
     map.setFilter("source-highlight", [
       "==",
       ["get", "source_id"],
-      src?.source_id ?? "__none__",
+      srcs?.[0]?.source_id ?? "__none__",
     ]);
 
   const lines = [];
@@ -169,10 +169,13 @@ map.on("click", async (e) => {
       }</strong>`,
     );
   }
-  if (src !== undefined)
+  if (srcs !== undefined) {
     lines.push(
-      `<small>source: ${src ? src.source_name : "GEBCO (global)"}</small>`,
+      `<small>source: ${srcs[0]?.source_name ?? "GEBCO (global)"}</small>`,
     );
+    for (const s of srcs.slice(1))
+      lines.push(`<small>also covered by: ${s.source_name}</small>`);
+  }
   if (!lines.length) return;
 
   new maplibregl.Popup()

@@ -91,13 +91,14 @@ Four stages — `source → aggregation → downsampling → bundle` — all wri
 - **source** (`source_*.py`, per `sources/<id>/`): fetch → datum offset → normalize to a 4326 COG → `bounds.csv` → coverage polygon → tarball. Each source owns its recipe (`sources/<id>/Justfile`) composing the shared steps. Priority derives from `(maxzoom, id)` — GEBCO loses (smallest maxzoom), so regional sources win in overlap.
 - **aggregation** (`aggregation_*.py`): `cover` slices the planet into source-aware aggregation tiles (one CSV each); `run` reprojects each source by priority into a merged Float32 DEM (Gaussian seam feather), slope-smooths it (`smooth.py`), encodes Terrarium raster tiles, and forks contours (`contour_run.py`) and soundings (`soundings_run.py`) off the same merged DEM. Sources flagged `land_clamp` (GEBCO/EMODnet — coarse, no land/water concept) get their negative land pixels clamped to 0 against the OSM land mask (`landmask.py`, prep once with `just landmask`) right after warp, so shoreline cells don't paint false water/contours/soundings over land. The same mask feeds a `drying_run.py` fork: it polygonizes the green foreshore (elevation in `[0, DRYING_CAP]` seaward of the land line — chart drying areas) into the `drying` layer. A `depare_run.py` fork buckets the same merged DEM into depth-area partitions (ENC DEPARE: water between charted isobaths, `drval1`/`drval2` depth bounds) — the vector twin of the raster depth shading.
 - **downsampling**: 2×2-average overview pyramid below each source's native maxzoom.
-- **bundle** (`bundle.py`): concat single-zoom pmtiles into `planet.pmtiles` + one overlay archive per populated grid cell + `manifest.json`; contours, soundings, and drying/depare/coverage layers bundle into `vector.pmtiles` via tippecanoe.
+- **bundle** (`bundle.py`): concat single-zoom pmtiles into `planet.pmtiles` + one overlay archive per populated grid cell + `manifest.json`; contours, soundings, and drying/depare layers bundle into `vector.pmtiles` via tippecanoe; the per-source coverage footprints bundle standalone into `coverage.pmtiles` (`just coverage`).
 
 A full build (`planet`) lands in `pipelines/store/bundle/`:
 
 - `planet.pmtiles` — the all-sources-merged base (Terrarium-encoded raster, per-zoom quantized), z0–`macrotile_z` (z8 = GEBCO native, no upsampling).
 - `overlay-{z}-{x}-{y}.pmtiles` — one per populated `OVERLAY_SPLIT_Z` grid cell (default z5), z`macrotile_z+1`→cell-max, carrying the GEBCO-filled merged mosaic under that cell.
-- `vector.pmtiles` — MVT vector source: `contours` (GEBCO baked to the deepest zoom by tippecanoe) plus the folded-in `soundings`, `drying` (green-foreshore polygons), `depare` (depth-band partitions, z6+), and `coverage` layers.
+- `vector.pmtiles` — MVT vector source: `contours` (GEBCO baked to the deepest zoom by tippecanoe) plus the folded-in `soundings`, `drying` (green-foreshore polygons), and `depare` (depth-band partitions, z6+) layers.
+- `coverage.pmtiles` — source-provenance footprints, its own tileset ending at z8 (MapLibre overzooms it independently; inside `vector.pmtiles` the sea-sized fills either minted millions of deep-ocean tiles or vanished above their zoom).
 - `manifest.json` — planet metadata + `overlay.cells` ({cell: max_zoom}) for the Worker.
 
 ### Why a planet cap + grid overlays
@@ -118,9 +119,11 @@ The Worker presents one endpoint per layer and resolves per tile:
 
 ```
 GET /seascape/{z}/{x}/{y}.webp   raster: z≤8 → planet · z>8 in a populated grid cell → that cell's overlay · else → overzoom the planet · miss → transparent
-GET /seascape/{z}/{x}/{y}.pbf    vector: vector.pmtiles passthrough (contours, soundings, drying, depare, coverage layers)
+GET /seascape/{z}/{x}/{y}.pbf    vector: vector.pmtiles passthrough (contours, soundings, drying, depare layers)
+GET /seascape/coverage/{z}/{x}/{y}.pbf  coverage.pmtiles passthrough (source-provenance footprints)
 GET /seascape/raster.json        TileJSON (terrarium raster)
 GET /seascape/vector.json        TileJSON (vector layers)
+GET /seascape/coverage.json      TileJSON (coverage footprints)
 ```
 
 This keeps the base at native z8 (no global upsampling) while presenting one

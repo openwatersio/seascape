@@ -127,8 +127,15 @@ jobs:
         run: |
           volatile=$(jq -r '.volatile // false' "sources/${{ matrix.source }}/metadata.json")
           have=$(aws s3 cp "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/.recipe-hash" - 2>/dev/null || true)
+          # A source whose recipe polygonizes must have its footprint in R2 (the plan
+          # job's coverage tileset builds from bathymetry/polygon/). Missing means the
+          # source last built before the polygon push existed — rebuild once to backfill.
+          poly_ok=true
+          if grep -q source_polygonize "sources/${{ matrix.source }}/Justfile"; then
+            aws s3 ls "s3://$DATA_BUCKET/bathymetry/polygon/${{ matrix.source }}.gpkg" >/dev/null || poly_ok=false
+          fi
           if [ "$volatile" = "true" ]; then current=false
-          elif [ -n "$RECIPE_HASH" ] && [ "$have" = "$RECIPE_HASH" ]; then current=true
+          elif [ -n "$RECIPE_HASH" ] && [ "$have" = "$RECIPE_HASH" ] && [ "$poly_ok" = "true" ]; then current=true
           else current=false; fi
           echo "current=$current" >> "$GITHUB_OUTPUT"
           echo "hash=$RECIPE_HASH" >> "$GITHUB_OUTPUT"
@@ -154,6 +161,11 @@ jobs:
         if: steps.check.outputs.current != 'true'
         run: |
           aws s3 sync "store/source/${{ matrix.source }}" "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}" --delete --exclude '.recipe-hash'
+          # Provenance footprint → bathymetry/polygon/ (the plan job's coverage tileset
+          # reads them all). Guarded: streaming sources register remote COGs and build none.
+          if [ -f "store/polygon/${{ matrix.source }}.gpkg" ]; then
+            aws s3 cp "store/polygon/${{ matrix.source }}.gpkg" "s3://$DATA_BUCKET/bathymetry/polygon/${{ matrix.source }}.gpkg"
+          fi
           # The container writes store/ as root, so write the marker to R2 from stdin
           # (not into the root-owned dir); --exclude above keeps --delete off it.
           printf '%s' "${{ steps.check.outputs.hash }}" | aws s3 cp - "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/.recipe-hash"
@@ -228,6 +240,20 @@ jobs:
           # so the sharded downsample job downstream sees the same plan from R2.
           docker run --rm -v "$PWD:/app" -e BBOX -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just cover
           docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just downsample-cover
+      - name: Build coverage.pmtiles
+        run: |
+          # Source-provenance footprints → their own small tileset (z0-8; the renderer
+          # overzooms it past that, independent of vector.pmtiles). Built here, not in
+          # contour-bundle: plan just wrote the covering, whose aggregation CSVs are the
+          # authoritative per-source maxzoom (metadata.json max_zoom is only an optional
+          # cap most sources omit). `just coverage` fails loudly when bathymetry/polygon/
+          # is empty — a planet build without footprints is a broken build, not a
+          # fallback; the silent drop is how the layer went missing from every release.
+          mkdir -p store/polygon
+          aws s3 sync "s3://$DATA_BUCKET/bathymetry/polygon" store/polygon
+          docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just coverage
+          aws s3 cp store/bundle/coverage.pmtiles "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/coverage.pmtiles" \
+            --content-type application/octet-stream
       - name: Freeze the dirty work lists
         run: |
           # Compute the aggregate + downsample dirty sets ONCE, from this single R2 listing
@@ -637,15 +663,12 @@ jobs:
         run: |
           aws s3 cp store/bundle "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/contour-shards/" \
             --recursive --exclude '*' --include '*-shard-*.pmtiles' --content-type application/octet-stream
-          # Global contour maxz (identical from every shard) — contour-bundle's merge needs
-          # it to tile the coverage layer to the same depth as the contours.
-          aws s3 cp store/contour-maxz.txt "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/contour-maxz.txt"
 
-  # tile-join the per-shard pmtiles (contours + soundings + drying slices) + coverage
-  # into one vector.pmtiles, in ONE join: tile-join rewrites every tile of the whole
+  # tile-join the per-shard pmtiles (contours + soundings + drying + depare slices) into
+  # one vector.pmtiles, in ONE join: tile-join rewrites every tile of the whole
   # archive, so the old merge-then-fold-per-layer shape re-paid the planet-wide join
   # per layer (~90 min each, serial, as the only job left running — the last 2 h 40
-  # of the build).
+  # of the build). Coverage is its own tileset, built by the plan job.
   contour-bundle:
     needs: contours
     if: ${{ !cancelled() && needs.contours.result == 'success' }}
@@ -658,8 +681,7 @@ jobs:
         run: |
           mkdir -p store/bundle
           aws s3 sync "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/contour-shards" store/bundle
-          aws s3 cp "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/contour-maxz.txt" store/contour-maxz.txt
-      - name: Merge shards + fold coverage
+      - name: Merge shards
         run: docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just contour-merge
       - name: Push vector.pmtiles to R2 build
         run: |

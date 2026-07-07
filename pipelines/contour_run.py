@@ -260,11 +260,21 @@ def bundle_maxz(own_max):
 
 # ── source coverage (provenance) layer ───────────────────────────────────────
 # Tile each source's union footprint (store/polygon/<id>.gpkg, from the source stage)
-# into a `coverage` layer alongside `contours` in the same pmtiles, so the viewer can
-# show which source covers a clicked point. GEBCO (the global base) declares no
-# max_zoom, so it's skipped; only regional footprints get a polygon.
+# into its own store/bundle/coverage.pmtiles, so the viewer can show which source
+# covers a clicked point. Its own tileset, NOT a layer in vector.pmtiles: a joined
+# archive shares one zoom range, and sea-sized fill polygons tiled to the contours'
+# maxzoom mint millions of deep-ocean tiles, while tiled lower the layer vanishes
+# above its maxzoom (MapLibre overzooms a missing *tile*, never a missing *layer*).
+# Standalone, the renderer overzooms it past COVERAGE_MAX_ZOOM on its own. GEBCO
+# (the global base) declares no max_zoom, so it's skipped; only regional footprints
+# get a polygon.
 
 BASE_SOURCE = "gebco"  # the global fallback; its footprint is the whole planet, never an overlay
+
+# z8's 4096-cell MVT grid resolves ~37 m and the footprints are already simplified
+# to 0.001° (~100 m) — fidelity is simplify-bound, not zoom-bound — while the z8
+# tile address space caps the archive at 65k tiles.
+COVERAGE_MAX_ZOOM = int(os.environ.get("COVERAGE_MAX_ZOOM", "8"))
 
 
 def _source_maxzooms():
@@ -287,7 +297,7 @@ def _source_maxzooms():
 def _coverage_geojson():
     """Combine every regional source's simplified footprint into one GeoJSON FC with
     {source_id, source_name, source_maxzoom}; write it and return the path. None if no
-    polygons are present locally (e.g. a CI contour job that only pulled FGB slices)."""
+    polygons are present locally (coverage_bundle turns that into a hard failure)."""
     valid = set(config.sources())
     zmax = _source_maxzooms()
     feats = []
@@ -315,35 +325,40 @@ def _coverage_geojson():
     return path
 
 
-def _coverage_pmtiles(maxz):
+def coverage_bundle():
     """tippecanoe the source footprints into store/bundle/coverage.pmtiles (layer
-    `coverage`, z0..maxz, footprints kept whole). None when no footprints are local."""
+    `coverage`, z0..COVERAGE_MAX_ZOOM, footprints kept whole). Fails when no
+    footprints are local: a planet build without them ships a dead provenance
+    layer — the silent drop is exactly how the layer went missing from every
+    published build. (Contour shard jobs never take this path; only the plan job
+    and a local `just planet` build coverage.)"""
     src = _coverage_geojson()
     if not src:
-        return None
-    out = "store/contour/coverage.pmtiles"  # intermediate (not store/bundle, which seed.sh ships)
+        raise SystemExit("coverage: no footprints in store/polygon/ — pull "
+                         "bathymetry/polygon/*.gpkg or prepare a source first")
+    utils.create_folder("store/bundle")
+    out = "store/bundle/coverage.pmtiles"
     subprocess.run(
         ["tippecanoe", "-o", out, "-f", "-l", "coverage", "-n", "Source coverage",
-         "-A", utils.ATTRIBUTION, "-Z", "0", "-z", str(maxz), "-P", "-q",
+         "-A", utils.ATTRIBUTION, "-Z", "0", "-z", str(COVERAGE_MAX_ZOOM), "-P", "-q",
          "--no-tile-size-limit", src], check=True)
-    return out
+    print(f"coverage bundle: {out} (z0-{COVERAGE_MAX_ZOOM})")
 
 
-def _finalize_contours(archives, maxz):
+def _finalize_contours(archives):
     """tile-join the layer archives (a local build's contour pmtiles, or the CI shards —
-    which carry contours, soundings, drying, AND depare slices) + the coverage layer + the
-    whole-set soundings/drying/depare pmtiles (local path, when their bundles ran first)
-    into store/bundle/vector.pmtiles. ONE join: tile-join rewrites every tile of the whole
+    which carry contours, soundings, drying, AND depare slices) + the whole-set
+    soundings/drying/depare pmtiles (local path, when their bundles ran first) into
+    store/bundle/vector.pmtiles. ONE join: tile-join rewrites every tile of the whole
     archive, so folding each sparse layer in afterwards re-paid the planet-wide join
     per layer (~90 min each in CI). -pk keeps every feature of every layer; a layer
-    whose pmtiles isn't present locally is simply not joined."""
-    cov = _coverage_pmtiles(maxz)
-    layers = [p for p in [cov, "store/bundle/soundings.pmtiles", "store/bundle/drying.pmtiles",
+    whose pmtiles isn't present locally is simply not joined. Coverage is its own
+    tileset (coverage_bundle), not a layer here."""
+    layers = [p for p in ["store/bundle/soundings.pmtiles", "store/bundle/drying.pmtiles",
                           "store/bundle/depare.pmtiles"]
-              if p and os.path.isfile(p)]
+              if os.path.isfile(p)]
     subprocess.run(["tile-join", "-o", "store/bundle/vector.pmtiles", "-f", "-pk",
                     *archives, *layers], check=True)
-    return cov is not None
 
 
 def _current_stems():
@@ -381,34 +396,29 @@ def bundle(shard=None):
         return
     maxz = bundle_maxz(_global_maxz(fgbs))
     utils.create_folder("store/bundle")
-    if shard is not None:  # CI: lines only; coverage joins once at the merge step
+    if shard is not None:  # CI: lines only; soundings/drying join once at the merge step
         out = f"store/bundle/contours-shard-{shard}.pmtiles"
         _tippecanoe(fgbs, 0, maxz, out)
         print(f"contour shard {shard}: {out} (z0-{maxz}, {len(fgbs)} FGBs)")
         return
-    # Local whole-set: tippecanoe the lines, then fold in the coverage layer.
+    # Local whole-set: tippecanoe the lines, then fold in soundings/drying.
     lines = "store/contour/contours-lines.pmtiles"
     _tippecanoe(fgbs, 0, maxz, lines)
-    cov = _finalize_contours([lines], maxz)
+    _finalize_contours([lines])
     os.remove(lines)
-    print(f"contour bundle: store/bundle/vector.pmtiles (z0-{maxz}, {len(fgbs)} FGBs"
-          f"{', + coverage layer' if cov else ''})")
+    print(f"contour bundle: store/bundle/vector.pmtiles (z0-{maxz}, {len(fgbs)} FGBs)")
 
 
 def bundle_merge():
     """tile-join the per-shard pmtiles — contours, soundings, drying (each shard job
-    bundles its slice of all three) — + the coverage layer into one vector.pmtiles
-    (-pk keeps every feature; the shards are disjoint file slices unioned per tile)."""
+    bundles its slice of all three) — into one vector.pmtiles (-pk keeps every
+    feature; the shards are disjoint file slices unioned per tile)."""
     shards = sorted(glob("store/bundle/*-shard-*.pmtiles"))
     if not shards:
         print("contour merge: no shard pmtiles")
         return
-    maxzfile = "store/contour-maxz.txt"  # the CI shard path always writes this (shared global maxz)
-    if not os.path.isfile(maxzfile):
-        raise SystemExit("contour merge: store/contour-maxz.txt missing (the shard jobs write it)")
-    cov = _finalize_contours(shards, int(open(maxzfile).read().strip()))
-    print(f"contour merge: store/bundle/vector.pmtiles ({len(shards)} shard archives"
-          f"{', + coverage layer' if cov else ''})")
+    _finalize_contours(shards)
+    print(f"contour merge: store/bundle/vector.pmtiles ({len(shards)} shard archives)")
 
 
 def _check():
@@ -448,7 +458,9 @@ if __name__ == "__main__":
         bundle(int(a[1]))
     elif a[:1] == ["bundle-merge"]:
         bundle_merge()
+    elif a[:1] == ["coverage"]:
+        coverage_bundle()
     elif a[:1] == ["check"]:
         _check()
     else:
-        sys.exit("usage: contour_run.py bundle | bundle-shard <i> | bundle-merge | check")
+        sys.exit("usage: contour_run.py bundle | bundle-shard <i> | bundle-merge | coverage | check")
