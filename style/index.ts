@@ -76,7 +76,7 @@ export const day: Flavor = {
   contour: "#4a7a9c",
   label: "#036",
   labelHalo: "#fff",
-  font: ["Open Sans Regular"],
+  font: ["Noto Sans Regular"],
   hillshadeShadow: "#9adcfe",
   coverage: "#f58231",
 };
