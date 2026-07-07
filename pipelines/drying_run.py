@@ -31,6 +31,18 @@ import contour_run
 import landmask
 import utils
 
+# Shoreline grow (px, on the merged-DEM grid): how far the wet/foreshore seed may claim
+# adjacent foreshore-height land pixels — sized to the OSM-coastline/DEM registration
+# error, NOT a coastline redefinition (see drying_mask). Env-tunable on a re-run.
+DRYING_GROW_PX = int(os.environ.get("DRYING_GROW_PX", "2"))
+# Seaward overhang (px): drying also claims water pixels this close to the foreshore, so
+# the polygon's seaward edge sits INSIDE the blue. The drying fill renders above the depth
+# shading, so the visible water/foreshore boundary becomes the crisp vector edge — the
+# simplification retreat (DP tol 1.5 px + tippecanoe) and the overzoom halo can no longer
+# open a land-wash gap at the waterline. Shoal-conservative: water only ever reads narrower.
+DRYING_SEAWARD_PX = int(os.environ.get("DRYING_SEAWARD_PX", "1"))
+_DILATE_BAND = 4096  # rows per _dilate band; module-level so the self-check can shrink it
+
 
 def _polys(geom):
     """Every non-empty Polygon inside a geometry, recursing into Multi/GeometryCollection and
@@ -46,14 +58,24 @@ def _polys(geom):
 
 def drying_mask(dem_path, mask_path, cap):
     """Whole-tile Byte drying mask (1 = foreshore) built in windows, so the multi-GB Float32 DEM
-    is never held whole — only this uint8 result (a quarter the size). 1 where a valid DEM pixel
-    is above chart datum but no deeper than the tide range (0 <= elev <= cap) AND seaward of the
-    land polygons (mask == 0). read_masks so nodata/alpha pixels drop out; the >= 0 term also
+    is never held whole. 1 where a valid DEM pixel is above chart datum but no deeper than the
+    tide range (0 <= elev <= cap) AND seaward of the land polygons (mask == 0), PLUS a bounded
+    shoreline grow (below). read_masks so nodata/alpha pixels drop out; the >= 0 term also
     excludes the DEM's -9999 nodata by itself. Returns (uint8 array, transform).
 
-    Ceiling: the uint8 mask is materialised whole for polygonize (rasterio.features.shapes needs
-    one array). It is a quarter the DEM's bytes, but a deep coastal macrotile is still ~1 GB;
-    upgrade path is a windowed streaming polygonize (gdal_polygonize) if that ever OOMs a shard.
+    Shoreline grow: the OSM coastline and the DEM waterline never register exactly — the line is
+    drawn at a different tide state than chart datum, and any DEM pixel straddling it rasterizes
+    to land — so a 1-3 px strip of foreshore-height "land" (much of it the clamp's elev==0
+    signature: the source read it below datum) separates the water from the drying polygons and
+    renders as a bare land-wash sliver between blue and green. Grow the wet/foreshore seed
+    DRYING_GROW_PX into land pixels within [0, cap]: registration-error sized, so it heals the
+    sliver without repainting genuinely low coastal land (Fyn, polders) — beyond it, OSM's land
+    verdict stands. An unbounded connectivity fill is NOT safe: low country connects the beach
+    to sub-cap terrain tens of km inland.
+
+    Ceiling: three uint8 planes are materialised whole (out for polygonize needs one array
+    anyway; seed/fringe for the cross-window grow). A deep coastal macrotile is ~1 GB each;
+    upgrade path is a windowed streaming polygonize + banded grow if that ever OOMs a shard.
     """
     with rasterio.open(dem_path) as d, rasterio.open(mask_path) as m:
         if (d.height, d.width) != (m.height, m.width):
@@ -61,6 +83,8 @@ def drying_mask(dem_path, mask_path, cap):
                 f"land mask {(m.height, m.width)} != DEM {(d.height, d.width)} for {dem_path} "
                 "(rasterize -te/-tr must match the merged DEM grid)")
         out = np.zeros((d.height, d.width), dtype="uint8")
+        seed = np.zeros_like(out)    # wet or foreshore: what the grow spreads from
+        fringe = np.zeros_like(out)  # foreshore-height land: what the grow may claim
         block = 2048
         for row in range(0, d.height, block):
             for col in range(0, d.width, block):
@@ -69,9 +93,40 @@ def drying_mask(dem_path, mask_path, cap):
                 elev = d.read(1, window=win)
                 valid = d.read_masks(1, window=win) != 0
                 land = m.read(1, window=win)
-                hit = valid & (elev >= 0) & (elev <= cap) & (land == 0)
-                out[row:row + hit.shape[0], col:col + hit.shape[1]] = hit
+                in_range = valid & (elev >= 0) & (elev <= cap)
+                hit = in_range & (land == 0)
+                sl = np.s_[row:row + hit.shape[0], col:col + hit.shape[1]]
+                out[sl] = hit
+                seed[sl] = hit | (valid & (elev < 0))
+                fringe[sl] = in_range & (land == 1)
+        out |= fringe & _dilate(seed, DRYING_GROW_PX)
+        # Seaward overhang: claim adjacent WATER pixels (seed minus foreshore) so the polygon
+        # edge overlaps the blue — see DRYING_SEAWARD_PX. Runs after the landward grow so
+        # grown foreshore overhangs too.
+        out |= (seed != 0) & (out == 0) & _dilate(out, DRYING_SEAWARD_PX)
         return out, d.transform
+
+
+def _dilate(a, n):
+    """Chebyshev binary dilation of a uint8 mask by n pixels, done in horizontal bands with an
+    n-px halo so the temporaries stay band-sized (a whole-plane pad would double peak memory).
+    Zero-padded at the array edge — no wraparound (np.roll would bleed one coast onto the
+    opposite edge, and the halo the tile carries can be as thin as 1 px)."""
+    if n <= 0:
+        return a.astype(bool)
+    h, w = a.shape
+    out = np.zeros((h, w), dtype=bool)
+    band = _DILATE_BAND
+    for r0 in range(0, h, band):
+        r1 = min(r0 + band, h)
+        p = np.pad(a[max(r0 - n, 0):min(r1 + n, h)] != 0, n)  # halo rows + zero edge pad
+        top = n + (r0 - max(r0 - n, 0))                       # first row of the band inside p
+        acc = np.zeros((r1 - r0, w), dtype=bool)
+        for dy in range(-n, n + 1):
+            for dx in range(-n, n + 1):
+                acc |= p[top + dy:top + dy + (r1 - r0), n + dx:n + dx + w]
+        out[r0:r1] = acc
+    return out
 
 
 def polygons(mask_arr, transform):
@@ -218,10 +273,47 @@ def _check():
     assert arr[7, 5] == 0, "in-band elevation under land must not be drying"
     assert arr[34, 5] == 0, "above-cap topo must not be drying"
     assert arr[2, 5] == 0 and arr[38, 5] == 0, "deep water / bare land must not be drying"
+    # seaward overhang: the water row adjacent to the band greens; the next row out does not
+    assert arr[30, 5] == 1, "water adjacent to foreshore must join it (seaward overhang)"
+    assert arr[31, 5] == 0, "water beyond the overhang must stay water"
     # Pixelwise-pure: same inputs -> byte-identical mask (the seam contract reduces to this once
     # the DEM/mask are deterministic, which merge/smooth/landmask already assert). The real
     # adjacent-tile seam is exercised end-to-end in test_engine.check_drying.
     assert np.array_equal(arr, drying_mask(dem_p, mask_p, cap)[0]), "drying mask not deterministic"
+
+    # Shoreline grow: foreshore-height LAND within DRYING_GROW_PX of the wet seed greens (heals
+    # the OSM-line/DEM registration sliver); the same height farther inland — and an isolated
+    # low blob (a clamped polder) — stay land. Water rows >= 8; land: dry +30 above a 0.0 strip.
+    land2 = np.zeros((16, 16), dtype="uint8"); land2[:8, :] = 1
+    dem2 = np.full((16, 16), -50.0, dtype="float32")
+    dem2[:4, :] = 30.0     # dry land above the cap — neither seed nor fringe
+    dem2[4:8, :] = 0.0     # rows 6,7 within 2 px of water -> grow greens; rows 4,5 beyond -> land
+    dem2[0:2, 0:3] = 0.0   # isolated low blob far from water -> stays land
+    d2, m2 = f"{d}/dem2.tif", f"{d}/mask2.tif"
+    for path, a2, dt in ((d2, dem2, "float32"), (m2, land2, "uint8")):
+        with rasterio.open(path, "w", driver="GTiff", height=16, width=16, count=1, dtype=dt,
+                           nodata=NODATA if dt == "float32" else 0, crs="EPSG:3857",
+                           transform=from_origin(0, 1600, 100, 100)) as dst:
+            dst.write(a2, 1)
+    arr2, _ = drying_mask(d2, m2, cap)
+    assert arr2[7, 8] == 1 and arr2[6, 8] == 1, "registration sliver must green (within grow)"
+    assert arr2[5, 8] == 0 and arr2[4, 8] == 0, "low land beyond the grow must stay land"
+    assert arr2[1, 1] == 0, "isolated low blob (polder) must stay land"
+    assert arr2[8, 8] == 1, "grown foreshore must overhang one water row"
+    assert arr2[10, 8] == 0, "deep water beyond the overhang is never drying"
+
+    # _dilate: banded result == single-band result (band boundaries carry the halo), and the
+    # zero pad means no wraparound (a seed at the top edge never reaches the bottom edge).
+    global _DILATE_BAND
+    seed_a = (np.random.default_rng(7).random((37, 21)) < 0.1).astype("uint8")
+    whole = _dilate(seed_a, 2)
+    _DILATE_BAND = 8
+    try:
+        assert np.array_equal(whole, _dilate(seed_a, 2)), "banded dilation != whole-array dilation"
+    finally:
+        _DILATE_BAND = 4096
+    edge = np.zeros((12, 5), dtype="uint8"); edge[0, 0] = 1
+    assert not _dilate(edge, 2)[10:, :].any(), "dilation must not wrap around the array edge"
 
     from shapely.geometry import Point
     geoms = polygons(arr, transform)
