@@ -19,7 +19,9 @@
  * run on any GL JS with color-relief (MapLibre >= 5.6). To change them on a
  * live map, applyState() re-derives the handful of unit/safety-dependent
  * properties and sets them in place; or fetch a regenerated style
- * (`/style.json?unit=ft&safety=3`).
+ * (`/style.json?unit=ft&safety=3`). `shading` ("relief" | "bands") picks the
+ * water shading: the raster ramp, or the vector ENC depth-area bands above z6
+ * (the relief keeps z<6 either way).
  */
 import type {
   ExpressionSpecification,
@@ -29,6 +31,11 @@ import type {
 } from "@maplibre/maplibre-gl-style-spec";
 
 export type Unit = "m" | "ft" | "fm";
+// Water shading: the raster color-relief ramp (continuous, fuzzy edges) or the
+// vector ENC depth-area bands (crisp edges on the charted isobaths, safety
+// snapped to the next-deeper charted level). Never both at once — the 0.85
+// opacities would compound.
+export type Shading = "relief" | "bands";
 
 export interface Flavor {
   bandColors: string[]; // deepest → shoalest (6 entries)
@@ -85,6 +92,11 @@ export const day: Flavor = {
 // Mariner-setting defaults for layers()/style() when the caller omits them.
 const DEFAULT_UNIT: Unit = "m";
 const DEFAULT_SAFETY = 2;
+const DEFAULT_SHADING: Shading = "relief";
+
+// The depare layer's data floor (tippecanoe -Z in the pipeline) and the contour
+// lines' presentation floor — depth shading carries lower zooms.
+const BANDS_MIN_ZOOM = 6;
 
 const DEFAULT_GLYPHS =
   "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf";
@@ -172,6 +184,50 @@ export function depthRelief(
   ] as unknown as ExpressionSpecification;
 }
 
+// ─── Depth-area (ENC DEPARE) band colour ─────────────────────────────────────
+// Charted isobath ladders, positive-down metres — must mirror pipelines/config.py
+// DEPARE_LEVELS / DEPARE_LEVELS_FT (the bucket edges baked into the depare
+// layer). The safety contour snaps UP this ladder to the next-deeper rung
+// (ECDIS behaviour, bias shallow) — vector bands can only flip at charted
+// levels, unlike the raster ramp's continuous crisp edge.
+const DEPARE_LADDER_M = [
+  2, 5, 10, 20, 30, 50, 100, 200, 300, 500, 1000, 2000, 3000, 4000, 5000, 6000,
+  8000, 10000,
+];
+const DEPARE_LADDER_FT = [
+  1, 2, 3, 5, 10, 20, 30, 50, 100, 200, 300, 500, 1000, 2000, 3000, 5000,
+].map((fm) => fm * 1.8288);
+
+// Comparisons against drval1 subtract this: tiles may carry the fathom-curve
+// drvals (1.8288, 5.4864, …) as 32-bit floats, which can land a hair below the
+// exact edge value. Ladder rungs are ≥ ~1.8 m apart, so 0.01 m is safely
+// inside every gap.
+const DRVAL_EPS = 0.01;
+
+// Fill colour for the depare partitions: the band tint keyed off drval1 (the
+// band's shallow bound), with every band shallower than the snapped safety
+// contour painted the hazard tint. Literals only, like depthRelief — runtime
+// changes go through applyState().
+export function depthAreasColor(
+  flavor: Flavor = day,
+  { unit = "m", safety = 0 }: { unit?: Unit; safety?: number } = {},
+): ExpressionSpecification {
+  const metric = unit === "m";
+  const edges = [...flavor.bandEdges[metric ? "m" : "ft"]].reverse(); // shoalest → deepest
+  const step: unknown[] = ["step", ["get", "drval1"], flavor.bandColors[5]];
+  edges.forEach((d, i) => step.push(d - DRVAL_EPS, flavor.bandColors[4 - i]));
+  if (!(safety > 0)) return step as unknown as ExpressionSpecification;
+  const ladder = metric ? DEPARE_LADDER_M : DEPARE_LADDER_FT;
+  const snap =
+    ladder.find((l) => l >= safety - DRVAL_EPS) ?? ladder[ladder.length - 1];
+  return [
+    "case",
+    ["<", ["get", "drval1"], snap - DRVAL_EPS],
+    flavor.hazard,
+    step,
+  ] as unknown as ExpressionSpecification;
+}
+
 // ─── Sources ─────────────────────────────────────────────────────────────────
 // tilesBase is the Worker endpoint; the sources reference its TileJSON docs
 // (raster.json / vector.json), which carry the tile URLs, zoom range, bounds,
@@ -209,11 +265,13 @@ export function layers(
     vector = "seascape-vector",
     unit = DEFAULT_UNIT,
     safety = DEFAULT_SAFETY,
+    shading = DEFAULT_SHADING,
   }: {
     dem?: string;
     vector?: string;
     unit?: Unit;
     safety?: number;
+    shading?: Shading;
   } = {},
 ): LayerSpecification[] {
   // `unit` picks every sounding/contour label and which isobath set shows;
@@ -266,9 +324,30 @@ export function layers(
       id: "depth-shading",
       type: "color-relief",
       source: dem,
+      // Bands mode: the vector depth areas take over at their z6 data floor;
+      // the relief carries lower zooms (same palette, so the handoff is a
+      // sharpness change, not a colour change).
+      ...(shading === "bands" ? { maxzoom: BANDS_MIN_ZOOM } : {}),
       paint: {
         "color-relief-color": depthRelief(flavor, { unit, safety }),
         "color-relief-opacity": 0.85,
+      },
+    },
+    {
+      // ENC DEPARE depth bands: the vector twin of depth-shading — crisp band
+      // edges on the charted isobaths, safety recolour snapped to the next-
+      // deeper charted level. Hidden in relief mode (never rendered under the
+      // relief — the opacities would compound).
+      id: "depth-areas",
+      type: "fill",
+      source: vector,
+      "source-layer": "depare",
+      filter: contourLineFilter,
+      minzoom: BANDS_MIN_ZOOM,
+      layout: { visibility: shading === "bands" ? "visible" : "none" },
+      paint: {
+        "fill-color": depthAreasColor(flavor, { unit, safety }),
+        "fill-opacity": 0.85,
       },
     },
     {
@@ -292,7 +371,7 @@ export function layers(
       type: "fill",
       source: vector,
       "source-layer": "drying",
-      paint: { "fill-color": flavor.drying, "fill-opacity": 0.55 },
+      paint: { "fill-color": flavor.drying, "fill-opacity": 0.85 },
     },
     {
       id: "contour-lines",
@@ -416,6 +495,7 @@ export function style({
   osm = true,
   unit = DEFAULT_UNIT,
   safety = DEFAULT_SAFETY,
+  shading = DEFAULT_SHADING,
 }: {
   tilesBase: string;
   flavor?: Flavor;
@@ -423,6 +503,7 @@ export function style({
   osm?: boolean;
   unit?: Unit;
   safety?: number;
+  shading?: Shading;
 }): StyleSpecification {
   const osmSource: Record<string, SourceSpecification> = osm
     ? {
@@ -443,7 +524,7 @@ export function style({
     name: "Open Waters Seascape",
     glyphs,
     sources: { ...osmSource, ...sources({ tilesBase }) },
-    layers: [...osmBase, ...layers(flavor, { unit, safety })],
+    layers: [...osmBase, ...layers(flavor, { unit, safety, shading })],
   };
 }
 
@@ -481,6 +562,14 @@ export function applyState(
       "color-relief-color",
       spec["depth-shading"].paint["color-relief-color"],
     );
+  if (map.getLayer("depth-areas")) {
+    map.setFilter("depth-areas", spec["depth-areas"].filter);
+    map.setPaintProperty(
+      "depth-areas",
+      "fill-color",
+      spec["depth-areas"].paint["fill-color"],
+    );
+  }
   if (map.getLayer("contour-lines"))
     map.setFilter("contour-lines", spec["contour-lines"].filter);
   if (map.getLayer("contour-labels")) {

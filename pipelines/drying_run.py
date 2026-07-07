@@ -39,8 +39,11 @@ DRYING_GROW_PX = int(os.environ.get("DRYING_GROW_PX", "2"))
 # the polygon's seaward edge sits INSIDE the blue. The drying fill renders above the depth
 # shading, so the visible water/foreshore boundary becomes the crisp vector edge — the
 # simplification retreat (DP tol 1.5 px + tippecanoe) and the overzoom halo can no longer
-# open a land-wash gap at the waterline. Shoal-conservative: water only ever reads narrower.
-DRYING_SEAWARD_PX = int(os.environ.get("DRYING_SEAWARD_PX", "1"))
+# open a land-wash gap at the waterline. Sized to exceed the COMBINED simplification wobble
+# of drying and the depare band edge beneath it: in bands mode the shallowest depth band's
+# 0-edge is an independently simplified vector edge (not a continuous raster), so both edges
+# wobble ~1.5 px each. Shoal-conservative: water only ever reads narrower.
+DRYING_SEAWARD_PX = int(os.environ.get("DRYING_SEAWARD_PX", "3"))
 _DILATE_BAND = 4096  # rows per _dilate band; module-level so the self-check can shrink it
 
 
@@ -272,10 +275,13 @@ def _check():
     assert arr[27, 0] == 0, "nodata in the band must not be drying"
     assert arr[7, 5] == 0, "in-band elevation under land must not be drying"
     assert arr[34, 5] == 0, "above-cap topo must not be drying"
-    assert arr[2, 5] == 0 and arr[38, 5] == 0, "deep water / bare land must not be drying"
-    # seaward overhang: the water row adjacent to the band greens; the next row out does not
-    assert arr[30, 5] == 1, "water adjacent to foreshore must join it (seaward overhang)"
-    assert arr[31, 5] == 0, "water beyond the overhang must stay water"
+    # (rows 0-4 are sub-datum pixels under the land mask — seed pixels — so the 3 px
+    # overhang legitimately claims them next to the grown rows-5/6 foreshore; probe
+    # farther from any foreshore instead.)
+    assert arr[13, 5] == 0 and arr[38, 5] == 0, "far land / deep water must not be drying"
+    # seaward overhang: the water rows adjacent to the band green; above-cap water never does
+    assert arr[30, 5] == 1 and arr[31, 5] == 1, "water within the overhang must join the foreshore"
+    assert arr[32, 5] == 0, "above-cap water is never claimed, even inside the overhang"
     # Pixelwise-pure: same inputs -> byte-identical mask (the seam contract reduces to this once
     # the DEM/mask are deterministic, which merge/smooth/landmask already assert). The real
     # adjacent-tile seam is exercised end-to-end in test_engine.check_drying.
@@ -299,8 +305,8 @@ def _check():
     assert arr2[7, 8] == 1 and arr2[6, 8] == 1, "registration sliver must green (within grow)"
     assert arr2[5, 8] == 0 and arr2[4, 8] == 0, "low land beyond the grow must stay land"
     assert arr2[1, 1] == 0, "isolated low blob (polder) must stay land"
-    assert arr2[8, 8] == 1, "grown foreshore must overhang one water row"
-    assert arr2[10, 8] == 0, "deep water beyond the overhang is never drying"
+    assert arr2[8, 8] == 1 and arr2[10, 8] == 1, "grown foreshore must overhang into the water"
+    assert arr2[11, 8] == 0, "deep water beyond the overhang is never drying"
 
     # _dilate: banded result == single-band result (band boundaries carry the halo), and the
     # zero pad means no wraparound (a seed at the top edge never reaches the bottom edge).

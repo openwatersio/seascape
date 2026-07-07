@@ -89,6 +89,26 @@ map.on("load", () => {
   document
     .getElementById("unit-select")
     ?.addEventListener("change", applyControls);
+  // Shading mode — relief (raster ramp, continuous) vs bands (vector ENC depth
+  // areas: crisp isobath edges, safety snapped to a charted level). Bands data
+  // floors at z6, so relief keeps z<6 in bands mode; never both at once (the
+  // 0.85 opacities would compound).
+  const applyShading = () => {
+    const bands =
+      document.getElementById("shading-select")?.value === "bands";
+    if (map.getLayer("depth-areas"))
+      map.setLayoutProperty(
+        "depth-areas",
+        "visibility",
+        bands ? "visible" : "none",
+      );
+    if (map.getLayer("depth-shading"))
+      map.setLayerZoomRange("depth-shading", 0, bands ? 6 : 24);
+  };
+  applyShading();
+  document
+    .getElementById("shading-select")
+    ?.addEventListener("change", applyShading);
   // Layer toggles: the checkboxes are the source of truth — sync once on load
   // (the style's own defaults may differ, e.g. hillshade ships hidden) and on
   // every change.

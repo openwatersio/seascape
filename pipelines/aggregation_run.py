@@ -25,6 +25,7 @@ import aggregation_merge
 import aggregation_reproject
 import aggregation_tile
 import contour_run
+import depare_run
 import drying_run
 import landmask
 import smooth
@@ -35,6 +36,7 @@ import utils
 SKIP_CONTOURS = os.environ.get("SKIP_CONTOURS", "")
 SKIP_SOUNDINGS = os.environ.get("SKIP_SOUNDINGS", "")
 SKIP_DRYING = os.environ.get("SKIP_DRYING", "")
+SKIP_DEPARE = os.environ.get("SKIP_DEPARE", "")
 SKIP_SMOOTH = os.environ.get("SKIP_SMOOTH", "")
 
 
@@ -60,6 +62,8 @@ def run(filepath):
         soundings_run.generate(filepath)     # vector soundings off the same merged DEM
     if not SKIP_DRYING:
         drying_run.generate(filepath)        # green-foreshore polygons off the DEM + land mask
+    if not SKIP_DEPARE:
+        depare_run.generate(filepath)        # depth-area partitions (ENC DEPARE) off the same DEM
     if not os.environ.get("KEEP_TMP"):       # KEEP_TMP=1 preserves the merged DEM for re-running a fork
         shutil.rmtree(tmp_folder)
     utils.run_command(f'touch {filepath.replace("-aggregation.csv", "-aggregation.done")}')

@@ -3,6 +3,7 @@ import { validateStyleMin } from "@maplibre/maplibre-gl-style-spec";
 import {
   applyState,
   day,
+  depthAreasColor,
   depthRelief,
   sources,
   layers,
@@ -22,6 +23,7 @@ test("generated style validates against the MapLibre style spec", () => {
       unit: "ft",
       safety: 3,
     }),
+    style({ tilesBase: "https://t.example", shading: "bands", safety: 5 }),
   ];
   for (const s of variants) expect(validateStyleMin(s)).toEqual([]);
 });
@@ -101,6 +103,7 @@ test("contour lines floor at z6 — depth shading carries lower zooms", () => {
 test("layer ids are stable — consumers key toggles/queries off them", () => {
   expect(layers().map((l) => l.id)).toEqual([
     "depth-shading",
+    "depth-areas",
     "hillshade",
     "drying-areas",
     "contour-lines",
@@ -111,6 +114,43 @@ test("layer ids are stable — consumers key toggles/queries off them", () => {
     "source-outline",
     "source-labels",
   ]);
+});
+
+test("shading picks relief or bands, never both at once", () => {
+  const get = (ls: ReturnType<typeof layers>, id: string) =>
+    ls.find((l) => l.id === id) as {
+      maxzoom?: number;
+      minzoom?: number;
+      layout?: { visibility?: string };
+    };
+  const relief = layers(); // default
+  expect(get(relief, "depth-areas").layout?.visibility).toBe("none");
+  expect(get(relief, "depth-shading").maxzoom).toBeUndefined();
+  const bands = layers(day, { shading: "bands" });
+  expect(get(bands, "depth-areas").layout?.visibility).toBe("visible");
+  // Handoff at the bands' z6 data floor: relief below, bands above.
+  expect(get(bands, "depth-shading").maxzoom).toBe(6);
+  expect(get(bands, "depth-areas").minzoom).toBe(6);
+});
+
+test("depthAreasColor tints bands off drval1 and snaps safety deeper", () => {
+  // No safety: a step from shoalest to deepest band colour, stops just under
+  // the band edges (float32 drval fuzz guard).
+  const off = raw(depthAreasColor(day, { unit: "m", safety: 0 }));
+  expect(off[0]).toBe("step");
+  expect(off[2]).toBe(day.bandColors[5]); // < 2 m → shoalest
+  expect(off[3]).toBe(2 - 0.01);
+  expect(off[off.length - 2]).toBe(50 - 0.01);
+  expect(off[off.length - 1]).toBe(day.bandColors[0]); // ≥ 50 m → deepest
+  expect(off).not.toContain(day.hazard);
+  // safety 15 m snaps to the 20 m rung: bands with drval1 < 20 go hazard.
+  const on = depthAreasColor(day, { unit: "m", safety: 15 }) as unknown[];
+  expect(on[0]).toBe("case");
+  expect(JSON.stringify(on[1])).toContain(String(20 - 0.01));
+  expect(on[2]).toBe(day.hazard);
+  // Fathom mode snaps up the fathom-curve ladder (safety 3 m → the 2 fm rung).
+  const fm = depthAreasColor(day, { unit: "fm", safety: 3 }) as unknown[];
+  expect(JSON.stringify(fm[1])).toContain(String(2 * 1.8288 - 0.01));
 });
 
 test("applyState re-derives every unit/safety-dependent property", () => {
@@ -132,10 +172,20 @@ test("applyState re-derives every unit/safety-dependent property", () => {
   );
   expect(ramp).toContain(-30 * 1.8288);
   expect(ramp).toContain(day.hazard);
-  // Isobath filters flip to the fathom-curve set — lines and labels together.
-  for (const id of ["contour-lines", "contour-labels"])
+  // Isobath filters flip to the fathom-curve set — lines, labels, and the
+  // depth bands together.
+  for (const id of ["contour-lines", "contour-labels", "depth-areas"])
     expect(calls.find((c) => c.fn === "filter" && c.layer === id)!.value)
       .toEqual(["==", ["get", "sys"], "ft"]);
+  // Band fill recolours with the snapped safety contour (5 m is a rung).
+  expect(
+    JSON.stringify(
+      calls.find(
+        (c) =>
+          c.fn === "paint" && c.layer === "depth-areas" && c.prop === "fill-color",
+      )!.value,
+    ),
+  ).toContain(day.hazard);
   // Label text follows the unit.
   expect(
     JSON.stringify(

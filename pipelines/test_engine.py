@@ -441,6 +441,82 @@ def check_drying():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def check_depare():
+    """The depare fork through the REAL depare_run.generate(): off a merged DEM it buckets the
+    water into depth-band partitions (drval1/drval2, both level ladders, tagged sys). Two
+    adjacent tiles carry the same depth bands across their shared edge, so the assertions
+    cover: exactly one m-partition with the right bucket over each band, land dropped, the
+    fathom-curve set present, and — the seam contract — both tiles' partitions meet at the
+    boundary (each clipped exactly to its bbox)."""
+    import geopandas as gpd
+    import mercantile
+    from pyproj import Transformer
+    from shapely.geometry import Point
+
+    import depare_run
+    from aggregation_reproject import get_resolution
+
+    tmp = tempfile.mkdtemp()
+    cwd = os.getcwd()
+    aid = "01DEPAREDEPAREDEPAREDEPARE"
+    try:
+        os.chdir(tmp)
+        to4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
+
+        def build(tile):
+            """Write a merged DEM for `tile` on its native 3857 grid, run generate()."""
+            stem = f"{tile.z}-{tile.x}-{tile.y}-{tile.z}"  # child_z == z: a native 512 px tile
+            tdir = f"store/aggregation/{aid}/{stem}-tmp"
+            os.makedirs(tdir, exist_ok=True)
+            b = mercantile.xy_bounds(tile)
+            res = get_resolution(tile.z)
+            px = round((b.right - b.left) / res)
+            tr = from_origin(b.left, b.top, res, res)
+            q = px // 4
+            dem = np.full((px, px), -150.0, dtype="float32")  # [100,200] bucket baseline
+            dem[:q, :] = 8.0             # land -> no partition
+            dem[q:2 * q, :] = -1.0       # -> the [0,2] bucket
+            dem[2 * q:3 * q, :] = -25.0  # -> the [20,30] bucket
+            with rasterio.open(f"{tdir}/0-3857.tiff", "w", driver="GTiff", height=px, width=px,
+                               count=1, dtype="float32", nodata=-9999, crs="EPSG:3857",
+                               transform=tr) as d:
+                d.write(dem, 1)
+            depare_run.generate(f"store/aggregation/{aid}/{stem}-aggregation.csv")
+            row_lonlat = lambda r: to4326.transform(*(tr * (px // 2 + 0.5, r + 0.5)))
+            return (gpd.read_file(f"store/depare/{stem}.fgb"),
+                    {"land": Point(row_lonlat(q // 2)),
+                     "shoal": Point(row_lonlat(q + q // 2)),
+                     "mid": Point(row_lonlat(2 * q + q // 2)),
+                     "deep": Point(row_lonlat(3 * q + q // 2))})
+
+        left = mercantile.Tile(x=301, y=384, z=10)
+        right = mercantile.Tile(x=302, y=384, z=10)          # shares left's east edge
+        gL, pts = build(left)
+        gR, _ = build(right)
+        m = gL[gL["sys"] == "m"]
+
+        def bucket(pt):
+            hit = m[m.covers(pt)]
+            assert len(hit) == 1, f"exactly one m-partition must cover the point, got {len(hit)}"
+            return (hit.iloc[0]["drval1"], hit.iloc[0]["drval2"])
+
+        assert bucket(pts["shoal"]) == (0.0, 2.0), "-1 m must land in the [0,2] bucket"
+        assert bucket(pts["mid"]) == (20.0, 30.0), "-25 m must land in the [20,30] bucket"
+        assert bucket(pts["deep"]) == (100.0, 200.0), "-150 m must land in the [100,200] bucket"
+        assert not gL.covers(pts["land"]).any(), "no partition may cover land"
+        assert (gL["sys"] == "ft").any(), "the fathom-curve partition set must be present"
+
+        # Seam: left's partitions reach its east edge, right's reach its west edge, and they are
+        # the same longitude (each clipped exactly to its bbox) — the band fills meet across it.
+        seam = mercantile.bounds(left).east
+        assert abs(gL.total_bounds[2] - seam) < 1e-4, f"left depare stops short of the seam: {gL.total_bounds[2]}"
+        assert abs(gR.total_bounds[0] - seam) < 1e-4, f"right depare stops short of the seam: {gR.total_bounds[0]}"
+        print("depare ok — bands bucketed to their ladder levels, land dropped, tiles meet at the seam")
+    finally:
+        os.chdir(cwd)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     tmp = tempfile.mkdtemp()
     try:
@@ -567,10 +643,12 @@ def main():
 
 
 if __name__ == "__main__":
+    import depare_run
     import drying_run
     import landmask
     landmask._check()
     drying_run._check()
+    depare_run._check()
     check_priority()
     check_shard_partition()
     check_weighted_shards()
@@ -578,4 +656,5 @@ if __name__ == "__main__":
     check_grid_split()
     check_land_clamp()
     check_drying()
+    check_depare()
     main()

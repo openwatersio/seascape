@@ -260,9 +260,9 @@ jobs:
               aws s3 rm "s3://$DATA_BUCKET/bathymetry/aggregation/$id" --recursive
             }
           done
-      - name: Prune orphaned contour FGBs + soundings + drying (covering re-tiled)
+      - name: Prune orphaned contour FGBs + soundings + drying + depare (covering re-tiled)
         run: |
-          # store/contour FGBs (and store/soundings geojson, store/drying FGBs) are keyed {z}-{x}-{y}-{child_z},
+          # store/contour FGBs (and store/soundings geojson, store/drying + store/depare FGBs) are keyed {z}-{x}-{y}-{child_z},
           # same as the covering's aggregation tiles. A source's footprint/maxzoom shift
           # re-tiles its area, but the sync (line ~270) has no --delete, so the superseded
           # file lingers in R2 and bundle globs EVERY one → two sets overlap. Drop any R2
@@ -293,6 +293,14 @@ jobs:
               aws s3 rm "s3://$DATA_BUCKET/$key"
             }
           done < /tmp/r2-dry.txt
+          aws s3 ls "s3://$DATA_BUCKET/bathymetry/depare/" --recursive | awk '{print $NF}' | grep '\.fgb$' > /tmp/r2-dep.txt || true
+          while read -r key; do
+            [ -n "$key" ] || continue
+            grep -qx "$(basename "$key" .fgb)" /tmp/valid-stems.txt || {
+              echo "pruning orphan depare $key"
+              aws s3 rm "s3://$DATA_BUCKET/$key"
+            }
+          done < /tmp/r2-dep.txt
       - name: Prune orphaned pmtiles (covering re-tiled)
         run: |
           # Same orphan class as the contour prune: a re-tiled covering leaves the old
@@ -350,7 +358,7 @@ jobs:
           # No R2 listing here: the shard reads its work from the plan's frozen dirty list
           # (shipped in the covering tarball, pulled above), so every shard partitions the
           # SAME list. Reproject range-reads sources via /vsicurl, so no pmtiles are pulled.
-          mkdir -p store/pmtiles store/contour store/soundings store/drying
+          mkdir -p store/pmtiles store/contour store/soundings store/drying store/depare
       - name: Aggregate shard ${{ matrix.shard.i }}/${{ matrix.shard.n }}
         run: |
           # SOURCE_VSI_BASE → reproject resolves each source tile to a public /vsicurl
@@ -373,6 +381,7 @@ jobs:
           aws s3 sync store/contour "s3://$DATA_BUCKET/bathymetry/contour"
           aws s3 sync store/soundings "s3://$DATA_BUCKET/bathymetry/soundings"
           aws s3 sync store/drying "s3://$DATA_BUCKET/bathymetry/drying"
+          aws s3 sync store/depare "s3://$DATA_BUCKET/bathymetry/depare"
           # Markers only — the covering tarball is immutable (plan owns it) and the
           # untarred CSVs must not be re-uploaded as the loose files we just collapsed.
           aws s3 sync store/aggregation "s3://$DATA_BUCKET/bathymetry/aggregation" --exclude '*' --include '*.done'
@@ -585,7 +594,7 @@ jobs:
           echo "contour FGBs: $count → matrix $shards"
 
   # tippecanoe one strided slice of every vector layer per runner → per-shard
-  # contours/soundings/drying pmtiles. Soundings + drying ride the contour shards
+  # contours/soundings/drying/depare pmtiles. The sparse layers ride the contour shards
   # (separately they held contour-bundle's tile-join back ~26 min while the rest of
   # the build sat finished); the slices stride each layer's own sorted list — no
   # geographic alignment needed, the merge unions everything per tile anyway.
@@ -607,18 +616,19 @@ jobs:
       # cleanly), and parallel-copy the strided slices this shard owns.
       - name: Pull this shard's layer slices from R2
         run: |
-          mkdir -p store/contour store/soundings store/drying store/bundle
+          mkdir -p store/contour store/soundings store/drying store/depare store/bundle
           aws s3 ls "s3://$DATA_BUCKET/bathymetry/contour/" --recursive | awk '{print $NF}' | grep '\.fgb$' | sort > /tmp/all-contour.txt
           sed 's#.*/##; s/\.fgb$//' /tmp/all-contour.txt | awk -F- '{print $4}' | sort -n | tail -1 > store/contour-maxz.txt
           aws s3 ls "s3://$DATA_BUCKET/bathymetry/soundings/" --recursive | awk '{print $NF}' | grep '\.geojson$' | sort > /tmp/all-soundings.txt
           aws s3 ls "s3://$DATA_BUCKET/bathymetry/drying/" --recursive | awk '{print $NF}' | grep '\.fgb$' | sort > /tmp/all-drying.txt
+          aws s3 ls "s3://$DATA_BUCKET/bathymetry/depare/" --recursive | awk '{print $NF}' | grep '\.fgb$' | sort > /tmp/all-depare.txt
           # Bounded outer retry + visible errors — see the downsample pull above.
-          for spec in "/tmp/all-contour.txt store/contour" "/tmp/all-soundings.txt store/soundings" "/tmp/all-drying.txt store/drying"; do
+          for spec in "/tmp/all-contour.txt store/contour" "/tmp/all-soundings.txt store/soundings" "/tmp/all-drying.txt store/drying" "/tmp/all-depare.txt store/depare"; do
             set -- $spec
             awk -v i="${{ matrix.shard.i }}" -v n="${{ matrix.shard.n }}" 'NR % n == (i + 1) % n' "$1" \
               | xargs -P 8 -I{} sh -c 'for a in 1 2 3 4 5; do aws s3 cp "s3://$DATA_BUCKET/$1" "$2/" --only-show-errors && exit 0; sleep "$a"; done; echo "giving up on $1 after 5 attempts" >&2; exit 1' _ {} "$2"
           done
-          echo "shard ${{ matrix.shard.i }}/${{ matrix.shard.n }}: $(ls store/contour/*.fgb 2>/dev/null | wc -l) contour FGBs, $(ls store/soundings/*.geojson 2>/dev/null | wc -l) soundings, $(ls store/drying/*.fgb 2>/dev/null | wc -l) drying, global maxz $(cat store/contour-maxz.txt)"
+          echo "shard ${{ matrix.shard.i }}/${{ matrix.shard.n }}: $(ls store/contour/*.fgb 2>/dev/null | wc -l) contour FGBs, $(ls store/soundings/*.geojson 2>/dev/null | wc -l) soundings, $(ls store/drying/*.fgb 2>/dev/null | wc -l) drying, $(ls store/depare/*.fgb 2>/dev/null | wc -l) depare, global maxz $(cat store/contour-maxz.txt)"
       - name: Vector shard ${{ matrix.shard.i }}
         run: |
           docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" \

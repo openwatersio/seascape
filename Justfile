@@ -25,14 +25,15 @@ sources:
     done
 
 # Planet build: cover -> aggregate -> downsample -> bundle -> vector layers (BBOX="W,S,E,N"
-# for a region). Soundings + drying bundle BEFORE contours: the contours tile-join folds
-# their pmtiles into vector.pmtiles in the same single pass.
+# for a region). Soundings + drying + depare bundle BEFORE contours: the contours tile-join
+# folds their pmtiles into vector.pmtiles in the same single pass.
 planet:
     just cover
     uv run python aggregation_run.py
     just combine
     just soundings
     just drying
+    just depare
     just contours
 
 # Plan the covering: slice the planet into aggregation tiles (BBOX="W,S,E,N" for a region).
@@ -112,15 +113,22 @@ soundings:
 drying:
     uv run python drying_run.py bundle
 
+# Depth areas (ENC DEPARE bands): bundle the per-tile partitions into depare.pmtiles
+# (folded into vector.pmtiles by the contours tile-join, same as soundings/drying).
+depare:
+    uv run python depare_run.py bundle
+
 # tippecanoe this shard's local slice of every vector layer -> {contours,soundings,
-# drying}-shard-{i}.pmtiles (CI pulls only the shard's slices + writes
+# drying,depare}-shard-{i}.pmtiles (CI pulls only the shard's slices + writes
 # store/contour-maxz.txt so all layers tile to one depth; merged by contour-merge).
-# Three invocations, not one -L run: the layers need different tippecanoe flags
-# (soundings -r1, drying --drop-densest-as-needed, contours' per-zoom filter).
+# Four invocations, not one -L run: the layers need different tippecanoe flags
+# (soundings -r1, drying --drop-densest-as-needed, depare --detect-shared-borders,
+# contours' per-zoom filter).
 vector-shard i:
     uv run python contour_run.py bundle-shard {{i}}
     uv run python soundings_run.py bundle-shard {{i}}
     uv run python drying_run.py bundle-shard {{i}}
+    uv run python depare_run.py bundle-shard {{i}}
 
 # tile-join the per-shard pmtiles (all layers) + coverage into vector.pmtiles.
 contour-merge:
@@ -163,7 +171,7 @@ preview bbox="-74.30,40.40,-73.75,40.80" local="":
     fi
     # Build the mask locally (one-time OSM download) if we're pointed at a local path with no file.
     case "$LANDMASK" in /vsicurl/*) : ;; *) [ -f "$LANDMASK" ] || just landmask ;; esac
-    rm -rf store/aggregation store/pmtiles store/bundle store/meta store/contour store/soundings store/drying
+    rm -rf store/aggregation store/pmtiles store/bundle store/meta store/contour store/soundings store/drying store/depare
     just planet
     ../worker/seed.sh
 
