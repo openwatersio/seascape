@@ -17,8 +17,22 @@ Read these as history, not documentation. Each file captures the intent and appr
 *Written YYYY-MM-DD. Point-in-time; the code is the source of truth.*
 
 ## Problem
+What we're solving and why. Link the issue(s).
+
+## Goals / Non-goals
+What this does, and explicitly what it doesn't.
+
 ## Approach
-## Open questions / decisions
+The plan: data sources (+ datum/provenance), pipeline stages, key decisions.
+
+## Alternatives considered
+What else we looked at, and why not.
+
+## Validation
+How we'll know it's correct — fixtures, accuracy checks, tests.
+
+## Open questions
+Unresolved decisions.
 ```
 
 Keep them short.
