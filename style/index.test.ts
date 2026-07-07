@@ -3,7 +3,6 @@ import { validateStyleMin } from "@maplibre/maplibre-gl-style-spec";
 import {
   applyState,
   day,
-  state,
   depthRelief,
   sources,
   layers,
@@ -44,9 +43,12 @@ test("sources reference the endpoint's TileJSON, encoding inline", () => {
   expect(src["seascape-vector"].url).toBe("https://t.example/vector.json");
 });
 
-test("unit/safety bake into both state defaults and the depth ramp", () => {
+test("unit/safety reach the layers as literals", () => {
   const s = style({ tilesBase: "https://t.example", unit: "fm", safety: 3 });
-  expect(s.state).toEqual({ unit: { default: "fm" }, safety: { default: 3 } });
+  // The compat contract: every expression is a literal, so the style runs on
+  // any GL JS with color-relief.
+  expect(JSON.stringify(s)).not.toContain("global-state");
+  expect(s).not.toHaveProperty("state");
   const shading = s.layers.find((l) => l.id === "depth-shading");
   const ramp = raw(
     (shading as { paint: Record<string, unknown> }).paint[
@@ -111,42 +113,45 @@ test("layer ids are stable — consumers key toggles/queries off them", () => {
   ]);
 });
 
-test("state defaults exist for every global-state key the expressions read", () => {
-  expect(Object.keys(state).sort()).toEqual(["safety", "unit"]);
-});
-
-test("applyState keeps global-state and the ramp in sync", () => {
-  const globals: Record<string, unknown> = { unit: "m", safety: 2 };
-  const paints: unknown[] = [];
+test("applyState re-derives every unit/safety-dependent property", () => {
+  type Call = { fn: string; layer: string; prop?: string; value: unknown };
+  const calls: Call[] = [];
   const map: ChartMap = {
-    setGlobalStateProperty: (k, v) => (globals[k] = v),
-    getGlobalState: () => globals,
-    setPaintProperty: (layer, prop, value) => paints.push({ layer, prop, value }),
-    getLayer: (id) => (id === "depth-shading" ? {} : undefined),
+    setFilter: (layer, value) => calls.push({ fn: "filter", layer, value }),
+    setLayoutProperty: (layer, prop, value) =>
+      calls.push({ fn: "layout", layer, prop, value }),
+    setPaintProperty: (layer, prop, value) =>
+      calls.push({ fn: "paint", layer, prop, value }),
+    getLayer: () => ({}),
   };
 
-  // Changing only safety must rebuild the ramp with the CURRENT unit.
-  applyState(map, { safety: 5 });
-  expect(globals.safety).toBe(5);
-  expect(paints).toHaveLength(1);
+  applyState(map, { unit: "fm", safety: 5 });
+  // Ramp: fathom-curve band edges active, hazard band folded.
   const ramp = raw(
-    (paints[0] as { layer: string; prop: string; value: unknown }).value,
+    calls.find((c) => c.fn === "paint" && c.layer === "depth-shading")!.value,
   );
-  expect(ramp).toContain(day.hazard); // safety > 0 folds the hazard band
-  expect(ramp).toContain(-10); // metric band edge → unit stayed "m"
+  expect(ramp).toContain(-30 * 1.8288);
+  expect(ramp).toContain(day.hazard);
+  // Isobath filters flip to the fathom-curve set — lines and labels together.
+  for (const id of ["contour-lines", "contour-labels"])
+    expect(calls.find((c) => c.fn === "filter" && c.layer === id)!.value)
+      .toEqual(["==", ["get", "sys"], "ft"]);
+  // Label text follows the unit.
+  expect(
+    JSON.stringify(
+      calls.find((c) => c.fn === "layout" && c.layer === "soundings")!.value,
+    ),
+  ).toContain("depth_fm");
+  // Unsafe-sounding emphasis carries the safety literal.
+  expect(
+    JSON.stringify(
+      calls.find((c) => c.fn === "paint" && c.layer === "soundings")!.value,
+    ),
+  ).toContain("5");
 
-  // Changing unit swaps the ramp onto the fathom curves.
-  applyState(map, { unit: "fm" });
-  expect(globals.unit).toBe("fm");
-  const fmRamp = raw(
-    (paints[1] as { layer: string; prop: string; value: unknown }).value,
-  );
-  expect(fmRamp).toContain(-30 * 1.8288); // 30 fm curve → ft/fm band edges
-  // Same-call values win over (possibly async) map state reads.
-  expect(fmRamp).toContain(day.hazard); // safety 5 still folded
-
-  // No depth-shading layer (composed style without it) → state set, no repaint.
+  // Layers absent from the map (composed subsets) are skipped entirely.
+  const before = calls.length;
   const bare: ChartMap = { ...map, getLayer: () => undefined };
-  applyState(bare, { safety: 0 });
-  expect(paints).toHaveLength(2);
+  applyState(bare, { unit: "m", safety: 0 });
+  expect(calls).toHaveLength(before);
 });

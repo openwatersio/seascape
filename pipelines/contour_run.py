@@ -201,8 +201,12 @@ def _per_zoom_filter():
     bands, lo = [], 0
     for hi, depths in CONTOUR_TIERS:
         min_abs = min(-d for d in depths)  # shallowest metre curve shown in this band
+        # Both bands test depth_m (gdal_contour's Real attribute): -j comparisons are
+        # type-strict, and the enriched int columns (depth_abs_m et al.) reach the filter
+        # as strings via the FlatGeobuf Integer64 path — a numeric test on them matches
+        # nothing, which silently dropped every ft curve below native zoom.
         bands.append(["all", [">=", "$zoom", lo], ["<", "$zoom", hi], ["==", "sys", "m"], ["in", "depth_m", *depths]])
-        bands.append(["all", [">=", "$zoom", lo], ["<", "$zoom", hi], ["==", "sys", "ft"], [">=", "depth_abs_m", min_abs]])
+        bands.append(["all", [">=", "$zoom", lo], ["<", "$zoom", hi], ["==", "sys", "ft"], ["<=", "depth_m", -min_abs]])
         lo = hi
     bands.append(["all", [">=", "$zoom", lo]])  # native+ zoom: every curve, both systems
     return json.dumps({"*": ["any", *bands]})
@@ -220,6 +224,8 @@ def _tippecanoe(fgbs, minz, maxz, out):
          # maxz, so maxz detail is untouched). Env-tunable to dial on a re-bundle.
          "--simplification", os.environ.get("CONTOUR_SIMPLIFICATION", "8"),
          "-y", "depth_m", "-y", "depth_abs_m", "-y", "sys", "-y", "depth_ft", "-y", "depth_fm",
+         # FlatGeobuf Integer64 attributes otherwise land in the MVT as strings.
+         "-T", "depth_abs_m:int", "-T", "depth_ft:int", "-T", "depth_fm:int",
          "-j", PER_ZOOM_FILTER, *fgbs],
         check=True)
 
@@ -255,9 +261,8 @@ def bundle_maxz(own_max):
 # ── source coverage (provenance) layer ───────────────────────────────────────
 # Tile each source's union footprint (store/polygon/<id>.gpkg, from the source stage)
 # into a `coverage` layer alongside `contours` in the same pmtiles, so the viewer can
-# show which source covers a clicked point — ROADMAP Milestone 5.3, "tile straight from
-# the coverage polygons." GEBCO (the global base) declares no max_zoom, so it's skipped;
-# only regional footprints get a polygon.
+# show which source covers a clicked point. GEBCO (the global base) declares no
+# max_zoom, so it's skipped; only regional footprints get a polygon.
 
 BASE_SOURCE = "gebco"  # the global fallback; its footprint is the whole planet, never an overlay
 
@@ -422,6 +427,8 @@ def _check():
     assert _chaikin_iters(NAV_SMOOTH_MAX_M + 1) == CHAIKIN_ITERATIONS
     # metre and feet/fathom isobaths each get their own per-zoom bands in the tippecanoe filter
     assert '["==", "sys", "m"]' in PER_ZOOM_FILTER and '["==", "sys", "ft"]' in PER_ZOOM_FILTER
+    # the filter must only compare depth_m — the int columns are string-typed at -j time
+    assert "depth_abs_m" not in PER_ZOOM_FILTER
     # every tier level must exist in the generated contour set (else it filters to nothing)
     assert all(d in config.CONTOUR_LEVELS for _, depths in CONTOUR_TIERS for d in depths)
     print("contour_run ring-drop + orphan-filter self-check ok")

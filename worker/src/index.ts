@@ -364,9 +364,8 @@ export default {
     // Drop-in MapLibre style for these tiles — the same style the viewer
     // renders (assembled by @openwaters/seascape); the endpoint base is derived
     // from the request. Point MapLibre's `style:` (or Maputnik) at this URL
-    // directly. ?unit=m|ft|fm and ?safety=<metres> bake mariner defaults into
-    // the served style (the depth ramp can't read runtime state, so zero-build
-    // consumers parameterize here instead).
+    // directly. ?unit=m|ft|fm and ?safety=<metres> set mariner defaults in the
+    // served style; on a live map the package's applyState changes them.
     if (rel === "/style.json") {
       // Uncacheable plain-text 400s: an intermediary must never cache an error
       // for a URL that would succeed once the param is fixed.
