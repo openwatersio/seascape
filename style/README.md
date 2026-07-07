@@ -30,12 +30,11 @@ Composed into your own style (the protomaps-basemaps pattern — you own
 `sources`, the package provides layer groups):
 
 ```js
-import { day, sources, layers, state } from "@openwaters/seascape";
+import { day, sources, layers } from "@openwaters/seascape";
 
 const myStyle = {
   version: 8,
   glyphs: "...",
-  state, // global-state defaults for `unit` and `safety`
   sources: { ...myBasemapSources, ...sources({ tilesBase }) },
   layers: [...myBasemapLayers, ...layers(day)],
 };
@@ -46,13 +45,12 @@ Options: `style()` takes `unit` / `safety` (baked defaults, see below),
 
 ## Runtime parameters
 
-`unit` (`"m" | "ft" | "fm"`) and `safety` (metres, 0 = off) are MapLibre
-[global-state](https://maplibre.org/maplibre-style-spec/root/#state) variables
-(GL JS ≥ 5.6). Change them with `applyState`, which flips the state (every
-label, isobath filter, and unsafe-sounding emphasis re-evaluates) **and**
-rebuilds the depth-shading ramp — the one piece that can't read global-state
-(`interpolate` stops must be literals). Setting one without the other desyncs
-tint from labels, so don't:
+`unit` (`"m" | "ft" | "fm"`) and `safety` (metres, 0 = off) appear in the
+generated expressions as literals, so the style runs on any GL JS with the
+`color-relief` layer (MapLibre ≥ 5.6). Change them on a live map with
+`applyState`, which re-derives every dependent property (depth ramp, isobath
+filters, label text, unsafe-sounding emphasis) and sets them in place. Pass the
+full settings each call — nothing map-side remembers the previous values:
 
 ```js
 import { applyState } from "@openwaters/seascape";

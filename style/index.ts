@@ -13,12 +13,13 @@
  * Zooms, bounds, and attribution come from the endpoint's TileJSON documents
  * (raster.json / vector.json).
  *
- * Runtime parameters: the `unit` ("m" | "ft" | "fm") and `safety` (metres,
- * 0 = off) global-state variables drive every label, filter, and sounding-
- * emphasis expression — flip them with map.setGlobalStateProperty() and the
- * style re-evaluates, no per-layer restyle. The one exception is the
- * depth-shading ramp: interpolate stops must be literals, so on unit or safety
- * change rebuild it with depthRelief() and setPaintProperty (see below).
+ * Runtime parameters: `unit` ("m" | "ft" | "fm") and `safety` (metres, 0 = off)
+ * appear in the generated expressions as literals — every label, isobath
+ * filter, sounding emphasis, and the depth-shading ramp. Literal expressions
+ * run on any GL JS with color-relief (MapLibre >= 5.6). To change them on a
+ * live map, applyState() re-derives the handful of unit/safety-dependent
+ * properties and sets them in place; or fetch a regenerated style
+ * (`/style.json?unit=ft&safety=3`).
  */
 import type {
   ExpressionSpecification,
@@ -81,11 +82,9 @@ export const day: Flavor = {
   coverage: "#f58231",
 };
 
-// global-state defaults (the style root `state` object).
-export const state: { unit: { default: Unit }; safety: { default: number } } = {
-  unit: { default: "m" },
-  safety: { default: 2 },
-};
+// Mariner-setting defaults for layers()/style() when the caller omits them.
+const DEFAULT_UNIT: Unit = "m";
+const DEFAULT_SAFETY = 2;
 
 const DEFAULT_GLYPHS =
   "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf";
@@ -135,8 +134,8 @@ const rampColorAt = (ramp: RampStops, e: number): string => {
 };
 
 // The color-relief expression for the active unit system and safety depth.
-// Interpolate stops can't be live global-state values, so unit/safety changes
-// rebuild this and apply it with setPaintProperty("depth-shading", ...).
+// Unit/safety changes rebuild this and apply it with
+// setPaintProperty("depth-shading", ...) — applyState() does exactly that.
 export function depthRelief(
   flavor: Flavor = day,
   { unit = "m", safety = 0 }: { unit?: Unit; safety?: number } = {},
@@ -208,10 +207,8 @@ export function layers(
   {
     dem = "seascape-dem",
     vector = "seascape-vector",
-    // Baked into the initial depth-shading ramp; keep in sync with the state
-    // defaults (runtime changes go through depthRelief() + setPaintProperty).
-    unit = state.unit.default,
-    safety = state.safety.default,
+    unit = DEFAULT_UNIT,
+    safety = DEFAULT_SAFETY,
   }: {
     dem?: string;
     vector?: string;
@@ -219,43 +216,36 @@ export function layers(
     safety?: number;
   } = {},
 ): LayerSpecification[] {
-  // One global-state variable — `unit` — drives every sounding/contour label
-  // and which isobaths show.
+  // `unit` picks every sounding/contour label and which isobath set shows;
+  // `safety` sets the unsafe-sounding emphasis. Everything is a literal, so
+  // runtime changes go through applyState(), which regenerates these.
   //
   // Soundings: props depth_m / depth_ft / depth_fm, all floored toward
   // shallower; depth_m already carries one decimal in the shoal band (<6 m)
   // and an integer deeper, so metres just print it.
-  const UNIT: ExpressionSpecification = ["global-state", "unit"];
   const soundingText: ExpressionSpecification = [
-    "case",
-    ["==", UNIT, "ft"],
-    ["to-string", ["get", "depth_ft"]],
-    ["==", UNIT, "fm"],
-    ["to-string", ["get", "depth_fm"]],
-    ["to-string", ["get", "depth_m"]], // metres (default; also covers unit unset)
+    "to-string",
+    [
+      "get",
+      unit === "ft" ? "depth_ft" : unit === "fm" ? "depth_fm" : "depth_m",
+    ],
   ];
   // Contours: metre isobaths (sys != "ft", also legacy no-sys tiles) vs the
   // fathom-curve set (sys == "ft"), which labels as feet or fathoms. Both
   // systems label every curve — the standard isobath sets are sparse enough
   // that GL collision thins the labels.
-  const IS_FEET: ExpressionSpecification = [
-    "any",
-    ["==", UNIT, "ft"],
-    ["==", UNIT, "fm"],
-  ];
-  const contourLineFilter: ExpressionSpecification = [
-    "case",
-    IS_FEET,
-    ["==", ["get", "sys"], "ft"],
-    ["!=", ["get", "sys"], "ft"],
-  ];
+  const contourLineFilter: ExpressionSpecification =
+    unit === "m" ? ["!=", ["get", "sys"], "ft"] : ["==", ["get", "sys"], "ft"];
   const contourLabelText: ExpressionSpecification = [
-    "case",
-    ["==", UNIT, "ft"],
-    ["concat", ["to-string", ["get", "depth_ft"]], "ft"],
-    ["==", UNIT, "fm"],
-    ["concat", ["to-string", ["get", "depth_fm"]], "fm"],
-    ["concat", ["to-string", ["get", "depth_abs_m"]], "m"],
+    "concat",
+    [
+      "to-string",
+      [
+        "get",
+        unit === "ft" ? "depth_ft" : unit === "fm" ? "depth_fm" : "depth_abs_m",
+      ],
+    ],
+    unit,
   ];
 
   // Shared label styling so soundings and contour labels read as one chart.
@@ -357,16 +347,10 @@ export function layers(
         // Soundings at or shoaler than the safety depth print black — S-52
         // shows unsafe-water soundings in black and lets the hazard tint carry
         // the alarm; safety=0 → all normal.
-        "text-color": [
-          "case",
-          [
-            "all",
-            [">", ["global-state", "safety"], 0],
-            ["<=", ["get", "depth_m"], ["global-state", "safety"]],
-          ],
-          "#000",
-          flavor.label,
-        ],
+        "text-color":
+          safety > 0
+            ? ["case", ["<=", ["get", "depth_m"], safety], "#000", flavor.label]
+            : flavor.label,
         "text-halo-color": flavor.labelHalo,
         "text-halo-width": 1,
       },
@@ -423,15 +407,15 @@ export function layers(
 // ─── Whole style ─────────────────────────────────────────────────────────────
 // A complete, drop-in StyleSpecification: OSM raster base (osm: false for
 // layers-only over your own basemap) + the bathymetry sources and layers.
-// `unit`/`safety` bake mariner defaults into both the depth ramp and the
-// style's global-state defaults, so labels and tint always agree.
+// `unit`/`safety` parameterize every layer, ramp included, so labels and tint
+// always agree.
 export function style({
   tilesBase,
   flavor = day,
   glyphs = DEFAULT_GLYPHS,
   osm = true,
-  unit = state.unit.default,
-  safety = state.safety.default,
+  unit = DEFAULT_UNIT,
+  safety = DEFAULT_SAFETY,
 }: {
   tilesBase: string;
   flavor?: Flavor;
@@ -458,53 +442,67 @@ export function style({
     version: 8,
     name: "Open Waters Seascape",
     glyphs,
-    state: { unit: { default: unit }, safety: { default: safety } },
     sources: { ...osmSource, ...sources({ tilesBase }) },
     layers: [...osmBase, ...layers(flavor, { unit, safety })],
   };
 }
 
 // ─── Runtime helpers ──────────────────────────────────────────────────────────
-// The style is not pure JSON: the depth ramp can't read global-state, and depth
-// readout decodes Terrarium pixels. These live here so consumers don't re-derive
-// either.
+// The unit/safety literals in the layers only change when the layers are
+// regenerated, and depth readout decodes Terrarium pixels. These live here so
+// consumers don't re-derive either.
 
 // The subset of maplibregl.Map that applyState touches (structural, so the
 // package needs no maplibre-gl dependency).
 export interface ChartMap {
-  setGlobalStateProperty(name: string, value: unknown): unknown;
-  getGlobalState(): Record<string, unknown>;
+  setFilter(layerId: string, filter: unknown): unknown;
+  setLayoutProperty(layerId: string, name: string, value: unknown): unknown;
   setPaintProperty(layerId: string, name: string, value: unknown): unknown;
   getLayer(id: string): unknown;
 }
 
-// Change the mariner settings on a live map. Flipping the `unit` / `safety`
-// global-state re-evaluates every label, filter, and sounding-emphasis
-// expression — but the depth-shading ramp's interpolate stops must be literals,
-// so it is rebuilt here with the SAME values. This pairing is the whole point:
-// setting the state without repainting the ramp (or vice versa) desyncs tint
-// from labels.
+// Change the mariner settings on a live map: re-derive the unit/safety-
+// dependent layer properties (depth ramp, isobath filters, label text, unsafe-
+// sounding emphasis) and set them in place — the in-place equivalent of
+// reloading a regenerated style. Takes the full settings each call: nothing
+// map-side stores the previous values, so callers pass what their controls
+// currently show. Layers absent from the map (composed subsets) are skipped.
 export function applyState(
   map: ChartMap,
-  changes: { unit?: Unit; safety?: number },
+  { unit, safety }: { unit: Unit; safety: number },
   flavor: Flavor = day,
 ): void {
-  if (changes.unit !== undefined)
-    map.setGlobalStateProperty("unit", changes.unit);
-  if (changes.safety !== undefined)
-    map.setGlobalStateProperty("safety", changes.safety);
-  const current = {
-    unit: state.unit.default,
-    safety: state.safety.default,
-    ...map.getGlobalState(),
-    ...changes,
-  } as { unit: Unit; safety: number };
+  const spec = Object.fromEntries(
+    layers(flavor, { unit, safety }).map((l) => [l.id, l]),
+  ) as Record<string, { filter?: unknown; layout?: any; paint?: any }>;
   if (map.getLayer("depth-shading"))
     map.setPaintProperty(
       "depth-shading",
       "color-relief-color",
-      depthRelief(flavor, current),
+      spec["depth-shading"].paint["color-relief-color"],
     );
+  if (map.getLayer("contour-lines"))
+    map.setFilter("contour-lines", spec["contour-lines"].filter);
+  if (map.getLayer("contour-labels")) {
+    map.setFilter("contour-labels", spec["contour-labels"].filter);
+    map.setLayoutProperty(
+      "contour-labels",
+      "text-field",
+      spec["contour-labels"].layout["text-field"],
+    );
+  }
+  if (map.getLayer("soundings")) {
+    map.setLayoutProperty(
+      "soundings",
+      "text-field",
+      spec["soundings"].layout["text-field"],
+    );
+    map.setPaintProperty(
+      "soundings",
+      "text-color",
+      spec["soundings"].paint["text-color"],
+    );
+  }
 }
 
 // Chart-datum elevation at a point, in metres — negative below datum (depth),

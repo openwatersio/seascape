@@ -74,9 +74,9 @@ const toggles = {
 
 map.on("load", () => {
   // Mariner settings — unit (m/ft/fm) and safety depth (metres, 0 = off; drives
-  // the hazard tint and black-sounding emphasis, S-52 style). applyState flips
-  // the global-state AND rebuilds the depth ramp together (the ramp can't read
-  // global-state), so the controls just forward their current values.
+  // the hazard tint and black-sounding emphasis, S-52 style). The style carries
+  // the settings as literals; applyState re-derives every dependent property
+  // from the full current values, so the controls just forward them.
   const applyControls = () =>
     applyState(map, {
       unit: document.getElementById("unit-select")?.value || "m",
