@@ -159,20 +159,26 @@ def prep_water():
     The read is anonymous (AWS_NO_SIGN_REQUEST) — the Overture bucket needs no credentials.
 
     Coverage ceiling: this only reopens water OSM maps as *polygons*. Narrow tidal channels
-    mapped as a bare waterway centerline (the ICW's Pablo Creek reach, for one) stay "land" in
-    the mask — harmless for the clamp (trusted sources are never clamped) but it gates drying
-    there until OSM grows an area or another feed does."""
+    mapped as a bare waterway centerline stay "land" in the mask — harmless for the clamp
+    (trusted sources are never clamped) but it gates drying there until OSM grows an area or
+    another feed does.
+
+    BBOX (W,S,E,N lon/lat, the same regional-build env the covering uses) pushes a -spat
+    prefilter into the remote read, so a regional or preview build pulls only that window
+    instead of scanning the planet's ~65M features. Unset (a normal CI build) → whole planet."""
     out = water_path()
     if os.path.isfile(out):
         print(f"inland-water mask already present: {out}")
         return
     utils.create_folder(os.path.dirname(out) or ".")
     raw = out + ".raw.gpkg"
+    bbox = os.environ.get("BBOX", "").strip()
+    spat = f"-spat {bbox.replace(',', ' ')} " if bbox else ""
     try:
         utils.run_command(
             "AWS_NO_SIGN_REQUEST=YES AWS_DEFAULT_REGION=us-west-2 "
             f"ogr2ogr -f GPKG -overwrite -nln water_raw -lco SPATIAL_INDEX=NO "
-            "-where \"subtype <> 'ocean'\" "
+            f"{spat}-where \"subtype <> 'ocean'\" "
             f"{raw} {WATER_PARQUET_URL}",
             silent=False)
         utils.run_command(

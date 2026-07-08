@@ -152,7 +152,9 @@ contour-merge:
 # no local source prep. `just preview-local` instead builds from already-prepared sources in
 # store/source (no R2; SOURCE_VSI_BASE unset). Override SOURCE_VSI_BASE/BOUNDS_BASE for a mirror.
 # The coarse-source land clamp needs the land mask: streamed from R2 when published, else built
-# locally once (a 700 MB OSM download; override with LANDMASK to reuse an existing copy).
+# locally once (a 700 MB OSM download; override with LANDMASK to reuse an existing copy). The
+# inland-water mask (clamp subtraction, #24 inverse clamp, depare nodata) is streamed from R2
+# when published, else built bbox-scoped from Overture in seconds (override with WATERMASK).
 # View with `just dev` (tile Worker on :8787 + Vite viewer on :5173).
 preview bbox="-74.30,40.40,-73.75,40.80" local="":
     #!/usr/bin/env bash
@@ -183,12 +185,31 @@ preview bbox="-74.30,40.40,-73.75,40.80" local="":
         else
             export LANDMASK="${LANDMASK:-store/landmask/land.fgb}"
         fi
+        # Inland-water mask (the clamp subtraction, the #24 inverse clamp, and depare's nodata
+        # areas all read it): stream from R2 when published, else build it locally SCOPED TO THE
+        # PREVIEW BBOX — prep-water honors BBOX as a -spat prefilter, so it pulls only this window
+        # (seconds), and it's rebuilt each run since it's region-specific. A WATERMASK override is
+        # honored untouched; whole-planet R2 always wins over a stale regional local copy.
+        r2water="https://data.openwaters.io/bathymetry/landmask/water.fgb"
+        if [ -n "${WATERMASK:-}" ]; then
+            :
+        elif curl -fsI "$r2water" >/dev/null 2>&1; then
+            export WATERMASK="/vsicurl/$r2water"
+        else
+            export WATERMASK="store/landmask/water.fgb"
+            rm -f "$WATERMASK"
+        fi
     else
         unset SOURCE_VSI_BASE  # read prepared COGs from store/source on disk
         export LANDMASK="${LANDMASK:-store/landmask/land.fgb}"
+        # Offline preview: use a local water mask only if it's already there (prep-water needs
+        # the network); absent, the clamp/nodata degrade to land-only.
+        export WATERMASK="${WATERMASK:-store/landmask/water.fgb}"
     fi
-    # Build the mask locally (one-time OSM download) if we're pointed at a local path with no file.
+    # Build each mask locally if we're pointed at a local path with no file — the land mask is a
+    # one-time OSM download; the water mask is the bbox-scoped Overture pull (skipped offline).
     case "$LANDMASK" in /vsicurl/*) : ;; *) [ -f "$LANDMASK" ] || just landmask ;; esac
+    case "${WATERMASK:-}" in /vsicurl/*|"") : ;; *) [ -f "$WATERMASK" ] || { [ -z "{{local}}" ] && just watermask || echo "no water mask (offline preview) — clamp/nodata degrade to land-only"; } ;; esac
     rm -rf store/aggregation store/pmtiles store/bundle store/meta store/contour store/soundings store/drying store/depare
     just planet
     ../worker/seed.sh
