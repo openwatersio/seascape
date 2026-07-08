@@ -62,11 +62,11 @@ jobs:
             echo "::error::No build at $src/ — release/dispatch a commit that was built on main."
             exit 1
           fi
-          # contour-maxz.txt is a build-only handoff; contour-shards/bundle-frags are build scratch.
+          # contour-shards/bundle-frags are build scratch.
           # manifest.json copied separately, last, so a crash mid-copy never leaves a false marker.
           rclone copy "$src" "$dst" --transfers 16 --checkers 16 \
             --exclude 'contour-shards/**' --exclude 'bundle-frags/**' \
-            --exclude 'manifest.json' --exclude 'contour-maxz.txt'
+            --exclude 'manifest.json'
           rclone copyto "$src/manifest.json" "$dst/manifest.json"
       - name: Prune old releases (keep newest 3)
         run: |

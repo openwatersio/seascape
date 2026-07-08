@@ -2,12 +2,14 @@
  * Unified bathymetry tile endpoint.
  *
  *   GET /seascape/{z}/{x}/{y}.webp  (or .png)  → Terrarium WebP (raster terrain)
- *   GET /seascape/{z}/{x}/{y}.pbf   (or .mvt)  → MVT (vector — contours, soundings, drying, coverage)
+ *   GET /seascape/{z}/{x}/{y}.pbf   (or .mvt)  → MVT (vector — contours, soundings, drying)
+ *   GET /seascape/coverage/{z}/{x}/{y}.pbf     → MVT (source-provenance footprints)
  *
  * Extension picks the representation: webp/png → raster, pbf/mvt → vector.
  *
  * Reads the bundles published to R2 (planet.pmtiles + one overlay-{cell}.pmtiles
- * per populated grid cell + vector.pmtiles + manifest.json) and resolves per tile:
+ * per populated grid cell + vector.pmtiles + coverage.pmtiles + manifest.json)
+ * and resolves per tile:
  *   - z ≤ planet.max_zoom        → planet tile
  *   - z > planet.max_zoom, the tile's grid cell is populated → that cell's tile
  *     (or the overzoomed deepest ancestor present in the cell)
@@ -27,6 +29,7 @@
 import { PMTiles, Source, RangeResponse } from "pmtiles";
 import { style as seascapeStyle } from "@openwaters/seascape";
 import { CachedSource, contentEtag, OVERZOOM_TAG_VERSION } from "./cache";
+import { coverageTileJSON } from "./coverage";
 import { unpackTerrarium, packTerrariumInto, cubicBSpline } from "./terrarium";
 import { OverlayIndex, overlayFor } from "./overlay";
 // jSquash on Workers: WASM must be imported as a module and passed to init()
@@ -473,31 +476,23 @@ export default {
               sys: "String",
             },
           },
-          {
-            // Per-source data-extent polygons (provenance / click-to-identify).
-            id: "coverage",
-            fields: {
-              source_id: "String",
-              source_name: "String",
-              source_maxzoom: "Number",
-            },
-          },
         ],
         attribution: mf.attribution ?? "",
       });
     }
-    // Tiles: extension selects representation — webp/png → raster, pbf/mvt → vector.
-    const m = rel.match(/^\/(\d+)\/(\d+)\/(\d+)\.(png|webp|pbf|mvt)$/);
-    if (!m)
-      return new Response(`usage: ${base}/{z}/{x}/{y}.{webp,pbf}`, {
-        status: 404,
-        headers: CORS,
-      });
-    const z = +m[1],
-      x = +m[2],
-      y = +m[3];
-    const ext = m[4];
-
+    // Source-provenance footprints — their own tileset with a low maxzoom that
+    // MapLibre overzooms independently of the vector source (in vector.pmtiles
+    // the layer either minted millions of deep-ocean fill tiles or vanished
+    // above its zoom — a joined archive shares one zoom range).
+    if (rel === "/coverage.json") {
+      const mf = await manifest(env);
+      // Absent coverage.pmtiles (a pre-coverage release) → empty TileJSON, not
+      // a 500 — same tolerance manifest() extends to pre-grid releases.
+      const h = await pm(env, "coverage.pmtiles")
+        .getHeader()
+        .catch(() => null);
+      return json(coverageTileJSON(h, tilesBase, mf.attribution ?? ""));
+    }
     // Tiles validate by CONTENT, not release: ETag = hash of the tile bytes
     // (or of the native ancestor a synthesized tile is a pure function of).
     // An unchanged tile keeps its validator across releases, so clients
@@ -526,6 +521,33 @@ export default {
         ctx.waitUntil(caches.default.put(cacheKey, res.clone()));
       return inm === tag ? notModified(tag) : res;
     };
+
+    // Coverage tiles, from their own archive. A within-range miss (open ocean),
+    // out-of-range x/y, and an absent archive (pre-coverage release) all 204 —
+    // the same noTile contract as vector, never a 500.
+    const cov = rel.match(/^\/coverage\/(\d+)\/(\d+)\/(\d+)\.(pbf|mvt)$/);
+    if (cov) {
+      const cz = +cov[1],
+        cx = +cov[2],
+        cy = +cov[3];
+      if (cx >= 2 ** cz || cy >= 2 ** cz) return noTile();
+      const t = await tile(env, "coverage.pmtiles", cz, cx, cy).catch(
+        () => undefined,
+      );
+      return t ? sendTile(t, MVT, await contentEtag(t)) : noTile();
+    }
+
+    // Tiles: extension selects representation — webp/png → raster, pbf/mvt → vector.
+    const m = rel.match(/^\/(\d+)\/(\d+)\/(\d+)\.(png|webp|pbf|mvt)$/);
+    if (!m)
+      return new Response(`usage: ${base}/{z}/{x}/{y}.{webp,pbf}`, {
+        status: 404,
+        headers: CORS,
+      });
+    const z = +m[1],
+      x = +m[2],
+      y = +m[3];
+    const ext = m[4];
     // Overzoom: resolve the ancestor first — the validator derives from it, so
     // a matching revalidation skips the decode → B-spline → encode entirely.
     // (The 304 path doesn't populate the colo cache; the next full GET does.)

@@ -26,9 +26,12 @@ sources:
 
 # Planet build: cover -> aggregate -> downsample -> bundle -> vector layers (BBOX="W,S,E,N"
 # for a region). Soundings + drying + depare bundle BEFORE contours: the contours tile-join
-# folds their pmtiles into vector.pmtiles in the same single pass.
+# folds their pmtiles into vector.pmtiles in the same single pass. Coverage right after cover
+# (it needs only footprints + the covering) so missing footprints fail in the first minute,
+# not after hours of aggregation.
 planet:
     just cover
+    just coverage
     uv run python aggregation_run.py
     just combine
     just soundings
@@ -118,6 +121,12 @@ drying:
 depare:
     uv run python depare_run.py bundle
 
+# Source-provenance footprints -> their own store/bundle/coverage.pmtiles (z0-8;
+# the renderer overzooms it deeper). Needs store/polygon/*.gpkg + a covering;
+# fails loudly without footprints — a build without them ships a dead layer.
+coverage:
+    uv run python contour_run.py coverage
+
 # tippecanoe this shard's local slice of every vector layer -> {contours,soundings,
 # drying,depare}-shard-{i}.pmtiles (CI pulls only the shard's slices + writes
 # store/contour-maxz.txt so all layers tile to one depth; merged by contour-merge).
@@ -130,7 +139,7 @@ vector-shard i:
     uv run python drying_run.py bundle-shard {{i}}
     uv run python depare_run.py bundle-shard {{i}}
 
-# tile-join the per-shard pmtiles (all layers) + coverage into vector.pmtiles.
+# tile-join the per-shard pmtiles (all layers) into vector.pmtiles.
 contour-merge:
     uv run python contour_run.py bundle-merge
 
@@ -150,10 +159,17 @@ preview bbox="-74.30,40.40,-73.75,40.80" local="":
     if [ -z "{{local}}" ]; then
         export SOURCE_VSI_BASE="${SOURCE_VSI_BASE:-/vsicurl/https://data.openwaters.io/bathymetry/source}"
         BOUNDS_BASE="${BOUNDS_BASE:-https://data.openwaters.io/bathymetry/source}"
+        POLY_BASE="${POLY_BASE:-${BOUNDS_BASE%/source}/polygon}"
+        mkdir -p store/polygon
         for id in $(uv run python -c "import config; print('\n'.join(config.sources()))"); do
             mkdir -p "store/source/$id"
             curl -fsS "$BOUNDS_BASE/$id/bounds.csv" -o "store/source/$id/bounds.csv" \
                 || { echo "skip $id (no bounds.csv in R2)"; rm -rf "store/source/$id"; }
+            # Provenance footprint for the coverage tileset (streaming sources have none).
+            # Replace only on success — a 404 must not clobber a locally-prepared polygon.
+            curl -fsS "$POLY_BASE/$id.gpkg" -o "store/polygon/$id.gpkg.tmp" \
+                && mv "store/polygon/$id.gpkg.tmp" "store/polygon/$id.gpkg" \
+                || rm -f "store/polygon/$id.gpkg.tmp"
         done
         # S-102 re-registers from a live catalog (and may not be in R2 yet), so re-sync it
         just source noaa_s102

@@ -13,7 +13,8 @@ style.
 ## Usage
 
 Whole style (OSM raster base + bathymetry). Zooms, bounds, and attribution
-come from the endpoint's TileJSON (`raster.json` / `vector.json`) — no other
+come from the endpoint's TileJSON (`raster.json` / `vector.json` /
+`coverage.json`) — no other
 fetch needed:
 
 ```js

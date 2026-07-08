@@ -230,16 +230,21 @@ export function depthAreasColor(
 
 // ─── Sources ─────────────────────────────────────────────────────────────────
 // tilesBase is the Worker endpoint; the sources reference its TileJSON docs
-// (raster.json / vector.json), which carry the tile URLs, zoom range, bounds,
-// and the combined per-source attribution.
+// (raster.json / vector.json / coverage.json), which carry the tile URLs, zoom
+// range, bounds, and the combined per-source attribution. Coverage is its own
+// source: its tileset ends at a low maxzoom and MapLibre overzooms it
+// independently of the vector source (a layer inside vector.pmtiles would
+// vanish above the zoom it was tiled to).
 export function sources({
   tilesBase,
   dem = "seascape-dem",
   vector = "seascape-vector",
+  coverage = "seascape-coverage",
 }: {
   tilesBase: string;
   dem?: string;
   vector?: string;
+  coverage?: string;
 }): Record<string, SourceSpecification> {
   tilesBase = tilesBase.replace(/\/+$/, ""); // tolerate a trailing slash
   return {
@@ -254,6 +259,10 @@ export function sources({
       type: "vector",
       url: `${tilesBase}/vector.json`,
     },
+    [coverage]: {
+      type: "vector",
+      url: `${tilesBase}/coverage.json`,
+    },
   };
 }
 
@@ -263,12 +272,14 @@ export function layers(
   {
     dem = "seascape-dem",
     vector = "seascape-vector",
+    coverage = "seascape-coverage",
     unit = DEFAULT_UNIT,
     safety = DEFAULT_SAFETY,
     shading = DEFAULT_SHADING,
   }: {
     dem?: string;
     vector?: string;
+    coverage?: string;
     unit?: Unit;
     safety?: number;
     shading?: Shading;
@@ -435,12 +446,12 @@ export function layers(
       },
     },
     // Source coverage (provenance): footprint polygons with props source_id /
-    // source_name / source_maxzoom. Hidden by default; a viewer can toggle
-    // them on for click-to-identify.
+    // source_name / source_maxzoom, from the standalone coverage tileset.
+    // Hidden by default; a viewer can toggle them on for click-to-identify.
     {
       id: "source-fill",
       type: "fill",
-      source: vector,
+      source: coverage,
       "source-layer": "coverage",
       layout: { visibility: "none" },
       paint: { "fill-color": coverageColor, "fill-opacity": 0.12 },
@@ -449,7 +460,7 @@ export function layers(
       // Brightened fill of one source (filter set by the consumer on click).
       id: "source-highlight",
       type: "fill",
-      source: vector,
+      source: coverage,
       "source-layer": "coverage",
       filter: ["==", ["get", "source_id"], "__none__"],
       layout: { visibility: "none" },
@@ -458,7 +469,7 @@ export function layers(
     {
       id: "source-outline",
       type: "line",
-      source: vector,
+      source: coverage,
       "source-layer": "coverage",
       layout: { visibility: "none" },
       paint: { "line-color": coverageColor, "line-width": 1.5 },
@@ -466,7 +477,7 @@ export function layers(
     {
       id: "source-labels",
       type: "symbol",
-      source: vector,
+      source: coverage,
       "source-layer": "coverage",
       layout: {
         visibility: "none",

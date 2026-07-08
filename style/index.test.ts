@@ -43,6 +43,7 @@ test("sources reference the endpoint's TileJSON, encoding inline", () => {
   // MapLibre doesn't read `encoding` from TileJSON — it must be inline.
   expect(src["seascape-dem"].encoding).toBe("terrarium");
   expect(src["seascape-vector"].url).toBe("https://t.example/vector.json");
+  expect(src["seascape-coverage"].url).toBe("https://t.example/coverage.json");
 });
 
 test("unit/safety reach the layers as literals", () => {
@@ -89,10 +90,17 @@ test("depthRelief stops stay strictly ascending for any safety depth", () => {
 });
 
 test("layers reference only the caller's source names", () => {
-  const named = layers(day, { dem: "bathy-dem", vector: "bathy" });
+  const named = layers(day, {
+    dem: "bathy-dem",
+    vector: "bathy",
+    coverage: "bathy-coverage",
+  });
   expect(
     [...new Set(named.map((l) => (l as { source: string }).source))].sort(),
-  ).toEqual(["bathy", "bathy-dem"]);
+  ).toEqual(["bathy", "bathy-coverage", "bathy-dem"]);
+  // The source-* provenance layers read the coverage source, not vector.
+  for (const l of named.filter((l) => l.id.startsWith("source-")))
+    expect((l as { source: string }).source).toBe("bathy-coverage");
 });
 
 test("contour lines floor at z6 — depth shading carries lower zooms", () => {
