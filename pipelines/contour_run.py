@@ -241,7 +241,7 @@ def _stems_maxz(stems):
 
 def bundle_maxz(own_max):
     """The tileset maxzoom EVERY vector layer bundles to (contours, soundings,
-    drying). They tile-join into one vector.pmtiles, whose maxzoom is the max
+    drying, depare). They tile-join into one vector.pmtiles, whose maxzoom is the max
     across layers — a layer bundled only to its own regional max silently
     vanishes from deeper tiles (drying stopped at z11 while contours ran to
     z14, so the Æbelø flats rendered as bare land above z11). Use the shared
@@ -331,14 +331,15 @@ def _coverage_pmtiles(maxz):
 
 def _finalize_contours(archives, maxz):
     """tile-join the layer archives (a local build's contour pmtiles, or the CI shards —
-    which carry contours, soundings, AND drying slices) + the coverage layer + the
-    whole-set soundings/drying pmtiles (local path, when their bundles ran first) into
-    store/bundle/vector.pmtiles. ONE join: tile-join rewrites every tile of the whole
+    which carry contours, soundings, drying, AND depare slices) + the coverage layer + the
+    whole-set soundings/drying/depare pmtiles (local path, when their bundles ran first)
+    into store/bundle/vector.pmtiles. ONE join: tile-join rewrites every tile of the whole
     archive, so folding each sparse layer in afterwards re-paid the planet-wide join
     per layer (~90 min each in CI). -pk keeps every feature of every layer; a layer
     whose pmtiles isn't present locally is simply not joined."""
     cov = _coverage_pmtiles(maxz)
-    layers = [p for p in [cov, "store/bundle/soundings.pmtiles", "store/bundle/drying.pmtiles"]
+    layers = [p for p in [cov, "store/bundle/soundings.pmtiles", "store/bundle/drying.pmtiles",
+                          "store/bundle/depare.pmtiles"]
               if p and os.path.isfile(p)]
     subprocess.run(["tile-join", "-o", "store/bundle/vector.pmtiles", "-f", "-pk",
                     *archives, *layers], check=True)

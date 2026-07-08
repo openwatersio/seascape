@@ -364,8 +364,9 @@ export default {
     // Drop-in MapLibre style for these tiles — the same style the viewer
     // renders (assembled by @openwaters/seascape); the endpoint base is derived
     // from the request. Point MapLibre's `style:` (or Maputnik) at this URL
-    // directly. ?unit=m|ft|fm and ?safety=<metres> set mariner defaults in the
-    // served style; on a live map the package's applyState changes them.
+    // directly. ?unit=m|ft|fm, ?safety=<metres>, and ?shading=relief|bands set
+    // mariner defaults in the served style; on a live map the package's
+    // applyState changes unit/safety in place.
     if (rel === "/style.json") {
       // Uncacheable plain-text 400s: an intermediary must never cache an error
       // for a URL that would succeed once the param is fixed.
@@ -389,11 +390,19 @@ export default {
       const safety = safetyParam === null ? undefined : Number(safetyParam);
       if (safety !== undefined && !(Number.isFinite(safety) && safety >= 0))
         return bad("safety must be a non-negative number (metres)");
+      const shadingParam = url.searchParams.get("shading");
+      const shading =
+        shadingParam === null
+          ? undefined
+          : (["relief", "bands"] as const).find((s) => s === shadingParam);
+      if (shadingParam !== null && shading === undefined)
+        return bad("shading must be relief or bands");
       return json(
         seascapeStyle({
           tilesBase,
           ...(unit !== undefined ? { unit } : {}),
           ...(safety !== undefined ? { safety } : {}),
+          ...(shading !== undefined ? { shading } : {}),
         }),
       );
     }
@@ -453,6 +462,16 @@ export default {
             // Green-foreshore polygons (drying areas) — geometry only, no attributes.
             id: "drying",
             fields: {},
+          },
+          {
+            // Depth-band partitions (ENC DEPARE): water between charted
+            // isobaths, drval1/drval2 = shallow/deep bound (positive-down m).
+            id: "depare",
+            fields: {
+              drval1: "Number",
+              drval2: "Number",
+              sys: "String",
+            },
           },
           {
             // Per-source data-extent polygons (provenance / click-to-identify).

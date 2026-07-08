@@ -35,6 +35,14 @@ FATHOM_CURVES = [1, 2, 3, 5, 10, 20, 30, 50, 100, 200, 300, 500, 1000, 2000, 300
 # Ascending (deepest first, like CONTOUR_LEVELS) — gdal_contour -fl needs strictly increasing.
 CONTOUR_LEVELS_FT = sorted(round(-fm * 1.8288, 4) for fm in FATHOM_CURVES)
 
+# Depth-area (ENC DEPARE) partition levels: every charted isobath is a band edge, plus 0 to
+# close the shoalest band at the shoreline (the encoder holds land at >= 0, water below).
+# gdal_contour -p buckets the DEM between successive levels; the style tints buckets off
+# drval1 and snaps the safety contour to the next-deeper level. Mirrored in style/index.ts
+# (DEPARE_LADDER_M / DEPARE_LADDER_FT) — keep them in sync.
+DEPARE_LEVELS = CONTOUR_LEVELS + [0]
+DEPARE_LEVELS_FT = CONTOUR_LEVELS_FT + [0]
+
 
 def sources():
     """All source ids (directory names under SOURCES_DIR)."""

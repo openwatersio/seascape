@@ -28,7 +28,7 @@ The toolchain is heavy native tooling. There are two routes to get it running:
 2. **Local dependencies**: This is faster for iterative development but requires a lot of local setup, could be brittle, and is subject to change. You'll need:
    - **[uv](https://docs.astral.sh/uv/)** — Python env for `pipelines/` (synced automatically on the first `uv run`).
    - **[just](https://github.com/casey/just)** — task runner.
-   - **GDAL CLI** — `gdalwarp`, `gdal_translate`, `gdal_contour`, `ogr2ogr`, `gdalbuildvrt`, `ogrinfo`.
+   - **GDAL CLI** — `gdalwarp`, `gdal_translate`, `gdal_contour`, `ogr2ogr`, `gdalbuildvrt`, `ogrinfo`. Use a recent release (the container pins 3.13): 3.8-era polygon-contour mode mis-writes the deepest depth-area bucket's `amin`.
    - **tippecanoe** + **tile-join** — contour vector tiles.
    - **Node + npm** — the viewer, style, and Worker are one npm workspace; a single `npm install` at the root covers all three (including `wrangler`).
 
@@ -54,7 +54,7 @@ Key knobs (env vars, read by `pipelines/utils.py` / `bundle.py`):
 - `OVERLAY_SPLIT_Z` - overlay grid cell zoom (default 5 — raise it if a cell's bundle ever outgrows a CI runner)
 - `NUM_OVERVIEWS` - overview pyramid levels below each source's native maxzoom
 - `SMOOTH_DEM_SIGMA` / `SMOOTH_SLOPE_LOW` / `SMOOTH_SLOPE_HIGH` - slope-adaptive DEM smoothing (Gaussian sigma + the slope band it fades across)
-- `SKIP_SMOOTH`, `SKIP_CONTOURS`, `SKIP_SOUNDINGS`, `SKIP_DRYING` - skip that step
+- `SKIP_SMOOTH`, `SKIP_CONTOURS`, `SKIP_SOUNDINGS`, `SKIP_DRYING`, `SKIP_DEPARE` - skip that step
 - `CONTOUR_NAV_SMOOTH_MAX` - navigable-band contour-smoothing gate (replaces the retired `SKIP_CONTOUR_SMOOTH`)
 - `SOUND_CELL_PX` / `SOUND_MIN_DEPTH_M` - sounding spacing / min charted depth
 - `DRYING_CAP` - max elevation (m) tinted as drying foreshore
@@ -89,15 +89,15 @@ flowchart LR
 Four stages — `source → aggregation → downsampling → bundle` — all writing under `pipelines/store/` (gitignored), one subdir per stage (`store/source`, `store/aggregation`, `store/pmtiles`, `store/contour`, `store/bundle`, …).
 
 - **source** (`source_*.py`, per `sources/<id>/`): fetch → datum offset → normalize to a 4326 COG → `bounds.csv` → coverage polygon → tarball. Each source owns its recipe (`sources/<id>/Justfile`) composing the shared steps. Priority derives from `(maxzoom, id)` — GEBCO loses (smallest maxzoom), so regional sources win in overlap.
-- **aggregation** (`aggregation_*.py`): `cover` slices the planet into source-aware aggregation tiles (one CSV each); `run` reprojects each source by priority into a merged Float32 DEM (Gaussian seam feather), slope-smooths it (`smooth.py`), encodes Terrarium raster tiles, and forks contours (`contour_run.py`) and soundings (`soundings_run.py`) off the same merged DEM. Sources flagged `land_clamp` (GEBCO/EMODnet — coarse, no land/water concept) get their negative land pixels clamped to 0 against the OSM land mask (`landmask.py`, prep once with `just landmask`) right after warp, so shoreline cells don't paint false water/contours/soundings over land. The same mask feeds a `drying_run.py` fork: it polygonizes the green foreshore (elevation in `[0, DRYING_CAP]` seaward of the land line — chart drying areas) into the `drying` layer.
+- **aggregation** (`aggregation_*.py`): `cover` slices the planet into source-aware aggregation tiles (one CSV each); `run` reprojects each source by priority into a merged Float32 DEM (Gaussian seam feather), slope-smooths it (`smooth.py`), encodes Terrarium raster tiles, and forks contours (`contour_run.py`) and soundings (`soundings_run.py`) off the same merged DEM. Sources flagged `land_clamp` (GEBCO/EMODnet — coarse, no land/water concept) get their negative land pixels clamped to 0 against the OSM land mask (`landmask.py`, prep once with `just landmask`) right after warp, so shoreline cells don't paint false water/contours/soundings over land. The same mask feeds a `drying_run.py` fork: it polygonizes the green foreshore (elevation in `[0, DRYING_CAP]` seaward of the land line — chart drying areas) into the `drying` layer. A `depare_run.py` fork buckets the same merged DEM into depth-area partitions (ENC DEPARE: water between charted isobaths, `drval1`/`drval2` depth bounds) — the vector twin of the raster depth shading.
 - **downsampling**: 2×2-average overview pyramid below each source's native maxzoom.
-- **bundle** (`bundle.py`): concat single-zoom pmtiles into `planet.pmtiles` + one overlay archive per populated grid cell + `manifest.json`; contours, soundings, and drying/coverage layers bundle into `vector.pmtiles` via tippecanoe.
+- **bundle** (`bundle.py`): concat single-zoom pmtiles into `planet.pmtiles` + one overlay archive per populated grid cell + `manifest.json`; contours, soundings, and drying/depare/coverage layers bundle into `vector.pmtiles` via tippecanoe.
 
 A full build (`planet`) lands in `pipelines/store/bundle/`:
 
 - `planet.pmtiles` — the all-sources-merged base (Terrarium-encoded raster, per-zoom quantized), z0–`macrotile_z` (z8 = GEBCO native, no upsampling).
 - `overlay-{z}-{x}-{y}.pmtiles` — one per populated `OVERLAY_SPLIT_Z` grid cell (default z5), z`macrotile_z+1`→cell-max, carrying the GEBCO-filled merged mosaic under that cell.
-- `vector.pmtiles` — MVT vector source: `contours` (GEBCO baked to the deepest zoom by tippecanoe) plus the folded-in `soundings`, `drying` (green-foreshore polygons), and `coverage` layers.
+- `vector.pmtiles` — MVT vector source: `contours` (GEBCO baked to the deepest zoom by tippecanoe) plus the folded-in `soundings`, `drying` (green-foreshore polygons), `depare` (depth-band partitions, z6+), and `coverage` layers.
 - `manifest.json` — planet metadata + `overlay.cells` ({cell: max_zoom}) for the Worker.
 
 ### Why a planet cap + grid overlays
@@ -118,7 +118,7 @@ The Worker presents one endpoint per layer and resolves per tile:
 
 ```
 GET /seascape/{z}/{x}/{y}.webp   raster: z≤8 → planet · z>8 in a populated grid cell → that cell's overlay · else → overzoom the planet · miss → transparent
-GET /seascape/{z}/{x}/{y}.pbf    vector: vector.pmtiles passthrough (contours, soundings, drying, coverage layers)
+GET /seascape/{z}/{x}/{y}.pbf    vector: vector.pmtiles passthrough (contours, soundings, drying, depare, coverage layers)
 GET /seascape/raster.json        TileJSON (terrarium raster)
 GET /seascape/vector.json        TileJSON (vector layers)
 ```
