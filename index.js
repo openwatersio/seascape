@@ -62,7 +62,6 @@ const toggles = {
   "toggle-contours": ["contour-lines"],
   "toggle-labels": ["contour-labels"],
   "toggle-soundings": ["soundings"],
-  "toggle-drying": ["drying-areas"],
   "toggle-osm": ["osm-base"],
   "toggle-sources": [
     "source-fill",
@@ -73,42 +72,33 @@ const toggles = {
 };
 
 map.on("load", () => {
-  // Mariner settings — unit (m/ft/fm) and safety depth (metres, 0 = off; drives
-  // the hazard tint and black-sounding emphasis, S-52 style). The style carries
-  // the settings as literals; applyState re-derives every dependent property
-  // from the full current values, so the controls just forward them.
-  const applyControls = () =>
+  // Mariner settings — unit (m/ft/fm), safety depth (metres, 0 = off; drives the
+  // hazard tint and black-sounding emphasis, S-52 style), and shading mode: relief
+  // (raster ramp, continuous) vs bands (vector ENC depth areas — crisp isobath
+  // edges, safety snapped to a charted level). The style carries the settings as
+  // literals; applyState re-derives every dependent property from the full current
+  // values, so the controls just forward them. shading gates the depare fill's own
+  // filter (it hides the depth bands but keeps drying/unknown-depth water), so it
+  // rides through applyState too — the raster only needs its zoom range adjusted:
+  // bands data floors at z6, so relief keeps z<6, and never both at once (the 0.85
+  // opacities would compound).
+  const apply = () => {
+    const shading =
+      document.getElementById("shading-select")?.value === "bands"
+        ? "bands"
+        : "relief";
     applyState(map, {
       unit: document.getElementById("unit-select")?.value || "m",
       safety: parseFloat(document.getElementById("safety-depth")?.value) || 0,
+      shading,
     });
-  applyControls();
-  document
-    .getElementById("safety-depth")
-    ?.addEventListener("input", applyControls);
-  document
-    .getElementById("unit-select")
-    ?.addEventListener("change", applyControls);
-  // Shading mode — relief (raster ramp, continuous) vs bands (vector ENC depth
-  // areas: crisp isobath edges, safety snapped to a charted level). Bands data
-  // floors at z6, so relief keeps z<6 in bands mode; never both at once (the
-  // 0.85 opacities would compound).
-  const applyShading = () => {
-    const bands =
-      document.getElementById("shading-select")?.value === "bands";
-    if (map.getLayer("depth-areas"))
-      map.setLayoutProperty(
-        "depth-areas",
-        "visibility",
-        bands ? "visible" : "none",
-      );
     if (map.getLayer("depth-shading"))
-      map.setLayerZoomRange("depth-shading", 0, bands ? 6 : 24);
+      map.setLayerZoomRange("depth-shading", 0, shading === "bands" ? 6 : 24);
   };
-  applyShading();
-  document
-    .getElementById("shading-select")
-    ?.addEventListener("change", applyShading);
+  apply();
+  document.getElementById("safety-depth")?.addEventListener("input", apply);
+  document.getElementById("unit-select")?.addEventListener("change", apply);
+  document.getElementById("shading-select")?.addEventListener("change", apply);
   // Layer toggles: the checkboxes are the source of truth — sync once on load
   // (the style's own defaults may differ, e.g. hillshade ships hidden) and on
   // every change.

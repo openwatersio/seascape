@@ -32,17 +32,17 @@ sources:
     done
 
 # Planet build: cover -> aggregate -> downsample -> bundle -> vector layers (BBOX="W,S,E,N"
-# for a region). Soundings + drying + depare bundle BEFORE contours: the contours tile-join
-# folds their pmtiles into vector.pmtiles in the same single pass. Coverage right after cover
-# (it needs only footprints + the covering) so missing footprints fail in the first minute,
-# not after hours of aggregation.
+# for a region). Soundings + depare bundle BEFORE contours: the contours tile-join folds their
+# pmtiles into vector.pmtiles in the same single pass. Drying rides inside depare (a DEPARE band
+# with negative drval1) — aggregation_run generates its per-tile FGB, which depare consumes.
+# Coverage right after cover (it needs only footprints + the covering) so missing footprints
+# fail in the first minute, not after hours of aggregation.
 planet:
     just cover
     just coverage
     uv run python aggregation_run.py
     just combine
     just soundings
-    just drying
     just depare
     just contours
 
@@ -108,7 +108,7 @@ bundle-merge:
     uv run python bundle.py merge
 
 # Contours, whole set (local/regional); the final tile-join also folds in any
-# soundings/drying pmtiles already bundled. CI shards these across runners — see below.
+# soundings/depare pmtiles already bundled. CI shards these across runners — see below.
 contours:
     uv run python contour_run.py bundle
 
@@ -118,13 +118,10 @@ contours:
 soundings:
     uv run python soundings_run.py bundle
 
-# Drying areas (green foreshore): bundle the per-tile polygons into drying.pmtiles
-# (folded into vector.pmtiles by the contours tile-join, same as soundings).
-drying:
-    uv run python drying_run.py bundle
-
-# Depth areas (ENC DEPARE bands): bundle the per-tile partitions into depare.pmtiles
-# (folded into vector.pmtiles by the contours tile-join, same as soundings/drying).
+# Depth areas (ENC DEPARE): bundle the per-tile partitions into depare.pmtiles (folded into
+# vector.pmtiles by the contours tile-join, same as soundings). Carries three feature kinds in
+# one layer — depth bands, drying (negative drval1), and nodata (no drval1) — built per tile by
+# aggregation_run off the merged DEM + drying FGB + the inland-water polygons.
 depare:
     uv run python depare_run.py bundle
 
@@ -135,15 +132,13 @@ coverage:
     uv run python contour_run.py coverage
 
 # tippecanoe this shard's local slice of every vector layer -> {contours,soundings,
-# drying,depare}-shard-{i}.pmtiles (CI pulls only the shard's slices + writes
+# depare}-shard-{i}.pmtiles (CI pulls only the shard's slices + writes
 # store/contour-maxz.txt so all layers tile to one depth; merged by contour-merge).
-# Four invocations, not one -L run: the layers need different tippecanoe flags
-# (soundings -r1, drying --drop-densest-as-needed, depare --detect-shared-borders,
-# contours' per-zoom filter).
+# Three invocations, not one -L run: the layers need different tippecanoe flags
+# (soundings -r1, depare --detect-shared-borders, contours' per-zoom filter).
 vector-shard i:
     uv run python contour_run.py bundle-shard {{i}}
     uv run python soundings_run.py bundle-shard {{i}}
-    uv run python drying_run.py bundle-shard {{i}}
     uv run python depare_run.py bundle-shard {{i}}
 
 # tile-join the per-shard pmtiles (all layers) into vector.pmtiles.

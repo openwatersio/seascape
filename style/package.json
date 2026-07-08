@@ -1,7 +1,7 @@
 {
   "name": "@openwaters/seascape",
-  "version": "0.2.0",
-  "description": "MapLibre GL style for Open Waters bathymetry tiles \u2014 depth shading, contours, soundings, drying areas",
+  "version": "0.3.0",
+  "description": "MapLibre GL style for Open Waters bathymetry tiles — depth shading, contours, soundings, depth areas",
   "license": "BSD-3-Clause",
   "type": "module",
   "main": "dist/index.js",
