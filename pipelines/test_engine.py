@@ -316,7 +316,8 @@ def check_land_clamp():
     tmp = tempfile.mkdtemp()
     cwd, saved_dir = os.getcwd(), config.SOURCES_DIR
     saved_landmask = os.environ.pop("LANDMASK", None)  # else an exported dev mask overrides the
-    try:                                               # synthetic one → geography-dependent failure
+    saved_watermask = os.environ.pop("WATERMASK", None)  # synthetic one → geography-dependent
+    try:                                                 # failure; this tile has no inland water
         os.chdir(tmp)
         config.SOURCES_DIR = "sources"  # in-process reproject() reads config.SOURCES_DIR directly
 
@@ -364,6 +365,72 @@ def check_land_clamp():
         config.SOURCES_DIR = saved_dir
         if saved_landmask is not None:
             os.environ["LANDMASK"] = saved_landmask
+        if saved_watermask is not None:
+            os.environ["WATERMASK"] = saved_watermask
+        os.chdir(cwd)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def check_feather_guard():
+    """The merge seam feather must not manufacture water (Part 1's stage invariant, the reason
+    the source-blind post-merge re-clamp could be deleted): a pixel entering the blend >= 0
+    — clamped land, real land topo, or a 0-filled nodata hole — may not leave it < 0.
+
+    Through the REAL aggregation_merge.merge(): a land stripe (0) and a negative water stripe
+    (-5) from two sources meet at a feathered source seam, with an uncovered hole carved into
+    the water so the nodata-origin path is exercised too (its pre-feather value is the 0-fill,
+    which the guard snapshots AFTER the fill). Assert every pixel that entered >= 0 stays >= 0.
+
+    Load-bearing: without the guard the 0-land pixels on the seam and the 0-filled hole pixels
+    within feather reach of it blur toward -5 and go negative — the false water rim the guard
+    exists to prevent.
+    """
+    import aggregation_merge
+
+    tmp = tempfile.mkdtemp()
+    cwd = os.getcwd()
+    try:
+        os.chdir(tmp)
+        aid = "01FEATHERFEATHERFEATHERFE"
+        stem = "8-0-0-8"
+        tdir = f"store/aggregation/{aid}/{stem}-tmp"
+        os.makedirs(tdir)
+
+        h = w = 96
+        # source 0 (higher priority): left half = 0 (clamped land); right half nodata.
+        s0 = np.full((h, w), -9999.0, dtype="float32")
+        s0[:, :48] = 0.0
+        # source 1 (lower priority): right half = -5 (water), except a hole neither source fills
+        # -> merge 0-fills it, and the feather (centred on the col-48 seam) can reach it.
+        s1 = np.full((h, w), -9999.0, dtype="float32")
+        s1[:, 48:] = -5.0
+        s1[40:56, 50:56] = -9999.0
+        tr = from_origin(0, h, 1, 1)
+        for name, arr in (("0-3857.tiff", s0), ("1-3857.tiff", s1)):
+            with rasterio.open(f"{tdir}/{name}", "w", driver="GTiff", height=h, width=w, count=1,
+                               dtype="float32", nodata=-9999, crs="EPSG:3857", transform=tr) as dd:
+                dd.write(arr, 1)
+        with open(f"{tdir}/reprojection.json", "w") as f:
+            json.dump({"buffer_pixels": 16}, f)  # -> a real feather (sigma ~ 3)
+
+        aggregation_merge.merge(f"store/aggregation/{aid}/{stem}-aggregation.csv")
+        with rasterio.open(f"{tdir}/2-3857.tiff") as r:  # merge writes {len(tiffs)}-3857.tiff
+            out = r.read(1)
+
+        # pre-feather value per pixel: source 0 where valid, else source 1 where valid, else the
+        # 0-fill of a truly-uncovered pixel — exactly the set the guard must keep >= 0.
+        pre = np.where(s0 != -9999.0, s0, np.where(s1 != -9999.0, s1, 0.0))
+        nonneg = pre >= 0
+        assert (out[nonneg] >= 0).all(), \
+            f"feather manufactured water: {int((out[nonneg] < 0).sum())} of {int(nonneg.sum())} " \
+            ">=0 pixels went negative"
+        hole = np.zeros((h, w), bool)
+        hole[40:56, 50:56] = True
+        assert (out[hole] >= 0).all(), "a 0-filled nodata hole bordering water must not exit negative"
+        # non-vacuous: the feather ran and real water survived it (else >=0-stays->=0 is trivial).
+        assert (out[:, 60:] < 0).any(), "test is vacuous — no negative water survived the merge"
+        print(f"feather-guard ok — {int(nonneg.sum())} >=0 pixels stayed >=0 across the seam feather")
+    finally:
         os.chdir(cwd)
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -654,6 +721,7 @@ if __name__ == "__main__":
     check_weighted_shards()
     check_stale_overview()
     check_grid_split()
+    check_feather_guard()
     check_land_clamp()
     check_drying()
     check_depare()

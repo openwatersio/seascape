@@ -4,7 +4,10 @@ Vendored from mapterhorn (BSD-3) — the priority nodata-fill + localized Gaussi
 seam feather. Streams 512-windows (plus the buffer overlap): start from the
 best source, fill remaining nodata from lower-priority sources, then feather only
 across the valid/invalid boundary so source seams don't show as elevation steps.
-Interiors are untouched. This reconciles nothing vertically — datum handling is
+Interiors are untouched. A final guard restores any pixel the feather flips from
+>= 0 to < 0 back to its pre-blend value, so seam smoothing can never manufacture
+water on land — the stage invariant that lets the source-blind post-merge land
+re-clamp be dropped. This reconciles nothing vertically — datum handling is
 upstream in source_datum.
 """
 
@@ -83,6 +86,11 @@ def merge(filepath):
 
                         if 1 in boundary_tile:
                             merged_tile[merged_tile == NODATA] = 0
+                            # Snapshot AFTER the nodata fill: a truly-uncovered pixel must enter the
+                            # guard as 0 (not the -9999 sentinel), so the ">= 0" test below sees it
+                            # too — else a 0-filled hole the feather then pulls negative slips past a
+                            # >= 0 predicate and fabricates a false water rim around a data hole.
+                            pre_feather = merged_tile.copy()
                             truncate = 4
                             sigma = max(int(overlap / truncate) - 1, 1)
                             bb = ndimage.gaussian_filter(boundary_tile.astype(float), sigma=sigma, truncate=truncate)
@@ -91,6 +99,15 @@ def merge(filepath):
                             bb = 3 * bb ** 2 - 2 * bb ** 3  # smoothstep
                             blurred = ndimage.gaussian_filter(merged_tile, sigma=sigma, truncate=truncate)
                             merged_tile = bb * blurred + (1 - bb) * merged_tile
+                            # Stage rule: the seam feather may not manufacture water. Wherever the
+                            # blend pulled a pixel that entered >= 0 (clamped land, real land topo,
+                            # or a filled hole) below 0, restore its pre-feather value. This makes
+                            # the feather guarantee its own sign invariant, which is what lets the
+                            # source-blind post-merge land re-clamp be deleted: no downstream fork
+                            # sees a false negative rim where clamped land abuts water, and trusted
+                            # land keeps its true elevation instead of being re-flattened to 0.
+                            flipped = (pre_feather >= 0) & (merged_tile < 0)
+                            merged_tile = np.where(flipped, pre_feather, merged_tile)
 
                     crop_y_start = overlap if oy > 0 else 0
                     crop_y_end = merged_tile.shape[0] - (overlap if y_end < height else 0)

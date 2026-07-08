@@ -5,26 +5,39 @@ GEBCO cell straddling the shoreline averages in water and reads *negative on lan
 which downstream renders as a false "water" rim over the coast (and false contours /
 soundings). This module builds an OSM land-polygon mask and clamps a flagged coarse
 source's warped raster: where the mask says land AND the pixel is negative -> 0
-(chart datum at the shoreline). Only flagged sources are touched, so S-102 / CUDEM /
-lake / river bathymetry can never be damaged by a land-mask error.
+(chart datum at the shoreline). The clamp runs at warp time, on each source in turn,
+while every pixel still carries source identity — so only flagged sources are ever
+touched and S-102 / CUDEM / lake / river bathymetry cannot be damaged by a land-mask
+error. That immunity is now structural, not a promise: the merge seam feather guards
+its own sign flips (aggregation_merge), so no second, source-blind clamp runs after
+the merge to re-flatten trusted data by geography.
 
-Two clamp points: `clamp` on each flagged source's warped raster (before the merge),
-and `clamp_merged` on the final merged+smoothed DEM (after them). The second is needed
-because the merge's Gaussian seam feather blends the clamped 0-land with adjacent
-negative water across the shoreline, re-bleeding a soft negative band back onto land;
-the final pass restores a crisp land=0 shoreline for every consumer.
+Inland water: the mask subtracts an OSM-derived inland-water polygon layer (rivers,
+lakes, canals, reservoirs — not the ocean, which the land polygons already bound) so a
+flagged source keeps its genuine negative depths inside mapped water (EMODnet's Elbe
+fairway, GEBCO's Amazon channel) instead of flattening them to 0. Worst case inside a
+real water polygon is a coarse depth where water truly exists; the old worst case was
+land where water exists. Wetlands stay land: they are above-datum terrain, and a
+flagged negative there is exactly the shoreline-straddle junk the clamp exists for.
 
-Ceiling: OSM land polygons treat inland lakes/tidal rivers as "land", so a coarse
-source's own values inside them flatten to 0 (acceptable — the project's lake/river
-sources outrank GEBCO). Real below-sea-level land (Netherlands polders, Death Valley)
-and inland seas with genuine negative surfaces (Dead Sea, Salton) also flatten to 0.
-Upgrade path: subtract an inland-water polygon layer from the mask.
+Ceilings. These unclamped depths ship provisional and biased deep — GEBCO is ~MSL,
+which sits ~1-3 m above chart datum in the macrotidal estuaries this reopens. Deep
+cryptodepression lakes (surface above MSL, bed below — Baikal, Tanganyika, Malawi,
+Ladoga, Onega, Great Slave, Great Bear, Vänern) now expose coarse GEBCO "depths"
+referenced to nothing a mariner can use; shallow lakes stay sign-inert (beds above MSL
+render as land regardless). Real below-sea-level land (Netherlands polders, Death
+Valley), inland seas mapped as coastline (Caspian), and negative-surface seas with no
+water polygon (Dead Sea, Salton) still flatten to 0 — accepted ceiling, dedicated
+lake/river sources are the path if any is ever wanted.
 
-Local layout (store/landmask/): land.fgb — the prepared EPSG:3857 land mask (spatial
-index, HTTP-range friendly). LANDMASK overrides the path (default store/landmask/land.fgb).
+Local layout (store/landmask/): land.fgb — the prepared EPSG:3857 land mask; water.fgb
+— the inland-water polygons subtracted from it (optional: absent -> land-only mask,
+i.e. today's behavior, no crash). Both are spatial-indexed and HTTP-range friendly.
+LANDMASK / WATERMASK override the paths (defaults store/landmask/{land,water}.fgb).
 
-  python landmask.py prep      download -> unzip -> convert (run once)
-  python landmask.py --check   self-check
+  python landmask.py prep        download -> unzip -> convert the land mask (run once)
+  python landmask.py prep-water  download -> convert the inland-water mask (run once)
+  python landmask.py --check     self-check
 """
 
 import os
@@ -43,11 +56,22 @@ NODATA = -9999
 # single giant one) and reprojects/streams cleanly.
 LAND_POLYGONS_URL = "https://osmdata.openstreetmap.de/download/land-polygons-split-4326.zip"
 
+# Overture Maps water data (OSM-derived, ODbL like the land polygons) as GeoParquet on
+# the public S3 mirror — one dataset read beats an osmium filter over a planet PBF. Water
+# lives under theme=base (there is no theme=water). The release string is a dated
+# snapshot; bump it to the current Overture release when re-preparing (listing:
+# https://docs.overturemaps.org/release/). GDAL opens the partition directory as one
+# dataset (~65M features); the bucket is anonymous, so no credentials in the read path.
+OVERTURE_RELEASE = "2026-06-17.0"
+WATER_PARQUET_URL = (
+    f"/vsis3/overturemaps-us-west-2/release/{OVERTURE_RELEASE}/theme=base/type=water/")
+
 # Web-mercator latitude limit: clip the polygons to +/-85.06 deg (also drops the
 # Antarctica polygon's polar excess). The warp grids never reach beyond this.
 MERC_LAT = 85.06
 
 DEFAULT_LANDMASK = "store/landmask/land.fgb"
+DEFAULT_WATERMASK = "store/landmask/water.fgb"
 
 
 def path():
@@ -55,6 +79,13 @@ def path():
     Not an import-time constant, so CI/tests/callers that set LANDMASK after this module is
     imported still take effect — mirrors config.source_path reading SOURCE_VSI_BASE per call."""
     return os.environ.get("LANDMASK", DEFAULT_LANDMASK)
+
+
+def water_path():
+    """The inland-water-mask path, read from WATERMASK at *call time* (default
+    store/landmask/water.fgb). Optional: when it points nowhere the mask degrades to land-only.
+    Read per call for the same reason path() is — a caller setting WATERMASK after import wins."""
+    return os.environ.get("WATERMASK", DEFAULT_WATERMASK)
 
 
 def require():
@@ -97,8 +128,60 @@ def prep():
     print(f"land mask ready: {out}")
 
 
-def rasterize(bounds_3857, res, out_tif, src=None):
-    """Burn the land mask onto a Byte raster (1=land, 0=water) on the given 3857 grid.
+def prep_water():
+    """Build the inland-water mask once: read the Overture water parquet, keep only polygonal
+    non-ocean features (rivers/lakes/canals/reservoirs — the ocean is already bounded by the
+    land polygons), reproject to EPSG:3857, and write one spatial-indexed FlatGeobuf at
+    water_path(). The land clamp's rasterize subtracts it per tile, so a flagged coarse source
+    keeps its genuine depths inside mapped water. Guarded so a re-run is a no-op.
+
+    Two passes. The remote pass pulls non-ocean rows with the one filter the parquet reader can
+    push down (`subtype <> 'ocean'`); geometry-type predicates (OGR_GEOMETRY / ST_GeometryType)
+    silently match nothing through that read path, so dropping the linear river/stream
+    centerlines Overture also carries (a burned line would punch a spurious 1-px water gap
+    across land) happens in a local pass — SQLite dialect over the temp copy, polygons only.
+    AWS_DEFAULT_REGION is the region key GDAL honors, and it must be pinned: a dev/CI profile
+    aimed at another S3-compatible store (region "auto") otherwise poisons the bucket hostname.
+    The read is anonymous (AWS_NO_SIGN_REQUEST) — the Overture bucket needs no credentials.
+
+    Coverage ceiling: this only reopens water OSM maps as *polygons*. Narrow tidal channels
+    mapped as a bare waterway centerline (the ICW's Pablo Creek reach, for one) stay "land" in
+    the mask — harmless for the clamp (trusted sources are never clamped) but it gates drying
+    there until OSM grows an area or another feed does."""
+    out = water_path()
+    if os.path.isfile(out):
+        print(f"inland-water mask already present: {out}")
+        return
+    utils.create_folder(os.path.dirname(out) or ".")
+    raw = out + ".raw.gpkg"
+    try:
+        utils.run_command(
+            "AWS_NO_SIGN_REQUEST=YES AWS_DEFAULT_REGION=us-west-2 "
+            f"ogr2ogr -f GPKG -overwrite -nln water_raw -lco SPATIAL_INDEX=NO "
+            "-where \"subtype <> 'ocean'\" "
+            f"{raw} {WATER_PARQUET_URL}",
+            silent=False)
+        utils.run_command(
+            f"ogr2ogr -f FlatGeobuf -t_srs EPSG:3857 -overwrite -nln water -dialect SQLITE "
+            "-sql \"SELECT geometry FROM water_raw "
+            "WHERE GeometryType(geometry) LIKE '%POLYGON%'\" "  # column name from the parquet
+            f"-clipsrc -180 -{MERC_LAT} 180 {MERC_LAT} {out} {raw}",
+            silent=False)
+    finally:
+        if os.path.isfile(raw):
+            os.remove(raw)
+    print(f"inland-water mask ready: {out}")
+
+
+def _present(p):
+    """A mask source is usable if it's a local file that exists or a /vsi path (assumed
+    reachable, like require() does — a genuinely bad URL still fails loudly at read time)."""
+    return p.startswith("/vsi") or os.path.isfile(p)
+
+
+def rasterize(bounds_3857, res, out_tif, src=None, water_src=None):
+    """Burn the land mask onto a Byte raster (1=land, 0=water) on the given 3857 grid, then
+    subtract inland water (burn 0 over land) where a water mask is present.
 
     Pass the SAME -te/-tr gdalwarp uses for the tile, so the mask aligns pixel-for-pixel
     with the warped raster and neighbouring tiles rasterize their shared halo identically
@@ -111,14 +194,27 @@ def rasterize(bounds_3857, res, out_tif, src=None):
     The clip lands in GPKG (not FlatGeobuf): an open-ocean tile selects zero features, and
     writing an *empty* indexed FGB errors — most tiles are ocean, so that would sink them.
 
+    The water subtraction is a second burn (0) over the finished land raster on the same
+    grid: land=1 is already down, and mapped inland water wins where they overlap, so a
+    flagged coarse source keeps its genuine negative depths inside rivers/lakes instead of
+    clamping them to 0. It uses the same -spat GPKG clip (the empty-selection case — a tile
+    with no inland water — leaves an empty layer that gdal_rasterize burns as a clean no-op,
+    so the mask stays land-only). When no water mask is present the whole step is skipped and
+    the mask degrades to land-only (today's behavior), with no crash and no per-tile warning.
+    Known ceiling: deep cryptodepression lakes (surface above MSL, bed below — Baikal,
+    Tanganyika, ...) are unclamped here too and expose coarse GEBCO depths referenced to
+    nothing a mariner can use; shallow lakes stay sign-inert (beds above MSL render as land).
+
     The rasterize writes to a temp then atomically renames, so a crash mid-burn never leaves
     a truncated mask at out_tif that a resume would trust (the reproject cache is trusted if
     present). DEFLATE+TILED+SPARSE_OK keeps the mask tiny — a binary mask compresses ~1000:1
     and all-water blocks (most of the planet) become sparse holes.
     """
     src = src or path()
+    water = water_src if water_src is not None else water_path()
     xmin, ymin, xmax, ymax = bounds_3857
     clip = out_tif + ".clip.gpkg"
+    water_clip = out_tif + ".water.gpkg"
     tmp_out = out_tif + ".tmp.tif"
     try:
         utils.run_command(
@@ -127,9 +223,13 @@ def rasterize(bounds_3857, res, out_tif, src=None):
             f"gdal_rasterize -burn 1 -ot Byte -init 0 -te {xmin} {ymin} {xmax} {ymax} "
             f"-tr {res} {res} -co COMPRESS=DEFLATE -co TILED=YES -co SPARSE_OK=YES "
             f"{clip} {tmp_out}")
+        if _present(water):
+            utils.run_command(
+                f"ogr2ogr -f GPKG -overwrite -spat {xmin} {ymin} {xmax} {ymax} {water_clip} {water}")
+            utils.run_command(f"gdal_rasterize -burn 0 {water_clip} {tmp_out}")
         os.replace(tmp_out, out_tif)  # atomic: out_tif only ever exists complete
     finally:
-        for f in (clip, tmp_out):
+        for f in (clip, water_clip, tmp_out):
             if os.path.isfile(f):
                 os.remove(f)
 
@@ -175,21 +275,10 @@ def clamp(cog_path, mask_tif):
                          lambda ds, win, a: ds.read_masks(1, window=win) != 0)
 
 
-def clamp_merged(dem_path, mask_tif):
-    """Re-clamp the final merged+smoothed DEM against the land mask, to undo the merge seam
-    feather's re-bleed of negative water onto the per-source-clamped land (and any widening the
-    smooth adds), so every consumer sees a crisp land=0 shoreline. The merged DEM is a single
-    band with a nodata sentinel (not the per-source alpha COG), so validity is `!= nodata`, like
-    smooth_array. Only negative-under-land changes -> positive land (S-102/CUDEM topo) untouched."""
-    def valid(ds, win, a):
-        nodata = ds.nodata if ds.nodata is not None else NODATA
-        return a != nodata
-    _clamp_negative_land(dem_path, mask_tif, valid)
-
-
 def _check():
     """Clamp semantics on the REAL pipeline file (a COG with an ADD_ALPHA mask band, like
-    negate_band1's check) + the single-band merged variant + rasterize seam determinism."""
+    negate_band1's check), the inland-water subtraction (water burns land back to water, an
+    absent water file degrades to land-only), and rasterize seam determinism."""
     import json
     import tempfile
 
@@ -207,14 +296,26 @@ def _check():
     land_fgb = f"{d}/land.fgb"
     utils.run_command(f"ogr2ogr -f FlatGeobuf -t_srs EPSG:3857 -overwrite {land_fgb} {gj}")
 
+    # An inland-water box wholly inside the land box (a lake/river inside the coastline).
+    wgj = f"{d}/water.geojson"
+    with open(wgj, "w") as f:
+        json.dump({"type": "FeatureCollection", "features": [{"type": "Feature", "properties": {},
+                   "geometry": {"type": "Polygon", "coordinates":
+                                [[[1.4, 1.4], [1.6, 1.4], [1.6, 1.6], [1.4, 1.6], [1.4, 1.4]]]}}]}, f)
+    water_fgb = f"{d}/water.fgb"
+    utils.run_command(f"ogr2ogr -f FlatGeobuf -t_srs EPSG:3857 -overwrite {water_fgb} {wgj}")
+    absent = f"{d}/no-such-water.fgb"  # never created — the degrade-to-land-only baseline
+
     # A grid spanning the box + margin (lon/lat 0.5..2.5), ~1 km pixels.
     from rasterio.warp import transform_bounds
     xmin, ymin, xmax, ymax = transform_bounds("EPSG:4326", "EPSG:3857", 0.5, 0.5, 2.5, 2.5)
     res = (xmax - xmin) / 240
     te = (xmin, ymin, xmax, ymax)
 
+    # Land-only baseline (absent water -> no subtraction). Pass an explicit non-existent water
+    # path so the baseline is hermetic even if a real water.fgb sits in the dev store.
     mask_tif = f"{d}/mask.tif"
-    rasterize(te, res, mask_tif, src=land_fgb)
+    rasterize(te, res, mask_tif, src=land_fgb, water_src=absent)
     with rasterio.open(mask_tif) as m:
         land, tr, h, w = m.read(1), m.transform, m.height, m.width
     assert land.any() and (land == 0).any(), "mask must have both land and water pixels"
@@ -240,47 +341,50 @@ def _check():
     assert not valid[ys[1], xs[1]], "nodata under land must stay masked (untouched)"
     assert out[wy[0], wx[0]] == -5.0, "negative over water must survive"
 
-    # clamp_merged: a single-band DEM with a nodata sentinel (the merged/smoothed surface, no
-    # alpha band) — negative-under-land clamps; nodata, positive land, and water are untouched.
-    merged = f"{d}/merged.tif"
-    mdem = np.full((h, w), -5.0, dtype="float32")
-    mdem[ys[0], xs[0]] = 3.0        # positive land -> survive
-    mdem[ys[1], xs[1]] = NODATA     # nodata land   -> untouched
-    with rasterio.open(merged, "w", driver="GTiff", height=h, width=w, count=1, dtype="float32",
-                       nodata=NODATA, crs="EPSG:3857", transform=tr) as dst:
-        dst.write(mdem, 1)
-    clamp_merged(merged, mask_tif)
-    with rasterio.open(merged) as r:
-        mo = r.read(1)
-    assert mo[ys[2], xs[2]] == 0.0, "merged: negative under land must clamp to 0"
-    assert mo[ys[0], xs[0]] == 3.0, "merged: positive land must survive"
-    assert mo[ys[1], xs[1]] == NODATA, "merged: nodata must stay"
-    assert mo[wy[0], wx[0]] == -5.0, "merged: water must survive"
+    # Inland-water subtraction: the water box (inside the land box) burns land back to water,
+    # so a flagged source keeps its depths there. The second burn only ever turns land->water
+    # (0 wins over 1 where they overlap), never the reverse, and only inside the land box.
+    mask_water = f"{d}/mask_water.tif"
+    rasterize(te, res, mask_water, src=land_fgb, water_src=water_fgb)
+    with rasterio.open(mask_water) as m:
+        lw = m.read(1)
+    subtracted = (land == 1) & (lw == 0)
+    assert subtracted.any(), "an inland-water polygon must burn land pixels back to water"
+    changed = lw != land
+    assert (land[changed] == 1).all() and (lw[changed] == 0).all(), \
+        "the water burn must only turn land->water, never water->land"
+    assert not ((land == 0) & (lw == 1)).any(), "the water burn must not create land over water"
 
-    # Seam determinism: the same world cells rasterize identically from a shifted (still
-    # grid-aligned) extent — the overlap is byte-identical, so tile halos clamp the same.
+    # Seam determinism (with the water burn active): the same world cells rasterize identically
+    # from a shifted (still grid-aligned) extent — the overlap is byte-identical, so tile halos
+    # clamp the same whether or not the water subtraction moved a pixel.
     shift = 10
     te_b = (xmin + shift * res, ymin, xmax + shift * res, ymax)
     mask_b = f"{d}/mask_b.tif"
-    rasterize(te_b, res, mask_b, src=land_fgb)
+    rasterize(te_b, res, mask_b, src=land_fgb, water_src=water_fgb)
     with rasterio.open(mask_b) as m:
-        land_b = m.read(1)
-    assert np.array_equal(land[:, shift:], land_b[:, :w - shift]), "seam not deterministic across extents"
+        lw_b = m.read(1)
+    assert np.array_equal(lw[:, shift:], lw_b[:, :w - shift]), "seam not deterministic across extents"
 
-    # Open-ocean tile: -spat selects zero polygons → an all-water mask, no error (an empty
-    # FlatGeobuf clip would raise, sinking every ocean tile — hence the GPKG clip).
+    # Open-ocean tile: -spat selects zero land AND zero water polygons → an all-water mask, no
+    # error (an empty FlatGeobuf clip would raise, sinking every ocean tile — hence the GPKG
+    # clip; and gdal_rasterize over the empty water clip is a clean no-op).
     ocean = f"{d}/ocean.tif"
-    rasterize((xmax + 1e6, ymin, xmax + 1e6 + 200 * res, ymax), res, ocean, src=land_fgb)
+    rasterize((xmax + 1e6, ymin, xmax + 1e6 + 200 * res, ymax), res, ocean,
+              src=land_fgb, water_src=water_fgb)
     with rasterio.open(ocean) as m:
         assert m.read(1).sum() == 0, "ocean extent must rasterize to all-water"
 
-    print(f"landmask.py self-check ok (mask {h}x{w}, land pixels {int(land.sum())})")
+    print(f"landmask.py self-check ok (mask {h}x{w}, land {int(land.sum())}, "
+          f"water-subtracted {int(subtracted.sum())})")
 
 
 if __name__ == "__main__":
     if sys.argv[1:2] == ["prep"]:
         prep()
+    elif sys.argv[1:2] == ["prep-water"]:
+        prep_water()
     elif sys.argv[1:2] == ["--check"]:
         _check()
     else:
-        sys.exit("usage: landmask.py prep | --check")
+        sys.exit("usage: landmask.py prep | prep-water | --check")

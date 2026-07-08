@@ -15,6 +15,13 @@ source id:
 landmask:
     uv run python landmask.py prep
 
+# Prepare the inland-water mask once (Overture water theme -> EPSG:3857 FlatGeobuf at
+# store/landmask/water.fgb). The land clamp subtracts it so flagged coarse sources keep
+# their depths inside mapped rivers/lakes. Optional — absent, the clamp stays land-only.
+# WATERMASK overrides the output path.
+watermask:
+    uv run python landmask.py prep-water
+
 # Prepare every source under sources/.
 sources:
     #!/usr/bin/env bash
