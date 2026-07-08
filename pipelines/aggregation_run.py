@@ -48,13 +48,6 @@ def run(filepath):
     tmp_folder = filepath.replace("-aggregation.csv", "-tmp")
     if not SKIP_SMOOTH:
         smooth.smooth_merged(tmp_folder)     # slope-selective blur, shared by both
-    mask_tif = f"{tmp_folder}/landmask.tif"
-    if os.path.isfile(mask_tif):
-        # A flagged coarse source was land-clamped here; the merge seam feather re-bleeds
-        # negative water onto that clamped land (and smooth widens it). Re-clamp the final
-        # merged DEM so every fork below sees a crisp land=0 shoreline, not a soft blue rim.
-        dem = f"{tmp_folder}/{len(glob(f'{tmp_folder}/*.tiff')) - 1}-3857.tiff"
-        landmask.clamp_merged(dem, mask_tif)
     aggregation_tile.main(filepath)          # raster Terrain-RGB tiles
     if not SKIP_CONTOURS:
         contour_run.generate(filepath)       # vector contours off the merged DEM

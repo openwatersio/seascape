@@ -246,6 +246,19 @@ def reproject(filepath):
                 landmask.rasterize(buffered_bounds(aggregation_tile, buffer_3857_rounded),
                                    resolution, mask_tif)
             landmask.clamp(out_tiff, mask_tif)
+            # #24 inverse clamp: where this coarse source fabricates POSITIVE land over mapped
+            # inland water (a lake it holds no bathymetry for), clear it to nodata so the merge
+            # fills it to 0 and Part 3's nodata depth-area renders instead of tan false land.
+            # Keys on a water-ONLY raster, never the combined mask above (ocean and lake are both
+            # 0 there, so it would hole the coastal ocean). Same buffered -te/-tr, cached per tile
+            # across flagged sources. Skipped cleanly when no water feed is published — the mask
+            # degrades to land-clamp-only (today's behavior), like rasterize's water subtraction.
+            if landmask._present(landmask.water_path()):
+                water_tif = f"{tmp_folder}/watermask.tif"
+                if not os.path.isfile(water_tif):
+                    landmask.rasterize_water(buffered_bounds(aggregation_tile, buffer_3857_rounded),
+                                             resolution, water_tif)
+                landmask.clamp_positive_water(out_tiff, water_tif)
         if len(grouped) > 1 and not contains_nodata_pixels(out_tiff):
             break
 

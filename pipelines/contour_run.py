@@ -241,10 +241,10 @@ def _stems_maxz(stems):
 
 def bundle_maxz(own_max):
     """The tileset maxzoom EVERY vector layer bundles to (contours, soundings,
-    drying, depare). They tile-join into one vector.pmtiles, whose maxzoom is the max
+    depare). They tile-join into one vector.pmtiles, whose maxzoom is the max
     across layers — a layer bundled only to its own regional max silently
-    vanishes from deeper tiles (drying stopped at z11 while contours ran to
-    z14, so the Æbelø flats rendered as bare land above z11). Use the shared
+    vanishes from deeper tiles (the drying flats, folded into depare, once stopped
+    at z11 while contours ran to z14 and rendered as bare land above z11). Use the shared
     global contour maxz (store/contour-maxz.txt, written by the CI shard jobs)
     when present, else the current covering's max child_z, else the caller's
     own files' max."""
@@ -347,14 +347,15 @@ def coverage_bundle():
 
 def _finalize_contours(archives):
     """tile-join the layer archives (a local build's contour pmtiles, or the CI shards —
-    which carry contours, soundings, drying, AND depare slices) + the whole-set
-    soundings/drying/depare pmtiles (local path, when their bundles ran first) into
+    which carry contours, soundings, AND depare slices) + the whole-set
+    soundings/depare pmtiles (local path, when their bundles ran first) into
     store/bundle/vector.pmtiles. ONE join: tile-join rewrites every tile of the whole
     archive, so folding each sparse layer in afterwards re-paid the planet-wide join
     per layer (~90 min each in CI). -pk keeps every feature of every layer; a layer
     whose pmtiles isn't present locally is simply not joined. Coverage is its own
-    tileset (coverage_bundle), not a layer here."""
-    layers = [p for p in ["store/bundle/soundings.pmtiles", "store/bundle/drying.pmtiles",
+    tileset (coverage_bundle), not a layer here. Drying is no longer its own layer —
+    it folds into `depare` (a DEPARE band with negative drval1)."""
+    layers = [p for p in ["store/bundle/soundings.pmtiles",
                           "store/bundle/depare.pmtiles"]
               if os.path.isfile(p)]
     subprocess.run(["tile-join", "-o", "store/bundle/vector.pmtiles", "-f", "-pk",
@@ -410,9 +411,9 @@ def bundle(shard=None):
 
 
 def bundle_merge():
-    """tile-join the per-shard pmtiles — contours, soundings, drying (each shard job
-    bundles its slice of all three) — into one vector.pmtiles (-pk keeps every
-    feature; the shards are disjoint file slices unioned per tile)."""
+    """tile-join the per-shard pmtiles — contours, soundings, depare (each shard job
+    bundles its slice of all three; drying folds into depare) — into one vector.pmtiles
+    (-pk keeps every feature; the shards are disjoint file slices unioned per tile)."""
     shards = sorted(glob("store/bundle/*-shard-*.pmtiles"))
     if not shards:
         print("contour merge: no shard pmtiles")

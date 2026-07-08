@@ -316,7 +316,8 @@ def check_land_clamp():
     tmp = tempfile.mkdtemp()
     cwd, saved_dir = os.getcwd(), config.SOURCES_DIR
     saved_landmask = os.environ.pop("LANDMASK", None)  # else an exported dev mask overrides the
-    try:                                               # synthetic one → geography-dependent failure
+    saved_watermask = os.environ.pop("WATERMASK", None)  # synthetic one → geography-dependent
+    try:                                                 # failure; this tile has no inland water
         os.chdir(tmp)
         config.SOURCES_DIR = "sources"  # in-process reproject() reads config.SOURCES_DIR directly
 
@@ -364,6 +365,152 @@ def check_land_clamp():
         config.SOURCES_DIR = saved_dir
         if saved_landmask is not None:
             os.environ["LANDMASK"] = saved_landmask
+        if saved_watermask is not None:
+            os.environ["WATERMASK"] = saved_watermask
+        os.chdir(cwd)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def check_water_clamp():
+    """Part 2.5 (#24) inverse clamp through the REAL reproject(): a `land_clamp` coarse source's
+    fabricated POSITIVE land over mapped inland water is cleared to nodata (the merge then fills it
+    to 0 and Part 3 renders a nodata depth-area), while the same source's positive elsewhere — land,
+    and the surrounding ocean that has NO water polygon — survives, and an unflagged source is never
+    touched. Keys on the water-only mask, so ocean (== lake in the combined mask) stays safe."""
+    import mercantile
+    import rasterio.warp
+    import config
+    import aggregation_reproject
+
+    tmp = tempfile.mkdtemp()
+    cwd, saved_dir = os.getcwd(), config.SOURCES_DIR
+    saved_landmask = os.environ.pop("LANDMASK", None)
+    saved_watermask = os.environ.pop("WATERMASK", None)
+    try:
+        os.chdir(tmp)
+        config.SOURCES_DIR = "sources"
+        tile = mercantile.Tile(x=75, y=96, z=8)
+        w, s, e, n = mercantile.bounds(tile)
+        # a lake box in the tile interior (0.4..0.6 of each span, well inside the halo)
+        lw, ls = w + (e - w) * 0.4, s + (n - s) * 0.4
+        le, ln = w + (e - w) * 0.6, s + (n - s) * 0.6
+
+        # flagged coarse source: +50 across the whole tile (GEBCO's false land, incl. over the lake)
+        make_source(tmp, "cbase", w, n, e - w, 256, 50.0, 10, extra_meta={"land_clamp": True}, deg_ns=n - s)
+        # unflagged fine source: +50 over the west half — must survive even inside the lake
+        make_source(tmp, "cfine", w, n, (w + e) / 2 - w, 256, 50.0, 11, deg_ns=n - s)
+
+        os.makedirs("store/landmask", exist_ok=True)
+        with open("land.geojson", "w") as f:  # land = whole tile + halo (the land clamp needs a mask)
+            json.dump({"type": "FeatureCollection", "features": [{"type": "Feature", "properties": {},
+                       "geometry": {"type": "Polygon", "coordinates": [[[w - 1, s - 1], [e + 1, s - 1],
+                                    [e + 1, n + 1], [w - 1, n + 1], [w - 1, s - 1]]]}}]}, f)
+        subprocess.run(["ogr2ogr", "-f", "FlatGeobuf", "-t_srs", "EPSG:3857", "-overwrite",
+                        "store/landmask/land.fgb", "land.geojson"], check=True)
+        with open("water.geojson", "w") as f:  # water = the lake box, with a kind like the real feed
+            json.dump({"type": "FeatureCollection", "features": [{"type": "Feature",
+                       "properties": {"kind": "lake"}, "geometry": {"type": "Polygon", "coordinates":
+                       [[[lw, ls], [le, ls], [le, ln], [lw, ln], [lw, ls]]]}}]}, f)
+        subprocess.run(["ogr2ogr", "-f", "FlatGeobuf", "-t_srs", "EPSG:3857", "-overwrite",
+                        "store/landmask/water.fgb", "water.geojson"], check=True)
+        os.environ["LANDMASK"] = "store/landmask/land.fgb"
+        os.environ["WATERMASK"] = "store/landmask/water.fgb"
+
+        aid = "01WATERWATERWATERWATERWATE"
+        os.makedirs(f"store/aggregation/{aid}")
+        csv = f"store/aggregation/{aid}/8-75-96-11-aggregation.csv"
+        with open(csv, "w") as f:
+            f.write("source,filename,maxzoom\ncfine,cfine_0.tif,11\ncbase,cbase_0.tif,10\n")
+        aggregation_reproject.reproject(csv)
+        tdir = f"store/aggregation/{aid}/8-75-96-11-tmp"
+
+        def at(tiff, lon, lat):
+            with rasterio.open(tiff) as r:
+                xs, ys = rasterio.warp.transform("EPSG:4326", r.crs, [lon], [lat])
+                row, col = r.index(xs[0], ys[0])
+                return float(r.read(1)[row, col]), bool(r.read_masks(1)[row, col])
+
+        lake = ((lw + le) / 2, (ls + ln) / 2)               # inside the lake
+        west_lake = (lw + (le - lw) * 0.1, (ls + ln) / 2)   # inside the lake AND the west half (cfine)
+        outside = (w + (e - w) * 0.05, s + (n - s) * 0.05)  # a land/ocean corner, no water polygon
+
+        v_lake, ok_lake = at(f"{tdir}/1-3857.tiff", *lake)
+        assert not ok_lake, "flagged positive over inland water must clear to nodata"
+        v_out, ok_out = at(f"{tdir}/1-3857.tiff", *outside)
+        assert ok_out and v_out == 50.0, "flagged positive over non-water (land/ocean) must survive"
+        v_un, ok_un = at(f"{tdir}/0-3857.tiff", *west_lake)
+        assert ok_un and v_un == 50.0, "unflagged source must be untouched, even inside the lake"
+        print("water-clamp ok — flagged +land over water→nodata, land/ocean kept, unflagged survives")
+    finally:
+        config.SOURCES_DIR = saved_dir
+        if saved_landmask is not None:
+            os.environ["LANDMASK"] = saved_landmask
+        if saved_watermask is not None:
+            os.environ["WATERMASK"] = saved_watermask
+        os.chdir(cwd)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def check_feather_guard():
+    """The merge seam feather must not manufacture water (Part 1's stage invariant, the reason
+    the source-blind post-merge re-clamp could be deleted): a pixel entering the blend >= 0
+    — clamped land, real land topo, or a 0-filled nodata hole — may not leave it < 0.
+
+    Through the REAL aggregation_merge.merge(): a land stripe (0) and a negative water stripe
+    (-5) from two sources meet at a feathered source seam, with an uncovered hole carved into
+    the water so the nodata-origin path is exercised too (its pre-feather value is the 0-fill,
+    which the guard snapshots AFTER the fill). Assert every pixel that entered >= 0 stays >= 0.
+
+    Load-bearing: without the guard the 0-land pixels on the seam and the 0-filled hole pixels
+    within feather reach of it blur toward -5 and go negative — the false water rim the guard
+    exists to prevent.
+    """
+    import aggregation_merge
+
+    tmp = tempfile.mkdtemp()
+    cwd = os.getcwd()
+    try:
+        os.chdir(tmp)
+        aid = "01FEATHERFEATHERFEATHERFE"
+        stem = "8-0-0-8"
+        tdir = f"store/aggregation/{aid}/{stem}-tmp"
+        os.makedirs(tdir)
+
+        h = w = 96
+        # source 0 (higher priority): left half = 0 (clamped land); right half nodata.
+        s0 = np.full((h, w), -9999.0, dtype="float32")
+        s0[:, :48] = 0.0
+        # source 1 (lower priority): right half = -5 (water), except a hole neither source fills
+        # -> merge 0-fills it, and the feather (centred on the col-48 seam) can reach it.
+        s1 = np.full((h, w), -9999.0, dtype="float32")
+        s1[:, 48:] = -5.0
+        s1[40:56, 50:56] = -9999.0
+        tr = from_origin(0, h, 1, 1)
+        for name, arr in (("0-3857.tiff", s0), ("1-3857.tiff", s1)):
+            with rasterio.open(f"{tdir}/{name}", "w", driver="GTiff", height=h, width=w, count=1,
+                               dtype="float32", nodata=-9999, crs="EPSG:3857", transform=tr) as dd:
+                dd.write(arr, 1)
+        with open(f"{tdir}/reprojection.json", "w") as f:
+            json.dump({"buffer_pixels": 16}, f)  # -> a real feather (sigma ~ 3)
+
+        aggregation_merge.merge(f"store/aggregation/{aid}/{stem}-aggregation.csv")
+        with rasterio.open(f"{tdir}/2-3857.tiff") as r:  # merge writes {len(tiffs)}-3857.tiff
+            out = r.read(1)
+
+        # pre-feather value per pixel: source 0 where valid, else source 1 where valid, else the
+        # 0-fill of a truly-uncovered pixel — exactly the set the guard must keep >= 0.
+        pre = np.where(s0 != -9999.0, s0, np.where(s1 != -9999.0, s1, 0.0))
+        nonneg = pre >= 0
+        assert (out[nonneg] >= 0).all(), \
+            f"feather manufactured water: {int((out[nonneg] < 0).sum())} of {int(nonneg.sum())} " \
+            ">=0 pixels went negative"
+        hole = np.zeros((h, w), bool)
+        hole[40:56, 50:56] = True
+        assert (out[hole] >= 0).all(), "a 0-filled nodata hole bordering water must not exit negative"
+        # non-vacuous: the feather ran and real water survived it (else >=0-stays->=0 is trivial).
+        assert (out[:, 60:] < 0).any(), "test is vacuous — no negative water survived the merge"
+        print(f"feather-guard ok — {int(nonneg.sum())} >=0 pixels stayed >=0 across the seam feather")
+    finally:
         os.chdir(cwd)
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -517,6 +664,132 @@ def check_depare():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def check_depare_water():
+    """Part 3 nodata + drying folding through the REAL depare_run.generate(): with the inland-water
+    polygons published (WATERMASK) and the tile's drying FGB present, generate() emits three kinds
+    in ONE depare layer. A #24-cleared lake (uniform-0 DEM) yields nodata (carries `kind`, NO
+    drval1); the surveyed part yields depth bands; the drying FGB folds in with drval1 < 0 and the
+    drying rank; the three are disjoint where the plan requires it (nodata∩bands and nodata∩drying
+    empty — the drying box is subtracted from nodata); neighbouring tiles' nodata meet at the seam;
+    and a tile with no water polygon (ocean) gains no nodata."""
+    import geopandas as gpd
+    import mercantile
+    import numpy as np
+    from pyproj import Transformer
+    from shapely.geometry import Point, box
+
+    import config
+    import depare_run
+    from aggregation_reproject import get_resolution
+
+    tmp = tempfile.mkdtemp()
+    cwd = os.getcwd()
+    saved_watermask = os.environ.get("WATERMASK")
+    aid = "01DEPAREWATERDEPAREWATERDE"
+    try:
+        os.chdir(tmp)
+        to4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
+        left = mercantile.Tile(x=301, y=384, z=10)
+        right = mercantile.Tile(x=302, y=384, z=10)          # shares left's east edge
+        ocean = mercantile.Tile(x=350, y=384, z=10)          # no water polygon reaches it
+
+        # One inland-water polygon covering left+right (not the ocean tile), with a `kind`.
+        bl, br = mercantile.xy_bounds(left), mercantile.xy_bounds(right)
+        wbox = box(min(bl.left, br.left), min(bl.bottom, br.bottom),
+                   max(bl.right, br.right), max(bl.top, br.top))
+        os.makedirs("store/landmask", exist_ok=True)
+        os.makedirs("store/drying", exist_ok=True)
+        gpd.GeoDataFrame({"kind": ["lake"]}, geometry=[wbox], crs="EPSG:3857").to_file(
+            "store/landmask/water.fgb", driver="FlatGeobuf")
+        os.environ["WATERMASK"] = "store/landmask/water.fgb"
+
+        def build(tile, lake_side=None, drying=False, deep=False):
+            stem = f"{tile.z}-{tile.x}-{tile.y}-{tile.z}"  # child_z == z: a native 512 px tile
+            tdir = f"store/aggregation/{aid}/{stem}-tmp"
+            os.makedirs(tdir, exist_ok=True)
+            b = mercantile.xy_bounds(tile)
+            res = get_resolution(tile.z)
+            px = round((b.right - b.left) / res)
+            tr = from_origin(b.left, b.top, res, res)
+            if deep:
+                dem = np.full((px, px), -50.0, dtype="float32")   # ocean: all one band, no lake
+            else:
+                dem = np.full((px, px), -25.0, dtype="float32")   # surveyed baseline ([20,30] band)
+                q = px // 2
+                if lake_side == "east":
+                    dem[:, q:] = 0.0     # cleared lake (no band -> nodata), reaching the east seam
+                elif lake_side == "west":
+                    dem[:, :q] = 0.0     # cleared lake -> nodata, reaching the west seam
+            with rasterio.open(f"{tdir}/0-3857.tiff", "w", driver="GTiff", height=px, width=px,
+                               count=1, dtype="float32", nodata=-9999, crs="EPSG:3857",
+                               transform=tr) as d:
+                d.write(dem, 1)
+            if drying:  # a small drying box in the east (lake) region, in 4326 like drying_run writes
+                dbox = box(b.left + (b.right - b.left) * 0.70, b.bottom + (b.top - b.bottom) * 0.40,
+                           b.left + (b.right - b.left) * 0.85, b.bottom + (b.top - b.bottom) * 0.60)
+                gpd.GeoDataFrame(geometry=[dbox], crs="EPSG:3857").to_crs("EPSG:4326").to_file(
+                    f"store/drying/{stem}.fgb", driver="FlatGeobuf")
+            depare_run.generate(f"store/aggregation/{aid}/{stem}-aggregation.csv")
+            path = f"store/depare/{stem}.fgb"
+            return gpd.read_file(path) if os.path.isfile(path) else None
+
+        gL = build(left, lake_side="east", drying=True)
+        gR = build(right, lake_side="west")
+        gO = build(ocean, deep=True)
+
+        def frac_pt(b, fx, fy):
+            return Point(*to4326.transform(b.left + (b.right - b.left) * fx,
+                                           b.bottom + (b.top - b.bottom) * fy))
+        surveyed = frac_pt(bl, 0.25, 0.5)     # west half, DEM -25 -> a band
+        lake = frac_pt(bl, 0.55, 0.85)        # east half, DEM 0, clear of the drying box -> nodata
+        drying_pt = frac_pt(bl, 0.775, 0.50)  # inside the drying box -> drying, not nodata
+
+        assert gL is not None and len(gL), "left tile must produce depare features"
+        band = gL["drval1"] >= 0              # NaN (nodata) and <0 (drying) both compare False
+        nodata = gL["drval1"].isna()
+        dry = gL["drval1"] < 0
+        assert band.any() and nodata.any() and dry.any(), "left tile must carry all three depare kinds"
+
+        # nodata: carries kind, NO drval1/drval2/sys, the nodata rank
+        nd = gL[nodata]
+        assert (nd["kind"] == "lake").all(), "nodata must carry the water polygon's Overture kind"
+        assert nd["drval2"].isna().all(), "nodata must carry no drval2"
+        assert nd["sys"].isna().all(), "nodata must carry no sys (emitted once, unit-independent)"
+        assert (nd["rank"] == depare_run.NODATA_RANK).all(), "nodata rank"
+        # drying: negative drval1, drval2 == 0, the drying rank (draws over bands)
+        dr = gL[dry]
+        assert (dr["drval2"] == 0).all() and (dr["rank"] == depare_run.DRYING_RANK).all(), "drying schema"
+        assert (gL[band]["rank"] == depare_run.BAND_RANK).all(), "band rank"
+
+        # pairwise-disjoint where the plan requires it (nodata∩bands, nodata∩drying empty)
+        assert (gL[gL.covers(surveyed)]["drval1"] >= 0).any(), "surveyed water -> a depth band"
+        assert not gL[gL.covers(surveyed)]["drval1"].isna().any(), "surveyed water must not be nodata"
+        lh = gL[gL.covers(lake)]
+        assert len(lh) and lh["drval1"].isna().all(), "the cleared lake -> nodata only (no band)"
+        dh = gL[gL.covers(drying_pt)]
+        assert (dh["drval1"] < 0).any(), "the drying box -> a drying feature (drval1 < 0)"
+        assert not dh["drval1"].isna().any(), "drying is subtracted from nodata (none there)"
+
+        # Seam: left's lake nodata reaches its east edge, right's reaches its west edge — they meet.
+        seam = mercantile.bounds(left).east
+        ndL, ndR = gL[gL["drval1"].isna()], gR[gR["drval1"].isna()]
+        assert len(ndL) and len(ndR), "both tiles must carry nodata at the shared seam"
+        assert abs(ndL.total_bounds[2] - seam) < 1e-4, f"left nodata stops short of the seam: {ndL.total_bounds[2]}"
+        assert abs(ndR.total_bounds[0] - seam) < 1e-4, f"right nodata stops short of the seam: {ndR.total_bounds[0]}"
+
+        # Ocean: bands, but NO nodata (no water polygon reaches this tile).
+        assert gO is not None and len(gO) and (gO["drval1"] >= 0).all(), \
+            "ocean tile must be all depth bands — no water polygon, so no nodata"
+        print("depare-water ok — cleared lake→nodata(kind), drying→drval1<0, disjoint, seam meets, ocean none")
+    finally:
+        if saved_watermask is None:
+            os.environ.pop("WATERMASK", None)
+        else:
+            os.environ["WATERMASK"] = saved_watermask
+        os.chdir(cwd)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     tmp = tempfile.mkdtemp()
     try:
@@ -654,7 +927,10 @@ if __name__ == "__main__":
     check_weighted_shards()
     check_stale_overview()
     check_grid_split()
+    check_feather_guard()
     check_land_clamp()
+    check_water_clamp()
     check_drying()
     check_depare()
+    check_depare_water()
     main()
