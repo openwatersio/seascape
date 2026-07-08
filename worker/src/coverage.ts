@@ -22,7 +22,7 @@ export function coverageTileJSON(
 ) {
   return {
     tilejson: "3.0.0",
-    name: "Open Waters Bathymetry (source coverage)",
+    name: "Open Waters Seascape (source coverage)",
     tiles: [`${tilesBase}/coverage/{z}/{x}/{y}.pbf`],
     minzoom: h?.minZoom ?? 0,
     maxzoom: h?.maxZoom ?? 0,

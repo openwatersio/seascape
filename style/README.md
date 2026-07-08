@@ -90,11 +90,6 @@ Semver against the *tile schema* (protomaps' policy): renaming or removing a
 vector layer or feature property the style reads is a major; additive tile or
 style changes are minor; visual-only tweaks are patch.
 
-0.2.0 moved the `coverage` layer out of the vector tileset into its own
-`coverage.json` source (the `source-*` layers follow it). By the letter that's
-a major, but no published build ever contained the layer — nothing could have
-consumed it — so it ships as a minor.
-
 ## Development
 
 TypeScript; `tsc` emits `dist/` on install (`prepare`) and via `npm run

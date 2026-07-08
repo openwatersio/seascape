@@ -74,9 +74,10 @@ In `contour_run.py` (the footprint code already lives there):
 - `bundle_maxz` deliberately NOT used — that helper exists to keep layers *inside*
   the joined tileset alive to its max; coverage's whole point is to leave the join.
 - Ships automatically: `worker/seed.sh` seeds `store/bundle/*.pmtiles` and
-  release.yml's rclone promotes everything except manifest/contour-maxz, manifest
-  last. No manifest change: the Worker reads zooms/bounds from the pmtiles header,
-  like `/vector.json` does; `source_ids` (viewer palette) is already there.
+  release.yml's rclone promotes everything except build scratch
+  (contour-shards/bundle-frags), manifest last. No manifest change: the Worker
+  reads zooms/bounds from the pmtiles header, like `/vector.json` does;
+  `source_ids` (viewer palette) is already there.
 
 ## Part 3 — Worker
 
