@@ -121,7 +121,7 @@ soundings:
 # Depth areas (ENC DEPARE): bundle the per-tile partitions into depare.pmtiles (folded into
 # vector.pmtiles by the contours tile-join, same as soundings). Carries three feature kinds in
 # one layer — depth bands, drying (negative drval1), and nodata (no drval1) — built per tile by
-# aggregation_run off the merged DEM + drying FGB + the inland-water polygons.
+# aggregation_run off the merged DEM + the OSM land + inland-water polygons.
 depare:
     uv run python depare_run.py bundle
 
@@ -210,7 +210,7 @@ preview bbox="-74.30,40.40,-73.75,40.80" local="":
     # one-time OSM download; the water mask is the bbox-scoped Overture pull (skipped offline).
     case "$LANDMASK" in /vsicurl/*) : ;; *) [ -f "$LANDMASK" ] || just landmask ;; esac
     case "${WATERMASK:-}" in /vsicurl/*|"") : ;; *) [ -f "$WATERMASK" ] || { [ -z "{{local}}" ] && just watermask || echo "no water mask (offline preview) — clamp/nodata degrade to land-only"; } ;; esac
-    rm -rf store/aggregation store/pmtiles store/bundle store/meta store/contour store/soundings store/drying store/depare
+    rm -rf store/aggregation store/pmtiles store/bundle store/meta store/contour store/soundings store/depare
     just planet
     ../worker/seed.sh
 

@@ -388,9 +388,10 @@ export function layers(
       // feature kinds keyed by attribute presence (see the expressions above): depth bands
       // (crisp tint per drval1, safety recolour snapped to the next-deeper charted level),
       // drying foreshore (INT-1 green, negative drval1), and unknown-depth water (provisional
-      // flat tint, no drval1). `fill-sort-key: rank` orders overlaps within the layer — nodata
-      // under bands (real depth wins at incidental edges), drying over the shoal band its grow
-      // overhangs. Bands are filtered out in relief mode (the raster ramp carries depth); drying
+      // flat tint, no drval1). The three are disjoint by construction, so `fill-sort-key: rank`
+      // is only a stable tie-breaker at an incidental simplification-wobble edge — nodata under
+      // bands (real depth wins), drying over the shoal band it abuts along their shared 0 m seam.
+      // Bands are filtered out in relief mode (the raster ramp carries depth); drying
       // + nodata stay in both modes. Where no drying/nodata polygon covers a >=0 pixel the DEM
       // ramp still paints the land wash, so a mask miss degrades to plain land, never to
       // water-over-land.

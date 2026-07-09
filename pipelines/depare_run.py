@@ -8,27 +8,30 @@ water compose without extra layers or archives:
   1. depth bands — water partitioned into ranges between the charted isobath levels, each
      polygon carrying its range as drval1/drval2 (ENC DEPARE, positive-down metres) and a
      `sys` tag (m ladder / ft fathom curves). drval1 >= 0.
-  2. drying — the green foreshore folds in as DEPARE with a NEGATIVE drval1 (ENC-true:
-     drying = DEPARE, DRVAL1 < 0): drval1 = -DRYING_CAP, drval2 = 0 (one band for now).
-     drying_run already builds these off the same DEM + land mask, grow/overhang and all,
-     so this reads that FGB rather than recompute.
+  2. drying — the green foreshore, DEPARE with a NEGATIVE drval1 (ENC-true: drying = DEPARE,
+     DRVAL1 < 0): drval1 = -DRYING_CAP, drval2 = 0 (one band for now). Derived from the SAME
+     gdal_contour -p pass as the bands: the metre ladder carries DRYING_CAP as an extra
+     positive level, so its [0, DRYING_CAP] bucket is the foreshore and shares its 0 m
+     seaward edge with the shoal band's amax=0 edge — the same ring, so tippecanoe's
+     --detect-shared-borders simplifies both identically with no crack. Cut to effective
+     water (seaward of the OSM land line, but kept inside mapped inland water — the
+     ICW/tidal-channel case), see generate().
   3. nodata — water OSM maps as a polygon but the DEM holds no depth for (a #24-cleared
      lake, unsurveyed margins beside a fairway). NO drval1/drval2 — absence IS the encoding
      (MVT has no null; the fill's "no drval1" case renders S-52's NODATA fill) — plus a
      `kind` passthrough of the Overture subtype (river/lake/canal/reservoir).
 
-The three are pairwise disjoint by construction — bands come from the DEM's water pixels,
-nodata is the mapped water MINUS that coverage (and minus drying), so style ordering is
-irrelevant to them. The one exception is drying's grow/overhang, which deliberately
-overlaps the shoal band (see drying_run's "close the gap"): that overlap is ACCEPTED and
-resolved at render time by a `rank` sort attribute (a fill-sort-key draws higher rank on
-top). Ranks: nodata 0 < bands 1 < drying 2 — drying paints over the bands it overhangs,
-and bands win over nodata at any incidental simplification-wobble edge (data over no-data).
+The three are pairwise disjoint by construction — bands are the DEM's water pixels
+(amax <= 0), drying is the disjoint [0, DRYING_CAP] bucket ∩ effective water, and nodata is
+the mapped water MINUS both — so style ordering is cosmetic. The `rank` sort attribute
+survives only as a stable tie-breaker at an incidental simplification-wobble edge (nodata 0
+< bands 1 < drying 2: real depth over no-data, foreshore over the shoal band it abuts).
 
 sys multiplexing: the bands duplicate per sys (the ladders differ), but drying and nodata
 are unit-independent, so they ship ONCE with NO `sys` — the style filters them by drval
 semantics (drval1 < 0 / no drval1), not by sys, and showing them in both m and ft modes
 needs no duplication. Halves their feature bytes vs a per-sys copy for identical pixels.
+Drying rides the metre pass only (the cap is a metre level) and is emitted once.
 
 gdal_contour -p buckets the same merged, smoothed DEM the contour lines trace, with the
 same contour generator — band edges and contour lines coincide by construction. Geometry
@@ -40,12 +43,13 @@ lines, which skip Chaikin in the navigable band; deep lines smooth away from the
 edge by design — an invisible sliver between near-white deep tints.)
 
 Per tile: bands (gdal_contour -p at DEPARE_LEVELS / DEPARE_LEVELS_FT, drop land, drval/sys)
-+ drying (the tile's drying FGB, drval1 < 0) + nodata (inland-water polygons minus the DEM's
-water coverage) -> clip to the unbuffered tile bbox in shapely (polygon-only by construction,
-see drying_run) -> 4326 -> store/depare/{stem}.fgb. Same seam contract as contours/drying:
-deterministic on the buffered grid, so neighbouring tiles' features abut exactly at the clip
-line. bundle() tippecanoes them into a `depare` layer pmtiles (or a per-shard slice in CI);
-the contours tile-join folds it into vector.pmtiles like soundings.
++ drying (the metre ladder's [0, DRYING_CAP] bucket ∩ effective water, drval1 < 0) + nodata
+(inland-water polygons minus the DEM's water coverage and the drying) -> clip to the
+unbuffered tile bbox in shapely (polygon-only by construction, see _polys) -> 4326 ->
+store/depare/{stem}.fgb. Same seam contract as contours: deterministic on the buffered grid,
+so neighbouring tiles' features abut exactly at the clip line. bundle() tippecanoes them into
+a `depare` layer pmtiles (or a per-shard slice in CI); the contours tile-join folds it into
+vector.pmtiles like soundings.
 """
 
 import os
@@ -58,7 +62,6 @@ import rasterio
 
 import config
 import contour_run
-import drying_run
 import utils
 
 # The bands' zoom floor (matches the style's depth-areas/contour-lines minzoom):
@@ -68,38 +71,51 @@ import utils
 MIN_ZOOM = 6
 
 # Fill draw order for the `rank` sort attribute (a style fill-sort-key draws higher on top).
-# Bands and nodata are disjoint, so their order is cosmetic; drying's grow/overhang overlaps
-# the shoal band by design and must paint over it, so drying is highest. Bands over nodata is
-# the safe choice at any incidental edge overlap — real depth shows through, not "no data".
+# All three kinds are disjoint by construction, so rank is cosmetic — a stable tie-breaker at
+# an incidental simplification-wobble edge: real depth (bands) over no-data (nodata), and
+# drying over the shoal band it abuts along their shared 0 m seam.
 NODATA_RANK = 0
 BAND_RANK = 1
 DRYING_RANK = 2
 
-# nodata slivers: the Overture water outline (vector) and the depth-band edge (raster, pixel-
-# staircased) never coincide, so `water minus coverage` leaves crumbs along every shared
-# boundary. Drop any nodata polygon smaller than this many DEM pixels — it clears the staircase/
-# registration noise while genuine unknown-depth water (a whole cleared lake, a canal margin
-# beside a surveyed fairway) is orders of magnitude larger and survives. A long thin ribbon where
-# the outline and DEM shoreline genuinely disagree by several pixels is kept (it IS water with no
-# depth) — the ceiling Part 3 accepts. Env-tunable on a re-bundle.
+# Sliver filter: the vector edges (OSM water outline, effective-land cut) and the raster
+# depth-band edge (pixel-staircased) never coincide exactly, so `water minus coverage` and
+# `bucket minus land` both leave crumbs along every near-coincident boundary. Drop any polygon
+# smaller than this many DEM pixels — it clears the staircase/registration noise while a genuine
+# unknown-depth lake or foreshore is orders of magnitude larger and survives. A long thin ribbon
+# where the outline and DEM shoreline genuinely disagree by several pixels is kept. Env-tunable
+# on a re-bundle.
 NODATA_MIN_PX = float(os.environ.get("NODATA_MIN_PX", "64"))
 
 
+def _polys(geom):
+    """Every non-empty Polygon inside a geometry, recursing into Multi/GeometryCollection and
+    dropping the line/point slivers a clip or make_valid can leave — so the output layer is
+    uniformly polygon (FlatGeobuf rejects a mixed layer)."""
+    t = geom.geom_type
+    if t == "Polygon":
+        return [] if geom.is_empty else [geom]
+    if t in ("MultiPolygon", "GeometryCollection"):
+        return [p for g in geom.geoms for p in _polys(g)]
+    return []
+
+
 def partitions(dem, levels, raw_fgb):
-    """Water partitions off `dem`: gdal_contour -p buckets between `levels` -> drop land
-    (amin >= 0; 0 is always a level, so land is exactly the buckets above it) -> add
-    drval1/drval2 (ENC: shallow/deep bound, positive-down metres). GeoDataFrame in the
-    DEM's CRS."""
+    """Water/foreshore partitions off `dem`: gdal_contour -p buckets the DEM between `levels`,
+    tagging each bucket its range amin/amax -> drval1/drval2 (ENC: shallow/deep bound,
+    positive-down metres). Returns the full bucketed GeoDataFrame in the DEM's CRS; the caller
+    selects depth bands (amax <= 0), the [0, DRYING_CAP] drying bucket (0 < amax <= cap), and
+    drops land (amax above the shallowest positive level)."""
     import geopandas as gpd
     fl = " ".join(str(l) for l in levels)
     contour_run._run(
         f"gdal_contour -q -p -amin amin -amax amax -fl {fl} -f FlatGeobuf {dem} {raw_fgb}",
         "gdal_contour -p")
     g = gpd.read_file(raw_fgb)
-    # Water = amax <= 0, NOT amin < 0: GDAL 3.8's polygon mode writes a garbage amin
-    # (0) on the deepest bucket, which then read as land and vanished — amax is correct
-    # on every version. drval2 off a buggy amin still trips _check's drval1 < drval2.
-    g = g[g["amax"] <= 0].copy()
+    # Select on amax, NOT amin: GDAL 3.8's polygon mode writes a garbage amin (0) on the
+    # deepest bucket, which then read as land and vanished — amax is correct on every version.
+    # So drval1 keys off amax; drval2 (off amin) is right for the interior bands but unreliable
+    # on that deepest bucket, and the drying emit uses a literal drval2 = 0 anyway.
     g["drval1"] = 0.0 - g["amax"]  # 0.0 - keeps the shoalest bound 0.0, not -0.0
     g["drval2"] = 0.0 - g["amin"]
     return g
@@ -123,68 +139,100 @@ def generate(filepath):
         return
 
     clip = box(*mercantile.xy_bounds(tile))  # unbuffered, tile-aligned (EPSG:3857)
+    with rasterio.open(dem) as d:
+        b, res = d.bounds, abs(d.transform.a)
+    bbox = (b.left, b.bottom, b.right, b.top)  # the DEM's full (buffered) extent, EPSG:3857
+    buffered = box(*bbox)
+    min_area = NODATA_MIN_PX * res * res       # slivers where a vector edge meets the raster shore
     rows = []
 
-    # ── depth bands ── the metre + fathom partition ladders, each tagged sys, clipped in shapely
-    # (not ogr2ogr -clipsrc — the GDAL-3.8 GeometryCollection trap, see drying_run). The pre-clip
-    # (buffered) union is the water-coverage footprint the nodata pass subtracts; both ladders
-    # cover the same water pixels, so the metre union stands for it.
+    # ── depth bands + drying ── the metre + fathom partition ladders, each off one gdal_contour -p
+    # pass, clipped in shapely (not ogr2ogr -clipsrc — the GDAL-3.8 GeometryCollection trap). The
+    # metre pass carries DRYING_CAP as an extra positive level, so it ALSO yields the [0, cap]
+    # drying bucket, whose 0 m seaward edge is the same ring as the shoal band's amax=0 edge. The
+    # metre bands' pre-clip (buffered) union is the water-coverage footprint the nodata pass
+    # subtracts; both ladders cover the same water pixels, so the metre union stands for it.
     coverage_geoms = []
-    for sys_tag, levels in (("m", config.DEPARE_LEVELS), ("ft", config.DEPARE_LEVELS_FT)):
+    drying_geoms = []
+    for sys_tag, levels in (("m", config.DEPARE_LEVELS + [config.DRYING_CAP]),
+                            ("ft", config.DEPARE_LEVELS_FT)):
         g = partitions(dem, levels, f"{tmp}/depare-raw-{sys_tag}.fgb")
         if not len(g):
             continue
-        if sys_tag == "m":
-            coverage_geoms = list(g.geometry)
-        for r in g.itertuples():
-            for p in drying_run._polys(make_valid(r.geometry).intersection(clip)):
+        bands = g[g["amax"] <= 0]  # water; amax > 0 is drying (m) or land, both handled below
+        for r in bands.itertuples():
+            for p in _polys(make_valid(r.geometry).intersection(clip)):
                 rows.append({"geometry": p, "drval1": r.drval1, "drval2": r.drval2,
                              "sys": sys_tag, "rank": BAND_RANK})
+        if sys_tag == "m":
+            coverage_geoms = list(bands.geometry)
+            # The [0, DRYING_CAP] bucket, keyed on amax alone: 0 and the cap are discrete levels
+            # and every other level is negative, so 0 < amax <= cap uniquely picks it regardless
+            # of the garbage amin. Land above the cap (amax > cap) is dropped.
+            drying_geoms = list(g[(g["amax"] > 0) & (g["amax"] <= config.DRYING_CAP)].geometry)
     coverage = unary_union(coverage_geoms) if coverage_geoms else None
 
-    # ── drying ── fold the tile's foreshore in as DEPARE with a negative drval1. drying_run.generate
-    # produced these off the same DEM + land mask earlier this run (grow/overhang included), so read
-    # that FGB and reproject to the DEM's CRS. No sys (unit-independent); a higher rank so the grown
-    # overhang paints over the shoal band it overlaps. Its full grown footprint is also subtracted
-    # from nodata below, so nodata stays disjoint from it.
-    drying_fgb = f"store/drying/{stem}.fgb"
+    # Inland-water feed, read once by bbox (the nodata pass iterates its features for `kind`; the
+    # drying cut unions its geometry). Optional: absent -> no water term (today's land-only gate).
+    water_src = landmask.water_path()
+    water = None
+    if landmask._present(water_src):
+        w = gpd.read_file(water_src, bbox=bbox)
+        if len(w):
+            water = w.to_crs("EPSG:3857")
+    water_geom = unary_union(list(water.geometry)) if water is not None else None
+
+    # ── drying ── fold the [0, DRYING_CAP] foreshore in as DEPARE with a negative drval1. Cut the
+    # landward side by EFFECTIVE land = OSM land ∖ OSM inland water — the load-bearing point: the
+    # osmdata land product does NOT punch inland water out as holes, so a tidal channel OSM maps as
+    # a water polygon sits INSIDE the land coverage; cutting by raw land would delete the drying
+    # flats in and along that channel (the ICW/tidal-river failure). effective_water = (NOT land)
+    # OR water, so drying = bucket.difference(land) ∪ bucket.intersection(water) — matching the
+    # raster gate (rasterize burns land=1 then water=0) without materialising land ∖ water. Absent
+    # land.fgb -> no landward cut (degrade; land.fgb is effectively always present); absent
+    # water.fgb -> effective_water = NOT land (the union term is empty). Geometry stays RAW like the
+    # bands so the shared 0 m edge aligns; clip in shapely; the min-area filter drops seam slivers.
     drying_area = None
-    if os.path.isfile(drying_fgb):
-        dry = gpd.read_file(drying_fgb)
-        if len(dry):
-            dry = dry.to_crs("EPSG:3857")
-            drying_area = unary_union(list(dry.geometry))
-            for geom in dry.geometry:
-                for p in drying_run._polys(make_valid(geom)):  # already clipped to the bbox in drying_run
+    if drying_geoms:
+        bucket = unary_union(drying_geoms)
+        land_src = landmask.path()
+        land_geom = None
+        if landmask._present(land_src):
+            land = gpd.read_file(land_src, bbox=bbox)
+            if len(land):
+                land_geom = unary_union(list(land.to_crs("EPSG:3857").geometry))
+        if land_geom is None:
+            effective = bucket  # no land coverage here -> nothing to cut
+        else:
+            effective = bucket.difference(land_geom)
+            if water_geom is not None:
+                effective = unary_union([effective, bucket.intersection(water_geom)])
+        effective = make_valid(effective)
+        if not effective.is_empty:
+            drying_area = effective  # subtracted from nodata below (over the buffered extent)
+            for p in _polys(effective.intersection(clip)):
+                if p.area >= min_area:
                     rows.append({"geometry": p, "drval1": -config.DRYING_CAP, "drval2": 0.0,
-                                 "sys": None, "rank": DRYING_RANK})
+                                 "sys": None, "kind": None, "rank": DRYING_RANK})
 
     # ── nodata ── inland water we hold no depth for: the OSM water polygons (bbox-read, clipped to
-    # the buffered tile) MINUS the water-coverage footprint (depth bands ∪ the grown drying) — a #24-
-    # cleared lake produces no band, so its whole polygon survives; a surveyed lake nets to slivers
-    # the min-area filter drops. No drval (absence is the encoding) + a `kind` passthrough. Ocean has
-    # no water polygon, so it gains nothing. Skipped cleanly when no water feed is published.
-    water_src = landmask.water_path()
-    if landmask._present(water_src):
-        with rasterio.open(dem) as d:
-            b, res = d.bounds, abs(d.transform.a)
-        buffered = box(b.left, b.bottom, b.right, b.top)
+    # the buffered tile) MINUS the water-coverage footprint (depth bands ∪ drying) — a #24-cleared
+    # lake the merge left as nodata produces no band, so its whole polygon survives; a surveyed lake
+    # nets to slivers the min-area filter drops. No drval (absence is the encoding) + a `kind`
+    # passthrough. Ocean has no water polygon, so it gains nothing. Skipped when no water feed.
+    if water is not None:
         subtract = [g for g in (coverage, drying_area) if g is not None]
         subtract = unary_union(subtract) if subtract else None
-        min_area = NODATA_MIN_PX * res * res
-        water = gpd.read_file(water_src, bbox=(b.left, b.bottom, b.right, b.top))
-        if len(water):
-            water = water.to_crs("EPSG:3857")
-            for r in water.itertuples():
-                geom = make_valid(r.geometry).intersection(buffered)
-                if subtract is not None:
-                    geom = geom.difference(subtract)
-                geom = geom.intersection(clip)  # same seam contract as the bands
-                kind = getattr(r, "kind", None)
-                for p in drying_run._polys(geom):
-                    if p.area >= min_area:
-                        rows.append({"geometry": p, "drval1": None, "drval2": None,
-                                     "sys": None, "kind": kind, "rank": NODATA_RANK})
+        for r in water.itertuples():
+            geom = make_valid(r.geometry).intersection(buffered)
+            if subtract is not None:
+                geom = geom.difference(subtract)
+            geom = geom.intersection(clip)  # same seam contract as the bands
+            kind = getattr(r, "kind", None)
+            for p in _polys(geom):
+                if p.area >= min_area:
+                    rows.append({"geometry": p, "drval1": None, "drval2": None,
+                                 "sys": None, "kind": kind, "rank": NODATA_RANK})
 
     if not rows:
         print(f"depare: no water in tile bbox for {filename}")
@@ -237,11 +285,12 @@ def bundle(shard=None):
 
 
 def _check():
-    """gdal_contour -p buckets on a synthetic DEM: land dropped, each depth lands in its
-    ladder bucket (drval1/drval2 = the enclosing levels), partitions are pairwise disjoint
-    and jointly cover the water (the fill contract: no holes, no overlaps), the level
-    ladders ascend and end at 0 (gdal_contour -fl requires ascending; 0 closes the shoalest
-    band), and the output is deterministic (the seam contract reduces to this)."""
+    """gdal_contour -p buckets on a synthetic DEM: land above the cap dropped, the metre ladder's
+    extra DRYING_CAP level yields the [0, DRYING_CAP] drying bucket (selected by 0 < amax <= cap,
+    never amin), each water depth lands in its ladder bucket, the water bands are pairwise disjoint
+    and jointly cover the water, the ladders ascend and end at 0, and the buckets are deterministic
+    (the seam contract reduces to this). The effective-land drying cut is exercised end-to-end
+    against real masks in test_engine.check_depare_drying."""
     import tempfile
 
     import numpy as np
@@ -252,25 +301,31 @@ def _check():
 
     for levels in (config.DEPARE_LEVELS, config.DEPARE_LEVELS_FT):
         assert levels == sorted(levels) and levels[-1] == 0, "levels must ascend and end at 0"
+    assert config.DRYING_CAP > 0, "DRYING_CAP must be a positive level above 0"
 
     d = tempfile.mkdtemp()
-    h = w = 50
+    h = w = 60
     res = 100.0
     tr = from_origin(0, h * res, res, res)  # top-left origin, EPSG:3857
-    # Land on top, then four water bands stepping deeper — each 10 rows, values chosen to
-    # sit strictly inside a ladder bucket. Step transitions interpolate through the
-    # intervening levels, so extra sliver partitions between bands are expected and fine.
-    dem = np.full((h, w), 5.0, dtype="float32")
+    cap = config.DRYING_CAP
+    levels_m = config.DEPARE_LEVELS + [cap]
+    # Top-down: land above the cap (dropped), a [0, cap] foreshore (the drying bucket), then four
+    # water bands stepping deeper — each 10 rows, values strictly inside a bucket. Step transitions
+    # interpolate through the intervening levels, so extra sliver partitions are expected and fine.
+    dem = np.full((h, w), cap + 50, dtype="float32")     # rows 0-9: land above the cap
+    dem[10:20, :] = 2.0                                  # rows 10-19: [0, cap] foreshore -> drying
     for i, v in enumerate([-1.0, -7.0, -25.0, -150.0]):
-        dem[(i + 1) * 10:(i + 2) * 10, :] = v
+        dem[(i + 2) * 10:(i + 3) * 10, :] = v            # rows 20-59: four water bands
     p = f"{d}/dem.tif"
     with rasterio.open(p, "w", driver="GTiff", height=h, width=w, count=1, dtype="float32",
                        nodata=-9999, crs="EPSG:3857", transform=tr) as dst:
         dst.write(dem, 1)
 
-    g = partitions(p, config.DEPARE_LEVELS, f"{d}/raw.fgb")
-    assert len(g) and (g["drval1"] >= 0).all(), "land buckets must be dropped"
-    assert (g["drval1"] < g["drval2"]).all(), "drval1 must be the shallow bound"
+    g = partitions(p, levels_m, f"{d}/raw.fgb")
+    bands = g[g["amax"] <= 0]
+    drying = g[(g["amax"] > 0) & (g["amax"] <= cap)]
+    assert len(bands) and (bands["drval1"] >= 0).all(), "water bands must have drval1 >= 0"
+    assert (bands["drval1"] < bands["drval2"]).all(), "drval1 must be the shallow bound"
 
     def bucket_at(gdf, row):
         pt = Point(tr * (w / 2 + 0.5, row + 0.5))
@@ -278,40 +333,49 @@ def _check():
         assert len(hit) == 1, f"exactly one partition must cover row {row}, got {len(hit)}"
         return (hit.iloc[0]["drval1"], hit.iloc[0]["drval2"])
 
-    assert bucket_at(g, 15) == (0.0, 2.0), "-1 m must land in the [0,2] bucket"
-    assert bucket_at(g, 25) == (5.0, 10.0), "-7 m must land in the [5,10] bucket"
-    assert bucket_at(g, 35) == (20.0, 30.0), "-25 m must land in the [20,30] bucket"
-    assert bucket_at(g, 45) == (100.0, 200.0), "-150 m must land in the [100,200] bucket"
-    assert not g.covers(Point(tr * (w / 2 + 0.5, 5.5))).any(), "no partition may cover land"
+    assert bucket_at(bands, 25) == (0.0, 2.0), "-1 m must land in the [0,2] bucket"
+    assert bucket_at(bands, 35) == (5.0, 10.0), "-7 m must land in the [5,10] bucket"
+    assert bucket_at(bands, 45) == (20.0, 30.0), "-25 m must land in the [20,30] bucket"
+    assert bucket_at(bands, 55) == (100.0, 200.0), "-150 m must land in the [100,200] bucket"
 
-    # The fill contract: pairwise disjoint (sum of areas == union area) and jointly
-    # covering the water (union area == the water rows, ± the interpolated land edge).
-    union = unary_union(list(g.geometry))
-    assert abs(g.geometry.area.sum() - union.area) < 1e-6 * union.area, "partitions overlap"
-    water = (h - 10) * w * res * res
+    # The drying bucket: the [0, cap] foreshore, NOT a water band, NOT the above-cap land.
+    fore = Point(tr * (w / 2 + 0.5, 15.5))
+    land = Point(tr * (w / 2 + 0.5, 5.5))
+    assert len(drying) == 1 and drying.covers(fore).any(), "the [0, cap] foreshore is the drying bucket"
+    assert not bands.covers(fore).any(), "the foreshore is not a water band (amax > 0)"
+    assert not drying.covers(land).any() and not bands.covers(land).any(), \
+        "land above the cap is dropped from bands and drying alike"
+
+    # The fill contract for the water bands: pairwise disjoint (sum of areas == union area) and
+    # jointly covering the water (union area == the 40 water rows, ± the interpolated band edges).
+    union = unary_union(list(bands.geometry))
+    assert abs(bands.geometry.area.sum() - union.area) < 1e-6 * union.area, "bands overlap"
+    water = 40 * w * res * res
     assert abs(union.area - water) < 1.5 * w * res * res, \
-        f"partitions must tile the water ({union.area:.0f} vs {water:.0f})"
+        f"bands must tile the water ({union.area:.0f} vs {water:.0f})"
 
-    # Fathom-curve set: -7 m sits between the 3 fm and 5 fm curves.
+    # Fathom-curve set (no cap — drying rides the metre ladder only): -7 m sits between 3 fm and 5 fm.
     gft = partitions(p, config.DEPARE_LEVELS_FT, f"{d}/raw-ft.fgb")
-    d1, d2 = bucket_at(gft, 25)
+    d1, d2 = bucket_at(gft[gft["amax"] <= 0], 35)
     assert abs(d1 - 3 * 1.8288) < 1e-6 and abs(d2 - 5 * 1.8288) < 1e-6, (d1, d2)
 
-    # Deterministic: same DEM -> byte-identical buckets.
-    g2 = partitions(p, config.DEPARE_LEVELS, f"{d}/raw2.fgb")
+    # Deterministic: same DEM -> byte-identical buckets (the drying bucket included).
+    g2 = partitions(p, levels_m, f"{d}/raw2.fgb")
     assert sorted(x.wkb for x in g.geometry) == sorted(x.wkb for x in g2.geometry), \
         "partitions not deterministic"
 
-    # #24 invariant: a uniform-0 DEM (a cleared lake the merge filled to 0) yields NO band, so
-    # the whole water polygon survives as nodata in generate(); a shoal (-0.5) still buckets.
+    # #24 invariant: a uniform-0 DEM (a cleared lake the merge left unfilled/at datum) yields NO
+    # depth band, so in generate() its water polygon survives as nodata rather than a shoal tint.
     flat = np.zeros((h, w), dtype="float32")
     fp = f"{d}/flat.tif"
     with rasterio.open(fp, "w", driver="GTiff", height=h, width=w, count=1, dtype="float32",
                        nodata=-9999, crs="EPSG:3857", transform=tr) as dst:
         dst.write(flat, 1)
-    assert len(partitions(fp, config.DEPARE_LEVELS, f"{d}/flat-raw.fgb")) == 0, \
-        "a uniform-0 lake must produce no depth band (so it becomes nodata, not a shoal tint)"
-    print(f"depare_run self-check ok ({len(g)} m-partitions, {len(gft)} ft-partitions)")
+    flat_g = partitions(fp, levels_m, f"{d}/flat-raw.fgb")
+    assert len(flat_g[flat_g["amax"] <= 0]) == 0, \
+        "a uniform-0 lake must produce no depth band (so it can become nodata, not a shoal tint)"
+    print(f"depare_run self-check ok ({len(bands)} m-bands, {len(drying)} drying, "
+          f"{len(gft[gft['amax'] <= 0])} ft-bands)")
 
 
 if __name__ == "__main__":
