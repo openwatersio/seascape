@@ -32,6 +32,7 @@ import { CachedSource, contentEtag, OVERZOOM_TAG_VERSION } from "./cache";
 import { coverageTileJSON } from "./coverage";
 import { unpackTerrarium, packTerrariumInto, cubicBSpline } from "./terrarium";
 import { OverlayIndex, overlayFor } from "./overlay";
+import { limiter } from "./semaphore";
 // jSquash on Workers: WASM must be imported as a module and passed to init()
 // (no fetch-based instantiation in the Workers runtime).
 import decodeWebp, { init as initWebpDecode } from "@jsquash/webp/decode";
@@ -147,6 +148,14 @@ async function tile(
 // handler can derive the tile's validator from the ancestor bytes (the output
 // is a pure function of them) and skip this work entirely on a matching
 // revalidation.
+// Decode + B-spline + re-encode each hold several MB of libwebp working memory.
+// A request burst over a detailed region ran enough concurrently to exhaust the
+// isolate — malloc returned null and jsquash threw "Decoding error" on tiles that
+// are perfectly valid (they decode fine one at a time). Cap the concurrency so the
+// slow overzoom path queues instead of OOMing.
+// ponytail: fixed cap; raise it if bursts still starve throughput.
+const overzoomGate = limiter(4);
+
 async function synthesize(
   parent: ArrayBuffer,
   srcMax: number,
@@ -565,7 +574,10 @@ export default {
       if (!parent) return null; // ancestor missing; caller tries the next source
       const tag = await contentEtag(parent, OVERZOOM_TAG_VERSION + "-");
       if (inm === tag) return notModified(tag);
-      return sendTile(await synthesize(parent, srcMax, z, x, y), WEBP, tag);
+      const body = await overzoomGate(() =>
+        synthesize(parent, srcMax, z, x, y),
+      );
+      return sendTile(body, WEBP, tag);
     };
 
     const isVector = ext === "pbf" || ext === "mvt";
