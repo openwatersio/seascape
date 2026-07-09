@@ -516,7 +516,8 @@ def check_feather_guard():
 
 def check_depare_drying():
     """Contour-derived drying through the REAL depare_run.generate(): the metre ladder's
-    [0, DRYING_CAP] bucket, cut to EFFECTIVE water = OSM land ∖ inland water. A foreshore
+    [0, DRYING_CAP] bucket, kept where it is effective WATER = (NOT land) OR inland water — i.e.
+    cut by effective LAND = OSM land ∖ inland water (bucket ∖ land ∪ bucket ∩ water). A foreshore
     (+2) DEM meets the OSM land + inland-water masks, so the assertions cover the load-bearing
     cases: a foreshore seaward of the land line -> drying; the SAME height inside effective land
     (land, no water) -> cut, NOT drying; a foreshore inside a water polygon nested in the land

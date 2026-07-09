@@ -381,8 +381,11 @@ def _check():
     assert sorted(x.wkb for x in g.geometry) == sorted(x.wkb for x in g2.geometry), \
         "partitions not deterministic"
 
-    # #24 invariant: a uniform-0 DEM (a cleared lake the merge left unfilled/at datum) yields NO
-    # depth band, so in generate() its water polygon survives as nodata rather than a shoal tint.
+    # A uniform-0 DEM (terrain exactly at datum) yields NO depth band — it falls in the
+    # [0, DRYING_CAP] drying bucket, so a merge-filled-0 area tints as drying foreshore, never a
+    # false shoal. (The cleared-lake NODATA path is separate: gdal_contour skips NODATA pixels, so
+    # a genuinely-unfilled lake interior carries no bucket and renders as nodata — see
+    # check_depare_water. Only a thin 0-filled rim at a cleared lake's edge lands in this bucket.)
     flat = np.zeros((h, w), dtype="float32")
     fp = f"{d}/flat.tif"
     with rasterio.open(fp, "w", driver="GTiff", height=h, width=w, count=1, dtype="float32",
@@ -390,7 +393,7 @@ def _check():
         dst.write(flat, 1)
     flat_g = partitions(fp, levels_m, f"{d}/flat-raw.fgb")
     assert len(flat_g[flat_g["amax"] <= 0]) == 0, \
-        "a uniform-0 lake must produce no depth band (so it can become nodata, not a shoal tint)"
+        "a uniform-0 surface must produce no depth band (it's the drying bucket, not a shoal tint)"
     print(f"depare_run self-check ok ({len(bands)} m-bands, {len(drying)} drying, "
           f"{len(gft[gft['amax'] <= 0])} ft-bands)")
 
