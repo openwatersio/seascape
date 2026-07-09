@@ -164,21 +164,8 @@ def create_archive(filepaths, name):
 
 
 def attribution():
-    """One HTML attribution string crediting every configured source. terrain and
-    contours both come from the all-source merged DEM, so they share it.
-    Lists all configured sources, not just those a regional BBOX actually touched —
-    filter by manifest bbox intersection if a partial build ever needs exact credit."""
-    parts = [utils.ATTRIBUTION]
-    uses_landmask = False
-    for sid in config.sources():
-        m = config.load_metadata(sid)
-        uses_landmask = uses_landmask or bool(m.get("land_clamp"))
-        web, name = m.get("website"), m.get("name", sid)
-        parts.append(f'<a href="{web}">{name}</a>' if web else name)
-    if uses_landmask:  # OSM land polygons (ODbL) — the mask that clamps coarse land bleed
-        parts.append('<a href="https://osmdata.openstreetmap.de/data/land-polygons.html">'
-                     'OpenStreetMap land polygons (ODbL)</a>')
-    return " | ".join(parts)
+    """The linked page carries the full per-source attribution and modification notice."""
+    return utils.ATTRIBUTION
 
 
 def bundle_group(name, filepaths):
