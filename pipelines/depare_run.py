@@ -79,13 +79,17 @@ BAND_RANK = 1
 DRYING_RANK = 2
 
 # Sliver filter: the vector edges (OSM water outline, effective-land cut) and the raster
-# depth-band edge (pixel-staircased) never coincide exactly, so `water minus coverage` and
-# `bucket minus land` both leave crumbs along every near-coincident boundary. Drop any polygon
-# smaller than this many DEM pixels — it clears the staircase/registration noise while a genuine
-# unknown-depth lake or foreshore is orders of magnitude larger and survives. A long thin ribbon
-# where the outline and DEM shoreline genuinely disagree by several pixels is kept. Env-tunable
-# on a re-bundle.
-NODATA_MIN_PX = float(os.environ.get("NODATA_MIN_PX", "64"))
+# depth-band edge (pixel-staircased) never coincide exactly, so `water minus coverage` (nodata)
+# and `bucket minus land` (drying) both leave crumbs along every near-coincident boundary. Drop
+# any polygon smaller than this many DEM pixels to clear the registration noise. Sized from
+# measurement, not a guess: over a whole ICW macrotile the crumbs top out at ~3 px (95% are thin,
+# compactness < 0.2), so 4 px removes them all — while real intertidal flats and small unsurveyed
+# ponds bottom out around 4 px and survive. The old 64 px was tuned for nodata lakes alone and
+# culled ~1000 genuine small drying flats (only ~2% of the area, but most of the visible detail).
+# Ceiling: a pure area gate can't tell a LONG thin ribbon (1 px × 100 px ≈ 100 px area) from a
+# compact real flat; none occurred here (the difference yields corner fragments, not ribbons), but
+# a width/compactness gate is the targeted tool if thin ribbons ever appear. Env-tunable.
+SLIVER_MIN_PX = float(os.environ.get("SLIVER_MIN_PX", "4"))
 
 
 def _polys(geom):
@@ -152,7 +156,7 @@ def generate(filepath):
         b, res = d.bounds, abs(d.transform.a)
     bbox = (b.left, b.bottom, b.right, b.top)  # the DEM's full (buffered) extent, EPSG:3857
     buffered = box(*bbox)
-    min_area = NODATA_MIN_PX * res * res       # slivers where a vector edge meets the raster shore
+    min_area = SLIVER_MIN_PX * res * res       # slivers where a vector edge meets the raster shore
     rows = []
 
     # ── depth bands + drying ── the metre + fathom partition ladders, each off one gdal_contour -p
