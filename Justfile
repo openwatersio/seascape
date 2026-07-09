@@ -36,7 +36,8 @@ sources:
 # pmtiles into vector.pmtiles in the same single pass. Drying rides inside depare (a DEPARE band
 # with negative drval1) — aggregation_run generates its per-tile FGB, which depare consumes.
 # Coverage right after cover (it needs only footprints + the covering) so missing footprints
-# fail in the first minute, not after hours of aggregation.
+# fail in the first minute, not after hours of aggregation. Coverage honors BBOX, so a preview
+# builds only the region's footprints (CI builds the whole planet, in its own parallel job).
 planet:
     just cover
     just coverage
@@ -128,6 +129,7 @@ depare:
 # Source-provenance footprints -> their own store/bundle/coverage.pmtiles (z0-8;
 # the renderer overzooms it deeper). Needs store/polygon/*.gpkg + a covering;
 # fails loudly without footprints — a build without them ships a dead layer.
+# Honors BBOX: a preview builds only the region's footprints (whole planet if unset).
 coverage:
     uv run python contour_run.py coverage
 
