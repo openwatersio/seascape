@@ -265,20 +265,6 @@ jobs:
           # so the sharded downsample job downstream sees the same plan from R2.
           docker run --rm -v "$PWD:/app" -e BBOX -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just cover
           docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just downsample-cover
-      - name: Build coverage.pmtiles
-        run: |
-          # Source-provenance footprints → their own small tileset (z0-8; the renderer
-          # overzooms it past that, independent of vector.pmtiles). Built here, not in
-          # contour-bundle: plan just wrote the covering, whose aggregation CSVs are the
-          # authoritative per-source maxzoom (metadata.json max_zoom is only an optional
-          # cap most sources omit). `just coverage` fails loudly when bathymetry/polygon/
-          # is empty — a planet build without footprints is a broken build, not a
-          # fallback; the silent drop is how the layer went missing from every release.
-          mkdir -p store/polygon
-          aws s3 sync "s3://$DATA_BUCKET/bathymetry/polygon" store/polygon
-          docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just coverage
-          aws s3 cp store/bundle/coverage.pmtiles "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/coverage.pmtiles" \
-            --content-type application/octet-stream
       - name: Freeze the dirty work lists
         run: |
           # Compute the aggregate + downsample dirty sets ONCE, from this single R2 listing
@@ -375,6 +361,40 @@ jobs:
           SHARDS=$(docker run --rm -v "$PWD:/app" -e FORCE_REBUILD -v "$PWD/store:/app/pipelines/store" \
             "$IMAGE:$IMAGE_TAG" just downsample-matrix "$AGG_SHARDS" | tail -n1)
           echo "shards=$SHARDS" >> "$GITHUB_OUTPUT"
+
+  # Source-provenance footprints → coverage.pmtiles (z0-8; its own small tileset the renderer
+  # overzooms deeper, independent of vector.pmtiles). Its own job, NOT inline in plan: the
+  # tippecanoe of the footprints kept whole (uk_surfzone/infomar are large intertidal-survey
+  # unions) runs ~40 min, and inline it serialized that ahead of the whole aggregate fan-out
+  # (aggregate needs plan). It depends only on the covering plan just wrote (for the per-source
+  # maxzoom — metadata.json max_zoom is only an optional cap most sources omit) + the footprints,
+  # nothing from aggregate, so it runs in parallel with the multi-hour aggregate/downsample/
+  # contour chains and finishes long before release. `just coverage` fails loudly on missing
+  # footprints — a planet build without them ships a dead layer; the silent drop is how the
+  # layer went missing from every release.
+  coverage:
+    needs: [image, plan]
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: read }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/ghcr-login
+      - name: Pull footprints from R2
+        run: |
+          mkdir -p store/polygon
+          aws s3 sync "s3://$DATA_BUCKET/bathymetry/polygon" store/polygon
+      # The covering plan just wrote — its aggregation CSVs are the authoritative per-source
+      # maxzoom. markers: false — coverage reads CSVs only, never the resume markers.
+      - name: Pull covering from R2
+        uses: ./.github/actions/pull-covering
+        with:
+          markers: "false"
+      - name: Build + push coverage.pmtiles
+        run: |
+          docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just coverage
+          aws s3 cp store/bundle/coverage.pmtiles "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/coverage.pmtiles" \
+            --content-type application/octet-stream
 
   # Reproject → merge → tile → contour for one strided slice of the dirty tiles.
   # Shards re-derive the same sorted dirty list and never overlap, so each pushes
@@ -721,8 +741,8 @@ jobs:
   # dispatch release.yml for this exact sha. Only main builds deploy to production —
   # a build dispatched from a feature branch still writes build/<sha>/, but won't ship.
   release:
-    needs: [bundle-merge, contour-bundle]
-    if: ${{ github.ref == 'refs/heads/main' && needs.bundle-merge.result == 'success' && needs.contour-bundle.result == 'success' }}
+    needs: [bundle-merge, contour-bundle, coverage]
+    if: ${{ github.ref == 'refs/heads/main' && needs.bundle-merge.result == 'success' && needs.contour-bundle.result == 'success' && needs.coverage.result == 'success' }}
     runs-on: ubuntu-latest
     permissions: { actions: write }
     steps:
