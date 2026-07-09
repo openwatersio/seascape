@@ -144,6 +144,31 @@ jobs:
       - id: deployment
         uses: actions/deploy-pages@v5
 
+  # Publish @openwaters/seascape to npm via OIDC trusted publishing — no token secret,
+  # provenance attestation comes free. Independent of the R2 promote: it ships whatever
+  # version style/package.json declares at the released commit, and skips when that
+  # version is already on npm, so re-dispatches and pipeline-only releases are no-ops.
+  publish-npm:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # OIDC exchange with the npm registry
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with: { ref: "${{ github.event.inputs.sha || github.sha }}" }
+      - uses: actions/setup-node@v4
+        with: { node-version: 24 } # bundles npm ≥ 11.5.1, the floor for trusted publishing
+      - name: Publish if version is new
+        run: |
+          set -euo pipefail
+          version=$(node -p 'require("./style/package.json").version')
+          if [ "$(npm view "@openwaters/seascape@$version" version 2>/dev/null)" = "$version" ]; then
+            echo "@openwaters/seascape@$version already on npm — skipping"
+            exit 0
+          fi
+          npm ci # runs the style package's prepare (tsc → style/dist)
+          npm publish --workspace style
+
   # No cache purge on release: the Worker's edge-cache keys embed
   # RELEASE_PREFIX, so the deploy itself switches cache namespaces and the
   # old release's entries LRU out — nothing else on the zone is affected.
