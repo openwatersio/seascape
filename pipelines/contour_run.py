@@ -307,7 +307,7 @@ def _coverage_geojson():
     valid = set(config.sources())
     zmax = _source_maxzooms()
     bbox = os.environ.get("BBOX", "").strip()
-    spat = ["-spat", *bbox.split(",")] if bbox else []
+    spat = ["-spat", *(c.strip() for c in bbox.split(","))] if bbox else []
     feats = []
     for gpkg in sorted(glob("store/polygon/*.gpkg")):
         sid = gpkg.split("/")[-1].replace(".gpkg", "")

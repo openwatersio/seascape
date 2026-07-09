@@ -392,7 +392,10 @@ jobs:
           markers: "false"
       - name: Build + push coverage.pmtiles
         run: |
-          docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just coverage
+          # -e BBOX like the plan job's `just cover`: a regional dispatch (bbox input) builds a
+          # regional covering, so coverage must scope to the same window; empty (a planet build)
+          # → the whole world.
+          docker run --rm -v "$PWD:/app" -e BBOX -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just coverage
           aws s3 cp store/bundle/coverage.pmtiles "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/coverage.pmtiles" \
             --content-type application/octet-stream
 
