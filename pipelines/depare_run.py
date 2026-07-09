@@ -100,6 +100,16 @@ def _polys(geom):
     return []
 
 
+def valid_union(geoms):
+    """unary_union after make_valid per input. gdal_contour's polygon mode can emit a
+    self-touching ring (GEOS raises "side location conflict" on a raw union of it); make_valid
+    splits it into valid parts first. A no-op on already-valid geometry (bands are make_valid'd
+    per feature; this guards the bucket / coverage / mask unions)."""
+    from shapely import make_valid
+    from shapely.ops import unary_union
+    return unary_union([make_valid(g) for g in geoms])
+
+
 def partitions(dem, levels, raw_fgb):
     """Water/foreshore partitions off `dem`: gdal_contour -p buckets the DEM between `levels`,
     tagging each bucket its range amin/amax -> drval1/drval2 (ENC: shallow/deep bound,
@@ -126,7 +136,6 @@ def generate(filepath):
     import landmask
     from shapely import make_valid
     from shapely.geometry import box
-    from shapely.ops import unary_union
 
     agg_id, filename = filepath.split("/")[-2:]
     z, x, y, child_z = (int(a) for a in filename.replace("-aggregation.csv", "").split("-"))
@@ -170,7 +179,7 @@ def generate(filepath):
             # and every other level is negative, so 0 < amax <= cap uniquely picks it regardless
             # of the garbage amin. Land above the cap (amax > cap) is dropped.
             drying_geoms = list(g[(g["amax"] > 0) & (g["amax"] <= config.DRYING_CAP)].geometry)
-    coverage = unary_union(coverage_geoms) if coverage_geoms else None
+    coverage = valid_union(coverage_geoms) if coverage_geoms else None
 
     # Inland-water feed, read once by bbox (the nodata pass iterates its features for `kind`; the
     # drying cut unions its geometry). Optional: absent -> no water term (today's land-only gate).
@@ -180,7 +189,7 @@ def generate(filepath):
         w = gpd.read_file(water_src, bbox=bbox)
         if len(w):
             water = w.to_crs("EPSG:3857")
-    water_geom = unary_union(list(water.geometry)) if water is not None else None
+    water_geom = valid_union(list(water.geometry)) if water is not None else None
 
     # ── drying ── fold the [0, DRYING_CAP] foreshore in as DEPARE with a negative drval1. Cut the
     # landward side by EFFECTIVE land = OSM land ∖ OSM inland water — the load-bearing point: the
@@ -194,19 +203,19 @@ def generate(filepath):
     # bands so the shared 0 m edge aligns; clip in shapely; the min-area filter drops seam slivers.
     drying_area = None
     if drying_geoms:
-        bucket = unary_union(drying_geoms)
+        bucket = valid_union(drying_geoms)
         land_src = landmask.path()
         land_geom = None
         if landmask._present(land_src):
             land = gpd.read_file(land_src, bbox=bbox)
             if len(land):
-                land_geom = unary_union(list(land.to_crs("EPSG:3857").geometry))
+                land_geom = valid_union(list(land.to_crs("EPSG:3857").geometry))
         if land_geom is None:
             effective = bucket  # no land coverage here -> nothing to cut
         else:
             effective = bucket.difference(land_geom)
             if water_geom is not None:
-                effective = unary_union([effective, bucket.intersection(water_geom)])
+                effective = valid_union([effective, bucket.intersection(water_geom)])
         effective = make_valid(effective)
         if not effective.is_empty:
             drying_area = effective  # subtracted from nodata below (over the buffered extent)
@@ -222,7 +231,7 @@ def generate(filepath):
     # passthrough. Ocean has no water polygon, so it gains nothing. Skipped when no water feed.
     if water is not None:
         subtract = [g for g in (coverage, drying_area) if g is not None]
-        subtract = unary_union(subtract) if subtract else None
+        subtract = valid_union(subtract) if subtract else None
         for r in water.itertuples():
             geom = make_valid(r.geometry).intersection(buffered)
             if subtract is not None:
@@ -302,6 +311,14 @@ def _check():
     for levels in (config.DEPARE_LEVELS, config.DEPARE_LEVELS_FT):
         assert levels == sorted(levels) and levels[-1] == 0, "levels must ascend and end at 0"
     assert config.DRYING_CAP > 0, "DRYING_CAP must be a positive level above 0"
+
+    # valid_union must make_valid before unioning: gdal_contour emits self-touching rings that
+    # poison a raw union ("side location conflict"). A bowtie is invalid on every GEOS version,
+    # and a raw union of it stays invalid — valid_union must return valid geometry.
+    from shapely.geometry import Polygon
+    bowtie = Polygon([(0, 0), (2, 2), (2, 0), (0, 2), (0, 0)])
+    assert not bowtie.is_valid and valid_union([bowtie]).is_valid, \
+        "valid_union must make_valid before union (guards the contour side-location-conflict fix)"
 
     d = tempfile.mkdtemp()
     h = w = 60
