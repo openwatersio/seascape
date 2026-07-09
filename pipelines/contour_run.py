@@ -297,9 +297,17 @@ def _source_maxzooms():
 def _coverage_geojson():
     """Combine every regional source's simplified footprint into one GeoJSON FC with
     {source_id, source_name, source_maxzoom}; write it and return the path. None if no
-    polygons are present locally (coverage_bundle turns that into a hard failure)."""
+    polygons are present locally (coverage_bundle turns that into a hard failure).
+
+    BBOX (W,S,E,N lon/lat, the same regional-build env the covering uses) pushes a -spat
+    filter onto each footprint read, so a preview builds only the region's coverage instead of
+    tippecanoeing every footprint whole (the large intertidal-survey unions — uk_surfzone,
+    infomar — dominate that cost). Footprints are EPSG:4326, so BBOX maps straight to -spat.
+    Unset (a planet/CI build) → the whole world."""
     valid = set(config.sources())
     zmax = _source_maxzooms()
+    bbox = os.environ.get("BBOX", "").strip()
+    spat = ["-spat", *(c.strip() for c in bbox.split(","))] if bbox else []
     feats = []
     for gpkg in sorted(glob("store/polygon/*.gpkg")):
         sid = gpkg.split("/")[-1].replace(".gpkg", "")
@@ -307,7 +315,7 @@ def _coverage_geojson():
             continue
         meta = config.load_metadata(sid)
         out = subprocess.run(
-            ["ogr2ogr", "-f", "GeoJSON", "/vsistdout/", gpkg,
+            ["ogr2ogr", "-f", "GeoJSON", "/vsistdout/", gpkg, *spat,
              "-simplify", "0.001", "-lco", "COORDINATE_PRECISION=5"],
             capture_output=True, text=True, check=True).stdout
         for f in json.loads(out).get("features", []):
