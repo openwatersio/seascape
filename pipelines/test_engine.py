@@ -16,7 +16,6 @@ Run from pipelines/:  uv run python test_engine.py
 """
 
 import json
-import math
 import os
 import shutil
 import subprocess
@@ -99,13 +98,13 @@ def check_priority():
         shutil.rmtree(d, ignore_errors=True)
 
 
-def check_shard_partition():
-    """The frozen work list must give a complete, disjoint shard partition that does NOT drift
-    when the set of already-built tiles changes. The bug: each shard recomputed the dirty list
-    itself, so as sibling shards filled in the store the missing set — hence the [i::n] stride —
-    differed per shard, and a self-heal (missing) tile could land at an index matching no
-    shard's `i`. It was then never built, and downsample aborted 'pyramid incomplete'. A single
-    frozen list makes every shard partition the identical work."""
+def check_self_heal():
+    """A tile whose pmtiles is missing from the store is dirty even when its source coverage is
+    unchanged (self-heal). A covering is recorded before its tile is built, so a prior failed or
+    interrupted build can leave a covering with no tile; without this the incremental diff would
+    call it clean forever. On the build box this is what resumes an interrupted build: a
+    re-dispatch's fresh covering matches the last one (no source change), so only the tiles whose
+    pmtiles never got pushed come back dirty."""
     import aggregation_run
     env_force = os.environ.pop("FORCE_REBUILD", None)  # this check is about the incremental path
     tmp = tempfile.mkdtemp()
@@ -121,69 +120,18 @@ def check_shard_partition():
         # No coverage change (identical empty CSVs) → dirty is purely the self-heal set: tiles
         # whose pmtiles is absent from the listing. Mark every other tile present.
         present = tiles[::2]
-        keys = "".join(f"bathymetry/pmtiles/7-0-0/{t}.pmtiles\n" for t in present)
         with open("store/pmtiles-keys.txt", "w") as f:
-            f.write(keys)
-        aggregation_run.freeze()
-        frozen = aggregation_run.work_list()
-        missing = {f"store/aggregation/{cur}/{t}-aggregation.csv" for t in tiles if t not in present}
-        assert set(frozen) == missing, f"frozen list != self-heal set (Δ {set(frozen) ^ missing})"
-        n = 7
-        slices = [aggregation_run.work_list()[i::n] for i in range(n)]
-        flat = [fp for s in slices for fp in s]
-        assert sorted(flat) == sorted(frozen), f"partition drops/dupes tiles: {set(frozen) ^ set(flat)}"
-        assert len(flat) == len(set(flat)), "shards overlap"
-        # Regression: the store filling in later (everything now present) must still yield the
-        # SAME work — the frozen list is authoritative, so the partition cannot drift.
-        with open("store/pmtiles-keys.txt", "w") as f:
-            f.write("".join(f"bathymetry/pmtiles/7-0-0/{t}.pmtiles\n" for t in tiles))
-        assert aggregation_run.work_list() == frozen, "work_list drifted after the live listing changed"
-        print(f"shard-partition ok — {len(missing)} self-heal tiles, complete+disjoint across {n} shards, frozen vs live")
+            f.write("".join(f"bathymetry/pmtiles/7-0-0/{t}.pmtiles\n" for t in present))
+        dirty = {fp.split("/")[-1].replace("-aggregation.csv", "")
+                 for fp in aggregation_run.dirty_filepaths()}
+        missing = {t for t in tiles if t not in present}
+        assert dirty == missing, f"dirty != self-heal set (Δ {dirty ^ missing})"
+        print(f"self-heal ok — {len(missing)} tiles with missing pmtiles marked dirty, rest clean")
     finally:
         os.chdir(cwd)
         shutil.rmtree(tmp, ignore_errors=True)
         if env_force is not None:
             os.environ["FORCE_REBUILD"] = env_force
-
-
-def check_weighted_shards():
-    """Downsample deep shards bin-pack ancestors by work (parent-webp count), not
-    ancestor count: the count-sized stride left a 77-minute straggler shard next to
-    hundreds of spin-up-only ones. The partition must stay complete + disjoint (every
-    consumer derives the same bins from the frozen list), n must self-size to
-    total/heaviest, and no bin may exceed 2x the heaviest ancestor (the LPT bound)."""
-    import downsampling
-    import utils
-    tmp = tempfile.mkdtemp()
-    cwd = os.getcwd()
-    try:
-        os.chdir(tmp)
-        aid = "01CCCCCCCCCCCCCCCCCCCCCCCC"
-        os.makedirs(f"store/aggregation/{aid}")
-        rz = downsampling.SHARD_ROOT_Z
-        # 3 deep subtrees (extent -> extent+3: 4**3 = 64 parent webps each) among 40
-        # couple-of-overview ancestors (weight 1) — the planet build's shape in miniature.
-        heavies = [f"store/aggregation/{aid}/{rz}-{x}-0-{rz + 3}-downsampling.csv" for x in range(3)]
-        lights = [f"store/aggregation/{aid}/{rz}-{x}-{y}-{rz}-downsampling.csv"
-                  for x in range(8) for y in range(1, 6)]
-        with open(f"store/aggregation/{aid}/{downsampling.FROZEN}", "w") as f:
-            f.write("".join(fp + "\n" for fp in heavies + lights))
-        w = downsampling.ancestor_weights()
-        assert len(w) == 43 and sorted(w.values(), reverse=True)[:3] == [64, 64, 64], w
-        # matrix sizing: enough bins that each ~= the heaviest subtree — not one per ancestor
-        n = math.ceil(sum(w.values()) / max(w.values()))
-        assert n == 4, f"expected 4 work-sized bins for 43 ancestors, got {n}"
-        owned = [downsampling.owned_ancestors(i, n) for i in range(n)]
-        flat = [a for s in owned for a in s]
-        assert len(flat) == len(set(flat)) == len(w), "bins must partition the ancestors"
-        loads = [sum(w[a] for a in s) for s in owned]
-        assert max(loads) < 2 * max(w.values()), f"a bin exceeds the LPT bound: {loads}"
-        # the pure packer (also chunks the bundle groups): heaviest first into lightest bin
-        assert utils.lpt_bins({"a": 5, "b": 3, "c": 3, "d": 1}, 2) == [["a", "d"], ["b", "c"]]
-        print(f"weighted-shards ok — {len(w)} ancestors -> {n} bins, loads {sorted(loads, reverse=True)}")
-    finally:
-        os.chdir(cwd)
-        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def check_stale_overview():
@@ -848,73 +796,31 @@ def main():
         run(tmp, "aggregation_covering.py")
         run(tmp, "aggregation_run.py")
         run(tmp, "downsampling.py", "cover")
-        run(tmp, "downsampling.py", "freeze")  # the CI path: shards + tail read this frozen list
-        # Exercise the CI fan-out (deep shards + coarse tail), not just the single
-        # run() — both shards then the tail must reproduce a correct full pyramid.
-        run(tmp, "downsampling.py", "run", "shard", "0", "2")
-        run(tmp, "downsampling.py", "run", "shard", "1", "2")
-        run(tmp, "downsampling.py", "run", "tail")
+        run(tmp, "downsampling.py", "run")   # whole dirty pyramid on one machine
         run(tmp, "bundle.py")
 
-        # shard-keys (the CI per-shard pull filter) must select every deep tile (extent
-        # z >= SHARD_ROOT_Z) for exactly one shard and nothing below — a miss would pull
-        # the wrong tiles in CI and leave silent holes.
         import glob as _glob
-        shard_root_z = 10 - 2  # MACROTILE_Z - NUM_OVERVIEWS, the run() env above
         pmtiles = [os.path.basename(p) for p in _glob.glob(f"{tmp}/store/pmtiles/**/*.pmtiles", recursive=True)]
-        with open(f"{tmp}/store/pmtiles-keys.txt", "w") as f:
-            f.write("".join(f"pmtiles/{n}\n" for n in pmtiles))
-        deep = {n for n in pmtiles if int(n.split("-")[0]) >= shard_root_z}
-        selected = []
-        for i in range(2):
-            run(tmp, "downsampling.py", "shard-keys", str(i), "2")
-            with open(f"{tmp}/store/shard-keys.txt") as f:
-                selected.append({os.path.basename(l.strip()) for l in f if l.strip()})
-        union = selected[0] | selected[1]
-        assert union == deep, f"shard-keys miscovers deep tiles; missing {deep - union}, extra {union - deep}"
-        assert not (selected[0] & selected[1]), f"shards must be disjoint: {selected[0] & selected[1]}"
-        print(f"shard-keys ok — {len(deep)} deep pmtiles partitioned across 2 shards, none below z{shard_root_z}")
 
-        # bundle matrix + group-keys (the CI pull filter) must partition EVERY terrain
-        # pmtiles across the groups: a tile in no group is missing from the bundles (a
-        # hole the Worker overzooms GEBCO into); a tile in two is double-bundled. The
-        # groups are planet + one overlay per z5 grid cell holding a deep (z11) tile.
+        # The groups are planet + one overlay per z5 grid cell holding a deep (z11) tile.
         agg_dir = f"{tmp}/store/aggregation"
         agg_id = sorted(os.listdir(agg_dir))[-1]
         agg_stems = [n.replace("-aggregation.csv", "").split("-")
                      for n in os.listdir(f"{agg_dir}/{agg_id}") if n.endswith("-aggregation.csv")]
         expected = {"planet"} | {f"5-{int(x) >> (int(z) - 5)}-{int(y) >> (int(z) - 5)}"
                                  for z, x, y, cz in agg_stems if int(cz) > 10}
-        cli_env = {**os.environ, "SOURCES_DIR": "sources", "PYTHONPATH": PIPE,
-                   "MACROTILE_Z": "10", "NUM_OVERVIEWS": "2", "SKIP_CONTOURS": "1", "SKIP_SMOOTH": "1"}
-        chunks = json.loads(subprocess.run(
-            [sys.executable, os.path.join(PIPE, "bundle.py"), "matrix", "2"],
-            cwd=tmp, env=cli_env, check=True, capture_output=True, text=True).stdout.splitlines()[-1])
-        assert len(chunks) <= 2, f"matrix must respect the shard cap: {chunks}"
-        names = [n for c in chunks for n in c["cells"].split(",") if n]
-        assert sorted(names) == sorted(expected), f"unexpected groups: {sorted(names)} != {sorted(expected)}"
-        gsel = {}
-        for name in names:
-            run(tmp, "bundle.py", "group-keys", name)
-            with open(f"{tmp}/store/keys.txt") as f:
-                gsel[name] = {os.path.basename(l.strip()) for l in f if l.strip()}
-        gunion = set().union(*gsel.values())
-        assert gunion == set(pmtiles), f"group-keys miscovers; missing {set(pmtiles) - gunion}, extra {gunion - set(pmtiles)}"
-        assert sum(len(s) for s in gsel.values()) == len(gunion), "groups overlap"
-        print(f"group-keys ok — {len(pmtiles)} pmtiles partitioned across {len(names)} group(s)")
 
-        # orphan exclusion: a pmtiles left from a re-tiled covering (stem not in the
-        # current covering) must land in NO group, else it double-bundles a stale tile
-        # over the live tiling (the raster twin of the contour-overlap bug).
-        orphan = "0-0-0-99.pmtiles"
-        with open(f"{tmp}/store/pmtiles-keys.txt", "a") as f:
-            f.write(f"pmtiles/{orphan}\n")
-        for name in names:
-            run(tmp, "bundle.py", "group-keys", name)
-            with open(f"{tmp}/store/keys.txt") as f:
-                got = {os.path.basename(l.strip()) for l in f if l.strip()}
-            assert orphan not in got, f"orphan {orphan} leaked into group {name}"
-        print(f"orphan-exclusion ok — {orphan} excluded from every group")
+        # orphan exclusion: a pmtiles left from a re-tiled covering (stem not in the current
+        # covering) must land in NO bundle, else it double-bundles a stale tile over the live
+        # tiling (the raster twin of the contour-overlap bug). Drop one in and re-bundle: the
+        # manifest's overlay cells must be unchanged (an orphan z99 stem would else mint a cell).
+        open(f"{tmp}/store/pmtiles/0-0-0-99.pmtiles", "w").close()
+        run(tmp, "bundle.py")
+        mf_orphan = json.load(open(f"{tmp}/store/bundle/manifest.json"))
+        assert set(mf_orphan["overlay"]["cells"]) == expected - {"planet"}, \
+            f"orphan leaked into the bundle: {set(mf_orphan['overlay']['cells'])} != {expected - {'planet'}}"
+        os.remove(f"{tmp}/store/pmtiles/0-0-0-99.pmtiles")
+        print(f"orphan-exclusion ok — stale-covering pmtiles excluded from every bundle")
 
         # covering wrote the cap into child_z: the deepest aggregation tile is z11, not z13.
         child_zs = [int(cz) for _, _, _, cz in agg_stems]
@@ -944,7 +850,7 @@ def main():
         print(f"engine e2e ok — zooms {min(by_zoom)}..{max_z}, fine wins at z11 "
               f"({z11_shallowest:.1f}), base present (min {min(all_meds):.1f})")
 
-        # FAIL-CLOSED: a covering whose pmtiles is gone (a dropped/unsynced shard) must
+        # FAIL-CLOSED: a covering whose pmtiles is gone (a failed/interrupted run) must
         # fail the bundle, not silently publish a hole the Worker fills with overzoomed
         # GEBCO. Delete one tile and assert bundle.py now exits non-zero.
         victim = sorted(_glob.glob(f"{tmp}/store/pmtiles/**/*.pmtiles", recursive=True))[0]
@@ -965,8 +871,7 @@ if __name__ == "__main__":
     landmask._check()
     depare_run._check()
     check_priority()
-    check_shard_partition()
-    check_weighted_shards()
+    check_self_heal()
     check_stale_overview()
     check_grid_split()
     check_feather_guard()
