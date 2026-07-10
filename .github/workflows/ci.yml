@@ -52,10 +52,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/ghcr-login
-      - name: Engine + source self-checks
-        run: |
-          docker run --rm -v "$PWD:/app" "$IMAGE:$IMAGE_TAG" just test-sources
-          docker run --rm -v "$PWD:/app" "$IMAGE:$IMAGE_TAG" just test-engine
+      - name: Test suite (self-checks + workflow lint)
+        run: docker run --rm -v "$PWD:/app" "$IMAGE:$IMAGE_TAG" just test
       # The GC set-logic simulation exercises scripts/gc-collect.sh — the exact Collect step
       # gc.yml runs, the repo's only automated deletion — happy path + every refusal guard. Bare
       # bash + jq (both preinstalled on the runner); the toolchain image carries no jq, so no
