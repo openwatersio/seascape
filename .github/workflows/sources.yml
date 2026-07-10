@@ -144,8 +144,13 @@ jobs:
           if grep -q source_polygonize "sources/${{ matrix.source }}/Justfile"; then
             aws s3 ls "s3://$DATA_BUCKET/bathymetry/polygon/${{ matrix.source }}.gpkg" >/dev/null || poly_ok=false
           fi
+          # Every source must have its generated catalog.json in R2 (the `just source` tail
+          # assembles it). Missing means the source last registered before the catalog step
+          # existed — rebuild once, same shape as poly_ok.
+          catalog_ok=true
+          aws s3 ls "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/catalog.json" >/dev/null || catalog_ok=false
           if [ "$volatile" = "true" ] || [ "$FORCE" = "true" ]; then current=false
-          elif [ -n "$RECIPE_HASH" ] && [ "$have" = "$RECIPE_HASH" ] && [ "$poly_ok" = "true" ]; then current=true
+          elif [ -n "$RECIPE_HASH" ] && [ "$have" = "$RECIPE_HASH" ] && [ "$poly_ok" = "true" ] && [ "$catalog_ok" = "true" ]; then current=true
           else current=false; fi
           {
             echo "current=$current"
@@ -163,11 +168,17 @@ jobs:
           mkdir -p "store/source/${{ matrix.source }}"
           aws s3 cp "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/bounds.csv" \
             "store/source/${{ matrix.source }}/bounds.csv" 2>/dev/null || true
+      # `just source` ends in source_catalog.py, which stamps the source's recipe hash into
+      # the generated catalog.json (the same hash the .recipe-hash marker carries). Pass it in
+      # so the item matches; the pipeline stays R2-agnostic — RECIPE_HASH is just "the recipe
+      # content hash" to it, and it's empty on a laptop.
       - name: Prepare ${{ matrix.source }}
         if: steps.check.outputs.current != 'true'
+        env:
+          RECIPE_HASH: ${{ steps.check.outputs.hash }}
         run: |
           mkdir -p store
-          docker run --rm -v "$PWD:/app" -e MIRROR_ALLOW_SHRINK \
+          docker run --rm -v "$PWD:/app" -e MIRROR_ALLOW_SHRINK -e RECIPE_HASH \
             -v "$PWD/store:/app/pipelines/store" \
             "$IMAGE:$IMAGE_TAG" just source ${{ matrix.source }}
       # Mirror the upstream objects the registration just enumerated. mirror.txt is
