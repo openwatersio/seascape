@@ -1,8 +1,10 @@
 name: Build
 
 # Heavy planet build (see CONTRIBUTING.md / the port plan):
-#   image → sources (per-source matrix) → plan (cover + diff) → aggregate
-#   (sharded fan-out) → bundle + contours. Releasing/deploying is release.yml.
+#   image → plan (cover + diff) → aggregate (sharded fan-out) → bundle + contours.
+#   Source registration/preparation is sources.yml — a build never contacts a
+#   source upstream; it reads each source's last-published bounds.csv + bytes
+#   from R2. Releasing/deploying is release.yml.
 #
 # State lives in R2 under a single persistent prefix `store/` (the consolidated
 # pipelines/store dir) so rebuilds are incremental: `plan` diffs the new covering
@@ -52,11 +54,13 @@ env:
   AWS_RETRY_MODE: adaptive
   AWS_MAX_ATTEMPTS: "10"
 
-# One full build at a time, globally (not per-ref): the incremental store is shared,
-# so two builds must never run concurrently. cancel-in-progress: false → a new
-# dispatch queues behind the running build rather than cancelling it mid-write.
+# One store-mutating workflow at a time, globally (not per-ref): the incremental
+# store is shared, so a build must never interleave with another build OR with a
+# sources.yml refresh (whose prepared-source syncs use --delete) — both workflows
+# share this group. cancel-in-progress: false → a new dispatch queues behind the
+# running one rather than cancelling it mid-write.
 concurrency:
-  group: ${{ github.workflow }}
+  group: r2-store
   cancel-in-progress: false
 
 jobs:
@@ -87,88 +91,6 @@ jobs:
           tags: ${{ env.IMAGE }}:${{ env.IMAGE_TAG }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-  # Enumerate the sources (one dir per source) into a matrix.
-  discover:
-    runs-on: ubuntu-latest
-    outputs:
-      sources: ${{ steps.l.outputs.sources }}
-    steps:
-      - uses: actions/checkout@v6
-      - id: l
-        # directories only — sources/ also holds README.md
-        run: echo "sources=$(ls -d sources/*/ | xargs -n1 basename | jq -R -s -c 'split("\n")|map(select(length>0))')" >> "$GITHUB_OUTPUT"
-
-  # Prepare each source (fetch → datum → normalize → bounds → polygon → tarball)
-  # and push its store/source/<id> to R2. One source failing doesn't sink the rest:
-  # a failed source simply doesn't refresh its R2 state, so plan covers from its
-  # last successful bounds.csv (or omits a source that never succeeded) — hence the
-  # explicit `if:` on plan/aggregate below, which must run despite a red source.
-  # Cache skips re-fetching unchanged sources.
-  sources:
-    needs: [image, discover]
-    runs-on: ubuntu-latest
-    permissions: { contents: read, packages: read }
-    strategy:
-      fail-fast: false
-      matrix:
-        source: ${{ fromJSON(needs.discover.outputs.sources) }}
-    steps:
-      - uses: actions/checkout@v6
-      - uses: ./.github/actions/ghcr-login
-      # Unless a source is flagged "volatile" in metadata.json or its recipe under
-      # sources/<id>/ changed, skip the fetch and reuse R2's copy (a recipe-hash marker
-      # beside the data tracks this). Volatile sources (S-102/CUDEM) read a live
-      # upstream catalog whose tile list drifts, so they re-register every build.
-      - name: Already current in R2?
-        id: check
-        env:
-          RECIPE_HASH: ${{ hashFiles(format('sources/{0}/**', matrix.source)) }}
-        run: |
-          volatile=$(jq -r '.volatile // false' "sources/${{ matrix.source }}/metadata.json")
-          have=$(aws s3 cp "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/.recipe-hash" - 2>/dev/null || true)
-          # A source whose recipe polygonizes must have its footprint in R2 (the plan
-          # job's coverage tileset builds from bathymetry/polygon/). Missing means the
-          # source last built before the polygon push existed — rebuild once to backfill.
-          poly_ok=true
-          if grep -q source_polygonize "sources/${{ matrix.source }}/Justfile"; then
-            aws s3 ls "s3://$DATA_BUCKET/bathymetry/polygon/${{ matrix.source }}.gpkg" >/dev/null || poly_ok=false
-          fi
-          if [ "$volatile" = "true" ]; then current=false
-          elif [ -n "$RECIPE_HASH" ] && [ "$have" = "$RECIPE_HASH" ] && [ "$poly_ok" = "true" ]; then current=true
-          else current=false; fi
-          echo "current=$current" >> "$GITHUB_OUTPUT"
-          echo "hash=$RECIPE_HASH" >> "$GITHUB_OUTPUT"
-          echo "${{ matrix.source }}: recipe=$RECIPE_HASH r2=${have:-none} volatile=$volatile → current=$current"
-      # Seed the previous bounds.csv so a re-registered streaming source reuses cached
-      # tile headers and only reads newly-added URLs (CUDEM's 942 header reads → ~0 on a
-      # rebuild). Harmless for the rest: a GeoPackage source rebuilds bounds from its index,
-      # a prepared source overwrites it.
-      - name: Seed previous bounds
-        if: steps.check.outputs.current != 'true'
-        run: |
-          mkdir -p "store/source/${{ matrix.source }}"
-          aws s3 cp "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/bounds.csv" \
-            "store/source/${{ matrix.source }}/bounds.csv" 2>/dev/null || true
-      - name: Prepare ${{ matrix.source }}
-        if: steps.check.outputs.current != 'true'
-        run: |
-          mkdir -p store
-          docker run --rm -v "$PWD:/app" \
-            -v "$PWD/store:/app/pipelines/store" \
-            "$IMAGE:$IMAGE_TAG" just source ${{ matrix.source }}
-      - name: Push source to R2
-        if: steps.check.outputs.current != 'true'
-        run: |
-          aws s3 sync "store/source/${{ matrix.source }}" "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}" --delete --exclude '.recipe-hash'
-          # Provenance footprint → bathymetry/polygon/ (the plan job's coverage tileset
-          # reads them all). Guarded: streaming sources register remote COGs and build none.
-          if [ -f "store/polygon/${{ matrix.source }}.gpkg" ]; then
-            aws s3 cp "store/polygon/${{ matrix.source }}.gpkg" "s3://$DATA_BUCKET/bathymetry/polygon/${{ matrix.source }}.gpkg"
-          fi
-          # The container writes store/ as root, so write the marker to R2 from stdin
-          # (not into the root-owned dir); --exclude above keeps --delete off it.
-          printf '%s' "${{ steps.check.outputs.hash }}" | aws s3 cp - "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/.recipe-hash"
 
   # Mirror the OSM land mask AND the Overture inland-water mask to R2, rebuilding both when
   # landmask.py's recipe changes — same recipe-hash marker the sources use (a new OSM/Overture
@@ -226,11 +148,7 @@ jobs:
   # Cover the planet into aggregation tiles, diff against the previous covering,
   # and emit the shard matrix sized to the dirty count.
   plan:
-    needs: [image, sources]
-    # Run even when a source job failed (the whole build died skipped when the volatile
-    # S-102 registration hiccuped): plan reads bounds from R2, where a failed source's
-    # last successful state persists. Only a missing image is fatal.
-    if: ${{ !cancelled() && needs.image.result == 'success' }}
+    needs: [image]
     runs-on: ubuntu-latest
     permissions: { contents: read, packages: read }
     outputs:
@@ -403,9 +321,7 @@ jobs:
   # Shards re-derive the same sorted dirty list and never overlap, so each pushes
   # disjoint tile keys back to the store.
   aggregate:
-    needs: [image, sources, plan, landmask]
-    # Like plan: a red source job must not skip the build (see the sources comment).
-    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    needs: [image, plan, landmask]
     runs-on: ubuntu-latest
     permissions: { contents: read, packages: read }
     strategy:
@@ -416,7 +332,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/ghcr-login
       # Source COGs are NOT pulled — reproject range-reads them via /vsicurl from
-      # public R2 (and CUDEM from public NOAA). Only the covering + pmtiles keys.
+      # public R2 (mirrored volatile sources included). Only the covering + pmtiles keys.
       - name: Pull covering from R2
         uses: ./.github/actions/pull-covering
       - name: Prepare store

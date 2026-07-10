@@ -1,9 +1,9 @@
 """Plain HTTP download of a source's file_list.txt URLs into store/source/<id>/.
 
 Uses requests (no shell) so query-string URLs with ``&`` work. Other access
-patterns are their own steps a recipe picks instead: source_register_remote_urllist
-/ source_register_remote_geopkg (/vsicurl streaming refs), source_unzip (extract
-archives this step fetched).
+patterns are their own steps a recipe picks instead: source_mirror (volatile
+public tile collections, registered against the store's object mirror),
+source_unzip (extract archives this step fetched).
 """
 
 import os
