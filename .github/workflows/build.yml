@@ -92,59 +92,6 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # Mirror the OSM land mask AND the Overture inland-water mask to R2, rebuilding both when
-  # landmask.py's recipe changes — same recipe-hash marker the sources use (a new OSM/Overture
-  # snapshot, MERC_LAT, or the inland-water code all live in landmask.py, so hashing it catches
-  # every refresh; the pinned URL + Overture release mean the data can't drift underneath an
-  # unchanged recipe). One hash for both artifacts is correct: one file (prep + prep_water) builds
-  # both, so they can never mirror different snapshots of the module. Flagged coarse sources
-  # (GEBCO/EMODnet) clamp negative land pixels against the land mask and keep their genuine depths
-  # inside the water mask. The covering diff sees neither mask (they aren't in the aggregation
-  # CSVs), so a refresh still needs a force=true dispatch to re-aggregate the flagged tiles — the
-  # marker only automates the R2 mirror, not the diff.
-  landmask:
-    needs: image
-    runs-on: ubuntu-latest
-    permissions: { contents: read, packages: read }
-    steps:
-      - uses: actions/checkout@v6
-      - uses: ./.github/actions/ghcr-login
-      # prep-water spools EVERY non-ocean Overture water feature (rivers, lakes, canals, plus the
-      # river/stream centerlines the second pass filters out) into a temp .raw.gpkg before the
-      # polygon-only filter — tens of GB planet-wide, more than a stock runner's free root disk.
-      # Free it the same way the heaviest job (bundle) does, so the raw copy can't fill the disk
-      # mid-build. Land-only builds don't need it, but the recipe-skip path exits before writing
-      # anything, so running it unconditionally (as bundle does) is harmless and off the hot path.
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: true
-      - name: Ensure land + water masks in R2
-        env:
-          RECIPE_HASH: ${{ hashFiles('pipelines/landmask.py') }}
-        run: |
-          have=$(aws s3 cp "s3://$DATA_BUCKET/bathymetry/landmask/.recipe-hash" - 2>/dev/null || true)
-          if [ -n "$RECIPE_HASH" ] && [ "$have" = "$RECIPE_HASH" ]; then
-            echo "land + water masks current in R2 (recipe unchanged)"; exit 0
-          fi
-          echo "masks stale or missing (recipe=$RECIPE_HASH r2=${have:-none}) — rebuilding both"
-          mkdir -p store
-          # No `|| true` / continue-on-error on either build: a broken water mask fails the job
-          # exactly like a broken land mask, and the marker below is written last so a failure
-          # anywhere leaves the hash stale → next build retries instead of trusting a half-mirror.
-          docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just landmask
-          docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just watermask
-          aws s3 cp store/landmask/land.fgb "s3://$DATA_BUCKET/bathymetry/landmask/land.fgb"
-          aws s3 cp store/landmask/water.fgb "s3://$DATA_BUCKET/bathymetry/landmask/water.fgb"
-          # Marker last, only after BOTH uploads land: a crash in between re-runs next build
-          # rather than parking a "current" hash over a missing/stale water.fgb.
-          printf '%s' "$RECIPE_HASH" | aws s3 cp - "s3://$DATA_BUCKET/bathymetry/landmask/.recipe-hash"
-
   # Cover the planet into aggregation tiles, diff against the previous covering,
   # and emit the shard matrix sized to the dirty count.
   plan:
@@ -321,7 +268,7 @@ jobs:
   # Shards re-derive the same sorted dirty list and never overlap, so each pushes
   # disjoint tile keys back to the store.
   aggregate:
-    needs: [image, plan, landmask]
+    needs: [image, plan]
     runs-on: ubuntu-latest
     permissions: { contents: read, packages: read }
     strategy:
