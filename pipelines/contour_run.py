@@ -405,12 +405,12 @@ def bundle(shard=None):
         return
     maxz = bundle_maxz(_global_maxz(fgbs))
     utils.create_folder("store/bundle")
-    if shard is not None:  # CI: lines only; soundings/drying join once at the merge step
+    if shard is not None:  # CI: lines only; soundings/depare join once at the merge step
         out = f"store/bundle/contours-shard-{shard}.pmtiles"
         _tippecanoe(fgbs, 0, maxz, out)
         print(f"contour shard {shard}: {out} (z0-{maxz}, {len(fgbs)} FGBs)")
         return
-    # Local whole-set: tippecanoe the lines, then fold in soundings/drying.
+    # Local whole-set: tippecanoe the lines, then fold in soundings/depare.
     lines = "store/contour/contours-lines.pmtiles"
     _tippecanoe(fgbs, 0, maxz, lines)
     _finalize_contours([lines])

@@ -340,7 +340,7 @@ jobs:
           # No R2 listing here: the shard reads its work from the plan's frozen dirty list
           # (shipped in the covering tarball, pulled above), so every shard partitions the
           # SAME list. Reproject range-reads sources via /vsicurl, so no pmtiles are pulled.
-          mkdir -p store/pmtiles store/contour store/soundings store/drying store/depare
+          mkdir -p store/pmtiles store/contour store/soundings store/depare
       - name: Aggregate shard ${{ matrix.shard.i }}/${{ matrix.shard.n }}
         run: |
           # SOURCE_VSI_BASE → reproject resolves each source tile to a public /vsicurl

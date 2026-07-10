@@ -33,11 +33,10 @@ PIPE = os.path.dirname(os.path.abspath(__file__))
 def run(tmp, *args):
     # Small macrotile_z / num_overviews keep the synthetic rasters tiny.
     # SKIP_CONTOURS/SKIP_SMOOTH: this is the raster priority test (both have/need none).
-    # SKIP_DRYING: this synthetic world has no land mask, so drying (which needs one) is off here;
-    # check_drying exercises it directly against a mask.
+    # depare still runs (all-negative sources -> depth bands only, no drying/nodata, no mask
+    # needed); check_depare_drying / check_depare_water exercise those paths against real masks.
     env = {**os.environ, "SOURCES_DIR": "sources", "PYTHONPATH": PIPE,
-           "MACROTILE_Z": "10", "NUM_OVERVIEWS": "2", "SKIP_CONTOURS": "1", "SKIP_SMOOTH": "1",
-           "SKIP_DRYING": "1"}
+           "MACROTILE_Z": "10", "NUM_OVERVIEWS": "2", "SKIP_CONTOURS": "1", "SKIP_SMOOTH": "1"}
     subprocess.run([sys.executable, os.path.join(PIPE, args[0]), *args[1:]],
                    cwd=tmp, env=env, check=True)
 
@@ -515,31 +514,59 @@ def check_feather_guard():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def check_drying():
-    """The drying fork through the REAL drying_run.generate(): off a merged DEM + the tile's land
-    mask it polygonizes the foreshore (0 <= elev <= DRYING_CAP, seaward of land) into a `drying`
-    layer. Two adjacent tiles carry the same world band across their shared edge, so the assertions
-    cover: polygons over the band, none under land, none over above-cap topo, and — the seam
-    contract — the two tiles' polygons meet at the boundary (each clipped exactly to its bbox)."""
+def check_depare_drying():
+    """Contour-derived drying through the REAL depare_run.generate(): the metre ladder's
+    [0, DRYING_CAP] bucket, kept where it is effective WATER = (NOT land) OR inland water — i.e.
+    cut by effective LAND = OSM land ∖ inland water (bucket ∖ land ∪ bucket ∩ water). A foreshore
+    (+2) DEM meets the OSM land + inland-water masks, so the assertions cover the load-bearing
+    cases: a foreshore seaward of the land line -> drying; the SAME height inside effective land
+    (land, no water) -> cut, NOT drying; a foreshore inside a water polygon nested in the land
+    coverage -> STILL drying (the ICW/tidal-channel case — cutting by RAW land would delete it);
+    drying carries drval1 < 0, drval2 = 0, NO sys, the drying rank; bands ∪ drying ∪ nodata stay
+    pairwise disjoint; and two adjacent tiles' drying meets at the shared seam (deterministic on
+    the buffered grid, each clipped exactly to its bbox)."""
     import geopandas as gpd
     import mercantile
     from pyproj import Transformer
-    from shapely.geometry import Point
+    from shapely.geometry import Point, box
 
     import config
-    import drying_run
+    import depare_run
     from aggregation_reproject import get_resolution
 
     tmp = tempfile.mkdtemp()
     cwd = os.getcwd()
+    saved_landmask = os.environ.pop("LANDMASK", None)    # else an exported dev mask overrides
+    saved_watermask = os.environ.pop("WATERMASK", None)  # the synthetic ones
     cap = config.DRYING_CAP
-    aid = "01DRYINGDRYINGDRYINGDRYING"
+    aid = "01DRYGEODRYGEODRYGEODRYGEO"
     try:
         os.chdir(tmp)
         to4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
+        left = mercantile.Tile(x=301, y=384, z=10)
+        right = mercantile.Tile(x=302, y=384, z=10)          # shares left's east edge
+        bl, br = mercantile.xy_bounds(left), mercantile.xy_bounds(right)
+        wL, wR = bl.right - bl.left, br.right - br.left
+        m = 1000.0  # y margin (metres) so the mask boxes overhang the tile height
 
-        def build(tile):
-            """Write a merged DEM + land mask for `tile` on its native 3857 grid, run generate()."""
+        os.makedirs("store/landmask", exist_ok=True)
+        # land covers left [0.15..1.0] + right [0..0.30]; inland water (a channel) covers left
+        # [0.55..1.0] + right [0..0.30] — nested INSIDE the land, the ICW geometry. The land box
+        # reaches past the seam so both tiles' east/west foreshore is under land.
+        land_box = box(bl.left + 0.15 * wL, bl.bottom - m, br.left + 0.30 * wR, bl.top + m)
+        water_box = box(bl.left + 0.55 * wL, bl.bottom - m, br.left + 0.30 * wR, bl.top + m)
+        gpd.GeoDataFrame(geometry=[land_box], crs="EPSG:3857").to_file(
+            "store/landmask/land.fgb", driver="FlatGeobuf")
+        gpd.GeoDataFrame({"kind": ["lake"]}, geometry=[water_box], crs="EPSG:3857").to_file(
+            "store/landmask/water.fgb", driver="FlatGeobuf")
+        os.environ["LANDMASK"] = "store/landmask/land.fgb"
+        os.environ["WATERMASK"] = "store/landmask/water.fgb"
+
+        NODATA = -9999.0
+
+        def build(tile, cols):
+            """Write a merged DEM (foreshore +2 with the given -25 band / NODATA column spans on a
+            +2 baseline) for `tile` on its native 3857 grid, run generate()."""
             stem = f"{tile.z}-{tile.x}-{tile.y}-{tile.z}"  # child_z == z: a native 512 px tile
             tdir = f"store/aggregation/{aid}/{stem}-tmp"
             os.makedirs(tdir, exist_ok=True)
@@ -547,43 +574,74 @@ def check_drying():
             res = get_resolution(tile.z)
             px = round((b.right - b.left) / res)
             tr = from_origin(b.left, b.top, res, res)
-            q = px // 5
-            dem = np.full((px, px), -50.0, dtype="float32")  # deep water baseline
-            dem[:q, :] = 2.0            # north band, in-band value but UNDER land -> excluded
-            dem[q:2 * q, :] = cap + 50  # water above the cap -> not drying
-            dem[2 * q:3 * q, :] = 2.0   # water in-band -> DRYING
-            land = np.zeros((px, px), dtype="uint8")
-            land[:q, :] = 1             # land = the north fifth
+            dem = np.full((px, px), 2.0, dtype="float32")  # [0, cap] foreshore baseline
+            for lo, hi, v in cols:
+                dem[:, int(lo * px):int(hi * px)] = v
             with rasterio.open(f"{tdir}/0-3857.tiff", "w", driver="GTiff", height=px, width=px,
-                               count=1, dtype="float32", nodata=-9999, crs="EPSG:3857",
+                               count=1, dtype="float32", nodata=NODATA, crs="EPSG:3857",
                                transform=tr) as d:
                 d.write(dem, 1)
-            with rasterio.open(f"{tdir}/landmask.tif", "w", driver="GTiff", height=px, width=px,
-                               count=1, dtype="uint8", nodata=0, crs="EPSG:3857", transform=tr) as d:
-                d.write(land, 1)
-            drying_run.generate(f"store/aggregation/{aid}/{stem}-aggregation.csv")
-            row_lonlat = lambda r: to4326.transform(*(tr * (px // 2 + 0.5, r + 0.5)))
-            return (gpd.read_file(f"store/drying/{stem}.fgb"),
-                    {"band": Point(row_lonlat(2 * q + q // 2)),   # water in-band cell centre
-                     "land": Point(row_lonlat(q // 2)),           # in-band cell under land
-                     "cap": Point(row_lonlat(q + q // 2))})       # above-cap water cell
+            depare_run.generate(f"store/aggregation/{aid}/{stem}-aggregation.csv")
+            return gpd.read_file(f"store/depare/{stem}.fgb")
 
-        left = mercantile.Tile(x=301, y=384, z=10)
-        right = mercantile.Tile(x=302, y=384, z=10)          # shares left's east edge
-        gL, pts = build(left)
-        gR, _ = build(right)
-        assert len(gL) > 0, "drying must produce foreshore polygons"
-        assert gL.covers(pts["band"]).any(), "a drying polygon must cover the water foreshore band"
-        assert not gL.covers(pts["land"]).any(), "no drying polygon may cover land"
-        assert not gL.covers(pts["cap"]).any(), "no drying polygon may cover above-cap topo"
+        # left: open foreshore | cut foreshore (under land) | -25 band | NODATA | ICW foreshore
+        # (under land AND water, reaching the east seam). right: ICW foreshore reaching the west
+        # seam | -25 band. The +2 baseline fills the rest (open on the west, ICW on the east).
+        gL = build(left, [(0.35, 0.55, -25.0), (0.55, 0.70, NODATA)])
+        gR = build(right, [(0.30, 1.0, -25.0)])
 
-        # Seam: left's polygons reach its east edge, right's reach its west edge, and they are the
-        # same longitude (each clipped exactly to its bbox) — so the fills meet across the boundary.
+        def frac_pt(b, fx, fy):
+            return Point(*to4326.transform(b.left + (b.right - b.left) * fx,
+                                           b.bottom + (b.top - b.bottom) * fy))
+        openp = frac_pt(bl, 0.07, 0.5)    # foreshore seaward of the land line -> drying
+        cut = frac_pt(bl, 0.25, 0.5)      # foreshore inside effective land (no water) -> NOT drying
+        band = frac_pt(bl, 0.45, 0.5)     # -25 -> a depth band
+        nod = frac_pt(bl, 0.62, 0.5)      # NODATA under the water polygon -> nodata
+        icw = frac_pt(bl, 0.85, 0.5)      # foreshore inside water nested in land -> STILL drying
+
+        assert gL is not None and len(gL), "left tile must produce depare features"
+        dry = gL[gL["drval1"] < 0]
+        assert len(dry), "the foreshore must produce drying features"
+        assert dry.covers(openp).any(), "foreshore seaward of the land line must be drying"
+        assert not gL.covers(cut).any(), "foreshore inside effective land (no water) must be cut"
+        assert dry.covers(icw).any(), \
+            "foreshore inside a water polygon nested in land must stay drying (the ICW case)"
+
+        # drying schema: drval1 = -cap, drval2 = 0, NO sys, the drying rank.
+        assert (dry["drval1"] == -cap).all() and (dry["drval2"] == 0.0).all(), "drying drval schema"
+        assert dry["sys"].isna().all(), "drying ships once, with no sys"
+        assert (dry["rank"] == depare_run.DRYING_RANK).all(), "drying rank"
+
+        # The three kinds coexist and are pairwise disjoint (per-point, and by area).
+        assert (gL[gL.covers(band)]["drval1"] == 20.0).any(), "-25 m -> the [20,30] band"
+        nd = gL[gL.covers(nod)]
+        assert len(nd) and nd["drval1"].isna().all() and (nd["kind"] == "lake").all(), \
+            "NODATA under the water polygon -> nodata (kind, no drval1)"
+        kinds = {"band": gL[gL["drval1"] >= 0], "drying": dry, "nodata": gL[gL["drval1"].isna()]}
+        assert all(len(v) for v in kinds.values()), "left tile must carry all three depare kinds"
+        from shapely.ops import unary_union
+        merged = {k: unary_union(list(v.geometry)) for k, v in kinds.items()}
+        for a, bb in (("band", "drying"), ("band", "nodata"), ("drying", "nodata")):
+            inter = merged[a].intersection(merged[bb]).area
+            assert inter < 1e-6 * gL.geometry.area.sum(), f"{a} ∩ {bb} not disjoint ({inter})"
+
+        # Seam: left's ICW drying reaches its east edge, right's reaches its west edge, same
+        # longitude — the drying fills meet across the boundary (the bands' seam contract).
         seam = mercantile.bounds(left).east
-        assert abs(gL.total_bounds[2] - seam) < 1e-4, f"left drying stops short of the seam: {gL.total_bounds[2]}"
-        assert abs(gR.total_bounds[0] - seam) < 1e-4, f"right drying stops short of the seam: {gR.total_bounds[0]}"
-        print("drying ok — foreshore band tinted, land/above-cap excluded, tiles meet at the seam")
+        dryR = gR[gR["drval1"] < 0]
+        assert len(dryR), "right tile must carry drying at the shared seam"
+        assert abs(dry.total_bounds[2] - seam) < 1e-4, f"left drying stops short of the seam: {dry.total_bounds[2]}"
+        assert abs(dryR.total_bounds[0] - seam) < 1e-4, f"right drying stops short of the seam: {dryR.total_bounds[0]}"
+        print("depare-drying ok — foreshore drying, effective-land cut, ICW kept, disjoint, seam meets")
     finally:
+        if saved_landmask is not None:
+            os.environ["LANDMASK"] = saved_landmask
+        else:
+            os.environ.pop("LANDMASK", None)
+        if saved_watermask is not None:
+            os.environ["WATERMASK"] = saved_watermask
+        else:
+            os.environ.pop("WATERMASK", None)
         os.chdir(cwd)
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -600,6 +658,7 @@ def check_depare():
     from pyproj import Transformer
     from shapely.geometry import Point
 
+    import config
     import depare_run
     from aggregation_reproject import get_resolution
 
@@ -621,7 +680,7 @@ def check_depare():
             tr = from_origin(b.left, b.top, res, res)
             q = px // 4
             dem = np.full((px, px), -150.0, dtype="float32")  # [100,200] bucket baseline
-            dem[:q, :] = 8.0             # land -> no partition
+            dem[:q, :] = config.DRYING_CAP + 50  # land above the cap -> neither band nor drying
             dem[q:2 * q, :] = -1.0       # -> the [0,2] bucket
             dem[2 * q:3 * q, :] = -25.0  # -> the [20,30] bucket
             with rasterio.open(f"{tdir}/0-3857.tiff", "w", driver="GTiff", height=px, width=px,
@@ -665,20 +724,18 @@ def check_depare():
 
 
 def check_depare_water():
-    """Part 3 nodata + drying folding through the REAL depare_run.generate(): with the inland-water
-    polygons published (WATERMASK) and the tile's drying FGB present, generate() emits three kinds
-    in ONE depare layer. A #24-cleared lake (uniform-0 DEM) yields nodata (carries `kind`, NO
-    drval1); the surveyed part yields depth bands; the drying FGB folds in with drval1 < 0 and the
-    drying rank; the three are disjoint where the plan requires it (nodata∩bands and nodata∩drying
-    empty — the drying box is subtracted from nodata); neighbouring tiles' nodata meet at the seam;
-    and a tile with no water polygon (ocean) gains no nodata."""
+    """Part 3 nodata through the REAL depare_run.generate(): with the inland-water polygons
+    published (WATERMASK), an unsurveyed lake the merge left as NODATA yields the `nodata` kind
+    (carries `kind`, NO drval1/drval2/sys, the nodata rank) while the surveyed part yields depth
+    bands; nodata∩bands is empty (water MINUS the band coverage); neighbouring tiles' nodata meet
+    at the seam; and a tile with no water polygon (ocean) gains no nodata. Drying's derivation is
+    exercised in check_depare_drying."""
     import geopandas as gpd
     import mercantile
     import numpy as np
     from pyproj import Transformer
     from shapely.geometry import Point, box
 
-    import config
     import depare_run
     from aggregation_reproject import get_resolution
 
@@ -686,6 +743,7 @@ def check_depare_water():
     cwd = os.getcwd()
     saved_watermask = os.environ.get("WATERMASK")
     aid = "01DEPAREWATERDEPAREWATERDE"
+    NODATA = -9999.0
     try:
         os.chdir(tmp)
         to4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
@@ -698,12 +756,11 @@ def check_depare_water():
         wbox = box(min(bl.left, br.left), min(bl.bottom, br.bottom),
                    max(bl.right, br.right), max(bl.top, br.top))
         os.makedirs("store/landmask", exist_ok=True)
-        os.makedirs("store/drying", exist_ok=True)
         gpd.GeoDataFrame({"kind": ["lake"]}, geometry=[wbox], crs="EPSG:3857").to_file(
             "store/landmask/water.fgb", driver="FlatGeobuf")
         os.environ["WATERMASK"] = "store/landmask/water.fgb"
 
-        def build(tile, lake_side=None, drying=False, deep=False):
+        def build(tile, lake_side=None, deep=False):
             stem = f"{tile.z}-{tile.x}-{tile.y}-{tile.z}"  # child_z == z: a native 512 px tile
             tdir = f"store/aggregation/{aid}/{stem}-tmp"
             os.makedirs(tdir, exist_ok=True)
@@ -717,23 +774,18 @@ def check_depare_water():
                 dem = np.full((px, px), -25.0, dtype="float32")   # surveyed baseline ([20,30] band)
                 q = px // 2
                 if lake_side == "east":
-                    dem[:, q:] = 0.0     # cleared lake (no band -> nodata), reaching the east seam
+                    dem[:, q:] = NODATA  # unsurveyed lake (no depth -> nodata), reaching the east seam
                 elif lake_side == "west":
-                    dem[:, :q] = 0.0     # cleared lake -> nodata, reaching the west seam
+                    dem[:, :q] = NODATA  # unsurveyed lake -> nodata, reaching the west seam
             with rasterio.open(f"{tdir}/0-3857.tiff", "w", driver="GTiff", height=px, width=px,
-                               count=1, dtype="float32", nodata=-9999, crs="EPSG:3857",
+                               count=1, dtype="float32", nodata=NODATA, crs="EPSG:3857",
                                transform=tr) as d:
                 d.write(dem, 1)
-            if drying:  # a small drying box in the east (lake) region, in 4326 like drying_run writes
-                dbox = box(b.left + (b.right - b.left) * 0.70, b.bottom + (b.top - b.bottom) * 0.40,
-                           b.left + (b.right - b.left) * 0.85, b.bottom + (b.top - b.bottom) * 0.60)
-                gpd.GeoDataFrame(geometry=[dbox], crs="EPSG:3857").to_crs("EPSG:4326").to_file(
-                    f"store/drying/{stem}.fgb", driver="FlatGeobuf")
             depare_run.generate(f"store/aggregation/{aid}/{stem}-aggregation.csv")
             path = f"store/depare/{stem}.fgb"
             return gpd.read_file(path) if os.path.isfile(path) else None
 
-        gL = build(left, lake_side="east", drying=True)
+        gL = build(left, lake_side="east")
         gR = build(right, lake_side="west")
         gO = build(ocean, deep=True)
 
@@ -741,14 +793,12 @@ def check_depare_water():
             return Point(*to4326.transform(b.left + (b.right - b.left) * fx,
                                            b.bottom + (b.top - b.bottom) * fy))
         surveyed = frac_pt(bl, 0.25, 0.5)     # west half, DEM -25 -> a band
-        lake = frac_pt(bl, 0.55, 0.85)        # east half, DEM 0, clear of the drying box -> nodata
-        drying_pt = frac_pt(bl, 0.775, 0.50)  # inside the drying box -> drying, not nodata
+        lake = frac_pt(bl, 0.75, 0.5)         # east half, NODATA -> nodata
 
         assert gL is not None and len(gL), "left tile must produce depare features"
-        band = gL["drval1"] >= 0              # NaN (nodata) and <0 (drying) both compare False
+        band = gL["drval1"] >= 0
         nodata = gL["drval1"].isna()
-        dry = gL["drval1"] < 0
-        assert band.any() and nodata.any() and dry.any(), "left tile must carry all three depare kinds"
+        assert band.any() and nodata.any(), "left tile must carry both depth bands and nodata"
 
         # nodata: carries kind, NO drval1/drval2/sys, the nodata rank
         nd = gL[nodata]
@@ -756,19 +806,13 @@ def check_depare_water():
         assert nd["drval2"].isna().all(), "nodata must carry no drval2"
         assert nd["sys"].isna().all(), "nodata must carry no sys (emitted once, unit-independent)"
         assert (nd["rank"] == depare_run.NODATA_RANK).all(), "nodata rank"
-        # drying: negative drval1, drval2 == 0, the drying rank (draws over bands)
-        dr = gL[dry]
-        assert (dr["drval2"] == 0).all() and (dr["rank"] == depare_run.DRYING_RANK).all(), "drying schema"
         assert (gL[band]["rank"] == depare_run.BAND_RANK).all(), "band rank"
 
-        # pairwise-disjoint where the plan requires it (nodata∩bands, nodata∩drying empty)
-        assert (gL[gL.covers(surveyed)]["drval1"] >= 0).any(), "surveyed water -> a depth band"
+        # nodata ∩ bands empty (nodata is the water MINUS the band coverage)
+        assert (gL[gL.covers(surveyed)]["drval1"] >= 0).all(), "surveyed water -> a depth band"
         assert not gL[gL.covers(surveyed)]["drval1"].isna().any(), "surveyed water must not be nodata"
         lh = gL[gL.covers(lake)]
-        assert len(lh) and lh["drval1"].isna().all(), "the cleared lake -> nodata only (no band)"
-        dh = gL[gL.covers(drying_pt)]
-        assert (dh["drval1"] < 0).any(), "the drying box -> a drying feature (drval1 < 0)"
-        assert not dh["drval1"].isna().any(), "drying is subtracted from nodata (none there)"
+        assert len(lh) and lh["drval1"].isna().all(), "the unsurveyed lake -> nodata only (no band)"
 
         # Seam: left's lake nodata reaches its east edge, right's reaches its west edge — they meet.
         seam = mercantile.bounds(left).east
@@ -780,7 +824,7 @@ def check_depare_water():
         # Ocean: bands, but NO nodata (no water polygon reaches this tile).
         assert gO is not None and len(gO) and (gO["drval1"] >= 0).all(), \
             "ocean tile must be all depth bands — no water polygon, so no nodata"
-        print("depare-water ok — cleared lake→nodata(kind), drying→drval1<0, disjoint, seam meets, ocean none")
+        print("depare-water ok — unsurveyed lake→nodata(kind), nodata∩bands empty, seam meets, ocean none")
     finally:
         if saved_watermask is None:
             os.environ.pop("WATERMASK", None)
@@ -917,10 +961,8 @@ def main():
 
 if __name__ == "__main__":
     import depare_run
-    import drying_run
     import landmask
     landmask._check()
-    drying_run._check()
     depare_run._check()
     check_priority()
     check_shard_partition()
@@ -930,7 +972,7 @@ if __name__ == "__main__":
     check_feather_guard()
     check_land_clamp()
     check_water_clamp()
-    check_drying()
     check_depare()
+    check_depare_drying()
     check_depare_water()
     main()
