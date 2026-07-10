@@ -8,10 +8,10 @@ from whatever sources are there.
 
 The grid is deliberately source-agnostic. Grouping overlays by source made each
 archive's size a function of a source's footprint: one deep source whose bbox
-swallowed the continent's interior became a catch-all that outgrew a CI runner's
+swallowed the continent's interior became a catch-all that outgrew the build box's
 disk, and every new source made it worse. A grid cell is a fixed fraction of the
-globe, so new sources add *cells*, never bytes-per-cell; if a cell ever outgrows a
-runner, raise OVERLAY_SPLIT_Z. It also gives the serving Worker an O(1) route: the
+globe, so new sources add *cells*, never bytes-per-cell; if a cell ever outgrows the
+box, raise OVERLAY_SPLIT_Z. It also gives the serving Worker an O(1) route: the
 owning cell is computed from the tile address (no footprint search).
 
 ``manifest.json`` records planet metadata + ``overlay`` ({split_z, cells: {cell:
@@ -27,6 +27,7 @@ import math
 import os
 import sys
 from glob import glob
+from multiprocessing import get_context
 
 import mercantile
 from pmtiles.tile import zxy_to_tileid, TileType, Compression
@@ -42,7 +43,7 @@ PLANET_MAX_ZOOM = int(os.environ.get("PLANET_MAX_ZOOM", str(utils.macrotile_z)))
 # its ancestor cell at this zoom; one archive per populated cell.
 SPLIT_Z = int(os.environ.get("OVERLAY_SPLIT_Z", "5"))
 # cell_of shifts by (z - SPLIT_Z), so the grid must sit at or above the shallowest
-# overlay content zoom — fail fast here, not as a ValueError inside a matrix job.
+# overlay content zoom — fail fast here, not as a ValueError deep in the bundle.
 if SPLIT_Z > PLANET_MAX_ZOOM + 1:
     sys.exit(f"OVERLAY_SPLIT_Z ({SPLIT_Z}) must be <= PLANET_MAX_ZOOM + 1 ({PLANET_MAX_ZOOM + 1})")
 
@@ -176,10 +177,10 @@ def bundle_group(name, filepaths):
 def verify_complete(aggregation_id):
     """Every covering must have produced a pmtiles, or the pyramid has a silent hole.
     create_tile (aggregate) and run_one (downsample) emit one pmtiles per covering, so a
-    covering with no pmtiles means a shard never ran or didn't sync — the Worker overzooms
+    covering with no pmtiles means a failed/interrupted run — the Worker overzooms
     GEBCO into that hole, so it renders as missing high-zoom terrain. Fail rather than
-    publish it. (downsampling.execute catches gaps a *running* shard sees; this catches a
-    shard that produced nothing at all, which leaves nothing for execute to notice.)"""
+    publish it. (downsampling.execute catches gaps a *running* pass sees; this catches a
+    covering that produced nothing at all, which leaves nothing for execute to notice.)"""
     coverings = covering_stems(aggregation_id)
     have = {fp.split("/")[-1].replace(".pmtiles", "")
             for fp in glob("store/pmtiles/*.pmtiles") + glob("store/pmtiles/*/*.pmtiles")}
@@ -187,14 +188,14 @@ def verify_complete(aggregation_id):
     if missing:
         raise SystemExit(
             f"pyramid incomplete: {len(missing)} of {len(coverings)} coverings have no pmtiles "
-            f"(a failed/unsynced aggregate or downsample shard) — e.g. "
+            f"(a failed/interrupted aggregate or downsample run) — e.g. "
             f"{', '.join(missing[:15])}{' …' if len(missing) > 15 else ''}")
 
 
 def _fragment(name, meta):
-    """One per-group manifest fragment so a matrix bundle job's metadata survives to
-    the merge step. Planet keeps its full metadata; an overlay cell only needs its
-    max_zoom (the Worker computes the cell from the tile address — no bbox search)."""
+    """One per-group manifest fragment (a picklable Pool worker return). Planet keeps its full
+    metadata; an overlay cell only needs its max_zoom (the Worker computes the cell from the
+    tile address — no bbox search)."""
     if name == "planet":
         return {"kind": "planet", **meta}
     return {"kind": "cell", "cell": name, "max_zoom": meta["max_zoom"]}
@@ -212,78 +213,29 @@ def _manifest_from_fragments(frags):
     return manifest
 
 
-def groups_matrix(maxn):
-    """Verify the pyramid is whole, then print the CI bundle matrix: <= maxn chunks
-    of comma-joined group names, bin-packed by each group's local pmtiles bytes so
-    every chunk carries about the biggest single group (one-group chunks meant 235
-    runners each spending longer on spin-up than on bundling). The partition rides
-    IN the matrix (not re-derived per job from a live R2 listing), so every job
-    bundles the exact set this full-store runner saw — the same freeze-the-plan
-    reasoning as the aggregate/downsample shards."""
-    aggregation_id = utils.get_aggregation_ids()[-1]
-    verify_complete(aggregation_id)
-    groups = group_filepaths(aggregation_id)
-    weights = {name: sum(os.path.getsize(fp) for fp in fps) for name, fps in groups.items()}
-    n = min(maxn, math.ceil(sum(weights.values()) / max(max(weights.values()), 1))) if weights else 1
-    print(json.dumps([{"cells": ",".join(sorted(chunk))} for chunk in utils.lpt_bins(weights, n)]))
-
-
-def group_keys(name):
-    """Write store/keys.txt: the R2 pmtiles keys belonging to one group, derived from the
-    R2 listing (store/pmtiles-keys.txt) by the same rule group_filepaths uses on local
-    files — so a matrix job pulls ONLY its group's slice, never the whole store."""
-    aggregation_id = utils.get_aggregation_ids()[-1]
-    stems = covering_stems(aggregation_id)
-    out = []
-    with open("store/pmtiles-keys.txt") as f:
-        for key in f:
-            key = key.strip()
-            if not key.endswith(".pmtiles"):
-                continue
-            stem = key.split("/")[-1].replace(".pmtiles", "")
-            if stem not in stems:  # orphan from a re-tiled covering (see covering_stems)
-                continue
-            try:
-                if name in stem_groups(stem):
-                    out.append(key)
-            except ValueError:
-                continue
-    with open("store/keys.txt", "w") as f:
-        f.write("".join(k + "\n" for k in out))
-    print(f"group {name}: {len(out)} pmtiles selected")
-
-
-def group(name):
-    """Bundle one group from the tiles pulled locally (its slice only) + write its
-    fragment. Disk stays bounded by one group's tiles + output, not the whole planet."""
-    filepaths = sorted(glob("store/pmtiles/*.pmtiles") + glob("store/pmtiles/*/*.pmtiles"))
-    meta = bundle_group(name, filepaths)
-    utils.create_folder("store/bundle")
-    with open(f"store/bundle/{name}.json", "w") as f:
-        json.dump(_fragment(name, meta), f)
-
-
-def merge():
-    """Assemble manifest.json from the per-group fragments the matrix jobs produced."""
-    frags = [json.load(open(jf)) for jf in sorted(glob("store/bundle/*.json"))]
-    manifest = _manifest_from_fragments(frags)
-    utils.create_folder("store/bundle")
-    with open("store/bundle/manifest.json", "w") as f:
-        json.dump(manifest, f, indent=2)
-    print(f"merged manifest: planet + {len(manifest['overlay']['cells'])} overlay cell(s)")
+def _bundle_one(item):
+    """One (name, filepaths) → its manifest fragment. Top-level so a spawn Pool can pickle it."""
+    name, filepaths = item
+    return _fragment(name, bundle_group(name, filepaths))
 
 
 def main():
-    """Local / single-runner: bundle every group sequentially, biggest first. The pmtiles
-    writer spools each tile to a temp file then copies it into the archive (finalize ~2x's
-    a bundle on disk), so building all groups at once piled every temp+final onto one disk
-    and blew it at planet scale — CI fans this out in cell chunks instead."""
+    """Bundle every group (planet base + one overlay per populated grid cell) and write
+    manifest.json. Groups are independent — the overlay cells share no tiles and the planet
+    base is one unit — so they fan out across a process Pool.
+
+    SPAWN, not fork: bundle imports rasterio (via utils), which inits GDAL at module load, and
+    GDAL is not fork-safe (see downsampling.execute). Ceiling: the pmtiles writer spools each
+    tile then copies it into the archive, so finalize ~2x's a group's footprint — peak
+    memory/disk ≈ pool workers × the biggest group (the planet base). It fits the build box
+    today; if the planet base ever outgrows that, cap the pool or bundle planet on its own."""
     aggregation_id = utils.get_aggregation_ids()[-1]
     verify_complete(aggregation_id)
     groups = group_filepaths(aggregation_id)
-    frags = []
-    for name, filepaths in sorted(groups.items(), key=lambda kv: -len(kv[1])):
-        frags.append(_fragment(name, bundle_group(name, filepaths)))
+    utils.create_folder("store/bundle")
+    items = sorted(groups.items(), key=lambda kv: -len(kv[1]))  # biggest first → no straggler tail
+    with get_context("spawn").Pool() as pool:
+        frags = pool.map(_bundle_one, items)
     manifest = _manifest_from_fragments(frags)
     with open("store/bundle/manifest.json", "w") as f:
         json.dump(manifest, f, indent=2)
@@ -294,13 +246,5 @@ if __name__ == "__main__":
     a = sys.argv[1:]
     if not a:
         main()
-    elif a[:1] == ["matrix"] and len(a) == 2:
-        groups_matrix(int(a[1]))
-    elif a[:1] == ["group-keys"] and len(a) == 2:
-        group_keys(a[1])
-    elif a[:1] == ["group"] and len(a) == 2:
-        group(a[1])
-    elif a[:1] == ["merge"]:
-        merge()
     else:
-        sys.exit("usage: bundle.py [matrix <max> | group-keys <name> | group <name> | merge]")
+        sys.exit("usage: bundle.py  (no args — bundle planet + overlays + manifest.json)")
