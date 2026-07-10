@@ -5,16 +5,9 @@ tiles whose source set changed since the previous run (or all on the first run),
 skips those already marked done, and parallelizes across tiles with a process pool.
 
 CLI:
-  aggregation_run.py                 process every dirty tile (local `just planet`)
-  aggregation_run.py freeze          write the dirty list into the covering (plan, once)
-  aggregation_run.py shard <i> <n>   process the frozen dirty[i::n] (matrix shard i of n)
-  aggregation_run.py matrix <max>    print the shard matrix JSON (sized to the dirt)
-
-`shard` takes a strided slice of the single dirty list `freeze` wrote, so every shard
-partitions the identical list — no overlap, no coordination, nothing recomputed per shard.
+  aggregation_run.py   process every dirty tile (one machine — the build box or a laptop)
 """
 
-import json
 import os
 import shutil
 import sys
@@ -60,11 +53,9 @@ def run(filepath):
 
 
 def covering_sorted():
-    """Every aggregation CSV in the current covering, heaviest-first. Depends ONLY on the
-    immutable covering, never on which tiles are already built — so every shard derives the
-    identical tile order, and thus identical ownership, regardless of when it runs. child_z
-    is a strong cost proxy (each level quadruples output tiles + contour features), so the
-    heaviest-first stride hands each shard a balanced mix."""
+    """Every aggregation CSV in the current covering, heaviest-first. child_z is a strong cost
+    proxy (each level quadruples output tiles + contour features), so processing heaviest-first
+    keeps the process pool balanced (the longest tiles start first, no straggler tail)."""
     aggregation_id = utils.get_aggregation_ids()[-1]
     csvs = glob(f"store/aggregation/{aggregation_id}/*-aggregation.csv")
 
@@ -104,32 +95,6 @@ def dirty_filepaths():
     return [fp for fp in covering_sorted() if is_dirty(fp)]
 
 
-FROZEN = "_dirty-aggregate.txt"
-
-
-def freeze():
-    """Write the dirty work list into the covering dir, computed ONCE, so it travels with the
-    covering to every shard and they all partition the identical list."""
-    aggregation_id = utils.get_aggregation_ids()[-1]
-    with open(f"store/aggregation/{aggregation_id}/{FROZEN}", "w") as f:
-        f.write("".join(fp + "\n" for fp in dirty_filepaths()))
-
-
-def work_list():
-    """The frozen dirty list if present (every shard reads the SAME one, so the [i::n] stride
-    partitions identically across shards), else compute it live (local single-machine runs).
-    Freezing is load-bearing for sharding: when each shard recomputed the dirty set itself it
-    saw the store at a different moment — as sibling shards filled it in, the missing set (and
-    so the list order) shifted, which moved the stride and left some self-heal tile owned by no
-    shard. It silently never got built, and downsample then aborted 'pyramid incomplete'."""
-    aggregation_id = utils.get_aggregation_ids()[-1]
-    path = f"store/aggregation/{aggregation_id}/{FROZEN}"
-    if os.path.isfile(path):
-        with open(path) as f:
-            return [line.strip() for line in f if line.strip()]
-    return dirty_filepaths()
-
-
 def run_all(filepaths):
     if not filepaths:
         print("nothing to do.")
@@ -138,28 +103,18 @@ def run_all(filepaths):
                         # missing, not per-tile deep in the pool with an opaque ogr2ogr error
     print(f"start aggregating {len(filepaths)} items...")
     # Each tile holds a multi-GB merged DEM (a max 32768px tile ≈ 4 GB float32, more
-    # with the halo + smooth) so peak RAM ≈ workers × DEM. Cap workers in CI via
-    # AGG_PROCESSES to stay under runner RAM; unset/0 = all cores (local builds).
+    # with the halo + smooth) so peak RAM ≈ workers × DEM. Cap workers via AGG_PROCESSES to
+    # stay under the machine's RAM (the build box sizes it from RAM); unset/0 = all cores.
     procs = int(os.environ.get("AGG_PROCESSES", "0")) or None
     with Pool(procs) as pool:
         pool.starmap(run, [(fp,) for fp in filepaths], chunksize=1)
 
 
 def main(argv):
-    if argv == ["freeze"]:
-        freeze()
-    elif argv[:1] == ["matrix"]:
-        # Size the CI matrix to the dirt: <= max shards, >= 1 (a clean run still
-        # spins one no-op shard, keeping the bundle's `needs` graph simple).
-        n = min(int(argv[1]), max(len(work_list()), 1))
-        print(json.dumps([{"i": i, "n": n} for i in range(n)]))
-    elif argv[:1] == ["shard"]:
-        i, n = int(argv[1]), int(argv[2])
-        run_all(work_list()[i::n])
-    elif not argv:
+    if not argv:
         run_all(dirty_filepaths())
     else:
-        sys.exit("usage: aggregation_run.py [freeze | shard <i> <n> | matrix <max>]")
+        sys.exit("usage: aggregation_run.py  (no args — process every dirty tile)")
 
 
 if __name__ == "__main__":
