@@ -185,9 +185,15 @@ jobs:
             test -s "store/source/${{ matrix.source }}/$f" || {
               echo "volatile source produced no $f — registration is broken"; exit 1; }
           done
-          # From the distro archive, not `curl | bash`: reviewable, pinned by the
-          # runner image's apt sources, and every rclone flag below long predates it.
-          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          # Pinned release, sha256-verified — not apt: Ubuntu 24.04's rclone (1.60.1,
+          # 2022) records the x-amz-version-id R2 now returns on uploads, then 501s on
+          # its post-upload `HEAD ?versionId=` verification. The object still lands, so
+          # every transfer errors once and the retry pass goes green — noise that would
+          # bury a real failure.
+          curl -fsSL -o /tmp/rclone.zip "https://downloads.rclone.org/v1.74.4/rclone-v1.74.4-linux-amd64.zip"
+          echo "fe435e0c36228e7c2f116a8701f01127bb1f694005fc11d1f27186c8bca4115d  /tmp/rclone.zip" | sha256sum -c
+          unzip -q -j /tmp/rclone.zip '*/rclone' -d /tmp/rclone-bin
+          sudo install /tmp/rclone-bin/rclone /usr/local/bin/rclone
           # source_mirror enumerated the objects, enforced that they live on ONE
           # bucket, and wrote its name here — one URL parser, not a second in sed.
           bucket=$(cat "store/source/${{ matrix.source }}/mirror-bucket.txt")
