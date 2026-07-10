@@ -65,7 +65,7 @@ def main():
         for step in (["source_datum.py", sid, "--negate", "--offset", "-1"],
                      ["source_normalize.py", sid, "--crs", "EPSG:4326", "--nodata", "-9999"],
                      ["source_bounds.py", sid], ["source_polygonize.py", sid, "2"],
-                     ["source_create_tarball.py", sid]):
+                     ["source_create_tarball.py", sid], ["source_catalog.py", sid]):
             run(tmp, *step)
 
         norm = f"{tmp}/store/source/{sid}/{sid}_0.tif"
@@ -76,9 +76,19 @@ def main():
         assert out[0, 0] == -6.0 and out[1, 2] == -101.0, out  # negate then -1 m
         assert not valid[0, 2], "nodata pixel should remain nodata"
         for artifact in (f"{tmp}/store/source/{sid}/bounds.csv",
+                         f"{tmp}/store/source/{sid}/datum.json",
+                         f"{tmp}/store/source/{sid}/catalog.json",
                          f"{tmp}/store/polygon/{sid}.gpkg",
                          f"{tmp}/store/tar/{sid}.tar"):
             assert os.path.exists(artifact), artifact
+        # The catalog folds in the recorded transform (negate + −1 m offset), the assigned CRS,
+        # and the file count — the datum offset was invisible downstream before it was recorded.
+        with open(f"{tmp}/store/source/{sid}/catalog.json") as jf:
+            item = json.load(jf)
+        p = item["properties"]
+        assert item["id"] == sid and item["bbox"], item
+        assert p["seascape:negate"] is True and p["seascape:datum_offset_m"] == -1.0, p
+        assert p["proj:epsg"] == 4326 and p["seascape:file_count"] == 1, p
         print("source stage e2e ok")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
