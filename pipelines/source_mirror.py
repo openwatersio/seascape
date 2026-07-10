@@ -7,9 +7,10 @@ may depend on their availability: registration writes ``bounds.csv`` rows whose
 filenames are **relative** ``objects/<upstream-key>`` paths (``config.source_path``
 resolves them against the store — upstream key paths preserved 1:1, so provenance
 stays readable and no rename logic exists), plus ``mirror.txt`` — the full upstream
-key list, one per line — for whatever process maintains the store's copy of those
-objects. The manifest always carries the FULL list, not just new keys, so a partial
-prior mirror self-heals on the next pass.
+key list, one per line — and ``mirror-bucket.txt`` — the single bucket those keys
+live on — for whatever process maintains the store's copy of those objects. The
+manifest always carries the FULL list, not just new keys, so a partial prior mirror
+self-heals on the next pass.
 
 ``file_list.txt`` picks the enumeration shape per line:
 
@@ -66,11 +67,26 @@ SHRINK_TOLERANCE = 0.05
 # split that groups every product correctly.
 ISSUE_FIELD_LEN = 6
 
-# ListObjectsV2 response fields, matched by regex rather than an XML parser: the
-# response is machine-generated with Key/LastModified adjacent per <Contents>, and
-# skipping the parser sidesteps XXE/entity expansion on an untrusted payload.
-_CONTENTS_RE = re.compile(r"<Key>([^<]+)</Key><LastModified>([^<]+)</LastModified>")
-_TOKEN_RE = re.compile(r"<NextContinuationToken>([^<]+)</NextContinuationToken>")
+# ListObjectsV2 response fields, matched by regex rather than an XML parser —
+# skipping the parser sidesteps XXE/entity expansion on an untrusted payload. The
+# live response keeps Key/LastModified adjacent per <Contents>; the \s* tolerates a
+# pretty-printed variant without admitting anything between the two fields.
+_CONTENTS_RE = re.compile(r"<Key>([^<]+)</Key>\s*<LastModified>([^<]+)</LastModified>")
+_TOKEN_RE = re.compile(r"<NextContinuationToken>\s*([^<\s]+)\s*</NextContinuationToken>")
+
+
+def _next_token(xml):
+    """Continuation token of a truncated listing page, or None when the listing is
+    complete. A truncated page whose token can't be found is a hard error: returning
+    None there would silently enumerate a partial bucket, and the shrink guard is the
+    backstop for that, not the contract."""
+    if "<IsTruncated>true</IsTruncated>" not in xml:
+        return None
+    m = _TOKEN_RE.search(xml)
+    if not m:
+        sys.exit("truncated listing without a parsable NextContinuationToken — "
+                 "refusing a partial enumeration")
+    return m.group(1)
 
 
 def _split_bucket_key(url):
@@ -98,10 +114,7 @@ def list_prefix(bucket, prefix):
         r = requests.get(host, params=params, timeout=60)
         r.raise_for_status()
         items += _CONTENTS_RE.findall(r.text)
-        token = None
-        if "<IsTruncated>true</IsTruncated>" in r.text:
-            m = _TOKEN_RE.search(r.text)
-            token = m.group(1) if m else None
+        token = _next_token(r.text)
         if not token:
             return items
 
@@ -300,6 +313,11 @@ def main():
         sys.exit(f"{source}: nothing enumerated — refusing to publish an empty registration")
     print(f"{source}: {len(keys)} objects on {bucket}")
     register(source, keys, lambda key: read_header(bucket, key))
+    # After register() so a guarded/failed run leaves nothing half-written; the
+    # mirror process reads the bucket from here instead of re-deriving it from
+    # file_list.txt with a second, weaker URL parser.
+    with open(f"store/source/{source}/mirror-bucket.txt", "w") as f:
+        f.write(bucket + "\n")
 
 
 def _check():
@@ -321,13 +339,24 @@ def _check():
     assert dedupe_cells(items) == ["p/102US005JAXEF262227.h5", "p/102US005JAXEG262247.h5"], \
         dedupe_cells(items)
 
-    # listing XML: Key/LastModified pair up and the continuation token is found
+    # listing XML: Key/LastModified pair up — including in a pretty-printed variant —
+    # and the continuation token is found
     xml = ('<ListBucketResult><IsTruncated>true</IsTruncated>'
            '<Contents><Key>a/x.h5</Key><LastModified>2026-01-02T03:04:05.000Z</LastModified>'
            '<ETag>"e"</ETag><Size>1</Size></Contents>'
            '<NextContinuationToken>tok==</NextContinuationToken></ListBucketResult>')
     assert _CONTENTS_RE.findall(xml) == [("a/x.h5", "2026-01-02T03:04:05.000Z")]
-    assert _TOKEN_RE.search(xml).group(1) == "tok=="
+    pretty = xml.replace("><", ">\n  <")
+    assert _CONTENTS_RE.findall(pretty) == [("a/x.h5", "2026-01-02T03:04:05.000Z")]
+    # a complete listing has no token; a truncated one yields it (even pretty-printed);
+    # truncated WITHOUT a parsable token refuses the partial enumeration
+    assert _next_token(xml.replace("true", "false")) is None
+    assert _next_token(xml) == "tok==" and _next_token(pretty) == "tok=="
+    try:
+        _next_token("<IsTruncated>true</IsTruncated>")
+        assert False, "expected a truncated page without a token to exit"
+    except SystemExit as e:
+        assert "partial enumeration" in str(e), e
 
     # URL splitting + previous-filename normalization for the removed-key diff
     assert _split_bucket_key("https://noaa-s102-pds.s3.amazonaws.com/ed3.0.0/") == \

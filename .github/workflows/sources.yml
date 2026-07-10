@@ -181,14 +181,16 @@ jobs:
       - name: Mirror upstream objects to R2
         if: steps.check.outputs.current != 'true' && steps.check.outputs.volatile == 'true'
         run: |
-          test -s "store/source/${{ matrix.source }}/mirror.txt" || {
-            echo "volatile source produced no mirror.txt — registration is broken"; exit 1; }
-          curl -fsS https://rclone.org/install.sh | sudo bash
-          # The upstream bucket hosts the first file_list.txt URL; source_mirror
-          # enforces that every enumerated object lives on that same bucket, so
-          # deriving it here is safe.
-          bucket=$(grep -Ev '^[[:space:]]*(#|$)' "sources/${{ matrix.source }}/file_list.txt" \
-            | head -1 | sed -E 's|^https://([^.]+)\.s3[^/]*\.amazonaws\.com/.*$|\1|')
+          for f in mirror.txt mirror-bucket.txt; do
+            test -s "store/source/${{ matrix.source }}/$f" || {
+              echo "volatile source produced no $f — registration is broken"; exit 1; }
+          done
+          # From the distro archive, not `curl | bash`: reviewable, pinned by the
+          # runner image's apt sources, and every rclone flag below long predates it.
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          # source_mirror enumerated the objects, enforced that they live on ONE
+          # bucket, and wrote its name here — one URL parser, not a second in sed.
+          bucket=$(cat "store/source/${{ matrix.source }}/mirror-bucket.txt")
           echo "mirroring $(wc -l < "store/source/${{ matrix.source }}/mirror.txt") objects from $bucket"
           # Two remotes, no secrets on disk: the NOAA side is anonymous —
           # env_auth=false so the R2 credentials in the env can't sign its requests —
