@@ -1,7 +1,8 @@
 # NOAA CUDEM 1/9 arc-second national topobathy — a *filelist* (manifest), not a
-# data file: one tile URL per line, 942 tiles across all 18 US coastal regions
-# (Atlantic, Gulf, Pacific, AK). source_register_remote_urllist reads each tile's
-# header via /vsicurl and registers it as a streaming reference — no download. NAVD88
-# vertical / NAD83 (EPSG:4269) horizontal. NOAA regenerates the manifest as tiles
-# are re-surveyed, so coverage stays current without re-listing here.
+# data file: one tile URL per line, ~940 tiles across all 18 US coastal regions
+# (Atlantic, Gulf, Pacific, AK). source_mirror registers each tile as a relative
+# objects/<key> row (header reads for newly-listed tiles only) + a mirror manifest;
+# the bytes are copied into the store's object mirror — no build-time NOAA reads.
+# NAVD88 vertical / NAD83 (EPSG:4269) horizontal. NOAA regenerates the manifest as
+# tiles are re-surveyed, so coverage stays current without re-listing here.
 https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_ninth_Topobathy_2014_8483/urllist8483.txt

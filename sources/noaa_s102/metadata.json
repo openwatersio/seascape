@@ -8,6 +8,5 @@
     "mixed_crs": true,
     "volatile": true,
     "negate": true,
-    "link_column": "S102V30",
     "priority": 1
 }

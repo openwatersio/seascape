@@ -147,10 +147,11 @@ contour-merge:
 
 # Build a regional preview into the local Worker R2 — a faithful slice of the planet
 # build for BBOX="W,S,E,N" (default: NY harbor; e.g. Chesapeake = "-76.5,37.0,-76.0,37.5").
-# Refreshes each source's tiny bounds.csv from R2 and range-reads the COGs from R2 (prepared
-# sources) / NOAA (streaming) via SOURCE_VSI_BASE — the same read path as CI's aggregate, so
-# no local source prep. `just preview-local` instead builds from already-prepared sources in
-# store/source (no R2; SOURCE_VSI_BASE unset). Override SOURCE_VSI_BASE/BOUNDS_BASE for a mirror.
+# Refreshes each source's tiny bounds.csv from R2 and range-reads the COGs from R2 (mirrored
+# and prepared sources alike) via SOURCE_VSI_BASE — the same read path as CI's aggregate, so
+# no local source prep and no upstream traffic. `just preview-local` instead builds from
+# already-prepared sources in store/source (no R2; SOURCE_VSI_BASE unset). Override
+# SOURCE_VSI_BASE/BOUNDS_BASE for a mirror.
 # The coarse-source land clamp needs the land mask: streamed from R2 when published, else built
 # locally once (a 700 MB OSM download; override with LANDMASK to reuse an existing copy). The
 # inland-water mask (clamp subtraction, #24 inverse clamp, depare nodata) is streamed from R2
@@ -169,14 +170,12 @@ preview bbox="-74.30,40.40,-73.75,40.80" local="":
             mkdir -p "store/source/$id"
             curl -fsS "$BOUNDS_BASE/$id/bounds.csv" -o "store/source/$id/bounds.csv" \
                 || { echo "skip $id (no bounds.csv in R2)"; rm -rf "store/source/$id"; }
-            # Provenance footprint for the coverage tileset (streaming sources have none).
+            # Provenance footprint for the coverage tileset (mirrored sources have none).
             # Replace only on success — a 404 must not clobber a locally-prepared polygon.
             curl -fsS "$POLY_BASE/$id.gpkg" -o "store/polygon/$id.gpkg.tmp" \
                 && mv "store/polygon/$id.gpkg.tmp" "store/polygon/$id.gpkg" \
                 || rm -f "store/polygon/$id.gpkg.tmp"
         done
-        # S-102 re-registers from a live catalog (and may not be in R2 yet), so re-sync it
-        just source noaa_s102
         # Land mask for the coarse-source clamp: prefer a local copy if it's already there,
         # else stream it from R2 like the sources; if neither exists, it's built locally (below).
         r2mask="https://data.openwaters.io/bathymetry/landmask/land.fgb"
@@ -239,7 +238,8 @@ dev:
 # Offline self-checks (synthetic data, no network).
 test-sources:
     uv run python test_source_stage.py
-    uv run python source_register_remote_geopkg.py --check
+    uv run python source_mirror.py --check
+    uv run python source_remote.py
 test-engine:
     uv run python test_engine.py
     uv run python aggregation_reproject.py --check

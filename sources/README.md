@@ -6,7 +6,7 @@ Selection rule: **resolution sets the zoom cap, an openly-redistributable licens
 
 ## Access patterns
 
-- **Streamed** — range-read at build via `/vsicurl` / `/vsis3`, no download (CUDEM, S-102). Marked `volatile: true` in `metadata.json` so CI re-registers them every build as the upstream catalog drifts.
+- **Mirrored** — volatile upstream tile collections (CUDEM, S-102): the scheduled sources workflow enumerates the public bucket, mirrors every object into the data bucket, and registers relative `objects/<key>` rows — builds range-read only our mirror, never the upstream. Marked `volatile: true` in `metadata.json` so every sources run re-registers them as the upstream catalog drifts.
 - **Prepared** — download → normalize to a 4326 COG → R2 → stream from there (EMODnet, DDM, and most others). Gated upstreams get a `harvest.py` that refreshes an R2 mirror (BATNAS, UK SurfZone).
 
 ## Built sources
@@ -37,7 +37,7 @@ Selection rule: **resolution sets the zoom cap, an openly-redistributable licens
 
 Priority is derived, not configured: `(maxzoom, id)`, so GEBCO (smallest maxzoom) loses wherever a finer regional source overlaps — except a datum-authoritative source can set `priority` in metadata (S-102 over CUDEM, INFOMAR over EMODnet) to win regardless of zoom. Zoom caps are display caps (`max_zoom`), not native resolution. Inland lakes are pure GEBCO gap-fill: hydraulically isolated, so no seam against the ocean base; freshwater grids store lakebed _elevation_, so each carries a "subtract surface level" offset.
 
-The large US sources (CUDEM, S-102) are range-read straight off NOAA's public buckets at build time rather than downloaded — CUDEM alone is ~188 GB. S-102 takes the per-tile engine path: its tiles come from a GeoPackage index and span multiple UTM zones, so the mosaic reprojects them per-tile rather than as one VRT.
+The large US sources (CUDEM, S-102) are mirrored object-for-object into the data bucket on a schedule rather than downloaded to a runner — CUDEM alone is ~188 GB, streamed straight from NOAA's bucket into ours — and aggregation range-reads the mirror, so NOAA churn or outages can redden a sources refresh but never a build. S-102 takes the per-tile engine path: its products span multiple UTM zones, so the mosaic reprojects them per-tile rather than as one VRT.
 
 ## Open candidates
 
@@ -90,15 +90,15 @@ Two coverage notes that look like gaps but aren't: EMODnet's 58 tiles are the fu
 Check the catalog above first — the candidate may already be cataloged (with verified license/datum/access notes in its `source` issue) or ruled out.
 
 1. Create `sources/<id>/`:
-   - `metadata.json` — `name`, `producer`, `website`, `license`, and an optional `max_zoom` cap (omit to use the source's native resolution; cap it for high-res lidar like CUDEM). Flags as needed: `priority` (outrank a finer source, e.g. datum-authoritative), `mixed_crs`, `band`, `land_clamp` (coarse sources with no land/water concept), `volatile` (streamed sources whose upstream catalog drifts — CI re-registers every build).
+   - `metadata.json` — `name`, `producer`, `website`, `license`, and an optional `max_zoom` cap (omit to use the source's native resolution; cap it for high-res lidar like CUDEM). Flags as needed: `priority` (outrank a finer source, e.g. datum-authoritative), `mixed_crs`, `band`, `land_clamp` (coarse sources with no land/water concept), `volatile` (mirrored sources whose upstream catalog drifts — re-registered on every scheduled sources run).
    - `file_list.txt` — source URL(s): `https://…`, `s3://…` (read via `/vsis3/`), an ERDDAP `…/griddap/…` base, a `.zip`, or a local path.
    - `Justfile` — compose the shared `pipelines/source_*.py` steps the source needs. Copy an existing recipe and adjust:
-     - http GeoTIFF → `source_download`; public COG tiles → `source_register_remote_urllist` (flat urllist, e.g. CUDEM) or `source_register_remote_geopkg` (GeoPackage tile index, e.g. NOAA S-102) — streaming `/vsicurl` refs, no download; zip → `source_download` + `source_unzip`. Oddball fetches (ERDDAP griddap, portal APIs) get their own `source_download_<id>.py` — copy one.
+     - http GeoTIFF → `source_download`; volatile public tile collections → `source_mirror` (a bucket-prefix listing like S-102 or a flat urllist like CUDEM — registers relative `objects/<key>` rows + a mirror manifest; the sources workflow copies the bytes, builds never touch the upstream); zip → `source_download` + `source_unzip`. Oddball fetches (ERDDAP griddap, portal APIs) get their own `source_download_<id>.py` — copy one.
      - positive-down depths or a datum offset → `source_datum --negate --offset N`.
      - always: `source_normalize --crs EPSG:… [--nodata N]` → `source_bounds` → `source_polygonize <id> 8` → `source_create_tarball`.
 2. `just source <id>` (verify it lands in `pipelines/store/source/<id>/`).
 3. `just planet` — its tiles fold into the grid-cell overlays + manifest automatically (priority is derived from `(maxzoom, id)`). `just preview` over its bbox to eyeball depths and seams.
-4. Nothing to wire in CI — the build matrix discovers `sources/<id>/` directories automatically; dispatch a build.
+4. Nothing to wire in CI — the sources workflow discovers `sources/<id>/` directories automatically; dispatch it (optionally filtered to the new source), then dispatch a build.
 
 Transform params live in the recipe (CLI args); `metadata.json` is attribution +
 the optional `max_zoom` cap only.

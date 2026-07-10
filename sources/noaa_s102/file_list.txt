@@ -1,6 +1,7 @@
-# NOAA S-102 Bathymetric Surface — the navigation tile-scheme GeoPackage (a tile *index*, not
-# data). source_register_remote_geopkg resolves the newest Navigation_Tile_Scheme_<date>.gpkg
-# under this prefix and registers each tile's S102V30 .h5 URL as a /vsicurl/ stream — no download.
-# ~4,315 tiles, per-tile UTM zones, Float32 depth (band 1, positive-down) + uncertainty (band 2),
-# already reduced to MLLW (a chart datum). On an S-102 edition bump update the prefix (ed3.0.0 -> ...).
-https://noaa-s102-pds.s3.amazonaws.com/ed3.0.0/_CATALOG/
+# NOAA S-102 Bathymetric Surface — the current edition's public bucket prefix (the trailing
+# slash marks it as a *prefix listing* for source_mirror): ~4.3k .h5 products, per-tile UTM
+# zones, Float32 depth (band 1, positive-down) + uncertainty (band 2), already reduced to
+# MLLW (a chart datum). Products are deduped per cell (newest issue wins), registered as
+# relative objects/<key> rows, and mirrored into the store; the _CATALOG/ sidecars are
+# ignored. On an S-102 edition bump update the prefix (ed3.0.0 -> ...).
+https://noaa-s102-pds.s3.amazonaws.com/ed3.0.0/
