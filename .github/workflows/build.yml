@@ -42,7 +42,11 @@ env:
   SERVER_TYPE: ${{ github.event.inputs.server_type }}
   SERVER_IMAGE: ubuntu-24.04
   SERVER_LOCATION: fsn1
-  SSH_OPTS: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
+  # ServerAlive keepalives: the hosted runner's NAT drops idle TCP after ~4 min, and quiet
+  # pipeline stretches (tippecanoe, long warps) go silent for far longer — without keepalives
+  # the first silent stage kills the session ("Broken pipe", exit 255; seen on the first
+  # dispatch). 30s×20 also rides out ~10 min of transient network loss before giving up.
+  SSH_OPTS: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=20"
   NAME: seascape-build-${{ github.run_id }}
   # Dispatch inputs reach every `run:` as env vars, never as raw ${{…}} interpolated into a
   # shell line — a bbox like `$(cmd)` would otherwise run under command substitution in the
