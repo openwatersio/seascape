@@ -218,19 +218,25 @@ jobs:
           mkdir -p "$STORE"
 
           # ── knobs: AGG_PROCESSES = min(cores, RAM_GB/4) (each worker holds a multi-GB DEM);
-          #    GDAL_CACHEMAX scaled up from the 256 the 16 GB runners used. Computed HERE, not in
-          #    Python — the pipeline stays R2/host-agnostic. ──
+          #    BUNDLE_PROCESSES = min(cores, RAM_GB/8), more conservative — a bundle worker
+          #    reads whole input pmtiles into RAM and the planet base is one multi-GB unit,
+          #    unlike aggregate's bounded per-tile DEMs; GDAL_CACHEMAX scaled up from the 256
+          #    the 16 GB runners used. Computed HERE, not in Python — the pipeline stays
+          #    R2/host-agnostic. ──
           CORES=$(nproc)
           MEM_GB=$(( $(getconf _PHYS_PAGES) * $(getconf PAGE_SIZE) / 1073741824 ))
           AGG=$(( MEM_GB / 4 )); [ "$AGG" -gt "$CORES" ] && AGG=$CORES; [ "$AGG" -lt 1 ] && AGG=1
+          BND=$(( MEM_GB / 8 )); [ "$BND" -gt "$CORES" ] && BND=$CORES; [ "$BND" -lt 1 ] && BND=1
           export AGG_PROCESSES=$AGG
+          export BUNDLE_PROCESSES=$BND
           export GDAL_CACHEMAX=1024
           if [ "${FORCE:-}" = "true" ]; then export FORCE_REBUILD=1; else export FORCE_REBUILD=; fi
-          echo "box: ${CORES} cores / ${MEM_GB} GB → AGG_PROCESSES=$AGG_PROCESSES, BBOX='${BBOX:-}', FORCE='${FORCE:-}'"
+          echo "box: ${CORES} cores / ${MEM_GB} GB → AGG_PROCESSES=$AGG_PROCESSES, BUNDLE_PROCESSES=$BUNDLE_PROCESSES, BBOX='${BBOX:-}', FORCE='${FORCE:-}'"
 
-          # docker run wrapper: repo code at /app, the store bind-mounted, BBOX/FORCE forwarded.
+          # docker run wrapper: repo code at /app, the store bind-mounted, BBOX/FORCE forwarded
+          # (+ BUNDLE_PROCESSES — only bundle.py reads it; harmless for the other stages).
           dr() { docker run --rm -v /root/gebco:/app -v "$STORE:/app/pipelines/store" \
-            -e BBOX -e FORCE_REBUILD "$IMAGE:$IMAGE_TAG" just "$@"; }
+            -e BBOX -e FORCE_REBUILD -e BUNDLE_PROCESSES "$IMAGE:$IMAGE_TAG" just "$@"; }
 
           R2="R2:$DATA_BUCKET/bathymetry"
           # --retries 5: R2 occasionally returns a transient 500 InternalError; ride it out

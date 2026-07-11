@@ -18,7 +18,7 @@ ports=""; if [ "${1:-}" = "dev" ]; then ports="-p 5173:5173 -p 8787:8787"; fi
 # platform-specific (darwin vs linux binaries), so the container keeps its own.
 exec docker run --rm $tty $ports \
   -e BBOX -e SOURCE_VSI_BASE -e BOUNDS_BASE -e LANDMASK -e FORCE_REBUILD \
-  -e MACROTILE_Z -e OVERLAY_SPLIT_Z -e NUM_OVERVIEWS -e AGG_PROCESSES -e GDAL_CACHEMAX \
+  -e MACROTILE_Z -e OVERLAY_SPLIT_Z -e NUM_OVERVIEWS -e AGG_PROCESSES -e BUNDLE_PROCESSES -e GDAL_CACHEMAX \
   -e SMOOTH_DEM_SIGMA -e SMOOTH_SLOPE_LOW -e SMOOTH_SLOPE_HIGH -e SKIP_SMOOTH \
   -e SKIP_CONTOURS -e SKIP_SOUNDINGS -e SKIP_DRYING -e CONTOUR_NAV_SMOOTH_MAX \
   -e SOUND_CELL_PX -e SOUND_MIN_DEPTH_M -e DRYING_CAP \

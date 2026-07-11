@@ -225,16 +225,18 @@ def main():
     base is one unit — so they fan out across a process Pool.
 
     SPAWN, not fork: bundle imports rasterio (via utils), which inits GDAL at module load, and
-    GDAL is not fork-safe (see downsampling.execute). Ceiling: the pmtiles writer spools each
-    tile then copies it into the archive, so finalize ~2x's a group's footprint — peak
-    memory/disk ≈ pool workers × the biggest group (the planet base). It fits the build box
-    today; if the planet base ever outgrows that, cap the pool or bundle planet on its own."""
+    GDAL is not fork-safe (see downsampling.execute)."""
     aggregation_id = utils.get_aggregation_ids()[-1]
     verify_complete(aggregation_id)
     groups = group_filepaths(aggregation_id)
     utils.create_folder("store/bundle")
     items = sorted(groups.items(), key=lambda kv: -len(kv[1]))  # biggest first → no straggler tail
-    with get_context("spawn").Pool() as pool:
+    # Each worker reads whole input pmtiles into RAM and the writer spools ~2x its group on
+    # disk, so peak ≈ workers × the biggest group (the planet base). Cap workers via
+    # BUNDLE_PROCESSES to stay under the machine's RAM (the build box sizes it from RAM);
+    # unset/0 = all cores (local builds) — same convention as AGG_PROCESSES.
+    procs = int(os.environ.get("BUNDLE_PROCESSES", "0")) or None
+    with get_context("spawn").Pool(procs) as pool:
         frags = pool.map(_bundle_one, items)
     manifest = _manifest_from_fragments(frags)
     with open("store/bundle/manifest.json", "w") as f:
