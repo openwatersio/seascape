@@ -35,6 +35,7 @@ from pmtiles.reader import Reader, MmapSource, all_tiles
 from pmtiles.writer import Writer
 
 import config
+import keys
 import utils
 
 # Base cap = the GEBCO-native zoom (the planet is complete + overzoomable below it).
@@ -219,16 +220,45 @@ def _bundle_one(item):
     return _fragment(name, bundle_group(name, filepaths))
 
 
+# The terrain bundle depends only on its member pmtiles' keys (+ the grid geometry), so a change
+# that leaves every member's key untouched — a contour-config edit re-merging tiles but not
+# rewriting their pmtiles — leaves this key unchanged and the whole bundle skips. config.sources()
+# rides in because it becomes the manifest's source_ids.
+BUNDLE_MODULES = ["bundle", "utils"]
+
+
+def _bundle_key(groups):
+    inputs = []
+    for name in sorted(groups):
+        for fp in sorted(groups[name]):
+            stem = fp.split("/")[-1].replace(".pmtiles", "")
+            inputs.append(f"{name}/{stem}:{keys.read_key(fp) or ''}")
+    inputs += [f"source:{s}" for s in config.sources()]
+    cfg = {"planet_max_zoom": PLANET_MAX_ZOOM, "split_z": SPLIT_Z,
+           "macrotile_z": utils.macrotile_z, "num_overviews": utils.num_overviews}
+    return keys.stage_key(inputs, BUNDLE_MODULES, cfg)
+
+
 def main():
     """Bundle every group (planet base + one overlay per populated grid cell) and write
     manifest.json. Groups are independent — the overlay cells share no tiles and the planet
     base is one unit — so they fan out across a process Pool.
+
+    Skips wholesale when every member pmtiles' key is unchanged and the manifest is already on
+    disk (the key sidecar next to it matches) — but only after verify_complete, so a missing
+    pmtiles fails loudly rather than skipping. manifest.json is written whole whenever anything
+    changed (it is per-sha).
 
     SPAWN, not fork: bundle imports rasterio (via utils), which inits GDAL at module load, and
     GDAL is not fork-safe (see downsampling.execute)."""
     aggregation_id = utils.get_aggregation_ids()[-1]
     verify_complete(aggregation_id)
     groups = group_filepaths(aggregation_id)
+    manifest_path = "store/bundle/manifest.json"
+    bkey = _bundle_key(groups)
+    if keys.is_fresh(manifest_path, bkey):
+        print(f"bundle: {len(groups)} group(s) unchanged — skip")
+        return
     utils.create_folder("store/bundle")
     items = sorted(groups.items(), key=lambda kv: -len(kv[1]))  # biggest first → no straggler tail
     # Each worker reads whole input pmtiles into RAM and the writer spools ~2x its group on
@@ -239,8 +269,9 @@ def main():
     with get_context("spawn").Pool(procs) as pool:
         frags = pool.map(_bundle_one, items)
     manifest = _manifest_from_fragments(frags)
-    with open("store/bundle/manifest.json", "w") as f:
+    with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
+    keys.write_key(manifest_path, bkey)
     print(f"created {len(groups)} bundle(s): {', '.join(sorted(groups))} + manifest.json")
 
 

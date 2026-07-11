@@ -28,6 +28,7 @@ from glob import glob
 import mercantile
 
 import config
+import keys
 import utils
 from aggregation_reproject import get_resolution
 
@@ -49,6 +50,14 @@ def _chaikin_iters(depth_abs_m):
 # in m² (geometry is EPSG:3857 here).
 DEEP_CUTOFF_M = int(os.environ.get("CONTOUR_RING_DEEP_CUTOFF", "1000"))
 MIN_RING_AREA_M2 = float(os.environ.get("CONTOUR_RING_MIN_AREA", "16e6"))  # ~16 km²
+
+# The style hand-mirrors the DEFAULT metre ladder (style/index.ts DEPARE_LADDER_M/FT), so an
+# env-overridden CONTOUR_LEVELS silently diverges the tiles from the style. Warn loudly, once
+# per process; upgrade path is generating the style constants from config instead of mirroring.
+if config.CONTOUR_LEVELS != config.CONTOUR_LEVELS_DEFAULT:
+    print("WARNING: CONTOUR_LEVELS overridden — isobaths/depth-areas will diverge from the "
+          "style's hand-mirrored DEPARE_LADDER_M/FT (style/index.ts); update it to match.",
+          file=sys.stderr)
 
 
 def _run(cmd, what):
@@ -143,6 +152,17 @@ def generate(filepath):
         print(f"contour: no merged DEM for {filename}")
         return
 
+    # Drop a previous run's FGB AND its key sidecar up front, in the same breath: FlatGeobuf
+    # has no DeleteLayer (ogr2ogr -overwrite fails on an existing file), a config change that
+    # now yields no features must not leave the old artifact behind to bundle stale, and a
+    # crash after this point must read STALE next run — under FORCE the key is unchanged, so a
+    # surviving sidecar would read fresh forever over the deleted artifact (a permanent silent
+    # hole). aggregation_run re-records the sidecar only after this fork completes.
+    out = f"store/contour/{name}.fgb"
+    for stale in (out, keys.sidecar(out)):
+        if os.path.isfile(stale):
+            os.remove(stale)
+
     levels = " ".join(str(l) for l in config.CONTOUR_LEVELS)
     raw = f"{tmp}/contour-raw.fgb"
     _run(f"gdal_contour -q -fl {levels} -a depth_m -f FlatGeobuf {dem} {raw}", "gdal_contour m")
@@ -173,7 +193,6 @@ def generate(filepath):
     # Tile-keyed (not agg_id-scoped) so clean tiles' contours persist across
     # incremental runs, exactly like store/pmtiles — bundle() globs them all.
     utils.create_folder("store/contour")
-    out = f"store/contour/{name}.fgb"
     _run(f"ogr2ogr -f FlatGeobuf -overwrite -nlt PROMOTE_TO_MULTI -t_srs EPSG:4326 {out} {clipped}",
          "ogr2ogr reproject")
     print(f"contour: {filename} -> {feature_count(out)} features")
@@ -383,21 +402,50 @@ def _live_fgbs(fgbs, stems):
     return [f for f in fgbs if f.split("/")[-1].replace(".fgb", "") in stems]
 
 
+# vector.pmtiles depends on every per-tile contour/sounding/depare artifact's key + the three
+# layers' modules (the tippecanoe filter + flags live in them) + the env-tunable simplifications.
+# A per-tile fork whose key changed (a contour-levels edit) moves this key; an unchanged set skips
+# the whole tippecanoe + planet-wide tile-join.
+VECTOR_MODULES = ["contour_run", "soundings_run", "depare_run", "utils"]
+
+
+def _vector_key(maxz):
+    stems = _current_stems()
+    inputs = []
+    for folder, ext in (("contour", "fgb"), ("soundings", "geojson"), ("depare", "fgb")):
+        for path in sorted(glob(f"store/{folder}/*.{ext}")):
+            stem = path.split("/")[-1].rsplit(".", 1)[0]
+            if stems is not None and stem not in stems:  # orphan from a re-tiled covering
+                continue
+            inputs.append(f"{folder}/{stem}:{keys.read_key(path) or ''}")
+    cfg = {"maxz": maxz,
+           "contour_simplification": os.environ.get("CONTOUR_SIMPLIFICATION", "8"),
+           "depare_simplification": os.environ.get("DEPARE_SIMPLIFICATION", "8")}
+    return keys.stage_key(inputs, VECTOR_MODULES, cfg)
+
+
 def bundle():
     """tippecanoe every contour FGB into contour lines, then tile-join in the already-bundled
     soundings/depare layers → store/bundle/vector.pmtiles (one global tippecanoe + one join;
     maxz is the covering's shared max child_z so every layer tiles to the same depth). Soundings
-    and depare must bundle before this — the single tile-join folds their pmtiles in."""
+    and depare must bundle before this — the single tile-join folds their pmtiles in. Skips when
+    every per-tile vector artifact's key is unchanged and vector.pmtiles is already on disk (the
+    local iterative loop; the box's store/bundle is never hydrated, so a box build always runs)."""
     fgbs = _live_fgbs(sorted(glob("store/contour/*.fgb")), _current_stems())
     if not fgbs:
         print("contour bundle: no contour FGBs")
         return
     maxz = bundle_maxz(_global_maxz(fgbs))
+    vkey = _vector_key(maxz)
+    if keys.is_fresh("store/bundle/vector.pmtiles", vkey):
+        print("contour bundle: vector inputs unchanged — skip")
+        return
     utils.create_folder("store/bundle")
     lines = "store/contour/contours-lines.pmtiles"
     _tippecanoe(fgbs, 0, maxz, lines)
     _finalize_contours([lines])
     os.remove(lines)
+    keys.write_key("store/bundle/vector.pmtiles", vkey)
     print(f"contour bundle: store/bundle/vector.pmtiles (z0-{maxz}, {len(fgbs)} FGBs)")
 
 

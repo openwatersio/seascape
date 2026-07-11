@@ -57,9 +57,11 @@ planet:
 cover:
     uv run python aggregation_covering.py
 
-# Aggregate every dirty tile: reproject -> merge -> smooth -> encode terrain, forking
-# contours/soundings/depare off each merged DEM. AGG_PROCESSES caps concurrent tiles (each
-# holds a multi-GB merged DEM); unset = all cores. FORCE_REBUILD=1 rebuilds every tile.
+# Aggregate every stale tile: reproject -> merge -> smooth -> encode terrain, forking
+# contours/soundings/depare off each merged DEM. Staleness is per-fork content-hash keys
+# (keys.py: inputs ‖ code ‖ config ‖ toolchain); a fresh fork is skipped within the tile.
+# AGG_PROCESSES caps concurrent tiles (each holds a multi-GB merged DEM); unset = all cores.
+# FORCE_REBUILD=1 ignores the keys and rebuilds every tile (escape hatch).
 aggregate:
     uv run python aggregation_run.py
 
@@ -74,7 +76,8 @@ combine:
     just bundle
 
 # Overview pyramid below each source's native maxzoom: plan the parent tiles, then
-# 2x2-average each dirty overview (finest first, so each level feeds the next).
+# 2x2-average each stale overview (finest first, so each level feeds the next; an
+# overview's key hashes its children's keys, so child changes cascade up by construction).
 downsample:
     uv run python downsampling.py cover
     uv run python downsampling.py run
@@ -218,3 +221,4 @@ test-sources:
 test-engine:
     uv run python test_engine.py
     uv run python aggregation_reproject.py --check
+    uv run python keys.py --check

@@ -61,6 +61,7 @@ import rasterio
 
 import config
 import contour_run
+import keys
 import utils
 
 # The bands' zoom floor (matches the style's depth-areas/contour-lines minzoom):
@@ -68,6 +69,14 @@ import utils
 # one leaves a hole), so the floor is the low-zoom cost control — the raster depth
 # shading carries z<6.
 MIN_ZOOM = 6
+
+# DEPARE_LEVELS derives from CONTOUR_LEVELS, which the style hand-mirrors (style/index.ts
+# DEPARE_LADDER_M/FT) — warn when an env override diverges the bands from the style. Upgrade
+# path: generate the style constants from config instead of mirroring.
+if config.CONTOUR_LEVELS != config.CONTOUR_LEVELS_DEFAULT:
+    print("WARNING: CONTOUR_LEVELS overridden — depare bands will diverge from the style's "
+          "hand-mirrored DEPARE_LADDER_M/FT (style/index.ts); update it to match.",
+          file=sys.stderr)
 
 # Fill draw order for the `rank` sort attribute (a style fill-sort-key draws higher on top).
 # All three kinds are disjoint by construction, so rank is cosmetic — a stable tie-breaker at
@@ -149,6 +158,15 @@ def generate(filepath):
     if not os.path.exists(dem):
         print(f"depare: no merged DEM for {filename}")
         return
+
+    # Drop a previous run's FGB AND its key sidecar up front: a re-run that now yields no rows
+    # must not leave the old artifact behind to bundle stale, and a crash after this point must
+    # read STALE next run — under FORCE the key is unchanged, so a surviving sidecar would read
+    # fresh forever over the deleted artifact (see the contour fork; same rule all three).
+    out = f"store/depare/{stem}.fgb"
+    for stale in (out, keys.sidecar(out)):
+        if os.path.isfile(stale):
+            os.remove(stale)
 
     clip = box(*mercantile.xy_bounds(tile))  # unbuffered, tile-aligned (EPSG:3857)
     with rasterio.open(dem) as d:
@@ -251,7 +269,6 @@ def generate(filepath):
         return
 
     utils.create_folder("store/depare")  # tile-keyed, so clean tiles persist across incremental runs
-    out = f"store/depare/{stem}.fgb"
     # A mixed schema across the three kinds: a row omits a key it doesn't carry, geopandas writes
     # the gap as NULL (NaN for float drval, None for str sys/kind), and FlatGeobuf -> tippecanoe
     # encode that as an ABSENT MVT property — so nodata truly has no drval1, the fill's switch key.
@@ -279,8 +296,17 @@ def bundle():
         return
     maxz = contour_run.bundle_maxz(
         max(int(f.split("/")[-1].replace(".fgb", "").split("-")[3]) for f in fgbs))
-    utils.create_folder("store/bundle")
     out = "store/bundle/depare.pmtiles"
+    # Skip when every member tile's key is unchanged and the pmtiles is on disk (the local
+    # iterative loop; the box's store/bundle is never hydrated, so a box build always rebuilds).
+    dkey = keys.stage_key([f"{f}:{keys.read_key(f) or ''}" for f in fgbs],
+                          ["depare_run", "contour_run", "utils"],
+                          {"maxz": maxz, "min_zoom": MIN_ZOOM,
+                           "simplification": os.environ.get("DEPARE_SIMPLIFICATION", "8")})
+    if keys.is_fresh(out, dkey):
+        print("depare bundle: inputs unchanged — skip")
+        return
+    utils.create_folder("store/bundle")
     subprocess.run(
         ["tippecanoe", "-o", out, "-f", "-l", "depare",
          "-n", "Depth areas", "-A", utils.ATTRIBUTION,
@@ -290,6 +316,7 @@ def bundle():
          "-y", "drval1", "-y", "drval2", "-y", "sys", "-y", "kind", "-y", "rank",
          "-T", "rank:int", *fgbs],
         check=True)
+    keys.write_key(out, dkey)
     print(f"depare bundle: {out} (z{MIN_ZOOM}-{maxz}, {len(fgbs)} FGBs)")
 
 
