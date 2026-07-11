@@ -5,9 +5,13 @@
 
 set working-directory := 'pipelines'
 
-# Prepare one source: fetch -> datum -> normalize -> bounds -> polygon -> tarball.
+# Prepare one source: fetch -> datum -> normalize -> bounds -> polygon -> tarball, then
+# assemble catalog.json. The catalog step is the shared tail, so every source (prepared or
+# mirrored) gets a generated catalog item without editing each recipe. RECIPE_HASH (the
+# source's recipe content hash, supplied by the caller; empty locally) rides into the item.
 source id:
     just ../sources/{{id}}/
+    uv run python source_catalog.py {{id}}
 
 # Prepare the OSM land mask once (download -> unzip -> EPSG:3857 FlatGeobuf at
 # store/landmask/land.fgb). Flagged coarse sources (GEBCO/EMODnet) clamp negative
@@ -241,6 +245,7 @@ dev:
 test-sources:
     uv run python test_source_stage.py
     uv run python source_mirror.py --check
+    uv run python source_catalog.py --check
     uv run python source_remote.py
 test-engine:
     uv run python test_engine.py

@@ -15,6 +15,8 @@ final LERC COG.
 """
 
 import argparse
+import json
+import os
 import sys
 from glob import glob
 
@@ -49,8 +51,18 @@ def transform_file(filepath, negate, offset, clamp_positive=False):
     tmp = filepath + ".datum.tif"
     with rasterio.open(tmp, "w", **profile) as dst:
         dst.write(data, 1)
-    import os
     os.replace(tmp, filepath)
+
+
+def write_sidecar(source, negate, offset, clamp_positive):
+    """Record the applied transform in store/source/<id>/datum.json — the machine-readable
+    provenance source_catalog folds into the catalog item (vertical-datum offset was invisible
+    downstream when it lived only in this CLI arg). Written whenever the step runs, so a source
+    whose recipe calls source_datum always leaves a sidecar."""
+    os.makedirs(f"store/source/{source}", exist_ok=True)
+    with open(f"store/source/{source}/datum.json", "w") as f:
+        json.dump({"negate": bool(negate), "offset_m": float(offset),
+                   "clamp_positive": bool(clamp_positive)}, f, indent=2)
 
 
 def main():
@@ -62,6 +74,10 @@ def main():
                    help="after the offset, drop cells > 0 (above the water surface) to nodata — "
                         "removes a lake DEM's land fringe / a topobathy playa")
     a = p.parse_args()
+
+    # Record what this invocation applies even when it's a no-op, so the sidecar exists for
+    # every source whose recipe runs source_datum (source_catalog's invariant).
+    write_sidecar(a.source, a.negate, a.offset, a.clamp_positive)
 
     if not a.negate and a.offset == 0 and not a.clamp_positive:
         print(f"{a.source}: no datum transform (negate=False, offset=0)")

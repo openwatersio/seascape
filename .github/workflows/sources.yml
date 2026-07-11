@@ -90,6 +90,62 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  # Mirror the OSM land mask AND the Overture inland-water mask to R2, rebuilding both when
+  # landmask.py's recipe changes. They belong here, not in the build: they are source-shaped
+  # inputs fetched from upstream (OSM/Overture), on their own upstream cadence, and a build must
+  # never fetch from an upstream — it consumes land.fgb/water.fgb from R2 via /vsicurl like any
+  # prepared source. Recipe-hash-gated with the same marker the sources use (a new OSM/Overture
+  # snapshot, MERC_LAT, or the inland-water code all live in landmask.py, so hashing it catches
+  # every refresh; the pinned URL + Overture release mean the data can't drift underneath an
+  # unchanged recipe), so an unchanged run is a no-op. One hash for both artifacts is correct: one
+  # file (prep + prep_water) builds both, so they can never mirror different snapshots of the
+  # module. Flagged coarse sources (GEBCO/EMODnet) clamp negative land pixels against the land mask
+  # and keep their genuine depths inside the water mask. The build's covering diff sees neither
+  # mask (they aren't in the aggregation CSVs), so after a refresh the flagged tiles still need a
+  # force=true BUILD dispatch to re-aggregate — the marker only automates the R2 mirror, not the
+  # diff. force here doesn't apply: the pinned inputs can't drift under an unchanged recipe.
+  landmask:
+    needs: image
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: read }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/ghcr-login
+      # prep-water spools EVERY non-ocean Overture water feature (rivers, lakes, canals, plus the
+      # river/stream centerlines the second pass filters out) into a temp .raw.gpkg before the
+      # polygon-only filter — tens of GB planet-wide, more than a stock runner's free root disk.
+      # Free it, so the raw copy can't fill the disk mid-refresh. The recipe-skip path exits before
+      # writing anything, so running this unconditionally is harmless and off the hot path.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+      - name: Ensure land + water masks in R2
+        env:
+          RECIPE_HASH: ${{ hashFiles('pipelines/landmask.py') }}
+        run: |
+          have=$(aws s3 cp "s3://$DATA_BUCKET/bathymetry/landmask/.recipe-hash" - 2>/dev/null || true)
+          if [ -n "$RECIPE_HASH" ] && [ "$have" = "$RECIPE_HASH" ]; then
+            echo "land + water masks current in R2 (recipe unchanged)"; exit 0
+          fi
+          echo "masks stale or missing (recipe=$RECIPE_HASH r2=${have:-none}) — rebuilding both"
+          mkdir -p store
+          # No `|| true` / continue-on-error on either build: a broken water mask fails the job
+          # exactly like a broken land mask, and the marker below is written last so a failure
+          # anywhere leaves the hash stale → next run retries instead of trusting a half-mirror.
+          docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just landmask
+          docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just watermask
+          aws s3 cp store/landmask/land.fgb "s3://$DATA_BUCKET/bathymetry/landmask/land.fgb"
+          aws s3 cp store/landmask/water.fgb "s3://$DATA_BUCKET/bathymetry/landmask/water.fgb"
+          # Marker last, only after BOTH uploads land: a crash in between re-runs next time
+          # rather than parking a "current" hash over a missing/stale water.fgb.
+          printf '%s' "$RECIPE_HASH" | aws s3 cp - "s3://$DATA_BUCKET/bathymetry/landmask/.recipe-hash"
+
   # Enumerate the sources (one dir per source) into a matrix.
   discover:
     runs-on: ubuntu-latest
@@ -144,8 +200,13 @@ jobs:
           if grep -q source_polygonize "sources/${{ matrix.source }}/Justfile"; then
             aws s3 ls "s3://$DATA_BUCKET/bathymetry/polygon/${{ matrix.source }}.gpkg" >/dev/null || poly_ok=false
           fi
+          # Every source must have its generated catalog.json in R2 (the `just source` tail
+          # assembles it). Missing means the source last registered before the catalog step
+          # existed — rebuild once, same shape as poly_ok.
+          catalog_ok=true
+          aws s3 ls "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/catalog.json" >/dev/null || catalog_ok=false
           if [ "$volatile" = "true" ] || [ "$FORCE" = "true" ]; then current=false
-          elif [ -n "$RECIPE_HASH" ] && [ "$have" = "$RECIPE_HASH" ] && [ "$poly_ok" = "true" ]; then current=true
+          elif [ -n "$RECIPE_HASH" ] && [ "$have" = "$RECIPE_HASH" ] && [ "$poly_ok" = "true" ] && [ "$catalog_ok" = "true" ]; then current=true
           else current=false; fi
           {
             echo "current=$current"
@@ -163,11 +224,17 @@ jobs:
           mkdir -p "store/source/${{ matrix.source }}"
           aws s3 cp "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/bounds.csv" \
             "store/source/${{ matrix.source }}/bounds.csv" 2>/dev/null || true
+      # `just source` ends in source_catalog.py, which stamps the source's recipe hash into
+      # the generated catalog.json (the same hash the .recipe-hash marker carries). Pass it in
+      # so the item matches; the pipeline stays R2-agnostic — RECIPE_HASH is just "the recipe
+      # content hash" to it, and it's empty on a laptop.
       - name: Prepare ${{ matrix.source }}
         if: steps.check.outputs.current != 'true'
+        env:
+          RECIPE_HASH: ${{ steps.check.outputs.hash }}
         run: |
           mkdir -p store
-          docker run --rm -v "$PWD:/app" -e MIRROR_ALLOW_SHRINK \
+          docker run --rm -v "$PWD:/app" -e MIRROR_ALLOW_SHRINK -e RECIPE_HASH \
             -v "$PWD/store:/app/pipelines/store" \
             "$IMAGE:$IMAGE_TAG" just source ${{ matrix.source }}
       # Mirror the upstream objects the registration just enumerated. mirror.txt is
