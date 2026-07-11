@@ -7,18 +7,27 @@ name: Sources
 # build.yml (recipe-hash-gated, so an unchanged source is a no-op). Volatile
 # sources (NOAA S-102, CUDEM — upstream catalogs that drift) re-register on every
 # run: enumerate the public bucket → MIRROR the objects into the data bucket →
-# push registration files → publish bounds.csv LAST.
+# push registration files → publish bounds.csv → publish catalog.json LAST.
 #
-# That publish order is the atomicity mechanism. bounds.csv is the only file the
-# build's plan job reads, and every object a row references is verified-present in
-# R2 before the one-PUT bounds.csv lands — so a build dispatched mid-refresh sees
-# either the previous complete registration or the new one, never a half-mirror.
+# That publish order is the atomicity mechanism. bounds.csv drives the build's
+# covering, and every object a row references is verified-present in R2 before the
+# one-PUT bounds.csv lands — so a build dispatched mid-refresh sees either the
+# previous complete registration or the new one, never a half-mirror. catalog.json
+# publishes LAST, after even bounds.csv, because it is ALSO the staleness marker:
+# its seascape:recipe_hash replaces the retired .recipe-hash object, and whatever
+# vouches "this source is current" must land after every artifact it vouches for —
+# a crash anywhere above leaves a stale hash, so the next run redoes the source
+# instead of trusting a half-push. The cost is a crash window where bounds.csv is
+# one refresh ahead of catalog.json; consumers degrade gracefully (the build's tile
+# keys pick up the new hash on the run after the catalog lands), and the shared
+# r2-store concurrency group means a live build never interleaves with this push.
 # Upstream churn (deleted products, half-published editions, NOAA outages) turns
 # THIS workflow red — the alert channel — while builds keep reading the last-good
 # state. A 404 against our own mirror mid-build is our bug, and hard-fails there.
 #
-# NOTE: a volatile refresh changes bounds.csv filenames, so the next build's
-# covering diff re-aggregates the affected coastal tiles once. Expected, not a bug.
+# NOTE: a volatile refresh changes bounds.csv filenames + the catalog's recipe
+# hash, so the next build's tile keys re-aggregate the affected coastal tiles once.
+# Expected, not a bug.
 
 on:
   schedule:
@@ -100,10 +109,11 @@ jobs:
   # unchanged recipe), so an unchanged run is a no-op. One hash for both artifacts is correct: one
   # file (prep + prep_water) builds both, so they can never mirror different snapshots of the
   # module. Flagged coarse sources (GEBCO/EMODnet) clamp negative land pixels against the land mask
-  # and keep their genuine depths inside the water mask. The build's covering diff sees neither
-  # mask (they aren't in the aggregation CSVs), so after a refresh the flagged tiles still need a
-  # force=true BUILD dispatch to re-aggregate — the marker only automates the R2 mirror, not the
-  # diff. force here doesn't apply: the pinned inputs can't drift under an unchanged recipe.
+  # and keep their genuine depths inside the water mask. The build's tile keys hash landmask.py —
+  # the module IS the masks' identity, same reasoning as this marker — so a mask refresh (which
+  # only ever follows a landmask.py change) re-aggregates the flagged tiles on the next build with
+  # no force dispatch. This job keeps its own .recipe-hash object: the masks have no catalog item
+  # to absorb it. force here doesn't apply: the pinned inputs can't drift under an unchanged recipe.
   landmask:
     needs: image
     runs-on: ubuntu-latest
@@ -169,8 +179,8 @@ jobs:
   # Prepare each source and push its store/source/<id> to R2. One source failing
   # doesn't sink the rest (fail-fast: false): a failed source simply doesn't
   # refresh its R2 state, so builds keep covering from its last successful
-  # bounds.csv. The recipe-hash marker skips sources whose recipe (and, for
-  # non-volatile sources, data) can't have changed.
+  # bounds.csv. The recipe hash in the published catalog.json skips sources whose
+  # recipe (and, for non-volatile sources, data) can't have changed.
   sources:
     needs: [image, discover]
     runs-on: ubuntu-latest
@@ -192,7 +202,11 @@ jobs:
           FORCE: ${{ github.event.inputs.force == 'true' && 'true' || 'false' }}
         run: |
           volatile=$(jq -r '.volatile // false' "sources/${{ matrix.source }}/metadata.json")
-          have=$(aws s3 cp "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/.recipe-hash" - 2>/dev/null || true)
+          # The recipe hash lives IN the published catalog.json (seascape:recipe_hash — the
+          # retired .recipe-hash marker's successor). A source registered before the catalog
+          # existed, or whose catalog carries no hash, reads as stale and rebuilds once.
+          have=$(aws s3 cp "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/catalog.json" - 2>/dev/null \
+                 | jq -r '.properties["seascape:recipe_hash"] // empty' || true)
           # A source whose recipe polygonizes must have its footprint in R2 (the
           # build's coverage tileset builds from bathymetry/polygon/). Missing means
           # the source last built before the polygon push existed — rebuild once.
@@ -200,13 +214,8 @@ jobs:
           if grep -q source_polygonize "sources/${{ matrix.source }}/Justfile"; then
             aws s3 ls "s3://$DATA_BUCKET/bathymetry/polygon/${{ matrix.source }}.gpkg" >/dev/null || poly_ok=false
           fi
-          # Every source must have its generated catalog.json in R2 (the `just source` tail
-          # assembles it). Missing means the source last registered before the catalog step
-          # existed — rebuild once, same shape as poly_ok.
-          catalog_ok=true
-          aws s3 ls "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/catalog.json" >/dev/null || catalog_ok=false
           if [ "$volatile" = "true" ] || [ "$FORCE" = "true" ]; then current=false
-          elif [ -n "$RECIPE_HASH" ] && [ "$have" = "$RECIPE_HASH" ] && [ "$poly_ok" = "true" ] && [ "$catalog_ok" = "true" ]; then current=true
+          elif [ -n "$RECIPE_HASH" ] && [ "$have" = "$RECIPE_HASH" ] && [ "$poly_ok" = "true" ]; then current=true
           else current=false; fi
           {
             echo "current=$current"
@@ -225,9 +234,9 @@ jobs:
           aws s3 cp "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/bounds.csv" \
             "store/source/${{ matrix.source }}/bounds.csv" 2>/dev/null || true
       # `just source` ends in source_catalog.py, which stamps the source's recipe hash into
-      # the generated catalog.json (the same hash the .recipe-hash marker carries). Pass it in
-      # so the item matches; the pipeline stays R2-agnostic — RECIPE_HASH is just "the recipe
-      # content hash" to it, and it's empty on a laptop.
+      # the generated catalog.json (the staleness marker the check above reads back). Pass it
+      # in; the pipeline stays R2-agnostic — RECIPE_HASH is just "the recipe content hash" to
+      # it, and it's empty on a laptop.
       - name: Prepare ${{ matrix.source }}
         if: steps.check.outputs.current != 'true'
         env:
@@ -285,19 +294,20 @@ jobs:
             "upstream:$bucket" "r2:$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/objects" \
             --files-from "store/source/${{ matrix.source }}/mirror.txt" \
             --transfers 16 --checkers 32 --retries 5 --stats 60s --stats-one-line -v
-      # Push the registration files — everything EXCEPT bounds.csv, which publishes
-      # last (below). Volatile sources sync without --delete: their objects/ tree
+      # Push the registration files — everything EXCEPT bounds.csv and catalog.json, which
+      # publish last (below). Volatile sources sync without --delete: their objects/ tree
       # lives under the same prefix and must never be swept by a registration sync.
-      # Prepared sources keep --delete so retired artifacts don't linger.
+      # Prepared sources keep --delete so retired artifacts don't linger (this also sweeps
+      # the retired .recipe-hash object — its hash now rides inside catalog.json).
       - name: Push source to R2
         if: steps.check.outputs.current != 'true'
         run: |
           if [ "${{ steps.check.outputs.volatile }}" = "true" ]; then
             aws s3 sync "store/source/${{ matrix.source }}" "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}" \
-              --exclude '.recipe-hash' --exclude 'bounds.csv'
+              --exclude 'bounds.csv' --exclude 'catalog.json'
           else
             aws s3 sync "store/source/${{ matrix.source }}" "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}" \
-              --delete --exclude '.recipe-hash' --exclude 'bounds.csv'
+              --delete --exclude 'bounds.csv' --exclude 'catalog.json'
           fi
           # Provenance footprint → bathymetry/polygon/ (the build's coverage tileset
           # reads them all). Guarded: mirrored sources register remote objects and
@@ -305,16 +315,17 @@ jobs:
           if [ -f "store/polygon/${{ matrix.source }}.gpkg" ]; then
             aws s3 cp "store/polygon/${{ matrix.source }}.gpkg" "s3://$DATA_BUCKET/bathymetry/polygon/${{ matrix.source }}.gpkg"
           fi
-      # bounds.csv LAST — the atomic pointer. Every object a row references is
-      # already verified-present above, so a build dispatched at any moment sees a
-      # complete registration. The recipe-hash marker lands after even that: a crash
-      # anywhere above leaves the hash stale, and the next run redoes the source
-      # instead of trusting a half-push.
-      - name: Publish bounds.csv
+      # bounds.csv then catalog.json, in that order, LAST. bounds.csv is the atomic pointer
+      # (every object a row references is already verified-present above, so a build
+      # dispatched at any moment sees a complete registration). catalog.json lands after
+      # even that because its seascape:recipe_hash IS the staleness marker (the retired
+      # .recipe-hash): a crash anywhere above leaves the published hash stale, and the next
+      # run redoes the source instead of trusting a half-push. See the header comment for
+      # the (benign) bounds-ahead-of-catalog crash window this ordering accepts.
+      - name: Publish bounds.csv + catalog marker
         if: steps.check.outputs.current != 'true'
         run: |
           aws s3 cp "store/source/${{ matrix.source }}/bounds.csv" \
             "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/bounds.csv"
-          # The container writes store/ as root, so write the marker to R2 from
-          # stdin (not into the root-owned dir).
-          printf '%s' "${{ steps.check.outputs.hash }}" | aws s3 cp - "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/.recipe-hash"
+          aws s3 cp "store/source/${{ matrix.source }}/catalog.json" \
+            "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/catalog.json"
