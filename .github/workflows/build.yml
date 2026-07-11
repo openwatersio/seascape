@@ -299,6 +299,14 @@ jobs:
                     -e GDAL_HTTP_MULTIPLEX=YES -e GDAL_HTTP_VERSION=2
                     -e VSI_CACHE=TRUE -e VSI_CACHE_SIZE=33554432
                     -e GDAL_INGESTED_BYTES_AT_OPEN=524288)
+          # A dead multiplexed connection must error-and-retry, never hang: the tuned run's
+          # workers slid 510% → 180% → 1% CPU and sat at keepalive-only network — GDAL sets
+          # NO HTTP timeout by default, and under GDAL_HTTP_MULTIPLEX one dead HTTP/2
+          # connection blocks every read sharing it, forever. These timeouts turn the hang
+          # into a curl error; the retries that then ride it out are baked in the Dockerfile
+          # (GDAL_HTTP_MAX_RETRY=5, GDAL_HTTP_RETRY_DELAY=1 — set in ONE place, for every
+          # gdal invocation; deliberately not duplicated here).
+          AGG_ENV+=(-e GDAL_HTTP_TIMEOUT=120 -e GDAL_HTTP_CONNECTTIMEOUT=30)
           if rclone lsf "$R2/landmask/" --include water.fgb 2>/dev/null | grep -q water.fgb; then
             AGG_ENV+=(-e WATERMASK="/vsicurl/$PUBLIC_BASE/landmask/water.fgb")
           else
