@@ -472,8 +472,22 @@ def check_crash_leaves_stale():
         assert keys.read_key(out) is None, "a bundle crash must not leave the old sidecar"
         assert not keys.is_fresh(out, "prev-bundle-key", require_artifact=False), \
             "the post-crash bundle state must plan as stale"
-        print("crash-leaves-stale ok — a mid-fork or mid-bundle crash deletes the sidecar; "
-              "next run re-runs")
+
+        # Empty input, same rule: a previously-built bundle whose inputs are now ZERO must not
+        # survive the early return — _finalize_contours folds soundings/depare.pmtiles into
+        # vector.pmtiles whenever they exist on disk, so a stale layer would ship as current.
+        os.remove(f"store/soundings/{stem}.geojson")
+        for stale_out, mod in (("store/bundle/soundings.pmtiles", soundings_run),
+                               ("store/bundle/vector.pmtiles", contour_run)):
+            open(stale_out, "w").close()
+            keys.write_key(stale_out, "prev-bundle-key")
+            mod.bundle()  # zero members (no geojson / no contour FGBs) -> the empty-input path
+            assert not os.path.isfile(stale_out), \
+                f"{stale_out}: an empty-input bundle must remove the previously-built output"
+            assert keys.read_key(stale_out) is None, \
+                f"{stale_out}: an empty-input bundle must remove the old sidecar"
+        print("crash-leaves-stale ok — mid-fork/mid-bundle crashes and empty inputs all leave "
+              "no sidecar standing; next run re-runs")
     finally:
         config.SOURCES_DIR = saved_dir
         os.chdir(cwd)

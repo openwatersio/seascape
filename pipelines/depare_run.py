@@ -291,12 +291,19 @@ def bundle():
     FlatGeobuf Integer64, so -T rank:int keeps it numeric in the MVT (else it lands as a string,
     like the contour depth ints)."""
     fgbs = contour_run._live_fgbs(sorted(glob("store/depare/*.fgb")), contour_run._current_stems())
+    out = "store/bundle/depare.pmtiles"
     if not fgbs:
+        # Empty input is a real state, not a no-op: a previously-built archive (and the sidecar
+        # vouching for it) must not survive — _finalize_contours folds this file into
+        # vector.pmtiles whenever it exists on disk, so a stale layer would ship as current.
+        # The invalidate discipline, extended to "the current state is nothing".
+        for stale in (out, keys.sidecar(out)):
+            if os.path.isfile(stale):
+                os.remove(stale)
         print("depare bundle: no depare FGBs")
         return
     maxz = contour_run.bundle_maxz(
         max(int(f.split("/")[-1].replace(".fgb", "").split("-")[3]) for f in fgbs))
-    out = "store/bundle/depare.pmtiles"
     # Skip when every member tile's key is unchanged and the pmtiles is on disk (the local
     # iterative loop; the box's store/bundle is never hydrated, so a box build always rebuilds).
     dkey = keys.stage_key([f"{f}:{keys.read_key(f) or ''}" for f in fgbs],

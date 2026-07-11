@@ -432,12 +432,18 @@ def bundle():
     every per-tile vector artifact's key is unchanged and vector.pmtiles is already on disk (the
     local iterative loop; the box's store/bundle is never hydrated, so a box build always runs)."""
     fgbs = _live_fgbs(sorted(glob("store/contour/*.fgb")), _current_stems())
+    vec = "store/bundle/vector.pmtiles"
     if not fgbs:
+        # Empty input is a real state, not a no-op: a previously-built vector.pmtiles (and the
+        # sidecar vouching for it) must not survive to be pushed as this build's current vector
+        # layer. The invalidate discipline, extended to "the current state is nothing".
+        for stale in (vec, keys.sidecar(vec)):
+            if os.path.isfile(stale):
+                os.remove(stale)
         print("contour bundle: no contour FGBs")
         return
     maxz = bundle_maxz(_global_maxz(fgbs))
     vkey = _vector_key(maxz)
-    vec = "store/bundle/vector.pmtiles"
     if keys.is_fresh(vec, vkey):
         print("contour bundle: vector inputs unchanged — skip")
         return

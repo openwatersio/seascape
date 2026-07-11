@@ -205,14 +205,21 @@ def bundle():
     tile's key is unchanged and the pmtiles is already on disk (the local iterative loop; the
     build box's store/bundle is never hydrated, so a box build always rebuilds it)."""
     gj = _live(sorted(glob("store/soundings/*.geojson")), contour_run._current_stems())
+    out = "store/bundle/soundings.pmtiles"
     if not gj:
+        # Empty input is a real state, not a no-op: a previously-built archive (and the sidecar
+        # vouching for it) must not survive — _finalize_contours folds this file into
+        # vector.pmtiles whenever it exists on disk, so a stale layer would ship as current.
+        # The invalidate discipline, extended to "the current state is nothing".
+        for stale in (out, keys.sidecar(out)):
+            if os.path.isfile(stale):
+                os.remove(stale)
         print("soundings bundle: no soundings")
         return
     # Shared tileset maxzoom (see contour_run.bundle_maxz): tiling only to this
     # layer's own regional max would truncate it out of deeper joined tiles.
     maxz = contour_run.bundle_maxz(
         max(int(g.split("/")[-1].replace(".geojson", "").split("-")[3]) for g in gj))
-    out = "store/bundle/soundings.pmtiles"
     skey = keys.stage_key([f"{g}:{keys.read_key(g) or ''}" for g in gj],
                           ["soundings_run", "contour_run", "utils"], {"maxz": maxz})
     if keys.is_fresh(out, skey):
