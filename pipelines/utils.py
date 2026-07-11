@@ -166,20 +166,6 @@ def get_dirty_aggregation_filenames(current_aggregation_id, last_aggregation_id)
     return dirty_filenames
 
 
-def lpt_bins(weights, n):
-    """Deterministically bin-pack {name: weight} into n bins, heaviest item first
-    into the lightest bin (LPT greedy). Callers size n to ceil(total / max), so each
-    bin carries about the heaviest single item — the floor any partition has, since
-    one item can't split across shards. Guarantees a complete, disjoint partition and
-    (for n <= len(weights), all weights > 0) no empty bins."""
-    bins, loads = [[] for _ in range(n)], [0] * n
-    for name in sorted(weights, key=lambda k: (-weights[k], k)):
-        j = min(range(n), key=lambda k: (loads[k], k))
-        bins[j].append(name)
-        loads[j] += weights[name]
-    return bins
-
-
 def get_pmtiles_folder(x, y, z):
     if z < 7:
         return 'store/pmtiles'
@@ -190,10 +176,10 @@ def get_pmtiles_folder(x, y, z):
 
 
 def existing_pmtiles():
-    """Basenames of pmtiles already in the store. From a CI-provided listing
+    """Basenames of pmtiles already in the store. From a provided listing
     (store/pmtiles-keys.txt = the R2 keys) when present, else a local scan. Shared by the
     aggregate and downsample dirty-diffs so both agree on what's actually built — a
-    covering whose pmtiles isn't here is rebuilt, which is how a dropped/unsynced shard's
+    covering whose pmtiles isn't here is rebuilt, which is how a dropped/unsynced tile's
     hole self-heals instead of staying 'clean' forever."""
     keyfile = "store/pmtiles-keys.txt"
     if os.path.isfile(keyfile):

@@ -41,11 +41,13 @@ sources:
 # with negative drval1) — aggregation_run generates its per-tile FGB, which depare consumes.
 # Coverage right after cover (it needs only footprints + the covering) so missing footprints
 # fail in the first minute, not after hours of aggregation. Coverage honors BBOX, so a preview
-# builds only the region's footprints (CI builds the whole planet, in its own parallel job).
+# builds only the region's footprints (the build box builds the whole planet).
+# The build box runs these same recipes one at a time, pushing to R2 between stages so an
+# interrupted build resumes — see docs/build.md.
 planet:
     just cover
     just coverage
-    uv run python aggregation_run.py
+    just aggregate
     just combine
     just soundings
     just depare
@@ -55,71 +57,41 @@ planet:
 cover:
     uv run python aggregation_covering.py
 
-# Freeze the aggregate + downsample dirty work lists into the covering dir (plan job, after
-# cover, before the covering tarball is pushed). Every shard then reads the SAME list from the
-# covering instead of re-listing R2 itself — one partition, computed once, so no self-heal tile
-# slips between shards whose listings drifted across matrix waves.
-freeze-work:
-    uv run python aggregation_run.py freeze
-    uv run python downsampling.py freeze
+# Aggregate every dirty tile: reproject -> merge -> smooth -> encode terrain, forking
+# contours/soundings/depare off each merged DEM. AGG_PROCESSES caps concurrent tiles (each
+# holds a multi-GB merged DEM); unset = all cores. FORCE_REBUILD=1 rebuilds every tile.
+aggregate:
+    uv run python aggregation_run.py
 
-# Run one aggregate shard i of n — the CI fan-out unit (`aggregation_run.py` alone = all dirty).
-aggregate i n:
-    uv run python aggregation_run.py shard {{i}} {{n}}
+# Write store/source-manifest.txt: the source files the dirty tiles reference — lets the
+# build box hydrate exactly the dirty set from R2, then aggregate from local disk.
+sources-manifest:
+    uv run python aggregation_run.py sources-manifest
 
-# Print the CI aggregate shard matrix as JSON (<= max shards, sized to the dirt).
-shard-matrix max:
-    @uv run python aggregation_run.py matrix {{max}}
-
-# Single-runner terrain finish: overview pyramid -> planet/overlay bundles + manifest.
+# Single-machine terrain finish: overview pyramid -> planet/overlay bundles + manifest.
 combine:
+    just downsample
+    just bundle
+
+# Overview pyramid below each source's native maxzoom: plan the parent tiles, then
+# 2x2-average each dirty overview (finest first, so each level feeds the next).
+downsample:
     uv run python downsampling.py cover
     uv run python downsampling.py run
+
+# Concat the single-zoom pmtiles into planet.pmtiles + one overlay per populated
+# OVERLAY_SPLIT_Z grid cell + manifest.json (groups bundled in parallel).
+bundle:
     uv run python bundle.py
 
-# CI downsampling fan-out (deep levels shard by ancestor, coarse tail on the bundler):
-#   plan job   -> just downsample-cover   (writes -downsampling.csv beside the covering)
-#   plan job   -> just downsample-matrix N (the shard matrix, sized to the dirt)
-#   matrix job -> just downsample-shard-keys i n  (pick this shard's pmtiles to pull)
-#   matrix job -> just downsample-shard i n
-#   plan  job  -> just downsample-tail + bundle-matrix   (coarse tail, then the matrix)
-downsample-cover:
-    uv run python downsampling.py cover
-downsample-matrix max:
-    @uv run python downsampling.py matrix {{max}}
-# Filter store/pmtiles-keys.txt -> store/shard-keys.txt (only the tiles shard i reads),
-# so CI pulls a shard's slice of store/pmtiles instead of the whole tens-of-GB store.
-downsample-shard-keys i n:
-    uv run python downsampling.py shard-keys {{i}} {{n}}
-downsample-shard i n:
-    uv run python downsampling.py run shard {{i}} {{n}}
-downsample-tail:
-    uv run python downsampling.py run tail
-
-# CI terrain bundle fan-out (planet + one overlay per OVERLAY_SPLIT_Z grid cell; each
-# matrix job loops its chunk of groups pull->bundle->push->clean one group at a time, so
-# a runner's disk is bounded by ONE group's tiles + output no matter how many sources land):
-#   plan job   -> just downsample-tail + bundle-matrix N (tail, verify, emit chunk matrix)
-#   matrix job -> just bundle-group-keys <name>          (pick this group's pmtiles to pull)
-#   matrix job -> just bundle-group <name>               (bundle one group + its fragment)
-#   merge job  -> just bundle-merge                      (fragments -> manifest.json)
-bundle-matrix max:
-    @uv run python bundle.py matrix {{max}}
-bundle-group-keys name:
-    uv run python bundle.py group-keys {{name}}
-bundle-group name:
-    uv run python bundle.py group {{name}}
-bundle-merge:
-    uv run python bundle.py merge
-
-# Contours, whole set (local/regional); the final tile-join also folds in any
-# soundings/depare pmtiles already bundled. CI shards these across runners — see below.
+# Contours, whole set: one global tippecanoe over every contour FGB, then one tile-join that
+# also folds in the soundings/depare pmtiles already bundled → vector.pmtiles.
 contours:
     uv run python contour_run.py bundle
 
-# Soundings: bundle the per-tile points into soundings.pmtiles. Run BEFORE the contours
-# bundle/merge — its single tile-join folds the layer into vector.pmtiles (a separate
-# fold re-joined the whole planet archive per layer).
+# Soundings: bundle the per-tile points into soundings.pmtiles. Run BEFORE contours —
+# their single tile-join folds this layer into vector.pmtiles (a separate fold re-joined
+# the whole planet archive per layer).
 soundings:
     uv run python soundings_run.py bundle
 
@@ -136,20 +108,6 @@ depare:
 # Honors BBOX: a preview builds only the region's footprints (whole planet if unset).
 coverage:
     uv run python contour_run.py coverage
-
-# tippecanoe this shard's local slice of every vector layer -> {contours,soundings,
-# depare}-shard-{i}.pmtiles (CI pulls only the shard's slices + writes
-# store/contour-maxz.txt so all layers tile to one depth; merged by contour-merge).
-# Three invocations, not one -L run: the layers need different tippecanoe flags
-# (soundings -r1, depare --detect-shared-borders, contours' per-zoom filter).
-vector-shard i:
-    uv run python contour_run.py bundle-shard {{i}}
-    uv run python soundings_run.py bundle-shard {{i}}
-    uv run python depare_run.py bundle-shard {{i}}
-
-# tile-join the per-shard pmtiles (all layers) into vector.pmtiles.
-contour-merge:
-    uv run python contour_run.py bundle-merge
 
 # Build a regional preview into the local Worker R2 — a faithful slice of the planet
 # build for BBOX="W,S,E,N" (default: NY harbor; e.g. Chesapeake = "-76.5,37.0,-76.0,37.5").

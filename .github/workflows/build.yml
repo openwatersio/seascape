@@ -1,72 +1,71 @@
 name: Build
 
-# Heavy planet build (see CONTRIBUTING.md / the port plan):
-#   image → plan (cover + diff) → aggregate (sharded fan-out) → bundle + contours.
-#   Source registration/preparation is sources.yml — a build never contacts a
-#   source upstream; it reads each source's last-published bounds.csv + bytes
-#   from R2. Releasing/deploying is release.yml.
+# Full planet build on ONE ephemeral Hetzner box (the seamap build-planet.yml pattern):
+#   image → boot box → hydrate the store from R2 → run the whole pipeline through `just`
+#   → push each stage back to R2 → always-destroy the box. The runner here only
+#   orchestrates; the compute is pay-per-build (~€2/hr, ~€10 for a forced planet rebuild).
 #
-# State lives in R2 under a single persistent prefix `store/` (the consolidated
-# pipelines/store dir) so rebuilds are incremental: `plan` diffs the new covering
-# against the previous one and only the changed aggregation tiles get rebuilt;
-# clean tiles' pmtiles/contours are reused straight from the store. Final bundles
-# land in build/<sha>/; a release promotes that build (see release.yml).
+# The store still lives in R2 under bathymetry/ and rebuilds are still incremental: the box
+# `rclone copy`s the tile/vector store down, `just cover` diffs the new covering against the
+# previous one, and only the changed aggregation tiles rebuild (clean tiles' pmtiles/contours
+# are reused). Source registration/mirroring + the land/water masks are sources.yml — a build
+# never contacts an upstream; it reads every byte (sources + masks) from R2 over /vsicurl.
+# Final bundles land in build/<sha>/; a release promotes that build (release.yml).
 #
-# Runs on manual dispatch only (a shared incremental store shouldn't be mutated by
-# routine pushes); any branch can trigger one via workflow_dispatch (optionally with
-# a BBOX). The light per-commit checks live in ci.yml. Releasing a commit promotes
-# the build a dispatch produced for it — so dispatch a build before you release.
+# Dispatch-only (a shared incremental store shouldn't be mutated by routine pushes); any branch
+# can trigger one. A `bbox` builds a self-contained regional slice (no volume, no store push, no
+# prune, never released). The light per-commit checks are ci.yml.
 
 on:
   workflow_dispatch:
     inputs:
       bbox:
-        description: 'Bounding box "W,S,E,N" (empty = full global)'
+        description: 'Bounding box "W,S,E,N" (empty = full planet)'
         required: false
         default: ""
-      shards:
-        description: "Fan-out ceiling (<= 256): aggregate shard count; the other phases self-size to their work below it"
-        required: false
-        default: "24"
       force:
         description: "Force full rebuild — ignore the incremental diff (use after pipeline-code changes)"
         type: boolean
         default: false
+      server_type:
+        description: "Hetzner type — ccx33 (8 vCPU/32 GB, the account's dedicated-vCPU cap today); ccx63 once the quota is raised"
+        required: false
+        default: ccx33
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
-  # The public "data" bucket (data.openwaters.io) holds all build state + per-commit
-  # builds, compartmentalized per product under bathymetry/. release.yml promotes a
-  # finished build into the separate Worker-fronted "tiles" bucket for serving.
+  # The public "data" bucket (data.openwaters.io) holds all build state + per-commit builds
+  # under bathymetry/. release.yml promotes a finished build into the serving bucket.
   DATA_BUCKET: data
-  AGG_SHARDS: ${{ github.event.inputs.shards || '24' }}
-  BBOX: ${{ github.event.inputs.bbox || '' }}
-  # Set by the `force` dispatch input → consumed by get_dirty_aggregation_filenames to
-  # mark every tile dirty (the source-coverage diff can't see pipeline-code changes).
-  FORCE_REBUILD: ${{ github.event.inputs.force == 'true' && '1' || '' }}
-  # R2 via the S3 API (aws-cli v2 honours AWS_ENDPOINT_URL).
-  AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-  AWS_DEFAULT_REGION: auto
-  AWS_ENDPOINT_URL: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
-  # R2 occasionally returns a transient 500 InternalError; the CLI default (~3 tries)
-  # gives up mid-sync. Adaptive retry + a high ceiling rides it out across every aws s3 call.
-  AWS_RETRY_MODE: adaptive
-  AWS_MAX_ATTEMPTS: "10"
+  PUBLIC_BASE: https://data.openwaters.io/bathymetry
+  R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+  SERVER_TYPE: ${{ github.event.inputs.server_type }}
+  SERVER_IMAGE: ubuntu-24.04
+  SERVER_LOCATION: fsn1
+  # ServerAlive keepalives: the hosted runner's NAT drops idle TCP after ~4 min, and quiet
+  # pipeline stretches (tippecanoe, long warps) go silent for far longer — without keepalives
+  # the first silent stage kills the session ("Broken pipe", exit 255; seen on the first
+  # dispatch). 30s×20 also rides out ~10 min of transient network loss before giving up.
+  SSH_OPTS: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=20"
+  NAME: seascape-build-${{ github.run_id }}
+  # Dispatch inputs reach every `run:` as env vars, never as raw ${{…}} interpolated into a
+  # shell line — a bbox like `$(cmd)` would otherwise run under command substitution in the
+  # build.env heredoc / the `[ -z … ]` test.
+  BBOX: ${{ github.event.inputs.bbox }}
+  FORCE: ${{ github.event.inputs.force }}
 
-# One store-mutating workflow at a time, globally (not per-ref): the incremental
-# store is shared, so a build must never interleave with another build OR with a
-# sources.yml refresh (whose prepared-source syncs use --delete) — both workflows
-# share this group. cancel-in-progress: false → a new dispatch queues behind the
-# running one rather than cancelling it mid-write.
+# One store-mutating workflow at a time, globally (not per-ref): the incremental store is
+# shared, so a build must never interleave with another build OR with a sources.yml refresh
+# (whose prepared-source syncs use --delete) — both workflows share this group. No
+# cancel-in-progress → a new dispatch queues behind the running one rather than cancelling mid-write.
 concurrency:
   group: r2-store
   cancel-in-progress: false
 
 jobs:
-  # Ensure the deps-only toolchain image exists (code is mounted at runtime), keyed on
-  # the files that define the deps (IMAGE_TAG, exported by ghcr-login; shared with
-  # ci.yml, so a push-built image is reused here). Skipped when the tag is in GHCR.
+  # Ensure the deps-only toolchain image exists (code is mounted at runtime), keyed on the files
+  # that define the deps (IMAGE_TAG, exported by ghcr-login; shared with ci.yml, so a push-built
+  # image is reused here). Skipped when the tag is already in GHCR. The box pulls this image.
   image:
     runs-on: ubuntu-latest
     permissions: { contents: read, packages: write }
@@ -92,523 +91,414 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # Cover the planet into aggregation tiles, diff against the previous covering,
-  # and emit the shard matrix sized to the dirty count.
-  plan:
-    needs: [image]
+  # Boot an ephemeral box, hydrate → build → push, always-destroy. 350 min timeout — the max
+  # available: GitHub-HOSTED runners hard-cap jobs at 6 h, so it cannot be raised. Routine
+  # incrementals fit easily; a full forced planet rebuild on ccx33 may exceed it — the build
+  # resumes on re-dispatch (each stage is pushed as it finishes, aggregate additionally every
+  # ~20 min mid-stage, and the covering-diff's missing-pmtiles self-heal rebuilds only the
+  # tiles that never got pushed). ccx63 (quota pending) makes it moot.
+  build:
+    needs: image
     runs-on: ubuntu-latest
+    timeout-minutes: 350
     permissions: { contents: read, packages: read }
-    outputs:
-      shards: ${{ steps.m.outputs.shards }}
-      ds_shards: ${{ steps.dm.outputs.shards }}
+    env:
+      HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
     steps:
       - uses: actions/checkout@v6
-      - uses: ./.github/actions/ghcr-login
-      - name: Pull bounds + pmtiles index from R2
-        run: |
-          mkdir -p store/source
-          # Covering only needs each source's bounds.csv (not the full DEM)…
-          aws s3 sync "s3://$DATA_BUCKET/bathymetry/source" store/source --exclude '*' --include '*/bounds.csv'
-          # …and the list of already-built pmtiles, so the diff rebuilds any covering
-          # tile whose artifact is missing (self-heal — coverings are pushed before
-          # the tiles exist, so a failed prior build can leave gaps the diff trusts).
-          # Keep each tile's LastModified too: the downsample diff rebuilds an overview that
-          # is older than a child it averages (a child rebuilt by a later run/self-heal never
-          # re-dirtied its coarse parent, which then went stale — see downsampling.dirty_filepaths).
-          aws s3 ls "s3://$DATA_BUCKET/bathymetry/pmtiles/" --recursive > /tmp/pmtiles-ls.txt || true
-          awk '{print $4}' /tmp/pmtiles-ls.txt > store/pmtiles-keys.txt
-          awk '{print $1" "$2"\t"$4}' /tmp/pmtiles-ls.txt > store/pmtiles-mtimes.txt
-      # …plus the prior covering(s) so the dirty-diff has something to compare to.
-      # markers: false — the diff reads CSVs only, never the resume markers.
-      - name: Pull previous covering from R2
-        uses: ./.github/actions/pull-covering
-        with:
-          markers: "false"
-      - name: Cover
-        run: |
-          # Aggregation covering, then the downsampling coverings (-downsampling.csv)
-          # so the sharded downsample job downstream sees the same plan from R2.
-          docker run --rm -v "$PWD:/app" -e BBOX -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just cover
-          docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just downsample-cover
-      - name: Freeze the dirty work lists
-        run: |
-          # Compute the aggregate + downsample dirty sets ONCE, from this single R2 listing
-          # (store/pmtiles-keys.txt above), and write them into the covering dir so they ride
-          # in the covering tarball to every shard. Each shard then strides the SAME frozen
-          # list instead of re-listing R2 at its own start: across matrix waves those listings
-          # drifted (earlier shards had already pushed tiles), which shifted the [i::n] stride
-          # and left some self-heal tiles owned by no shard — silently never built, then
-          # downsample aborted "pyramid incomplete: <tile> missing". One list = one partition.
-          docker run --rm -v "$PWD:/app" -e FORCE_REBUILD -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just freeze-work
-      - name: Push covering to R2
-        run: |
-          # One gzipped tar per covering (covering.tar.gz) instead of ~2k loose CSVs —
-          # turns a latency-bound sync of thousands of tiny objects into a single PUT.
-          # ULIDs sort chronologically, so the newest dir is the covering just written.
-          id=$(ls store/aggregation | sort | tail -1)
-          tar -C "store/aggregation/$id" -czf /tmp/covering.tar.gz .
-          aws s3 cp /tmp/covering.tar.gz "s3://$DATA_BUCKET/bathymetry/aggregation/$id/covering.tar.gz"
-      - name: Prune old coverings (keep newest 3)
-        run: |
-          # R2 accrues one covering dir (ULID) per build, but every consumer reads only
-          # the newest two (current + previous, for the dirty-diff). Each dir is a tarball
-          # plus its build's resume markers; without pruning the backlog grows unbounded.
-          # Drop all but the newest 3 (one extra for margin); ULIDs sort chronologically.
-          ids=$(aws s3 ls "s3://$DATA_BUCKET/bathymetry/aggregation/" | awk '{print $2}' | tr -d /)
-          keep=$(echo "$ids" | sort | tail -3)
-          for id in $ids; do
-            grep -qx "$id" <<<"$keep" || {
-              echo "pruning covering $id"
-              aws s3 rm "s3://$DATA_BUCKET/bathymetry/aggregation/$id" --recursive
-            }
-          done
-      - name: Prune orphaned contour FGBs + soundings + depare (covering re-tiled)
-        run: |
-          # store/contour FGBs (and store/soundings geojson, store/depare FGBs) are keyed {z}-{x}-{y}-{child_z},
-          # same as the covering's aggregation tiles. A source's footprint/maxzoom shift
-          # re-tiles its area, but the sync (line ~270) has no --delete, so the superseded
-          # file lingers in R2 and bundle globs EVERY one → two sets overlap. Drop any R2
-          # file whose stem isn't a current-covering tile (this job just wrote the covering).
-          id=$(ls store/aggregation | sort | tail -1)
-          ls "store/aggregation/$id"/*-aggregation.csv | sed 's#.*/##; s/-aggregation\.csv$//' | sort > /tmp/valid-stems.txt
-          aws s3 ls "s3://$DATA_BUCKET/bathymetry/contour/" --recursive | awk '{print $NF}' | grep '\.fgb$' > /tmp/r2-fgbs.txt || true
-          while read -r key; do
-            [ -n "$key" ] || continue
-            grep -qx "$(basename "$key" .fgb)" /tmp/valid-stems.txt || {
-              echo "pruning orphan contour $key"
-              aws s3 rm "s3://$DATA_BUCKET/$key"
-            }
-          done < /tmp/r2-fgbs.txt
-          aws s3 ls "s3://$DATA_BUCKET/bathymetry/soundings/" --recursive | awk '{print $NF}' | grep '\.geojson$' > /tmp/r2-snd.txt || true
-          while read -r key; do
-            [ -n "$key" ] || continue
-            grep -qx "$(basename "$key" .geojson)" /tmp/valid-stems.txt || {
-              echo "pruning orphan soundings $key"
-              aws s3 rm "s3://$DATA_BUCKET/$key"
-            }
-          done < /tmp/r2-snd.txt
-          aws s3 ls "s3://$DATA_BUCKET/bathymetry/depare/" --recursive | awk '{print $NF}' | grep '\.fgb$' > /tmp/r2-dep.txt || true
-          while read -r key; do
-            [ -n "$key" ] || continue
-            grep -qx "$(basename "$key" .fgb)" /tmp/valid-stems.txt || {
-              echo "pruning orphan depare $key"
-              aws s3 rm "s3://$DATA_BUCKET/$key"
-            }
-          done < /tmp/r2-dep.txt
-      - name: Prune orphaned pmtiles (covering re-tiled)
-        run: |
-          # Same orphan class as the contour prune: a re-tiled covering leaves the old
-          # tile's pmtiles in R2 (sync has no --delete). bundle.py already filters orphans
-          # out at bundle time, so this is storage hygiene — keeps the pmtiles listing the
-          # dirty-diff/group-keys scan from growing dead keys. Valid stems = this covering's
-          # aggregate AND downsample tiles (downsample also emits pmtiles; cover ran both).
-          id=$(ls store/aggregation | sort | tail -1)
-          ls "store/aggregation/$id"/*-aggregation.csv "store/aggregation/$id"/*-downsampling.csv 2>/dev/null \
-            | sed 's#.*/##; s/-aggregation\.csv$//; s/-downsampling\.csv$//' | sort -u > /tmp/valid-pmt-stems.txt
-          aws s3 ls "s3://$DATA_BUCKET/bathymetry/pmtiles/" --recursive | awk '{print $NF}' | grep '\.pmtiles$' > /tmp/r2-pmt-keys.txt || true
-          # orphan keys = R2 key whose {z}-{x}-{y}-{child_z} basename isn't a current stem
-          awk 'NR==FNR{ok[$0]=1; next}{s=$0; sub(/.*\//,"",s); sub(/\.pmtiles$/,"",s); if(!(s in ok)) print}' \
-            /tmp/valid-pmt-stems.txt /tmp/r2-pmt-keys.txt > /tmp/orphan-pmt-keys.txt
-          echo "pruning $(wc -l < /tmp/orphan-pmt-keys.txt) orphan pmtiles of $(wc -l < /tmp/r2-pmt-keys.txt)"
-          while read -r key; do
-            [ -n "$key" ] || continue
-            aws s3 rm "s3://$DATA_BUCKET/$key"
-          done < /tmp/orphan-pmt-keys.txt
-      - id: m
-        name: Emit aggregate shard matrix
-        run: |
-          SHARDS=$(docker run --rm -v "$PWD:/app" -e FORCE_REBUILD -v "$PWD/store:/app/pipelines/store" \
-            "$IMAGE:$IMAGE_TAG" just shard-matrix "$AGG_SHARDS" | tail -n1)
-          echo "shards=$SHARDS" >> "$GITHUB_OUTPUT"
-      - id: dm
-        name: Emit downsample shard matrix
-        run: |
-          SHARDS=$(docker run --rm -v "$PWD:/app" -e FORCE_REBUILD -v "$PWD/store:/app/pipelines/store" \
-            "$IMAGE:$IMAGE_TAG" just downsample-matrix "$AGG_SHARDS" | tail -n1)
-          echo "shards=$SHARDS" >> "$GITHUB_OUTPUT"
 
-  # Source-provenance footprints → coverage.pmtiles (z0-8; its own small tileset the renderer
-  # overzooms deeper, independent of vector.pmtiles). Its own job, NOT inline in plan: the
-  # tippecanoe of the footprints kept whole (uk_surfzone/infomar are large intertidal-survey
-  # unions) runs ~40 min, and inline it serialized that ahead of the whole aggregate fan-out
-  # (aggregate needs plan). It depends only on the covering plan just wrote (for the per-source
-  # maxzoom — metadata.json max_zoom is only an optional cap most sources omit) + the footprints,
-  # nothing from aggregate, so it runs in parallel with the multi-hour aggregate/downsample/
-  # contour chains and finishes long before release. `just coverage` fails loudly on missing
-  # footprints — a planet build without them ships a dead layer; the silent drop is how the
-  # layer went missing from every release.
-  coverage:
-    needs: [image, plan]
-    if: ${{ !cancelled() && needs.plan.result == 'success' }}
-    runs-on: ubuntu-latest
-    permissions: { contents: read, packages: read }
-    steps:
-      - uses: actions/checkout@v6
-      - uses: ./.github/actions/ghcr-login
-      - name: Pull footprints from R2
-        run: |
-          mkdir -p store/polygon
-          aws s3 sync "s3://$DATA_BUCKET/bathymetry/polygon" store/polygon
-      # The covering plan just wrote — its aggregation CSVs are the authoritative per-source
-      # maxzoom. markers: false — coverage reads CSVs only, never the resume markers.
-      - name: Pull covering from R2
-        uses: ./.github/actions/pull-covering
-        with:
-          markers: "false"
-      - name: Build + push coverage.pmtiles
-        run: |
-          # -e BBOX like the plan job's `just cover`: a regional dispatch (bbox input) builds a
-          # regional covering, so coverage must scope to the same window; empty (a planet build)
-          # → the whole world.
-          docker run --rm -v "$PWD:/app" -e BBOX -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just coverage
-          aws s3 cp store/bundle/coverage.pmtiles "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/coverage.pmtiles" \
-            --content-type application/octet-stream
+      # The toolchain image tag (mirrors ghcr-login; hashed here, after checkout, so the
+      # workspace exists). The box pulls this exact tag and runs the pipeline through it.
+      - name: Toolchain image tag
+        run: echo "IMAGE_TAG=deps-${{ hashFiles('Dockerfile', 'pipelines/pyproject.toml', 'pipelines/uv.lock') }}" >> "$GITHUB_ENV"
 
-  # Reproject → merge → tile → contour for one strided slice of the dirty tiles.
-  # Shards re-derive the same sorted dirty list and never overlap, so each pushes
-  # disjoint tile keys back to the store.
-  aggregate:
-    needs: [image, plan]
-    runs-on: ubuntu-latest
-    permissions: { contents: read, packages: read }
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
-    steps:
-      - uses: actions/checkout@v6
-      - uses: ./.github/actions/ghcr-login
-      # Source COGs are NOT pulled — reproject range-reads them via /vsicurl from
-      # public R2 (mirrored volatile sources included). Only the covering + pmtiles keys.
-      - name: Pull covering from R2
-        uses: ./.github/actions/pull-covering
-      - name: Prepare store
+      - name: Install hcloud CLI
         run: |
-          # No R2 listing here: the shard reads its work from the plan's frozen dirty list
-          # (shipped in the covering tarball, pulled above), so every shard partitions the
-          # SAME list. Reproject range-reads sources via /vsicurl, so no pmtiles are pulled.
-          mkdir -p store/pmtiles store/contour store/soundings store/depare
-      - name: Aggregate shard ${{ matrix.shard.i }}/${{ matrix.shard.n }}
+          curl -fsSL https://github.com/hetznercloud/cli/releases/latest/download/hcloud-linux-amd64.tar.gz \
+            | tar xz hcloud
+          sudo mv hcloud /usr/local/bin/
+
+      - name: Boot ephemeral server
         run: |
-          # SOURCE_VSI_BASE → reproject resolves each source tile to a public /vsicurl
-          # URL on R2 instead of a local store/source path. No credentials needed.
-          # AGG_PROCESSES caps concurrent tiles (each holds a multi-GB merged DEM) so
-          # a heavy shard doesn't OOM the runner; GDAL_CACHEMAX trims the block cache
-          # the /vsicurl reads accumulate (per worker). GDAL HTTP retry is set globally
-          # in the Dockerfile (GDAL_HTTP_MAX_RETRY/RETRY_DELAY), so no per-run flag here.
-          # LANDMASK → flagged coarse sources (GEBCO/EMODnet) range-read the land mask FGB
-          # over /vsicurl and clamp negative land pixels; only the polygons each tile touches
-          # are read (FGB spatial index), so no per-shard download.
-          # WATERMASK → the same flagged sources subtract the inland-water mask, so they keep
-          # genuine depths inside mapped rivers/lakes instead of clamping them to 0 (same
-          # /vsicurl range-read, same per-tile spatial-index slice). Export it ONLY when the
-          # object exists in R2: landmask._present() assumes any /vsi path is reachable, so
-          # aiming it at a missing object would fail every tile's water clip mid-build. Omitting
-          # it falls back to the container's absent default (store/landmask/water.fgb) → the mask
-          # degrades to land-only (today's behavior), so a build against pre-water R2 state is safe.
-          watermask_env=()
-          if aws s3 ls "s3://$DATA_BUCKET/bathymetry/landmask/water.fgb" >/dev/null 2>&1; then
-            watermask_env=(-e WATERMASK="/vsicurl/https://data.openwaters.io/bathymetry/landmask/water.fgb")
-          else
-            echo "no water.fgb in R2 yet — inland-water subtraction degrades to land-only this build"
+          ssh-keygen -t ed25519 -N "" -f id_build -q
+          hcloud ssh-key create --name "$NAME" --public-key-from-file id_build.pub
+          hcloud server create --name "$NAME" \
+            --type "$SERVER_TYPE" --image "$SERVER_IMAGE" --location "$SERVER_LOCATION" \
+            --ssh-key "$NAME"
+          IP=$(hcloud server ip "$NAME")
+          echo "IP=$IP" >> "$GITHUB_ENV"
+          # Planet builds work on an attached volume; the root disk is too small. Sizing:
+          # ~50 GiB hydrated tile/vector store + bundle outputs which ~2x during pmtiles
+          # finalize (~100 GiB peak) + the dirty-set source hydrate (the full coastal
+          # S-102+CUDEM subset is ~100-200 GiB) → 400 GiB with headroom. A bbox build is
+          # self-contained on the root disk (like seamap's AREA smoke), so skip the volume.
+          if [ -z "$BBOX" ]; then
+            hcloud volume create --name "$NAME" --size 400 --server "$NAME"
           fi
-          docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" \
-            -e SOURCE_VSI_BASE="/vsicurl/https://data.openwaters.io/bathymetry/source" \
-            -e LANDMASK="/vsicurl/https://data.openwaters.io/bathymetry/landmask/land.fgb" \
-            "${watermask_env[@]}" \
-            -e AGG_PROCESSES=2 -e GDAL_CACHEMAX=256 -e FORCE_REBUILD \
-            "$IMAGE:$IMAGE_TAG" just aggregate ${{ matrix.shard.i }} ${{ matrix.shard.n }}
-      - name: Push tiles + contours + done-markers to R2
-        run: |
-          aws s3 sync store/pmtiles "s3://$DATA_BUCKET/bathymetry/pmtiles"
-          aws s3 sync store/contour "s3://$DATA_BUCKET/bathymetry/contour"
-          aws s3 sync store/soundings "s3://$DATA_BUCKET/bathymetry/soundings"
-          aws s3 sync store/depare "s3://$DATA_BUCKET/bathymetry/depare"
-          # Markers only — the covering tarball is immutable (plan owns it) and the
-          # untarred CSVs must not be re-uploaded as the loose files we just collapsed.
-          aws s3 sync store/aggregation "s3://$DATA_BUCKET/bathymetry/aggregation" --exclude '*' --include '*.done'
-
-  # Overview pyramid, sharded. The deep levels partition into read-closed subtrees
-  # (one per ancestor at the covering's seed zoom), bin-packed by work into the shards
-  # (a shard ≈ the heaviest single subtree — sizing to ancestor *count* left one
-  # 77-minute straggler blocking bundle-plan next to hundreds of spin-up-only shards),
-  # so they fan out with no coordination, exactly like aggregate; the coarse global
-  # tail (a few cheap levels whose tiles span subtrees) is finished on the single
-  # bundle runner below. The level barrier stays inside each runner. A clean rebuild
-  # still spins one no-op shard.
-  downsample:
-    needs: [image, aggregate, plan]
-    if: ${{ !cancelled() && needs.aggregate.result == 'success' }}
-    runs-on: ubuntu-latest
-    permissions: { contents: read, packages: read }
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: ${{ fromJSON(needs.plan.outputs.ds_shards) }}
-    steps:
-      - uses: actions/checkout@v6
-      - uses: ./.github/actions/ghcr-login
-      # Coverings (incl. -downsampling.csv from plan) — needed to derive the dirty set
-      # + which ancestors this shard owns, plus this shard's prior-attempt resume markers.
-      - name: Pull covering from R2
-        uses: ./.github/actions/pull-covering
-      - name: Pull this shard's tiles from R2
-        run: |
-          mkdir -p store/pmtiles
-          # Only this shard's slice of store/pmtiles (its ancestors' tiles), NOT the
-          # whole tens-of-GB store: list the keys, let Python filter to the shard, then
-          # parallel-copy preserving the z7-sharded layout.
-          aws s3 ls "s3://$DATA_BUCKET/bathymetry/pmtiles/" --recursive | awk '{print $4}' > store/pmtiles-keys.txt
-          docker run --rm -v "$PWD:/app" -e FORCE_REBUILD -v "$PWD/store:/app/pipelines/store" \
-            "$IMAGE:$IMAGE_TAG" just downsample-shard-keys ${{ matrix.shard.i }} ${{ matrix.shard.n }}
-          echo "pulling $(wc -l < store/shard-keys.txt) of $(wc -l < store/pmtiles-keys.txt) pmtiles"
-          # Outer retry: one transient R2 error (after aws's adaptive x10 internal retries)
-          # must not fail the whole shard. --only-show-errors keeps the cause visible if a
-          # key fails for real — --quiet swallowed it, so a dead shard left no diagnosis.
-          xargs -P 8 -I{} sh -c 'k="$1"; d="store/${k#bathymetry/}"; mkdir -p "$(dirname "$d")"; for a in 1 2 3 4 5; do aws s3 cp "s3://$DATA_BUCKET/$k" "$d" --only-show-errors && exit 0; sleep "$a"; done; echo "giving up on $k after 5 attempts" >&2; exit 1' _ {} < store/shard-keys.txt
-      - name: Downsample shard ${{ matrix.shard.i }}/${{ matrix.shard.n }}
-        run: |
-          docker run --rm -v "$PWD:/app" -e FORCE_REBUILD -v "$PWD/store:/app/pipelines/store" \
-            "$IMAGE:$IMAGE_TAG" just downsample-shard ${{ matrix.shard.i }} ${{ matrix.shard.n }}
-      - name: Push pyramid + done-markers to R2
-        run: |
-          # Disjoint tile keys + this shard's -downsampling.done markers (no --delete,
-          # so shards/tail never clobber each other's markers or the coverings).
-          aws s3 sync store/pmtiles "s3://$DATA_BUCKET/bathymetry/pmtiles"
-          # Markers only — covering tarball is immutable, untarred CSVs must not re-upload.
-          aws s3 sync store/aggregation "s3://$DATA_BUCKET/bathymetry/aggregation" --exclude '*' --include '*.done'
-
-  # Terrain bundle, fanned out so each runner holds only ONE group's tiles + output — not
-  # the whole store plus every bundle at once, which overran the disk (the pmtiles writer
-  # spools each tile then copies it into the archive, so finalize ~2x's a bundle). Groups
-  # are the planet base + one overlay per OVERLAY_SPLIT_Z grid cell — never per source,
-  # whose footprint-sized archives outgrew a runner as sources accumulated. bundle-plan
-  # finishes the coarse pyramid tail (it spans ancestors, so it can't be a deep shard),
-  # verifies the pyramid is whole, and emits the matrix: each entry is a comma-joined
-  # CHUNK of group names, bin-packed by pmtiles bytes so a chunk ≈ the biggest single
-  # group (one-group chunks spent more runner time on setup than bundling). The
-  # partition rides in the matrix, so jobs can't drift from the plan's store view. A
-  # matrix job loops its chunk pull→bundle→push→clean one group at a time;
-  # bundle-merge stitches the fragments. Contours are built separately (below).
-  bundle-plan:
-    needs: downsample
-    if: ${{ !cancelled() && needs.downsample.result == 'success' }}
-    runs-on: ubuntu-latest
-    permissions: { contents: read, packages: read }
-    outputs:
-      chunks: ${{ steps.g.outputs.chunks }}
-    steps:
-      - uses: actions/checkout@v6
-      - uses: ./.github/actions/ghcr-login
-      - name: Pull covering from R2
-        uses: ./.github/actions/pull-covering
-      - name: Pull pmtiles store from R2
-        run: |
-          # The tail is finished here on one runner from the full store; the matrix jobs
-          # below each pull only one group's slice at a time. Contours are bundled by the
-          # separate sharded jobs, so store/contour is NOT pulled here.
-          # Outer retry, same reason as the per-key pulls elsewhere: one mid-body
-          # connection reset (after aws's internal retries) exits the whole ~50 GiB
-          # sync 1; sync is incremental, so a retry only re-fetches what's missing.
-          mkdir -p store/pmtiles
-          for a in 1 2 3; do
-            aws s3 sync "s3://$DATA_BUCKET/bathymetry/pmtiles" store/pmtiles && exit 0
-            echo "pmtiles sync attempt $a failed; retrying in $((a * 10))s" >&2
-            sleep $((a * 10))
+          for _ in $(seq 1 60); do
+            # shellcheck disable=SC2086  # SSH_OPTS is intentionally word-split into flags
+            ssh $SSH_OPTS -i id_build "root@$IP" true 2>/dev/null && exit 0
+            sleep 5
           done
-          echo "pmtiles sync failed after 3 attempts" >&2
-          exit 1
-      - name: Coarse tail + bundle matrix
-        id: g
-        run: |
-          docker run --rm -v "$PWD:/app" -e FORCE_REBUILD -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just downsample-tail
-          docker run --rm -v "$PWD:/app" -e FORCE_REBUILD -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just bundle-matrix "$AGG_SHARDS" > /tmp/chunks.txt
-          # Emit the JSON matrix via the heredoc form, NOT name=value: the runner's post-step
-          # processing of `chunks=[...]` fails the step (every shell op here exits 0 — the
-          # failure is in GitHub's output handling, not the script), and <<EOF is accepted.
-          {
-            echo "chunks<<EOF"
-            tail -n1 /tmp/chunks.txt
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-          echo "bundle chunks: $(tail -n1 /tmp/chunks.txt)"
-      - name: Push tail tiles + done-markers to R2
-        run: |
-          # Tail overview tiles + downsampling done-markers feed the next incremental run,
-          # and the matrix jobs' R2 listing must include the tail tiles.
-          aws s3 sync store/pmtiles "s3://$DATA_BUCKET/bathymetry/pmtiles"
-          # Markers only — covering tarball is immutable, untarred CSVs must not re-upload.
-          aws s3 sync store/aggregation "s3://$DATA_BUCKET/bathymetry/aggregation" --exclude '*' --include '*.done'
+          echo "server never became reachable" >&2; exit 1
 
-  # One runner per chunk of groups, bundled strictly one at a time (pull slice → bundle →
-  # push → clean). Peak disk = the single biggest group's tiles + ~2x its output, no
-  # matter how many groups a chunk holds or how many sources the planet accumulates.
-  bundle:
-    needs: bundle-plan
-    if: ${{ !cancelled() && needs.bundle-plan.result == 'success' }}
-    runs-on: ubuntu-latest
-    permissions: { contents: read, packages: read }
-    strategy:
-      fail-fast: false
-      matrix:
-        chunk: ${{ fromJSON(needs.bundle-plan.outputs.chunks) }}
-    steps:
-      - uses: actions/checkout@v6
-      - uses: ./.github/actions/ghcr-login
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: true
-      # Covering — group-keys derives which pmtiles belong to each group, the same way
-      # bundle assigns local files, so we pull only one group's slice at a time.
-      - name: Pull covering from R2
-        uses: ./.github/actions/pull-covering
-      - name: List pmtiles store
-        run: |
-          mkdir -p store/pmtiles store/bundle
-          aws s3 ls "s3://$DATA_BUCKET/bathymetry/pmtiles/" --recursive | awk '{print $4}' > store/pmtiles-keys.txt
-      - name: Bundle chunk (one group at a time)
+      - name: Build & publish
         env:
-          CELLS: ${{ matrix.chunk.cells }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          GHCR_TOKEN: ${{ github.token }}
+          GHCR_USER: ${{ github.actor }}
         run: |
-          B="s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}"
-          for group in ${CELLS//,/ }; do
-            echo "── group: $group ──"
-            docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" \
-              "$IMAGE:$IMAGE_TAG" just bundle-group-keys "$group"
-            echo "pulling $(wc -l < store/keys.txt) of $(wc -l < store/pmtiles-keys.txt) pmtiles for $group"
-            # Bounded outer retry + visible errors — see the downsample pull above.
-            xargs -P 8 -I{} sh -c 'k="$1"; d="store/${k#bathymetry/}"; mkdir -p "$(dirname "$d")"; for a in 1 2 3 4 5; do aws s3 cp "s3://$DATA_BUCKET/$k" "$d" --only-show-errors && exit 0; sleep "$a"; done; echo "giving up on $k after 5 attempts" >&2; exit 1' _ {} < store/keys.txt
-            docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" \
-              "$IMAGE:$IMAGE_TAG" just bundle-group "$group"
-            # Archive name is deterministic from the group (see bundle.archive_filename).
-            pm=$([ "$group" = planet ] && echo "planet.pmtiles" || echo "overlay-$group.pmtiles")
-            aws s3 cp "store/bundle/$pm" "$B/$pm" --content-type application/octet-stream
-            aws s3 cp "store/bundle/$group.json" "$B/bundle-frags/$group.json" --content-type application/json
-            # Drop this group's tiles + archive before the next group — this per-iteration
-            # clean is what bounds the disk (the container wrote store/bundle as root).
-            sudo rm -rf store/pmtiles store/bundle store/keys.txt
-            mkdir -p store/pmtiles store/bundle
-          done
+          # Secrets + config to source on the box (kept off every command line). rclone reads
+          # the RCLONE_CONFIG_R2_* vars for the store sync; the AWS_* vars are the S3-API
+          # plumbing the pipeline expects for any /vsis3 read (source COGs are /vsicurl-public,
+          # so they aren't used today, but they cost nothing to carry).
+          #
+          # EVERY value is written via %q, never verbatim: build.env is `source`d as bash on
+          # the box, so anything written raw becomes code. The live vector is the dispatch
+          # inputs — a crafted bbox ('x"; curl …|bash; echo "') would execute with the R2 creds
+          # in the same file, and a "boolean" FORCE input is UI coercion only, not API-level
+          # validation — but quoting the secrets/config too makes the file safe by construction.
+          {
+            printf 'export RCLONE_CONFIG_R2_TYPE=%q\n'              s3
+            printf 'export RCLONE_CONFIG_R2_PROVIDER=%q\n'          Cloudflare
+            printf 'export RCLONE_CONFIG_R2_ENDPOINT=%q\n'          "$R2_ENDPOINT"
+            printf 'export RCLONE_CONFIG_R2_ACCESS_KEY_ID=%q\n'     "$R2_ACCESS_KEY_ID"
+            printf 'export RCLONE_CONFIG_R2_SECRET_ACCESS_KEY=%q\n' "$R2_SECRET_ACCESS_KEY"
+            printf 'export RCLONE_CONFIG_R2_NO_CHECK_BUCKET=%q\n'   true
+            printf 'export AWS_ACCESS_KEY_ID=%q\n'                  "$R2_ACCESS_KEY_ID"
+            printf 'export AWS_SECRET_ACCESS_KEY=%q\n'              "$R2_SECRET_ACCESS_KEY"
+            printf 'export AWS_DEFAULT_REGION=%q\n'                 auto
+            printf 'export AWS_ENDPOINT_URL=%q\n'                   "$R2_ENDPOINT"
+            printf 'export GHCR_TOKEN=%q\n'                         "$GHCR_TOKEN"
+            printf 'export GHCR_USER=%q\n'                          "$GHCR_USER"
+            printf 'export IMAGE=%q\n'                              "$IMAGE"
+            printf 'export IMAGE_TAG=%q\n'                          "$IMAGE_TAG"
+            printf 'export DATA_BUCKET=%q\n'                        "$DATA_BUCKET"
+            printf 'export PUBLIC_BASE=%q\n'                        "$PUBLIC_BASE"
+            printf 'export SHA=%q\n'                                "$GITHUB_SHA"
+            printf 'export BBOX=%q\n'                               "$BBOX"
+            printf 'export FORCE=%q\n'                              "$FORCE"
+          } > build.env
 
-  # Stitch the per-group manifest fragments into manifest.json (copied last, so its
-  # presence marks a complete build for release.yml). A failed overlay leaves no manifest.
-  bundle-merge:
-    needs: bundle
-    if: ${{ !cancelled() && needs.bundle.result == 'success' }}
-    runs-on: ubuntu-latest
-    permissions: { contents: read, packages: read }
-    steps:
-      - uses: actions/checkout@v6
-      - uses: ./.github/actions/ghcr-login
-      - name: Merge manifest from fragments
-        run: |
-          mkdir -p store/bundle
-          aws s3 sync "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/bundle-frags" store/bundle
-          docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just bundle-merge
-          aws s3 cp store/bundle/manifest.json "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/manifest.json" \
-            --content-type application/json
+          rsync -az --delete --exclude .git --exclude node_modules --exclude data --exclude pipelines/store \
+            -e "ssh $SSH_OPTS -i id_build" ./ "root@$IP:/root/seascape/"
+          # shellcheck disable=SC2086  # SSH_OPTS is intentionally word-split into flags
+          scp $SSH_OPTS -i id_build build.env "root@$IP:/root/seascape/build.env"
 
-  # ── Vector layers (sharded — one global tippecanoe blows the 6 h cap at planet scale) ─
-  # Size the fan-out to the contour work — the dominant layer; soundings + depare
-  # slices ride the same shards for ~20% more per-shard time (no download — just an
-  # R2 listing).
-  contour-plan:
-    needs: aggregate
-    if: ${{ !cancelled() && needs.aggregate.result == 'success' }}
-    runs-on: ubuntu-latest
-    outputs:
-      shards: ${{ steps.m.outputs.shards }}
-    steps:
-      - id: m
-        run: |
-          count=$(aws s3 ls "s3://$DATA_BUCKET/bathymetry/contour/" --recursive | grep -c '\.fgb$' || true)
-          # ~200 FGBs ≈ 10 min of tippecanoe per shard (observed ~3 s/FGB planet-wide);
-          # sizing to the raw count spun one runner per ~1 min of work. Retune the divisor
-          # if shard runtimes drift past ~30 min. AGG_SHARDS stays the ceiling.
-          shards=$(python3 -c "import json,sys; c=int(sys.argv[1]); n=min(${AGG_SHARDS}, max((c + 199) // 200, 1)); print(json.dumps([{'i':i,'n':n} for i in range(n)]))" "$count")
-          echo "shards=$shards" >> "$GITHUB_OUTPUT"
-          echo "contour FGBs: $count → matrix $shards"
+          # The remote script is single-quoted (<<'REMOTE'): nothing here is interpolated by
+          # Actions or this shell — every value comes from build.env, sourced on the box.
+          # shellcheck disable=SC2086  # SSH_OPTS is intentionally word-split into flags
+          ssh $SSH_OPTS -i id_build "root@$IP" bash -se <<'REMOTE'
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          cd /root/seascape
+          set -a; source build.env; set +a
 
-  # tippecanoe one strided slice of every vector layer per runner → per-shard
-  # contours/soundings/depare pmtiles. The sparse layers ride the contour shards
-  # (separately they held contour-bundle's tile-join back ~26 min while the rest of
-  # the build sat finished); the slices stride each layer's own sorted list — no
-  # geographic alignment needed, the merge unions everything per tile anyway.
-  contours:
-    needs: [aggregate, contour-plan]
-    if: ${{ !cancelled() && needs.contour-plan.result == 'success' }}
-    runs-on: ubuntu-latest
-    permissions: { contents: read, packages: read }
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: ${{ fromJSON(needs.contour-plan.outputs.shards) }}
-    steps:
-      - uses: actions/checkout@v6
-      - uses: ./.github/actions/ghcr-login
-      # Pull ONLY this shard's slices (not the whole sets). List each layer's keys
-      # (sorted = the order Python globs), derive the global maxz from the contour
-      # list (so every shard and layer tiles to the same depth and tile-joins
-      # cleanly), and parallel-copy the strided slices this shard owns.
-      - name: Pull this shard's layer slices from R2
-        run: |
-          mkdir -p store/contour store/soundings store/depare store/bundle
-          aws s3 ls "s3://$DATA_BUCKET/bathymetry/contour/" --recursive | awk '{print $NF}' | grep '\.fgb$' | sort > /tmp/all-contour.txt
-          sed 's#.*/##; s/\.fgb$//' /tmp/all-contour.txt | awk -F- '{print $4}' | sort -n | tail -1 > store/contour-maxz.txt
-          aws s3 ls "s3://$DATA_BUCKET/bathymetry/soundings/" --recursive | awk '{print $NF}' | grep '\.geojson$' | sort > /tmp/all-soundings.txt
-          aws s3 ls "s3://$DATA_BUCKET/bathymetry/depare/" --recursive | awk '{print $NF}' | grep '\.fgb$' | sort > /tmp/all-depare.txt
-          # Bounded outer retry + visible errors — see the downsample pull above.
-          for spec in "/tmp/all-contour.txt store/contour" "/tmp/all-soundings.txt store/soundings" "/tmp/all-depare.txt store/depare"; do
-            set -- $spec
-            awk -v i="${{ matrix.shard.i }}" -v n="${{ matrix.shard.n }}" 'NR % n == (i + 1) % n' "$1" \
-              | xargs -P 8 -I{} sh -c 'for a in 1 2 3 4 5; do aws s3 cp "s3://$DATA_BUCKET/$1" "$2/" --only-show-errors && exit 0; sleep "$a"; done; echo "giving up on $1 after 5 attempts" >&2; exit 1' _ {} "$2"
-          done
-          echo "shard ${{ matrix.shard.i }}/${{ matrix.shard.n }}: $(ls store/contour/*.fgb 2>/dev/null | wc -l) contour FGBs, $(ls store/soundings/*.geojson 2>/dev/null | wc -l) soundings, $(ls store/depare/*.fgb 2>/dev/null | wc -l) depare, global maxz $(cat store/contour-maxz.txt)"
-      - name: Vector shard ${{ matrix.shard.i }}
-        run: |
-          docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" \
-            "$IMAGE:$IMAGE_TAG" just vector-shard ${{ matrix.shard.i }}
-      - name: Push shard pmtiles to R2
-        run: |
-          aws s3 cp store/bundle "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/contour-shards/" \
-            --recursive --exclude '*' --include '*-shard-*.pmtiles' --content-type application/octet-stream
+          # ── toolchain: docker + the PINNED sha256-verified rclone (apt's 1.60.1 501s on R2's
+          #    version-id responses — same pin as sources.yml/release.yml) ──
+          apt-get update -qq
+          apt-get install -y -qq unzip e2fsprogs
+          command -v docker >/dev/null || curl -fsSL https://get.docker.com | sh
+          curl -fsSL -o /tmp/rclone.zip "https://downloads.rclone.org/v1.74.4/rclone-v1.74.4-linux-amd64.zip"
+          echo "fe435e0c36228e7c2f116a8701f01127bb1f694005fc11d1f27186c8bca4115d  /tmp/rclone.zip" | sha256sum -c
+          unzip -q -j /tmp/rclone.zip '*/rclone' -d /tmp/rclone-bin
+          install /tmp/rclone-bin/rclone /usr/local/bin/rclone
 
-  # tile-join the per-shard pmtiles (contours + soundings + depare slices) into
-  # one vector.pmtiles, in ONE join: tile-join rewrites every tile of the whole
-  # archive, so the old merge-then-fold-per-layer shape re-paid the planet-wide join
-  # per layer (~90 min each, serial, as the only job left running — the last 2 h 40
-  # of the build). Coverage is its own tileset, built by the plan job.
-  contour-bundle:
-    needs: contours
-    if: ${{ !cancelled() && needs.contours.result == 'success' }}
-    runs-on: ubuntu-latest
-    permissions: { contents: read, packages: read }
-    steps:
-      - uses: actions/checkout@v6
-      - uses: ./.github/actions/ghcr-login
-      - name: Pull shard pmtiles from R2
-        run: |
-          mkdir -p store/bundle
-          aws s3 sync "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/contour-shards" store/bundle
-      - name: Merge shards
-        run: docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just contour-merge
-      - name: Push vector.pmtiles to R2 build
-        run: |
-          aws s3 cp store/bundle/vector.pmtiles "s3://$DATA_BUCKET/bathymetry/build/${{ github.sha }}/vector.pmtiles" \
-            --content-type application/octet-stream
+          # ── GHCR toolchain image (private; same github.token auth as ci.yml) ──
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+          docker pull "$IMAGE:$IMAGE_TAG"
 
-  # A complete build (terrain manifest + contours both landed) auto-promotes itself:
-  # dispatch release.yml for this exact sha. Only main builds deploy to production —
-  # a build dispatched from a feature branch still writes build/<sha>/, but won't ship.
+          # ── store on the attached volume for a planet build, the root disk for a bbox ──
+          if [ -z "${BBOX:-}" ]; then
+            for i in $(seq 1 12); do
+              DEV=$(ls /dev/disk/by-id/scsi-0HC_Volume_* 2>/dev/null | head -1 || true)
+              [ -n "${DEV:-}" ] && break || sleep 5
+            done
+            [ -n "${DEV:-}" ] || { echo "build volume never attached" >&2; exit 1; }
+            mkfs.ext4 -qF "$DEV"; mkdir -p /mnt/store; mount "$DEV" /mnt/store
+            STORE=/mnt/store
+          else
+            STORE=/root/seascape/pipelines/store
+          fi
+          mkdir -p "$STORE"
+
+          # ── knobs, computed HERE, not in Python — the pipeline stays R2/host-agnostic.
+          #    AGG_PROCESSES = min(cores, RAM_GB/5). Per-worker memory budget: merged-DEM peak
+          #    ~4 GB (the dominant term; a max 32768px tile ≈ 4 GB float32, more with halo +
+          #    smooth) + GDAL_CACHEMAX 512 MB + 256 MB curl cache + ~32 MB VSI cache per open
+          #    dataset ≈ 5 GB — every cache below is PER PROCESS (workers share nothing), so
+          #    they scale with the worker count. ccx33 (8 cores / 32 GB) → 6 workers: ~5 GB of
+          #    caches + ~26 GB of DEM headroom, ~1 GB left for OS/docker. ccx63 (48 / 192) → 38.
+          #    BUNDLE_PROCESSES = min(cores, RAM_GB/8), more conservative — a bundle worker
+          #    reads whole input pmtiles into RAM and the planet base is one multi-GB unit,
+          #    unlike aggregate's bounded per-tile DEMs. ──
+          CORES=$(nproc)
+          MEM_GB=$(( $(getconf _PHYS_PAGES) * $(getconf PAGE_SIZE) / 1073741824 ))
+          AGG=$(( MEM_GB / 5 )); [ "$AGG" -gt "$CORES" ] && AGG=$CORES; [ "$AGG" -lt 1 ] && AGG=1
+          BND=$(( MEM_GB / 8 )); [ "$BND" -gt "$CORES" ] && BND=$CORES; [ "$BND" -lt 1 ] && BND=1
+          export AGG_PROCESSES=$AGG
+          export BUNDLE_PROCESSES=$BND
+          export GDAL_CACHEMAX=512
+          if [ "${FORCE:-}" = "true" ]; then export FORCE_REBUILD=1; else export FORCE_REBUILD=; fi
+          echo "box: ${CORES} cores / ${MEM_GB} GB → AGG_PROCESSES=$AGG_PROCESSES, BUNDLE_PROCESSES=$BUNDLE_PROCESSES, BBOX='${BBOX:-}', FORCE='${FORCE:-}'"
+
+          # docker run wrapper: repo code at /app, the store bind-mounted, BBOX/FORCE forwarded
+          # (+ BUNDLE_PROCESSES — only bundle.py reads it; harmless for the other stages).
+          dr() { docker run --rm -v /root/seascape:/app -v "$STORE:/app/pipelines/store" \
+            -e BBOX -e FORCE_REBUILD -e BUNDLE_PROCESSES "$IMAGE:$IMAGE_TAG" just "$@"; }
+
+          R2="R2:$DATA_BUCKET/bathymetry"
+          # --retries 5: R2 occasionally returns a transient 500 InternalError; ride it out
+          # instead of failing the stage (same convention as sources.yml's mirror). Applied to
+          # EVERY transfer, the single-file copyto publishes included — a flake on manifest.json
+          # or the covering tarball would break the completeness/resume contracts.
+          XFER="--transfers 32 --checkers 64 --fast-list --retries 5 --stats 30s --stats-one-line"
+          hydrate()    { rclone copy "$R2/$1" "$STORE/$2" $XFER "${@:3}"; }
+          push()       { rclone copy "$STORE/$1" "$R2/$2" $XFER "${@:3}"; }   # copy, NEVER sync --delete
+          push_build() { rclone copyto "$STORE/bundle/$1" "$R2/build/$SHA/$1" $XFER; }
+
+          # ── HYDRATE (planet only): the incremental store + each source's bounds.csv + the
+          #    footprint gpkgs. Source COGs + masks are hydrated selectively AFTER cover (the
+          #    dirty-set list doesn't exist yet — see the sources-manifest block below). A bbox
+          #    build rebuilds its window from scratch and streams sources, so it only needs
+          #    bounds + footprints. ──
+          if [ -z "${BBOX:-}" ]; then
+            echo "── hydrate ──"
+            hydrate pmtiles pmtiles
+            hydrate contour contour
+            hydrate soundings soundings
+            hydrate depare depare
+            hydrate aggregation aggregation
+            for t in "$STORE"/aggregation/*/covering.tar.gz; do
+              [ -e "$t" ] && tar -C "$(dirname "$t")" -xzf "$t"
+            done
+            hydrate source source --include '*/bounds.csv'
+            hydrate polygon polygon
+            n=$(find "$STORE/pmtiles" -name '*.pmtiles' 2>/dev/null | wc -l)
+            [ "$n" -gt 0 ] || { echo "hydrate pulled 0 pmtiles for a planet build — refusing to rebuild the world from empty" >&2; exit 1; }
+            echo "hydrated $n pmtiles"
+          else
+            hydrate source source --include '*/bounds.csv'
+            hydrate polygon polygon
+          fi
+
+          # ── aggregate env. Planet builds read sources + masks from LOCAL disk (hydrated
+          #    below, after cover names the dirty tiles): two real runs streaming per tile
+          #    banked ZERO tiles in 2.5-3.9 healthy hours — a coastal macrotile re-reads the
+          #    same S-102/CUDEM bytes over /vsicurl for every tile, >2.5 h each. With no
+          #    SOURCE_VSI_BASE / LANDMASK / WATERMASK set, config.source_path and the landmask
+          #    defaults resolve store/source/<id>/<file> and store/landmask/{land,water}.fgb —
+          #    the hydrated local copies (the preview-local read path). A legacy bounds row
+          #    whose filename is already an absolute /vsi path passes through source_path
+          #    untouched and still streams — acceptable fallback. bbox builds are
+          #    self-contained (no volume) and keep streaming everything, as before. ──
+          AGG_ENV=(-e AGG_PROCESSES -e GDAL_CACHEMAX)
+          if [ -n "${BBOX:-}" ]; then
+            # Flagged coarse sources (GEBCO/EMODnet) clamp land + subtract inland water over
+            # /vsicurl. WATERMASK only when it exists in R2 (landmask._present assumes any
+            # /vsi path is reachable).
+            AGG_ENV+=(-e SOURCE_VSI_BASE="/vsicurl/$PUBLIC_BASE/source"
+                      -e LANDMASK="/vsicurl/$PUBLIC_BASE/landmask/land.fgb")
+            if rclone lsf "$R2/landmask/" --include water.fgb 2>/dev/null | grep -q water.fgb; then
+              AGG_ENV+=(-e WATERMASK="/vsicurl/$PUBLIC_BASE/landmask/water.fgb")
+            else
+              echo "no water.fgb in R2 yet — inland-water subtraction degrades to land-only this build"
+            fi
+          fi
+          # Remote-read streaming tuning for whatever still goes over /vsicurl (bbox builds,
+          # legacy absolute-path rows): 5 MB range reads (S-102's HDF5 driver is the chattiest
+          # reader — big chunks amortize its many small requests), a real per-process curl
+          # cache and small per-open-dataset VSI cache (both budgeted in the RAM math above),
+          # HTTP/2 multiplexing (R2 speaks it), and a 512 KB first read at open instead of
+          # 16 KB (many opens per tile). Inert for local reads, so set unconditionally.
+          AGG_ENV+=(-e CPL_VSIL_CURL_CHUNK_SIZE=5242880
+                    -e CPL_VSIL_CURL_CACHE_SIZE=268435456
+                    -e GDAL_HTTP_MULTIPLEX=YES -e GDAL_HTTP_VERSION=2
+                    -e VSI_CACHE=TRUE -e VSI_CACHE_SIZE=33554432
+                    -e GDAL_INGESTED_BYTES_AT_OPEN=524288)
+          # A dead multiplexed connection must error-and-retry, never hang: the tuned run's
+          # workers slid 510% → 180% → 1% CPU and sat at keepalive-only network — GDAL sets
+          # NO HTTP timeout by default, and under GDAL_HTTP_MULTIPLEX one dead HTTP/2
+          # connection blocks every read sharing it, forever. These timeouts turn the hang
+          # into a curl error; the retries that then ride it out are baked in the Dockerfile
+          # (GDAL_HTTP_MAX_RETRY=5, GDAL_HTTP_RETRY_DELAY=1 — set in ONE place, for every
+          # gdal invocation; deliberately not duplicated here).
+          AGG_ENV+=(-e GDAL_HTTP_TIMEOUT=120 -e GDAL_HTTP_CONNECTTIMEOUT=30)
+
+          # ── BUILD, stage by stage, pushing after each so an orchestrator timeout loses at most
+          #    one stage. The stage order matches `just planet`; the box just interleaves pushes. ──
+          echo "── cover ──"
+          dr cover                        # writes the covering; the diff falls out of the pipeline
+
+          # ── coverage ∥ aggregate ── the plan's sanctioned DAG overlap: coverage reads only
+          # footprints + the covering and aggregate never reads coverage, but its single-
+          # threaded tippecanoe ran ~47 min BEFORE aggregate on the first real build, idling
+          # every other core. Backgrounded here, joined after aggregate. set -e cannot see a
+          # background job's failure, so the explicit wait below propagates its rc — and it
+          # sits BEFORE the manifest push, preserving manifest-last completeness (a build
+          # without coverage.pmtiles must not get a manifest). Output is prefixed so the two
+          # stages' interleaved logs stay readable; pipefail (set above, inherited by the
+          # subshell) makes the subshell's status the failing command's, never sed's.
+          echo "── coverage (backgrounded alongside aggregate) ──"
+          ( { dr coverage && push_build coverage.pmtiles; } 2>&1 | sed -u 's/^/[coverage] /' ) & COV_PID=$!
+
+          # ── selective source hydrate (planet only; overlaps the backgrounded coverage) ──
+          # Pull exactly the source files the dirty tiles reference, so aggregate reads them
+          # from local disk: sources-manifest derives the (source, filename) union with the
+          # same dirty diff the run itself uses (FORCE_REBUILD included). Legacy rows whose
+          # filename is an absolute /vsi path aren't R2 keys — filter them out of the
+          # files-from list; source_path streams them untouched (see the AGG_ENV note).
+          # The masks land at the container's DEFAULT store/landmask paths, so aggregate
+          # needs no LANDMASK/WATERMASK env: land.fgb is required (flagged coarse sources
+          # exist planet-wide — fail here, not per-tile), water.fgb optional (absent → the
+          # clamp degrades to land-only, exactly the old behavior).
+          if [ -z "${BBOX:-}" ]; then
+            echo "── hydrate dirty-set sources ──"
+            dr sources-manifest
+            grep -v -e '://' -e '/vsi' "$STORE/source-manifest.txt" > /tmp/source-files.txt || true
+            legacy=$(grep -c -e '://' -e '/vsi' "$STORE/source-manifest.txt" || true)
+            if [ "${legacy:-0}" -gt 0 ]; then
+              echo "$legacy legacy absolute-path row(s) keep streaming via /vsicurl"
+            fi
+            echo "hydrating $(wc -l < /tmp/source-files.txt) of $(wc -l < "$STORE/source-manifest.txt") referenced source file(s)"
+            rclone copy "$R2/source" "$STORE/source" --files-from /tmp/source-files.txt $XFER
+            hydrate landmask landmask --include 'land.fgb' --include 'water.fgb'
+            [ -f "$STORE/landmask/land.fgb" ] || { echo "no land.fgb in R2 — flagged coarse sources need the land mask" >&2; exit 1; }
+          fi
+
+          echo "── aggregate ──"
+          # Periodic background pushes while aggregate runs. A forced planet rebuild can outlive
+          # the orchestrator window (GitHub-HOSTED runners hard-cap jobs at 6 h, so the timeout
+          # cannot be raised past ~360), and a stage that pushes only at its end makes zero net
+          # progress across re-dispatches: destroy kills the volume, and every retry restarts
+          # aggregate from tile 1. rclone copy is idempotent (finished tiles skip), so a 20-min
+          # loop makes each re-dispatch monotonic. A file caught mid-write copies torn, but the
+          # next pass overwrites it and the final post-stage push (under set -e) is authoritative
+          # — acceptable residual. Loop failures never abort the build.
+          push_agg() { push pmtiles pmtiles; push contour contour; push soundings soundings; push depare depare; }
+          PUSH_LOOP=
+          if [ -z "${BBOX:-}" ]; then
+            ( while sleep 1200; do push_agg || true; done ) & PUSH_LOOP=$!
+          fi
+          agg_rc=0
+          docker run --rm -v /root/seascape:/app -v "$STORE:/app/pipelines/store" \
+            -e BBOX -e FORCE_REBUILD "${AGG_ENV[@]}" "$IMAGE:$IMAGE_TAG" just aggregate || agg_rc=$?
+          # Kill the loop on BOTH exits (success or failure) before anything else runs.
+          if [ -n "$PUSH_LOOP" ]; then kill "$PUSH_LOOP" 2>/dev/null || true; wait "$PUSH_LOOP" 2>/dev/null || true; fi
+          # First failure wins, as in the sequential version: on an aggregate failure, reap
+          # the in-flight coverage job and fail with aggregate's rc (destroy still runs).
+          if [ "$agg_rc" -ne 0 ]; then kill "$COV_PID" 2>/dev/null || true; exit "$agg_rc"; fi
+          if [ -z "${BBOX:-}" ]; then
+            push_agg
+          fi
+
+          # Join the backgrounded coverage: propagate a nonzero rc so a coverage failure fails
+          # the build exactly as the sequential version did — well before manifest.json.
+          cov_rc=0
+          wait "$COV_PID" || cov_rc=$?
+          [ "$cov_rc" -eq 0 ] || { echo "coverage stage failed (rc=$cov_rc)" >&2; exit "$cov_rc"; }
+
+          echo "── downsample ──"
+          dr downsample
+          if [ -z "${BBOX:-}" ]; then
+            push pmtiles pmtiles
+            # Publish the covering LAST of the store writes (agg + downsample CSVs both exist now),
+            # tarred like the old plan job — the next build's incremental baseline. Not the .done
+            # markers: a re-dispatch makes a fresh covering, so resume rides self-heal, not markers.
+            id=$(ls "$STORE/aggregation" | sort | tail -1)
+            tar -C "$STORE/aggregation/$id" --exclude='*.done' --exclude='*-tmp' -czf /tmp/covering.tar.gz .
+            rclone copyto /tmp/covering.tar.gz "$R2/aggregation/$id/covering.tar.gz" $XFER
+          fi
+
+          echo "── bundle (terrain) ──"
+          dr bundle
+          rclone copy "$STORE/bundle" "$R2/build/$SHA" $XFER --include 'planet.pmtiles' --include 'overlay-*.pmtiles'
+
+          echo "── vector layers ──"
+          dr soundings                    # soundings + depare bundle BEFORE contours: the single
+          dr depare                       # tile-join folds them into vector.pmtiles
+          dr contours
+          push_build vector.pmtiles
+
+          # ── PRUNE (planet only; skipped under bbox — a window covering reads every out-of-window
+          #    artifact as orphaned). Port of the old plan-job guards: list first, refuse a >25%
+          #    orphan fraction (a real re-tile orphans a slice; "most of the prefix" is a bad stems
+          #    list), and prune pmtiles BEFORE the vector FGBs — a wrongly-pruned pmtiles self-heals
+          #    (missing → dirty → rebuilt), a wrongly-pruned FGB does not. ──
+          if [ -z "${BBOX:-}" ]; then
+            id=$(ls "$STORE/aggregation" | sort | tail -1)
+            ls "$STORE/aggregation/$id"/*-aggregation.csv "$STORE/aggregation/$id"/*-downsampling.csv 2>/dev/null \
+              | sed 's#.*/##; s/-aggregation\.csv$//; s/-downsampling\.csv$//' | sort -u > /tmp/valid-pmt.txt
+            ls "$STORE/aggregation/$id"/*-aggregation.csv \
+              | sed 's#.*/##; s/-aggregation\.csv$//' | sort -u > /tmp/valid-agg.txt
+
+            prune_prefix() {   # <prefix> <ext> <valid-stems-file>
+              rclone lsf -R --files-only "$R2/$1" 2>/dev/null | grep "$2\$" > /tmp/r2-keys.txt || true
+              local total; total=$(wc -l < /tmp/r2-keys.txt)
+              [ "$total" -gt 0 ] || return 0
+              awk -v ext="$2" 'NR==FNR{ok[$0]=1;next}{s=$0; sub(/.*\//,"",s); sub(ext"$","",s); if(!(s in ok)) print}' \
+                "$3" /tmp/r2-keys.txt > /tmp/orphans.txt
+              local orph; orph=$(wc -l < /tmp/orphans.txt)
+              [ "$orph" -gt 0 ] || { echo "prune $1: no orphans of $total"; return 0; }
+              if [ $(( orph * 100 / total )) -gt 25 ]; then
+                echo "REFUSING to prune $1: $orph/$total orphaned (>25%) — a bad covering, not a re-tile" >&2
+                exit 1
+              fi
+              echo "prune $1: deleting $orph orphaned keys of $total"
+              rclone delete "$R2/$1" --files-from /tmp/orphans.txt
+            }
+            prune_prefix pmtiles   '\.pmtiles'  /tmp/valid-pmt.txt   # self-healing class first
+            prune_prefix contour   '\.fgb'      /tmp/valid-agg.txt
+            prune_prefix soundings '\.geojson'  /tmp/valid-agg.txt
+            prune_prefix depare    '\.fgb'      /tmp/valid-agg.txt
+
+            # Old coverings accrue one dir per build; keep the newest 3 (ULIDs sort chronologically).
+            ids=$(rclone lsf "$R2/aggregation" --dirs-only 2>/dev/null | tr -d /)
+            keep=$(echo "$ids" | sort | tail -3)
+            for cid in $ids; do
+              grep -qx "$cid" <<<"$keep" || { echo "prune covering $cid"; rclone purge "$R2/aggregation/$cid"; }
+            done
+          fi
+
+          # ── manifest.json LAST — its presence marks a complete build (release.yml refuses a sha
+          #    without one). Everything it references (planet + overlays + vector + coverage) is
+          #    already up. ──
+          push_build manifest.json
+          echo "── build complete → $R2/build/$SHA ──"
+          REMOTE
+
+      - name: Destroy server
+        if: always()
+        run: |
+          # Best-effort delete all three, then FAIL if a billable resource (server, volume)
+          # still exists — a leaked box must show as a red step, not invisible cost. Resources
+          # that never existed (boot failed early, bbox build without a volume) pass clean.
+          hcloud server delete "$NAME" 2>/dev/null || true
+          # The volume (planet builds only) detaches when the server is deleted; then remove it.
+          if hcloud volume describe "$NAME" >/dev/null 2>&1; then
+            for _ in $(seq 1 12); do
+              if hcloud volume delete "$NAME" 2>/dev/null; then break; else sleep 5; fi
+            done
+          fi
+          hcloud ssh-key delete "$NAME" 2>/dev/null || true   # not billable; best-effort
+          fail=0
+          if hcloud server describe "$NAME" >/dev/null 2>&1; then
+            echo "::error::leaked Hetzner server $NAME — delete it manually (billing until then)"
+            fail=1
+          fi
+          if hcloud volume describe "$NAME" >/dev/null 2>&1; then
+            echo "::error::leaked Hetzner volume $NAME — delete it manually (billing until then)"
+            fail=1
+          fi
+          exit "$fail"
+
+  # A complete planet build from main auto-promotes itself: dispatch release.yml for this sha.
+  # Only main builds deploy; a feature-branch build writes build/<sha>/ but won't ship. A bbox
+  # build is a window slice and never claims planet validity, so it never releases.
   release:
-    needs: [bundle-merge, contour-bundle, coverage]
-    if: ${{ github.ref == 'refs/heads/main' && needs.bundle-merge.result == 'success' && needs.contour-bundle.result == 'success' && needs.coverage.result == 'success' }}
+    needs: build
+    if: ${{ github.ref == 'refs/heads/main' && github.event.inputs.bbox == '' && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
     permissions: { actions: write }
     steps:

@@ -48,8 +48,7 @@ Per tile: bands (gdal_contour -p at DEPARE_LEVELS / DEPARE_LEVELS_FT, drop land,
 unbuffered tile bbox in shapely (polygon-only by construction, see _polys) -> 4326 ->
 store/depare/{stem}.fgb. Same seam contract as contours: deterministic on the buffered grid,
 so neighbouring tiles' features abut exactly at the clip line. bundle() tippecanoes them into
-a `depare` layer pmtiles (or a per-shard slice in CI); the contours tile-join folds it into
-vector.pmtiles like soundings.
+a `depare` layer pmtiles; the contours tile-join folds it into vector.pmtiles like soundings.
 """
 
 import os
@@ -262,15 +261,13 @@ def generate(filepath):
 
 # ── bundle ───────────────────────────────────────────────────────────────────
 
-def bundle(shard=None):
+def bundle():
     """tippecanoe the per-tile depare FGBs into store/bundle/depare.pmtiles (layer `depare`,
     folded into vector.pmtiles by the contours tile-join, same as soundings), z
-    MIN_ZOOM..shared maxz (see contour_run.bundle_maxz). With a shard index →
-    depare-shard-{shard}.pmtiles from this shard's local slice, like the other vector
-    layers. --detect-shared-borders keeps shared partition edges identical through
-    per-zoom simplification (no cracks between bands); --coalesce-smallest-as-needed,
-    never --drop-densest: a dropped partition is a tint hole, a coalesced one mis-tints
-    a sub-pixel blob. Orphan filter as contours.
+    MIN_ZOOM..shared maxz (see contour_run.bundle_maxz). --detect-shared-borders keeps shared
+    partition edges identical through per-zoom simplification (no cracks between bands);
+    --coalesce-smallest-as-needed, never --drop-densest: a dropped partition is a tint hole, a
+    coalesced one mis-tints a sub-pixel blob. Orphan filter as contours.
 
     Attributes: drval1/drval2 (Real -> numeric MVT; absent on nodata features, which is the
     fill's switch key), sys (bands only), kind (nodata only), rank (all — sort key). rank is
@@ -283,8 +280,7 @@ def bundle(shard=None):
     maxz = contour_run.bundle_maxz(
         max(int(f.split("/")[-1].replace(".fgb", "").split("-")[3]) for f in fgbs))
     utils.create_folder("store/bundle")
-    out = "store/bundle/depare.pmtiles" if shard is None \
-        else f"store/bundle/depare-shard-{shard}.pmtiles"
+    out = "store/bundle/depare.pmtiles"
     subprocess.run(
         ["tippecanoe", "-o", out, "-f", "-l", "depare",
          "-n", "Depth areas", "-A", utils.ATTRIBUTION,
@@ -406,9 +402,7 @@ if __name__ == "__main__":
     a = sys.argv[1:]
     if a[:1] == ["bundle"]:
         bundle()
-    elif a[:1] == ["bundle-shard"]:
-        bundle(int(a[1]))
     elif a[:1] == ["check"]:
         _check()
     else:
-        sys.exit("usage: depare_run.py bundle | bundle-shard <i> | check")
+        sys.exit("usage: depare_run.py bundle | check")

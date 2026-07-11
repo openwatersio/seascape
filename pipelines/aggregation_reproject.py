@@ -299,7 +299,7 @@ def _check():
     assert vboth > va > 0, (va, vboth)
 
     # run_command must RAISE on a failed gdalbuildvrt (not swallow it) — the bug that let a
-    # missing VRT reach gdalwarp as a baffling "No such file" and kill an hour-long shard.
+    # missing VRT reach gdalwarp as a baffling "No such file" and kill an hour-long aggregate.
     miss = f"{d}/miss.vrt"
     try:
         utils.run_command(f"gdalbuildvrt -overwrite {miss} {d}/does-not-exist.tif")
