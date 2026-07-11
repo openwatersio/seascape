@@ -219,6 +219,12 @@ def bundle():
         print("soundings bundle: inputs unchanged — skip")
         return
     utils.create_folder("store/bundle")
+    # Invalidate before writing (the crash rule every keyed writer follows): under FORCE the
+    # key is unchanged, so a crash mid-tippecanoe would otherwise leave the old sidecar reading
+    # a torn archive as fresh forever.
+    for stale in (out, keys.sidecar(out)):
+        if os.path.isfile(stale):
+            os.remove(stale)
     subprocess.run(
         ["tippecanoe", "-o", out, "-f", "-l", "soundings",
          "-n", "Bathymetric soundings", "-A", utils.ATTRIBUTION, "-Z", "0", "-z", str(maxz),

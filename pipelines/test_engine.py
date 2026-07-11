@@ -445,7 +445,35 @@ def check_crash_leaves_stale():
             assert keys.read_key(art) is None, f"{fork}: the crash must not leave the old sidecar"
             assert not keys.is_fresh(art, key, require_artifact=False), \
                 f"{fork}: the post-crash state must plan as stale"
-        print("crash-leaves-stale ok — a mid-fork crash deletes artifact + sidecar; next run re-runs")
+
+        # Bundle level, same rule: soundings.pmtiles' sidecar (and the stale archive) must go
+        # BEFORE tippecanoe starts, so a FORCE + crash mid-bundle reads stale next run instead
+        # of vouching for a torn archive. Garbage member geojson makes tippecanoe fail right
+        # after the invalidation.
+        utils.create_folder("store/soundings")
+        with open(f"store/soundings/{stem}.geojson", "w") as f:
+            f.write("not geojson")
+        utils.create_folder("store/bundle")
+        out = "store/bundle/soundings.pmtiles"
+        open(out, "w").close()
+        keys.write_key(out, "prev-bundle-key")
+        os.environ["FORCE_REBUILD"] = "1"  # the FORCE case: proceed despite whatever the key says
+        try:
+            soundings_run.bundle()
+            raise AssertionError("soundings bundle on a garbage member must raise")
+        except AssertionError:
+            raise
+        except Exception:
+            pass  # the simulated mid-bundle crash
+        finally:
+            os.environ.pop("FORCE_REBUILD", None)
+        # tippecanoe may itself leave a torn NEW archive behind — that's the real crash shape;
+        # what matters is the sidecar is gone, so nothing vouches for whatever file remains.
+        assert keys.read_key(out) is None, "a bundle crash must not leave the old sidecar"
+        assert not keys.is_fresh(out, "prev-bundle-key", require_artifact=False), \
+            "the post-crash bundle state must plan as stale"
+        print("crash-leaves-stale ok — a mid-fork or mid-bundle crash deletes the sidecar; "
+              "next run re-runs")
     finally:
         config.SOURCES_DIR = saved_dir
         os.chdir(cwd)

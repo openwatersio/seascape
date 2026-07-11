@@ -437,16 +437,23 @@ def bundle():
         return
     maxz = bundle_maxz(_global_maxz(fgbs))
     vkey = _vector_key(maxz)
-    if keys.is_fresh("store/bundle/vector.pmtiles", vkey):
+    vec = "store/bundle/vector.pmtiles"
+    if keys.is_fresh(vec, vkey):
         print("contour bundle: vector inputs unchanged — skip")
         return
     utils.create_folder("store/bundle")
+    # Invalidate before writing (the crash rule every keyed writer follows): under FORCE the
+    # key is unchanged, so a crash mid-tippecanoe/tile-join would otherwise leave the old
+    # sidecar reading a torn vector.pmtiles as fresh forever.
+    for stale in (vec, keys.sidecar(vec)):
+        if os.path.isfile(stale):
+            os.remove(stale)
     lines = "store/contour/contours-lines.pmtiles"
     _tippecanoe(fgbs, 0, maxz, lines)
     _finalize_contours([lines])
     os.remove(lines)
-    keys.write_key("store/bundle/vector.pmtiles", vkey)
-    print(f"contour bundle: store/bundle/vector.pmtiles (z0-{maxz}, {len(fgbs)} FGBs)")
+    keys.write_key(vec, vkey)
+    print(f"contour bundle: {vec} (z0-{maxz}, {len(fgbs)} FGBs)")
 
 
 def _check():

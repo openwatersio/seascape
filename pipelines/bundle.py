@@ -260,6 +260,13 @@ def main():
         print(f"bundle: {len(groups)} group(s) unchanged — skip")
         return
     utils.create_folder("store/bundle")
+    # Invalidate before writing (the crash rule every keyed writer follows): the manifest's
+    # sidecar vouches for EVERY group archive, so it must go before the first group is
+    # rewritten — under FORCE the key is unchanged, and a crash mid-bundle would otherwise
+    # skip over torn planet/overlay pmtiles as fresh forever.
+    sc = keys.sidecar(manifest_path)
+    if os.path.isfile(sc):
+        os.remove(sc)
     items = sorted(groups.items(), key=lambda kv: -len(kv[1]))  # biggest first → no straggler tail
     # Each worker reads whole input pmtiles into RAM and the writer spools ~2x its group on
     # disk, so peak ≈ workers × the biggest group (the planet base). Cap workers via
@@ -269,8 +276,12 @@ def main():
     with get_context("spawn").Pool(procs) as pool:
         frags = pool.map(_bundle_one, items)
     manifest = _manifest_from_fragments(frags)
-    with open(manifest_path, "w") as f:
+    # Atomic: manifest.json doubles as the fresh-bundle artifact (is_fresh reads its presence)
+    # and the workflow's completeness marker — it must never exist truncated at its final path.
+    tmp_path = manifest_path + ".tmp"
+    with open(tmp_path, "w") as f:
         json.dump(manifest, f, indent=2)
+    os.replace(tmp_path, manifest_path)
     keys.write_key(manifest_path, bkey)
     print(f"created {len(groups)} bundle(s): {', '.join(sorted(groups))} + manifest.json")
 

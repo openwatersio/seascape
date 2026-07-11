@@ -147,6 +147,12 @@ def run_one(filepath):
     out_folder = utils.get_pmtiles_folder(x, y, z)
     utils.create_folder(out_folder)
     out_filepath = f"{out_folder}/{z}-{x}-{y}-{parent_zoom}.pmtiles"
+    # Invalidate before writing (the crash rule every keyed writer follows): under FORCE the
+    # key is unchanged, so a crash mid-archive would otherwise leave the old sidecar reading
+    # a torn overview as fresh forever.
+    sc = keys.sidecar(out_filepath)
+    if os.path.isfile(sc):
+        os.remove(sc)
 
     extent = mercantile.Tile(x=x, y=y, z=z)
     tmp_folder = filepath.replace("-downsampling.csv", "-tmp")
