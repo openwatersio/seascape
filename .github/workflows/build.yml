@@ -221,19 +221,23 @@ jobs:
           fi
           mkdir -p "$STORE"
 
-          # ── knobs: AGG_PROCESSES = min(cores, RAM_GB/4) (each worker holds a multi-GB DEM);
+          # ── knobs, computed HERE, not in Python — the pipeline stays R2/host-agnostic.
+          #    AGG_PROCESSES = min(cores, RAM_GB/5). Per-worker memory budget: merged-DEM peak
+          #    ~4 GB (the dominant term; a max 32768px tile ≈ 4 GB float32, more with halo +
+          #    smooth) + GDAL_CACHEMAX 512 MB + 256 MB curl cache + ~32 MB VSI cache per open
+          #    dataset ≈ 5 GB — every cache below is PER PROCESS (workers share nothing), so
+          #    they scale with the worker count. ccx33 (8 cores / 32 GB) → 6 workers: ~5 GB of
+          #    caches + ~26 GB of DEM headroom, ~1 GB left for OS/docker. ccx63 (48 / 192) → 38.
           #    BUNDLE_PROCESSES = min(cores, RAM_GB/8), more conservative — a bundle worker
           #    reads whole input pmtiles into RAM and the planet base is one multi-GB unit,
-          #    unlike aggregate's bounded per-tile DEMs; GDAL_CACHEMAX scaled up from the 256
-          #    the 16 GB runners used. Computed HERE, not in Python — the pipeline stays
-          #    R2/host-agnostic. ──
+          #    unlike aggregate's bounded per-tile DEMs. ──
           CORES=$(nproc)
           MEM_GB=$(( $(getconf _PHYS_PAGES) * $(getconf PAGE_SIZE) / 1073741824 ))
-          AGG=$(( MEM_GB / 4 )); [ "$AGG" -gt "$CORES" ] && AGG=$CORES; [ "$AGG" -lt 1 ] && AGG=1
+          AGG=$(( MEM_GB / 5 )); [ "$AGG" -gt "$CORES" ] && AGG=$CORES; [ "$AGG" -lt 1 ] && AGG=1
           BND=$(( MEM_GB / 8 )); [ "$BND" -gt "$CORES" ] && BND=$CORES; [ "$BND" -lt 1 ] && BND=1
           export AGG_PROCESSES=$AGG
           export BUNDLE_PROCESSES=$BND
-          export GDAL_CACHEMAX=1024
+          export GDAL_CACHEMAX=512
           if [ "${FORCE:-}" = "true" ]; then export FORCE_REBUILD=1; else export FORCE_REBUILD=; fi
           echo "box: ${CORES} cores / ${MEM_GB} GB → AGG_PROCESSES=$AGG_PROCESSES, BUNDLE_PROCESSES=$BUNDLE_PROCESSES, BBOX='${BBOX:-}', FORCE='${FORCE:-}'"
 
@@ -282,6 +286,19 @@ jobs:
           AGG_ENV=(-e SOURCE_VSI_BASE="/vsicurl/$PUBLIC_BASE/source"
                    -e LANDMASK="/vsicurl/$PUBLIC_BASE/landmask/land.fgb"
                    -e AGG_PROCESSES -e GDAL_CACHEMAX)
+          # Remote-read streaming tuning, measured-baseline: the first real run (29150115584)
+          # held ~1-1.5 of 8 cores through aggregate — workers /vsicurl latency-bound on GDAL's
+          # remote-read defaults (16 KB chunks, 16 MB curl cache, HTTP/1.1). That run's
+          # aggregate wall-clock is the baseline; the next run measures this block's delta.
+          # 5 MB range reads (S-102's HDF5 driver is the chattiest reader — big chunks amortize
+          # its many small requests), a real per-process curl cache and small per-open-dataset
+          # VSI cache (both budgeted in the RAM math above), HTTP/2 multiplexing (R2 speaks
+          # it), and a 512 KB first read at open instead of 16 KB (many opens per tile).
+          AGG_ENV+=(-e CPL_VSIL_CURL_CHUNK_SIZE=5242880
+                    -e CPL_VSIL_CURL_CACHE_SIZE=268435456
+                    -e GDAL_HTTP_MULTIPLEX=YES -e GDAL_HTTP_VERSION=2
+                    -e VSI_CACHE=TRUE -e VSI_CACHE_SIZE=33554432
+                    -e GDAL_INGESTED_BYTES_AT_OPEN=524288)
           if rclone lsf "$R2/landmask/" --include water.fgb 2>/dev/null | grep -q water.fgb; then
             AGG_ENV+=(-e WATERMASK="/vsicurl/$PUBLIC_BASE/landmask/water.fgb")
           else
