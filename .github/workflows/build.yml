@@ -233,11 +233,13 @@ jobs:
 
           R2="R2:$DATA_BUCKET/bathymetry"
           # --retries 5: R2 occasionally returns a transient 500 InternalError; ride it out
-          # instead of failing the stage (same convention as sources.yml's mirror).
+          # instead of failing the stage (same convention as sources.yml's mirror). Applied to
+          # EVERY transfer, the single-file copyto publishes included — a flake on manifest.json
+          # or the covering tarball would break the completeness/resume contracts.
           XFER="--transfers 32 --checkers 64 --fast-list --retries 5 --stats 30s --stats-one-line"
           hydrate()    { rclone copy "$R2/$1" "$STORE/$2" $XFER "${@:3}"; }
           push()       { rclone copy "$STORE/$1" "$R2/$2" $XFER "${@:3}"; }   # copy, NEVER sync --delete
-          push_build() { rclone copyto "$STORE/bundle/$1" "$R2/build/$SHA/$1"; }
+          push_build() { rclone copyto "$STORE/bundle/$1" "$R2/build/$SHA/$1" $XFER; }
 
           # ── HYDRATE (planet only): the incremental store + each source's bounds.csv + the
           #    footprint gpkgs. Source COGs are range-read via /vsicurl (SOURCE_VSI_BASE), never
@@ -317,7 +319,7 @@ jobs:
             # markers: a re-dispatch makes a fresh covering, so resume rides self-heal, not markers.
             id=$(ls "$STORE/aggregation" | sort | tail -1)
             tar -C "$STORE/aggregation/$id" --exclude='*.done' --exclude='*-tmp' -czf /tmp/covering.tar.gz .
-            rclone copyto /tmp/covering.tar.gz "$R2/aggregation/$id/covering.tar.gz"
+            rclone copyto /tmp/covering.tar.gz "$R2/aggregation/$id/covering.tar.gz" $XFER
           fi
 
           echo "── bundle (terrain) ──"
