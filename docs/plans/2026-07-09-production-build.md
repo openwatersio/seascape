@@ -35,7 +35,7 @@ flowchart LR
     S1["1: sources<br/><i>sources.yml, weekly</i>"] --> S2
     S15["1.5: landmask + watermask<br/><i>sources.yml, on mask-code change</i>"] --> S2
     S2["2: mosaic<br/><i>merged Float32 DEM COGs</i>"] --> S3
-    S3["3: derived<br/><i>terrain tiles · contours · soundings<br/>depare · drying · coverage</i>"] --> R["release<br/><i>unchanged</i>"]
+    S3["3: derived<br/><i>terrain tiles · contours · soundings<br/>depare incl. drying · coverage</i>"] --> R["release<br/><i>unchanged</i>"]
 ```
 
 ### Stage 1 — sources (already done, `worktree-sources-mirror`)
@@ -66,7 +66,7 @@ Everything cartographic, each an independent hash-keyed consumer of mosaic windo
 
 - **Terrain tiles**: per-zoom render — read the mosaic at zoom-z resolution → smooth (`smooth.py`, depth/zoom-gated) → Terrarium encode (bias-shallow quantization) → `planet.pmtiles` (z0–`MACROTILE_Z`) + per-cell `overlay-*.pmtiles` (GEBCO-filled — Terrarium has no transparency) + `manifest.json`. The z8/overlay split stays a stage-3/serving concern; the mosaic knows nothing about it. The lowest zooms (z0–~z4) render from the planet z8 COG (the mosaic's own GTI-registered overview) rather than fanning out across thousands of tile COGs' top overviews. Coarse-zoom resampling is a conscious choice, not a `-r average` default: `average` moves an isolated shoal deeper (today's downsample already has this property — latent, not a regression); the conservative signal at coarse zoom is carried by soundings/depare, and if the shading itself should bias shallow, use a shallowest-in-window reducer in the navigable band (≤~30 m) and let `average` stand in deep water — the navigational-depth-bands split.
 - **Contours** (`contour_run.py`): gdal_contour at `CONTOUR_LEVELS`/`CONTOUR_LEVELS_FT` → Chaikin smooth under the never-deeper constraint → clip.
-- **Soundings, depare, drying**: unchanged internal logic (drying rides depare), re-pointed at mosaic windows.
+- **Soundings, depare**: unchanged internal logic, re-pointed at mosaic windows. Drying is a depare *feature kind* since #65 (the `[0, DRYING_CAP]` contour bucket cut by effective land — no separate drying stage or FGB exists); depare therefore consumes the land + water masks directly per tile.
 - **Coverage**: footprints → `coverage.pmtiles`, unchanged, runs concurrently with everything (it reads polygons, not the mosaic).
 - **Vector bundle**: **one global tippecanoe per layer + one `tile-join`** on the build box. The shard-and-merge path (`bundle-shard`, `contour-maxz.txt`, `bundle_merge`) existed only for the 6h cap and is deleted.
 
@@ -81,7 +81,7 @@ Every target's cache key is `H(input hashes ‖ code hash ‖ config values)`. C
 | mosaic tile | intersecting sources' catalog items (recipe hash + bounds rows), landmask + watermask hashes | merge/reproject/clamp modules | per-source priority · maxzoom · offset · land_clamp (all read from the catalog item), feather params, covering params |
 | terrain tiles | mosaic tile hashes under the output tile | `smooth.py`, `encode.py`, `bundle.py` | `SMOOTH_*`, quantization, `MACROTILE_Z`, `OVERLAY_SPLIT_Z`, `NUM_OVERVIEWS` |
 | contour tile | mosaic tile hashes under the (buffered) window | `contour_run.py` | `CONTOUR_LEVELS(_FT)`, `CONTOUR_NAV_SMOOTH_MAX`, zoom-tier levels |
-| soundings / depare / drying tile | mosaic tile hashes (+ watermask, drying FGB for depare) | their modules | `SOUND_*`, `DEPARE_LEVELS`, `DRYING_CAP` |
+| soundings / depare tile | mosaic tile hashes (+ landmask + watermask for depare's drying/nodata kinds) | their modules | `SOUND_*`, `DEPARE_LEVELS`, `DRYING_CAP` |
 | vector.pmtiles | all contour/sounding/depare FGB hashes | tippecanoe flags + filter code | per-zoom filter, layer flags |
 
 Rules that make it honest:
@@ -109,7 +109,7 @@ bathymetry/
   build/<sha>/                     final bundles + manifest.json (unchanged contract)
 ```
 
-- **Hydrate**: on box boot, `rclone copy` the two stores down to local NVMe (~50 GiB, minutes; R2 egress and Hetzner ingress are both free). R2 stays the source of truth; the box is disposable.
+- **Hydrate**: on box boot, `rclone copy` the two stores down to local NVMe (~50 GiB, minutes; R2 egress and Hetzner ingress are both free). R2 stays the source of truth; the box is disposable. rclone is the pinned sha-verified download (1.74.x pattern from release.yml/sources.yml) — apt's 1.60.1 fails on R2's version-id responses.
 - **Build**: entirely against local disk. No mid-build R2 writes — a failed build leaves R2 untouched.
 - **Push**: `rclone copy` (never `sync --delete`) new keys up — content-addressed, so unchanged keys are skipped and an incremental push is delta-sized — then manifests, then `build/<sha>/`, then pointers **last**. A crash mid-push leaves the old pointers over a complete old world; half-pushed objects are unreferenced garbage.
 - **GC**: a separate scheduled workflow deletes keys unreferenced by the last N mosaic/build manifests and any manifest a live release points at. It never runs during a build (shared concurrency group). This is the only deletion path anywhere.
@@ -119,7 +119,7 @@ bathymetry/
 
 ## Compute
 
-The seamap `build-planet.yml` pattern, adapted: boot an ephemeral Hetzner box (ccx63-class, 48 vCPU / 192 GB — request the dedicated-vCPU quota raise first) + attached volume, `docker pull` the existing GHCR toolchain image, rsync the repo, hydrate, `just planet`, push, always-destroy. Expected costs, for calibration: ~€2/hr while building → roughly €10 per forced planet build, €1–3 per weekly incremental; R2 grows by the mosaic store (Float32 COGs ≈ the current tile store again, ~+$1–2/mo) on top of today's ~$4/mo. Total well under €20/mo at weekly cadence, ~$0 when idle. `build.yml` shrinks to roughly: image job + boot/run/destroy + the concurrency group. The self-hosted-runner marketplace action is an acceptable variant (Actions-native logs, no SSH heredoc, no 6h cap applies); the SSH pattern is fewer moving parts — implementer's call. A dedicated box shared with seamap is a later option; hydrate-from-R2 stays the design either way so the box remains cattle.
+The seamap `build-planet.yml` pattern, adapted: boot an ephemeral Hetzner box + attached volume — `server_type` is a dispatch input: ccx33 (8 vCPU / 32 GB, the account's current dedicated-vCPU cap; full forced rebuild ≈ overnight, incrementals 1–2 h, ~€3.50/full build) until the quota raise unlocks ccx63-class (48 vCPU / 192 GB; Hetzner refuses upgrade requests on new accounts — retry after the first invoices or via support). Nothing in the workflow changes with the size — `docker pull` the existing GHCR toolchain image, rsync the repo, hydrate, `just planet`, push, always-destroy. Expected costs, for calibration: ~€2/hr while building → roughly €10 per forced planet build, €1–3 per weekly incremental; R2 grows by the mosaic store (Float32 COGs ≈ the current tile store again, ~+$1–2/mo) on top of today's ~$4/mo. Total well under €20/mo at weekly cadence, ~$0 when idle. `build.yml` shrinks to roughly: image job + boot/run/destroy + the concurrency group. The self-hosted-runner marketplace action is an acceptable variant (Actions-native logs, no SSH heredoc, no 6h cap applies); the SSH pattern is fewer moving parts — implementer's call. A dedicated box shared with seamap is a later option; hydrate-from-R2 stays the design either way so the box remains cattle.
 
 Parallelism on the box (mostly knobs and deletions — the pools already exist):
 
@@ -142,6 +142,7 @@ Once the mosaic is published, `just preview` grows a fast path: hydrate `bounds.
 - **Datum is an explicit recorded offset**, carried in the source catalog item and the mosaic manifest — never implicit in a recipe arg alone.
 - **Nearest-neighbour for categorical rasters** (the future provenance/confidence sidecar); never through the Gaussian feather.
 - **`land_clamp` immediately after warp** for flagged coarse sources; watermask subtraction preserved.
+- **Drying cuts by effective land (`land ∖ inland-water`), never raw OSM land** — raw land deletes the flats inside mapped tidal channels (the ICW failure; see [2026-07-08-drying-geometry.md](2026-07-08-drying-geometry.md)). Phase 5's re-pointing of depare at mosaic windows must carry this intact.
 - **nodata discipline**: overviews built nodata-aware (average over the valid subset; one numeric sentinel across every tile COG, not NaN); no nodata leaking into contours; the served render resolves nodata to GEBCO fill before encode even where the truth mosaic legitimately carries it.
 - **One smoothing function.** Terrain shading and contours call the same `f(depth, zoom)` smoothing, so isobaths agree with the shading at every zoom — the per-zoom render model yields that coherence only if both read the same code.
 - **Exact grid registration**: pixel-is-area vs pixel-is-point and half-pixel alignment must stay exact across the mosaic split — mosaic tile grids, stage-3 windows, and the serving tile grid all derive from one tiling math, or overlay seams misalign by half a pixel.
@@ -154,7 +155,7 @@ Once the mosaic is published, `just preview` grows a fast path: hydrate `bounds.
 2. **One box.** Rewrite `build.yml` on the seamap pattern: boot → hydrate → existing `just planet` (current pipeline semantics, covering-diff and all) → push → destroy. Delete the matrix/shard/freeze recipes and jobs. This alone removes the RAM/disk/6h/matrix constraints and most of build.yml, without touching pipeline logic. Un-cap `AGG_PROCESSES` by RAM; single tippecanoe; parallel bundle groups.
 3. **Hash keys.** Add `keys.py`; re-key each stage's done-check on content hashes (inputs ‖ code ‖ config); delete the covering diff, `.done` markers, and the `force`-for-correctness requirement (keep `force` as an escape hatch). The prunes become dead code but stay until phase 4.
 4. **Immutable store + GC.** Move `pmtiles/`/`contour/`/etc. writes to content-addressed keys + build manifests + pointer-last publish; delete both prune steps and their guards; add the scheduled GC workflow.
-5. **Mosaic split.** Persist the merged DEM as the stage-2 product (COG + overviews + manifest); re-point smooth/encode/contours/soundings/depare/drying at mosaic windows; delete the per-zoom downsample store. This is the largest pipeline change and lands last, on infrastructure phases 2–4 already carry.
+5. **Mosaic split.** Persist the merged DEM as the stage-2 product (COG + overviews + manifest); re-point smooth/encode/contours/soundings/depare (incl. its drying + nodata kinds) at mosaic windows; delete the per-zoom downsample store. This is the largest pipeline change and lands last, on infrastructure phases 2–4 already carry.
 6. **Preview-from-mosaic** fast path in the Justfile.
 
 ## Alternatives considered
