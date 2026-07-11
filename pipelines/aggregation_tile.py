@@ -14,6 +14,7 @@ from glob import glob
 import mercantile
 import rasterio
 
+import keys
 import utils
 
 NODATA = -9999
@@ -43,14 +44,15 @@ def create_tiles(tmp_folder, aggregation_tile, tiff_filepath, buffer_pixels):
             create_tile(i, j, tiff_filepath, f"{tmp_folder}/{child_z}-{x}-{y}.webp", buffer_pixels)
 
 
-def main(filepath):
+def main(filepath, out_filepath):
+    """Tile the merged DEM into single-zoom Terrarium PMTiles at ``out_filepath`` — the caller's
+    content-addressed name (``store/pmtiles/<stem>-<key>.pmtiles``). The archive is built in the
+    tile's tmp folder and published with an atomic rename, so ``out_filepath`` only ever appears
+    complete (a crash mid-write leaves the temp, and the fork reads stale next run)."""
     aggregation_id, filename = filepath.split("/")[-2:]
     z, x, y, child_z = (int(a) for a in filename.replace("-aggregation.csv", "").split("-"))
     tmp_folder = f"store/aggregation/{aggregation_id}/{z}-{x}-{y}-{child_z}-tmp"
 
-    if os.path.isfile(f"{tmp_folder}/pmtiles-done"):
-        print(f"tiling {filename} already done...")
-        return
     if not os.path.isfile(f"{tmp_folder}/merge-done"):
         print("merge not done yet...")
         return
@@ -62,9 +64,7 @@ def main(filepath):
     tiff_filepath = f"{tmp_folder}/{num_tiffs - 1}-3857.tiff"
 
     aggregation_tile = mercantile.Tile(x=x, y=y, z=z)
-    out_folder = utils.get_pmtiles_folder(x, y, z)
-    utils.create_folder(out_folder)
-    out_filepath = f"{out_folder}/{z}-{x}-{y}-{child_z}.pmtiles"
     create_tiles(tmp_folder, aggregation_tile, tiff_filepath, buffer_pixels)
-    utils.create_archive(tmp_folder, out_filepath)
-    utils.run_command(f"touch {tmp_folder}/pmtiles-done")
+    tmp_archive = f"{tmp_folder}/tile.pmtiles"   # not *.webp, so create_archive's glob skips it
+    utils.create_archive(tmp_folder, tmp_archive)
+    keys.publish(tmp_archive, out_filepath)      # atomic rename into the content name

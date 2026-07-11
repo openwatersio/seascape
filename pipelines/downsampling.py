@@ -31,10 +31,11 @@ import encode
 import keys
 import utils
 
-# An overview's key = H(its children's terrain/overview keys ‖ these modules ‖ config). A changed
-# child key propagates upward by construction (a rebuilt overview writes a new sidecar its parent
-# reads), so the mtime staleness-cascade is gone; missing-artifact self-heal is inherent (no
-# artifact → no fresh key).
+# An overview's key = H(its children's terrain/overview keys ‖ these modules ‖ config), and it
+# rides in the overview's content name (keys.content_path). A changed child gets a new content name
+# -> a new key here -> a new overview name that isn't present yet -> stale, so the mtime staleness-
+# cascade is gone and missing-artifact self-heal is inherent (no file -> stale). The child key is
+# read straight off the child's content filename, not a sidecar.
 DOWNSAMPLE_MODULES = ["downsampling", "encode", "utils"]
 
 
@@ -114,15 +115,13 @@ def create_tile(parent_x, parent_y, parent_z, tmp_folder, pmtiles_filenames):
             if child not in tile_to_filename:
                 continue
             filename = tile_to_filename[child]
-            fz, fx, fy, _ = (int(a) for a in filename.replace(".pmtiles", "").split("-"))
-            folder = utils.get_pmtiles_folder(fx, fy, fz)
-            child_path = f"{folder}/{filename}"
+            child_path = _child_content(filename)
             # A tile the covering referenced but the aggregate/downsample run never produced
             # (a prior failed/interrupted build): record it and leave this quadrant empty for
             # now — execute() raises once the level finishes, failing the build rather than
             # publishing a holed pyramid (the Worker overzooms GEBCO into such holes, so
             # they surface as missing high-zoom terrain).
-            if not os.path.isfile(child_path):
+            if child_path is None:
                 missing.add(filename)
                 continue
             with open(child_path, "r+b") as f:
@@ -142,17 +141,12 @@ def create_tile(parent_x, parent_y, parent_z, tmp_folder, pmtiles_filenames):
 def run_one(filepath):
     """Build one parent pmtiles. Returns the set of missing child filenames (empty if none).
     Pure per-filepath unit of work — safe to run in a process Pool."""
-    aggregation_id, filename = filepath.split("/")[-2:]
-    z, x, y, parent_zoom = (int(a) for a in filename.replace("-downsampling.csv", "").split("-"))
-    out_folder = utils.get_pmtiles_folder(x, y, z)
-    utils.create_folder(out_folder)
-    out_filepath = f"{out_folder}/{z}-{x}-{y}-{parent_zoom}.pmtiles"
-    # Invalidate before writing (the crash rule every keyed writer follows): under FORCE the
-    # key is unchanged, so a crash mid-archive would otherwise leave the old sidecar reading
-    # a torn overview as fresh forever.
-    sc = keys.sidecar(out_filepath)
-    if os.path.isfile(sc):
-        os.remove(sc)
+    # Content-addressed now — the base's "invalidate the sidecar before writing" (72c4034) is
+    # subsumed: keys.supersede clears last build's content name before the atomic publish below, so
+    # a crash mid-archive leaves nothing at the current key and the overview reads stale next run.
+    z, x, y, parent_zoom = (int(a) for a in
+                            filepath.split("/")[-1].replace("-downsampling.csv", "").split("-"))
+    logical = _overview_artifact(filepath)       # {folder}/{z}-{x}-{y}-{parent_zoom}.pmtiles (base)
 
     extent = mercantile.Tile(x=x, y=y, z=z)
     tmp_folder = filepath.replace("-downsampling.csv", "-tmp")
@@ -163,13 +157,16 @@ def run_one(filepath):
     parents = [extent] if z == parent_zoom else list(mercantile.children(extent, zoom=parent_zoom))
     for parent in parents:
         missing |= create_tile(parent.x, parent.y, parent.z, tmp_folder, pmtiles_filenames)
-    utils.create_archive(tmp_folder, out_filepath)
-    shutil.rmtree(tmp_folder)
-    # Don't key it when a referenced child was missing — leave it stale so a rerun (after the
-    # upstream gap is fixed) rebuilds it. The children were all rebuilt earlier this run (finest
-    # first), so their sidecars are final now — _overview_key reads their settled keys.
+    # Don't publish when a referenced child was missing — leave the overview stale so a rerun
+    # (after the upstream gap is fixed) rebuilds it. The children were all rebuilt earlier this
+    # run (finest first), so their content names are final now — _overview_key reads their
+    # settled keys. supersede clears last build's overview key before the atomic publish.
     if not missing:
-        keys.write_key(out_filepath, _overview_key(filepath))
+        tmp_archive = f"{tmp_folder}/overview.pmtiles"   # not *.webp, so create_archive skips it
+        utils.create_archive(tmp_folder, tmp_archive)
+        keys.supersede(logical)
+        keys.publish(tmp_archive, keys.content_path(logical, _overview_key(filepath)))
+    shutil.rmtree(tmp_folder)
     return missing
 
 
@@ -178,16 +175,36 @@ def _children(filepath):
         return [line.strip() for line in f.readlines()[1:] if line.strip()]
 
 
-def _child_pmtiles_path(child_filename):
+def _child_logical(child_filename):
+    """The LOGICAL base path of a child ('8-77-95-8.pmtiles' -> 'store/pmtiles/7-38-47/8-77-95-8.pmtiles')
+    — content_path splices a key onto this."""
     z, x, y, _cz = (int(a) for a in child_filename.replace(".pmtiles", "").split("-"))
     return f"{utils.get_pmtiles_folder(x, y, z)}/{child_filename}"
 
 
+def _child_content(child_filename):
+    """Resolve a covering's LOGICAL child name ('8-77-95-8.pmtiles') to its content-addressed
+    file on disk ('.../8-77-95-8-<key>.pmtiles'), or None if absent. After the per-stem sweep at
+    most one content file per logical stem exists locally, so the match is unambiguous."""
+    logical = _child_logical(child_filename)
+    root, ext = os.path.splitext(logical)
+    matches = glob(f"{root}-*{ext}")
+    return matches[0] if matches else None
+
+
+def _child_key(child_filename):
+    """The 12-hex key of a child, read straight off its content filename (the terrain key of an
+    aggregate child, the overview key of a coarser one). Empty string when the child is absent, so
+    the child's stem alone still keeps a vanished/rebuilt child moving the overview key."""
+    p = _child_content(child_filename)
+    return keys.stem_and_key(p)[1] if p else ""
+
+
 def _overview_key(filepath):
-    """A content-hash key from the children's own key sidecars — the terrain key of an aggregate
-    child, the overview key of a coarser child. A missing child sidecar contributes an empty key,
-    so the child's stem alone keeps a vanished/rebuilt child moving the overview key."""
-    inputs = sorted(f"{c}:{keys.read_key(_child_pmtiles_path(c)) or ''}" for c in _children(filepath))
+    """A content-hash key from the children's own keys (in their content filenames). A rebuilt
+    child gets a new content name -> a new key here -> a new overview name, cascading the change up
+    by construction; a missing child contributes an empty key on its stem."""
+    inputs = sorted(f"{c}:{_child_key(c)}" for c in _children(filepath))
     return keys.stage_key(inputs, DOWNSAMPLE_MODULES, {"num_overviews": utils.num_overviews})
 
 
@@ -202,13 +219,14 @@ def _parent_zoom(filepath):
 
 
 def dirty_filepaths():
-    """Sorted -downsampling.csv to (re)build: an overview whose own key is stale (its artifact
-    missing — self-heal — or its sidecar not matching the key its current children imply), OR any
-    of whose children will be rewritten this run (their key will change, so this overview's will
-    too). Processing finest-overview-first and carrying dirty stems forward makes the staleness
+    """Sorted -downsampling.csv to (re)build: an overview whose content name is absent (its
+    artifact missing — self-heal — or its key moved because its current children imply a new one),
+    OR any of whose children will be rewritten this run (their key will change, so this overview's
+    will too). Processing finest-overview-first and carrying dirty stems forward makes the staleness
     cascade all the way up the pyramid in one pass — the key equivalent of the old mtime cascade,
-    with no listing/mtime inputs: aggregate wrote each terrain child's sidecar before downsampling
-    runs, so the lowest overviews read settled child keys, and each dirty overview propagates."""
+    with no listing/mtime inputs: aggregate published each terrain child's content name before
+    downsampling runs, so the lowest overviews read settled child keys, and each dirty overview
+    propagates."""
     aggregation_id = utils.get_aggregation_ids()[-1]
     dirty_stems = set()
     out = []
@@ -219,7 +237,7 @@ def dirty_filepaths():
         if any(cs in dirty_stems for cs in child_stems):
             dirty = True  # a child overview will be rewritten (its key changes) -> so will this
         else:
-            dirty = not keys.is_fresh(_overview_artifact(filepath), _overview_key(filepath))
+            dirty = not keys.fork_fresh(_overview_artifact(filepath), _overview_key(filepath))
         if dirty:
             out.append(filepath)
             dirty_stems.add(own_stem)  # cascade to the coarser overview that averages this one

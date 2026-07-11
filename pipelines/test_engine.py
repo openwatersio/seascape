@@ -55,14 +55,28 @@ def run(tmp, *args, env=None):
     return proc
 
 
-def sidecars(tmp, pattern):
-    """{path: key} for every key sidecar matching pattern (relative to tmp) — the before/after
-    snapshot the key-stability assertions compare."""
+def content_names(tmp, *patterns):
+    """{logical stem: basename} for every content-addressed file matching the patterns (relative to
+    tmp, recursive). The key rides in the name, so a moved key shows as a changed basename for the
+    stem — this is the before/after snapshot the key-stability assertions compare (replacing the
+    phase-3 .key sidecar snapshot). Both a fork's artifact and its .empty marker are content-named,
+    so passing both globs snapshots every tile whether or not it produced features."""
+    import keys
     out = {}
-    for p in glob(f"{tmp}/{pattern}", recursive=True):
-        with open(p) as f:
-            out[p] = f.read()
+    for pattern in patterns:
+        for p in glob(f"{tmp}/{pattern}", recursive=True):
+            base = os.path.basename(p)
+            if keys.is_content_name(base):
+                out[keys.stem_of(base)] = base
     return out
+
+
+def store_manifest_body(tmp):
+    """Assemble the store manifest in the SAME subprocess env the build used (so the keys match)
+    and return its bytes. Writes store/manifests/<id>.json and reads it back."""
+    build_id = run(tmp, "store_manifest.py", "write").stdout.strip()
+    with open(f"{tmp}/store/manifests/{build_id}.json") as f:
+        return f.read()
 
 
 def make_source(tmp, sid, west, north, deg, px, value, max_zoom, extra_meta=None, deg_ns=None):
@@ -141,11 +155,11 @@ def _synthetic_covering(aid, tiles):
 
 def check_self_heal():
     """A tile whose terrain pmtiles is missing from the store is stale even when nothing changed
-    (self-heal): its computed key can't match a sidecar next to a missing artifact. Same invariant
-    the old covering diff enforced, now by construction. On the build box this is the resume
-    mechanism: a re-dispatch hydrates whatever got pushed, and only the tiles whose pmtiles (or
-    key sidecar) never landed come back stale. Also asserts FORCE_REBUILD makes everything stale
-    (the escape hatch) and that fresh keys mean ZERO work (the no-change contract at plan level).
+    (self-heal): its content-addressed name is simply absent. Same invariant the old covering diff
+    enforced, now by construction. On the build box this is the resume mechanism: a re-dispatch
+    hydrates whatever the last manifest referenced, and only the tiles whose content name never
+    landed come back stale. Also asserts FORCE_REBUILD makes everything stale (the escape hatch)
+    and that fresh keys mean ZERO work (the no-change contract at plan level).
 
     Also covers sources-manifest, which rides the same key-based dirty derivation: the manifest
     must be exactly the STALE tiles' (source, filename) union — per-tile rows for stale tiles
@@ -184,20 +198,21 @@ def check_self_heal():
                         "shared,common.tif,10\n"        # shared across every tile → dedup
                         f"legacy,{legacy},9\n")         # absolute /vsi row → verbatim
             fps.append(fp)
-        # Mark every fork of every tile fresh: terrain needs artifact + sidecar; a vector fork may
-        # legitimately produce nothing, so its sidecar alone marks it done.
+        # Mark every fork of every tile fresh by materializing its content-addressed file (existence
+        # is the freshness marker — no sidecar). A vector fork could instead leave a .empty marker;
+        # a content file works for all four here.
         for fp, t in zip(fps, tiles):
             for fork in aggregation_run.FORKS:
-                art = aggregation_run._artifact(fork, t)
-                utils.create_folder(os.path.dirname(art))
-                if fork == "terrain":
-                    open(art, "w").close()
-                keys.write_key(art, aggregation_run._KEYFN[fork](fp))
+                cpath = keys.content_path(aggregation_run._artifact(fork, t),
+                                          aggregation_run._KEYFN[fork](fp))
+                utils.create_folder(os.path.dirname(cpath))
+                open(cpath, "w").close()
         assert aggregation_run.dirty_filepaths() == [], "fresh keys must mean zero work"
 
         missing = set(tiles[1::2])
         for t in missing:
-            os.remove(aggregation_run._artifact("terrain", t))
+            os.remove(keys.content_path(aggregation_run._artifact("terrain", t),
+                                        aggregation_run._KEYFN["terrain"](fp_by_tile[t])))
         dirty = {fp.split("/")[-1].replace("-aggregation.csv", "")
                  for fp in aggregation_run.dirty_filepaths()}
         assert dirty == missing, f"dirty != self-heal set (Δ {dirty ^ missing})"
@@ -232,11 +247,12 @@ def check_self_heal():
 
 
 def check_stale_overview():
-    """An overview must rebuild when a child it averages changed (its key sidecar moved) or is
+    """An overview must rebuild when a child it averages changed (its content name moved) or is
     missing (about to self-heal), and the staleness must cascade up the pyramid — the invariants
-    the old mtime cascade enforced, now as a key cascade: an overview's key hashes its children's
-    keys, so a changed child mismatches the parent's sidecar by construction, and dirty stems
-    carry the cascade up within the finest-first plan."""
+    the old mtime cascade enforced, now as a content-name cascade: an overview's key hashes its
+    children's keys (read off their content filenames) and rides in its own name, so a rebuilt
+    child yields a new overview name that isn't present -> stale, and dirty stems carry the cascade
+    up within the finest-first plan."""
     import downsampling
     import keys
     import utils
@@ -263,32 +279,40 @@ def check_stale_overview():
             utils.create_folder(os.path.dirname(path))
             open(path, "w").close()
 
+        def base_content(key):  # the aggregate child's content-addressed terrain pmtiles
+            return keys.content_path(downsampling._child_logical("8-77-95-8.pmtiles"), key)
+
+        def settle_overview(stem):  # write the overview's content file at its current key
+            fp = f"store/aggregation/{aid}/{stem}-downsampling.csv"
+            touch(keys.content_path(downsampling._overview_artifact(fp), downsampling._overview_key(fp)))
+
         def dirty_stems():
             return {fp.split("/")[-1].replace("-downsampling.csv", "")
                     for fp in downsampling.dirty_filepaths()}
 
-        # The aggregate child's terrain artifact + key, then each overview keyed finest-first off
-        # its child's settled sidecar — exactly the state a completed run leaves behind.
-        base = downsampling._child_pmtiles_path("8-77-95-8.pmtiles")
-        touch(base)
-        keys.write_key(base, "terrainkey1")
-        for stem in chain:
-            fp = f"store/aggregation/{aid}/{stem}-downsampling.csv"
-            touch(downsampling._overview_artifact(fp))
-            keys.write_key(downsampling._overview_artifact(fp), downsampling._overview_key(fp))
+        K1, K2 = "aaaaaaaaaaaa", "bbbbbbbbbbbb"  # two content keys = a child rebuilt
+        # The aggregate child's terrain artifact (key K1), then each overview settled finest-first
+        # off its child's content name — exactly the state a completed run leaves behind.
+        touch(base_content(K1))
+        for stem in chain:  # 4-4-5-7, 3-2-2-6, 2-1-1-5 — finest first
+            settle_overview(stem)
         assert dirty_stems() == set(), "a settled pyramid must be fully fresh"
 
-        # 1) the aggregate child was rebuilt (new terrain key) -> the whole chain above is stale.
-        keys.write_key(base, "terrainkey2")
+        # 1) the aggregate child was rebuilt (new terrain key K2) -> the whole chain above is stale.
+        os.remove(base_content(K1))
+        touch(base_content(K2))
         assert dirty_stems() == {"4-4-5-7", "3-2-2-6", "2-1-1-5"}, f"child-key cascade wrong: {dirty_stems()}"
-        keys.write_key(base, "terrainkey1")
+        os.remove(base_content(K2))
+        touch(base_content(K1))
+        assert dirty_stems() == set(), "restoring the child key returns the pyramid to fresh"
 
         # 2) a middle overview's pmtiles vanished -> itself (self-heal) + everything above, but
         # NOT the fresh finer overview below it.
-        os.remove(downsampling._overview_artifact(f"store/aggregation/{aid}/3-2-2-6-downsampling.csv"))
+        mid = f"store/aggregation/{aid}/3-2-2-6-downsampling.csv"
+        os.remove(keys.content_path(downsampling._overview_artifact(mid), downsampling._overview_key(mid)))
         assert dirty_stems() == {"3-2-2-6", "2-1-1-5"}, f"missing-artifact cascade wrong: {dirty_stems()}"
         assert "4-4-5-7" not in dirty_stems(), "the fresh finer overview must not rebuild"
-        touch(downsampling._overview_artifact(f"store/aggregation/{aid}/3-2-2-6-downsampling.csv"))
+        settle_overview("3-2-2-6")
 
         # 3) FORCE re-runs the whole pyramid regardless of key matches.
         os.environ["FORCE_REBUILD"] = "1"
@@ -398,13 +422,14 @@ def check_key_invalidation():
 
 
 def check_crash_leaves_stale():
-    """A vector fork that crashes mid-run must leave the NEXT run stale. Each generate() deletes
-    the previous artifact up front, so it must delete the key sidecar in the same breath: under
-    FORCE (the key unchanged) a crash between the delete and completion would otherwise leave the
-    old sidecar matching the recomputed key over a missing artifact — is_fresh(require_artifact=
-    False) would read it fresh forever, a permanent silent hole in vector.pmtiles. A garbage DEM
-    (exists, unreadable) makes each fork crash right after its up-front delete; assert both the
-    artifact and the sidecar are gone and the fork plans as stale."""
+    """A fork that crashes mid-run must leave the NEXT run stale — the crash-safety invariant
+    content addressing preserves. run() SUPERSEDES a stem's content-named siblings (all keys, plus
+    any .empty marker) BEFORE (re)generating, so a crash between the supersede and the atomic
+    publish leaves nothing at the current key: no content file, no empty marker -> fork_fresh False.
+    Without the supersede, last build's content file at the SAME key (a FORCE re-run, or unchanged
+    inputs) would survive the crash and read fresh over a fork that never actually completed — a
+    permanent silent hole in vector.pmtiles. A garbage DEM (exists, unreadable) crashes each fork;
+    assert the stem carries neither artifact nor marker afterward and plans as stale."""
     import aggregation_run
     import config
     import contour_run
@@ -430,28 +455,31 @@ def check_crash_leaves_stale():
         for fork, mod in (("contour", contour_run), ("soundings", soundings_run), ("depare", depare_run)):
             art = aggregation_run._artifact(fork, stem)
             key = aggregation_run._KEYFN[fork](fp)
-            utils.create_folder(os.path.dirname(art))
-            open(art, "w").close()
-            keys.write_key(art, key)  # the pre-crash state: a fresh artifact + matching sidecar
-            assert keys.is_fresh(art, key, require_artifact=False), f"{fork}: setup must be fresh"
+            cpath = keys.content_path(art, key)
+            utils.create_folder(os.path.dirname(cpath))
+            open(cpath, "w").close()  # the pre-crash state: a fresh content artifact at this key
+            assert keys.fork_fresh(art, key), f"{fork}: setup must be fresh"
+            # run()'s per-fork sequence: supersede (clears this key + all others) THEN (re)generate.
+            keys.supersede(art)
             try:
-                mod.generate(fp)
+                mod.generate(fp, cpath)
                 raise AssertionError(f"{fork}: generate on a garbage DEM must raise")
             except AssertionError:
                 raise
             except Exception:
                 pass  # the simulated mid-run crash
-            assert not os.path.isfile(art), f"{fork}: the crash must not leave the old artifact"
-            assert keys.read_key(art) is None, f"{fork}: the crash must not leave the old sidecar"
-            assert not keys.is_fresh(art, key, require_artifact=False), \
-                f"{fork}: the post-crash state must plan as stale"
+            assert not os.path.isfile(cpath), f"{fork}: the crash must not leave a content artifact"
+            assert not os.path.isfile(keys.empty_marker(art, key)), f"{fork}: nor an empty marker"
+            assert not keys.fork_fresh(art, key), f"{fork}: the post-crash state must plan as stale"
 
-        # Bundle level, same rule: soundings.pmtiles' sidecar (and the stale archive) must go
-        # BEFORE tippecanoe starts, so a FORCE + crash mid-bundle reads stale next run instead
-        # of vouching for a torn archive. Garbage member geojson makes tippecanoe fail right
-        # after the invalidation.
+        # Bundle level, same rule: the per-sha bundle outputs (store/bundle/*.pmtiles + manifest.json)
+        # stay sidecar-keyed — they're never hydrated — so their invalidate-before-write discipline
+        # (72c4034) survives content addressing. soundings.pmtiles' sidecar (and the stale archive)
+        # must go BEFORE tippecanoe starts, so a FORCE + crash mid-bundle reads stale next run
+        # instead of vouching for a torn archive. A CONTENT-named garbage member (so _live keeps it)
+        # makes tippecanoe fail right after the invalidation.
         utils.create_folder("store/soundings")
-        with open(f"store/soundings/{stem}.geojson", "w") as f:
+        with open(f"store/soundings/{stem}-abcdef012345.geojson", "w") as f:
             f.write("not geojson")
         utils.create_folder("store/bundle")
         out = "store/bundle/soundings.pmtiles"
@@ -476,7 +504,12 @@ def check_crash_leaves_stale():
         # Empty input, same rule: a previously-built bundle whose inputs are now ZERO must not
         # survive the early return — _finalize_contours folds soundings/depare.pmtiles into
         # vector.pmtiles whenever they exist on disk, so a stale layer would ship as current.
-        os.remove(f"store/soundings/{stem}.geojson")
+        # Under content addressing "legitimately empty" means an .empty marker per covering stem;
+        # the completeness gate demands one before the empty-input path is even reachable.
+        os.remove(f"store/soundings/{stem}-abcdef012345.geojson")
+        for fork in ("contour", "soundings"):
+            keys.write_empty(aggregation_run._artifact(fork, stem),
+                             aggregation_run._KEYFN[fork](fp))
         for stale_out, mod in (("store/bundle/soundings.pmtiles", soundings_run),
                                ("store/bundle/vector.pmtiles", contour_run)):
             open(stale_out, "w").close()
@@ -486,8 +519,8 @@ def check_crash_leaves_stale():
                 f"{stale_out}: an empty-input bundle must remove the previously-built output"
             assert keys.read_key(stale_out) is None, \
                 f"{stale_out}: an empty-input bundle must remove the old sidecar"
-        print("crash-leaves-stale ok — mid-fork/mid-bundle crashes and empty inputs all leave "
-              "no sidecar standing; next run re-runs")
+        print("crash-leaves-stale ok — supersede + mid-fork/mid-bundle crashes and empty inputs "
+              "all leave nothing vouching; next run re-runs")
     finally:
         config.SOURCES_DIR = saved_dir
         os.chdir(cwd)
@@ -523,10 +556,12 @@ def check_grid_split():
     try:
         os.chdir(tmp)
         os.makedirs("store/pmtiles")
-        # One single-zoom archive under the coarse parent (4,4,5) at z9 — 1024 tiles
-        # spanning the 4 cells; payload = the tile id, so reads are verifiable.
+        # One single-zoom archive under the coarse parent (4,4,5) at z9 — 1024 tiles spanning the
+        # 4 cells; payload = the tile id, so reads are verifiable. Content-addressed name (a 12-hex
+        # key), which create_archive parses back to the logical stem via keys.stem_of.
+        pm = "store/pmtiles/4-4-5-9-abcdef012345.pmtiles"
         children = list(mercantile.children(mercantile.Tile(x=4, y=5, z=4), zoom=9))
-        with open("store/pmtiles/4-4-5-9.pmtiles", "wb") as f:
+        with open(pm, "wb") as f:
             w = Writer(f)
             for tid in sorted(zxy_to_tileid(t.z, t.x, t.y) for t in children):
                 w.write_tile(tid, str(tid).encode())
@@ -536,7 +571,7 @@ def check_grid_split():
                         "center_lon_e7": 0, "center_lat_e7": 0}, {})
         seen = set()
         for cell in fan:
-            meta = bundle.create_archive(["store/pmtiles/4-4-5-9.pmtiles"], cell)
+            meta = bundle.create_archive([pm], cell)
             with open(f"store/bundle/{meta['file']}", "r+b") as f:
                 for (z, x, y), data in all_tiles(Reader(MmapSource(f)).get_bytes):
                     assert bundle.cell_of(z, x, y) == cell, f"tile {(z, x, y)} leaked into {cell}"
@@ -834,8 +869,9 @@ def check_depare_drying():
                                count=1, dtype="float32", nodata=NODATA, crs="EPSG:3857",
                                transform=tr) as d:
                 d.write(dem, 1)
-            depare_run.generate(f"store/aggregation/{aid}/{stem}-aggregation.csv")
-            return gpd.read_file(f"store/depare/{stem}.fgb")
+            out = f"store/depare/{stem}.fgb"
+            depare_run.generate(f"store/aggregation/{aid}/{stem}-aggregation.csv", out)
+            return gpd.read_file(out)
 
         # left: open foreshore | cut foreshore (under land) | -25 band | NODATA | ICW foreshore
         # (under land AND water, reaching the east seam). right: ICW foreshore reaching the west
@@ -940,9 +976,10 @@ def check_depare():
                                count=1, dtype="float32", nodata=-9999, crs="EPSG:3857",
                                transform=tr) as d:
                 d.write(dem, 1)
-            depare_run.generate(f"store/aggregation/{aid}/{stem}-aggregation.csv")
+            out = f"store/depare/{stem}.fgb"
+            depare_run.generate(f"store/aggregation/{aid}/{stem}-aggregation.csv", out)
             row_lonlat = lambda r: to4326.transform(*(tr * (px // 2 + 0.5, r + 0.5)))
-            return (gpd.read_file(f"store/depare/{stem}.fgb"),
+            return (gpd.read_file(out),
                     {"land": Point(row_lonlat(q // 2)),
                      "shoal": Point(row_lonlat(q + q // 2)),
                      "mid": Point(row_lonlat(2 * q + q // 2)),
@@ -1034,8 +1071,8 @@ def check_depare_water():
                                count=1, dtype="float32", nodata=NODATA, crs="EPSG:3857",
                                transform=tr) as d:
                 d.write(dem, 1)
-            depare_run.generate(f"store/aggregation/{aid}/{stem}-aggregation.csv")
             path = f"store/depare/{stem}.fgb"
+            depare_run.generate(f"store/aggregation/{aid}/{stem}-aggregation.csv", path)
             return gpd.read_file(path) if os.path.isfile(path) else None
 
         gL = build(left, lake_side="east")
@@ -1107,9 +1144,23 @@ def main():
 
         n_tiles = len(glob(f"{tmp}/store/aggregation/*/*-aggregation.csv"))
 
+        # ── store manifest: complete (a name per fork per tile + one per overview), every name a
+        # real store object, and the ``.empty`` flag matches the extension. Assembled in the same
+        # subprocess env the build used so its recomputed keys match the content filenames.
+        body_first = store_manifest_body(tmp)
+        manifest = json.loads(body_first)
+        entries = manifest["entries"]
+        assert {"terrain", "contour", "soundings", "depare", "overview"} <= {e["fork"] for e in entries}, \
+            f"manifest missing a fork: {sorted({e['fork'] for e in entries})}"
+        for e in entries:
+            assert os.path.isfile(f"{tmp}/store/{e['name']}"), f"manifest names a missing file: {e['name']}"
+            assert e["name"].endswith(".empty") == e["empty"], f"empty flag/ext mismatch: {e}"
+        assert store_manifest_body(tmp) == body_first, "store manifest must be byte-deterministic across a re-walk"
+        print(f"store-manifest ok — {len(entries)} entries, complete, every name a live store object")
+
         # ── phase-3 acceptance (a): a NO-CHANGE rerun does zero work. A fresh covering (new
-        # ULID, identical rows) leaves every fork key matching its sidecar, so aggregate re-runs
-        # zero tiles, the overview keys all match, and the bundle skips off the manifest key.
+        # ULID, identical rows) leaves every fork's content name present, so aggregate re-runs
+        # zero tiles, the overview names all match, and the bundle skips off the manifest key.
         run(tmp, "aggregation_covering.py")
         out = run(tmp, "aggregation_run.py").stdout
         assert "nothing to do." in out, f"no-change rerun must aggregate nothing: {out!r}"
@@ -1118,7 +1169,11 @@ def main():
         assert "parent(s)" not in out, f"no-change rerun must downsample nothing: {out!r}"
         out = run(tmp, "bundle.py").stdout
         assert "unchanged — skip" in out, f"no-change rerun must skip the bundle: {out!r}"
-        print(f"no-change rerun ok — 0 of {n_tiles} tiles re-ran; downsample + bundle skipped")
+        # The manifest BODY is byte-stable across the no-op rerun even though the covering ULID
+        # (the manifest FILENAME) changed — the pointer-last atomicity depends on this determinism.
+        assert store_manifest_body(tmp) == body_first, \
+            "store manifest body must be byte-stable across a no-op rerun (new covering ULID)"
+        print(f"no-change rerun ok — 0 of {n_tiles} tiles re-ran; downsample + bundle skipped; manifest stable")
 
         # ── phase-3 acceptance (b): a CONTOUR_LEVELS change re-runs every tile (the contour +
         # depare forks are stale, and the shared merge is recomputed with them) but rewrites NO
@@ -1126,10 +1181,10 @@ def main():
         # terrain bundle skip entirely. The old covering diff's blind spot, now a test.
         levels = ("-10000 -8000 -6000 -5000 -4000 -3000 -2000 -1000 -500 -300 -200 "
                   "-100 -50 -30 -20 -10 -5")  # default ladder minus the -2
-        terrain_before = sidecars(tmp, "store/pmtiles/**/*.pmtiles.key")
-        contour_before = sidecars(tmp, "store/contour/*.fgb.key")
+        terrain_before = content_names(tmp, "store/pmtiles/**/*.pmtiles")
+        contour_before = content_names(tmp, "store/contour/*.fgb", "store/contour/*.empty")
         assert terrain_before and len(contour_before) == n_tiles, \
-            "first run must have written a contour key sidecar per tile"
+            "first run must have written a contour artifact or empty marker per tile"
         proc = run(tmp, "aggregation_run.py", env={"CONTOUR_LEVELS": levels})
         out = proc.stdout
         assert "nothing to do." not in out, "a contour-config change must dirty the tiles"
@@ -1137,13 +1192,14 @@ def main():
         # diverge from the style's hand-mirrored DEPARE_LADDER_M/FT.
         assert "CONTOUR_LEVELS overridden" in proc.stderr, \
             "the style-divergence warning must fire on an overridden ladder"
-        assert sidecars(tmp, "store/pmtiles/**/*.pmtiles.key") == terrain_before, \
-            "terrain keys must be untouched by a contour-config change"
-        # Every tile re-ran: its contour sidecar (one per tile, rewritten only by a re-run)
-        # carries the new key. Deterministic, unlike counting Pool workers' interleaved stdout.
-        contour_after = sidecars(tmp, "store/contour/*.fgb.key")
-        assert all(contour_after[p] != contour_before[p] for p in contour_before), \
-            "every tile's contour fork key must move on a contour-config change"
+        assert content_names(tmp, "store/pmtiles/**/*.pmtiles") == terrain_before, \
+            "terrain content names must be untouched by a contour-config change"
+        # Every tile re-ran: its contour content name (artifact or empty marker) carries the new
+        # key, and the old-key file was superseded. Deterministic, unlike counting Pool stdout.
+        contour_after = content_names(tmp, "store/contour/*.fgb", "store/contour/*.empty")
+        assert set(contour_after) == set(contour_before), "the same tiles must still be present"
+        assert all(contour_after[s] != contour_before[s] for s in contour_before), \
+            "every tile's contour content name (key) must move on a contour-config change"
         out = run(tmp, "downsampling.py", "run", env={"CONTOUR_LEVELS": levels}).stdout
         assert "parent(s)" not in out, f"downsample must skip when terrain keys are unchanged: {out!r}"
         out = run(tmp, "bundle.py", env={"CONTOUR_LEVELS": levels}).stdout
@@ -1161,18 +1217,19 @@ def main():
         expected = {"planet"} | {f"5-{int(x) >> (int(z) - 5)}-{int(y) >> (int(z) - 5)}"
                                  for z, x, y, cz in agg_stems if int(cz) > 10}
 
-        # orphan exclusion: a pmtiles left from a re-tiled covering (stem not in the current
-        # covering) must land in NO bundle, else it double-bundles a stale tile over the live
-        # tiling (the raster twin of the contour-overlap bug). Drop one in and re-bundle under
-        # FORCE (phase-3 acceptance (d): the escape hatch re-runs a fully-fresh bundle): the
+        # orphan exclusion: a CONTENT-named pmtiles left from a re-tiled covering (its stem is not
+        # in the current covering) must land in NO bundle, else it double-bundles a stale tile over
+        # the live tiling (the raster twin of the contour-overlap bug). Drop one in and re-bundle
+        # under FORCE (phase-3 acceptance (d): the escape hatch re-runs a fully-fresh bundle): the
         # manifest's overlay cells must be unchanged (an orphan z99 stem would else mint a cell).
-        open(f"{tmp}/store/pmtiles/0-0-0-99.pmtiles", "w").close()
+        orphan = f"{tmp}/store/pmtiles/0-0-0-99-abcdef012345.pmtiles"
+        open(orphan, "w").close()
         out = run(tmp, "bundle.py", env={"FORCE_REBUILD": "1"}).stdout
         assert "unchanged — skip" not in out, "FORCE must re-run the bundle regardless of keys"
         mf_orphan = json.load(open(f"{tmp}/store/bundle/manifest.json"))
         assert set(mf_orphan["overlay"]["cells"]) == expected - {"planet"}, \
             f"orphan leaked into the bundle: {set(mf_orphan['overlay']['cells'])} != {expected - {'planet'}}"
-        os.remove(f"{tmp}/store/pmtiles/0-0-0-99.pmtiles")
+        os.remove(orphan)
         print(f"orphan-exclusion ok — stale-covering pmtiles excluded from every bundle; FORCE re-bundles")
 
         # covering wrote the cap into child_z: the deepest aggregation tile is z11, not z13.
@@ -1215,6 +1272,22 @@ def main():
             print(f"completeness gate ok — bundle failed on missing {os.path.basename(victim)}")
         else:
             raise AssertionError("bundle.py must fail when a covering has no pmtiles")
+
+        # The VECTOR twin (contour_run.verify_vector_complete, self-enforcing rather than relying
+        # on build.yml's store-manifest step running first): a covering tile whose contour fork
+        # left neither artifact nor .empty marker must fail the contour bundle. The gate fires
+        # before tippecanoe, so this needs no tippecanoe binary; it also runs before the
+        # fresh-skip, so a fresh vector key can't paper over the gap.
+        vfgb = sorted(_glob.glob(f"{tmp}/store/contour/*.fgb"))[0]
+        os.remove(vfgb)
+        try:
+            run(tmp, "contour_run.py", "bundle")
+        except subprocess.CalledProcessError as e:
+            assert "contour incomplete" in (e.stderr or ""), \
+                f"wrong failure (want the completeness gate): {e.stderr!r}"
+            print(f"vector completeness gate ok — contour bundle failed on missing {os.path.basename(vfgb)}")
+        else:
+            raise AssertionError("contour_run.py bundle must fail when a covering tile has no contour artifact/marker")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

@@ -5,18 +5,21 @@ name: Build
 #   → push each stage back to R2 → always-destroy the box. The runner here only
 #   orchestrates; the compute is pay-per-build (~€2/hr, ~€10 for a forced planet rebuild).
 #
-# The store still lives in R2 under bathymetry/ and rebuilds are incremental via CONTENT-HASH
-# KEYS (pipelines/keys.py): every artifact carries a .key sidecar in the same prefix, hashing
-# its inputs ‖ pipeline code ‖ resolved config ‖ the toolchain image tag (TOOLCHAIN below), so
-# a stage skips artifacts whose keys match and code/config changes invalidate exactly their
-# dependents — no covering diff, no force-for-correctness. Source registration/mirroring + the
-# land/water masks are sources.yml — a build never contacts an upstream; it reads every byte
+# The store lives in R2 under bathymetry/ as an IMMUTABLE, CONTENT-ADDRESSED store: every artifact
+# carries its content-hash key (pipelines/keys.py) IN its filename (<stem>-<key12>.<ext>), so a
+# stage skips artifacts whose name is present and a code/config change writes a NEW name — the old
+# one becomes unreferenced garbage the GC (gc.yml) collects. Nothing is ever mutated or deleted in
+# place. Each planet build assembles a STORE MANIFEST (the content name of every artifact it left)
+# and flips a one-object pointer (store/manifest.json) LAST — one atomic PUT — so the next build's
+# hydrate and the GC see the whole old world or the whole new one. Source registration/mirroring +
+# the land/water masks are sources.yml — a build never contacts an upstream; it reads every byte
 # (sources + masks) from R2 over /vsicurl.
 # Final bundles land in build/<sha>/; a release promotes that build (release.yml).
 #
-# Dispatch-only (a shared incremental store shouldn't be mutated by routine pushes); any branch
-# can trigger one. A `bbox` builds a self-contained regional slice (no volume, no store push, no
-# prune, never released). The light per-commit checks are ci.yml.
+# Dispatch-only (a shared store shouldn't be mutated by routine pushes); any branch can trigger
+# one. A `bbox` builds a self-contained regional slice (no volume, no store push, no manifest/
+# pointer, never released). Deletion is out-of-band: gc.yml, sharing this concurrency group, is the
+# only path. The light per-commit checks are ci.yml.
 
 on:
   workflow_dispatch:
@@ -56,9 +59,9 @@ env:
   BBOX: ${{ github.event.inputs.bbox }}
   FORCE: ${{ github.event.inputs.force }}
 
-# One store-mutating workflow at a time, globally (not per-ref): the incremental store is
-# shared, so a build must never interleave with another build OR with a sources.yml refresh
-# (whose prepared-source syncs use --delete) — both workflows share this group. No
+# One store-mutating workflow at a time, globally (not per-ref): the store is shared, so a build
+# must never interleave with another build, a sources.yml refresh (whose prepared-source syncs use
+# --delete), OR the GC (gc.yml, the only deletion path) — all share this group. No
 # cancel-in-progress → a new dispatch queues behind the running one rather than cancelling mid-write.
 concurrency:
   group: r2-store
@@ -96,9 +99,11 @@ jobs:
   # Boot an ephemeral box, hydrate → build → push, always-destroy. 350 min timeout — the max
   # available: GitHub-HOSTED runners hard-cap jobs at 6 h, so it cannot be raised. Routine
   # incrementals fit easily; a full forced planet rebuild on ccx33 may exceed it — the build
-  # resumes on re-dispatch (each stage is pushed as it finishes, aggregate additionally every
-  # ~20 min mid-stage, and the hash keys skip everything whose artifact + .key sidecar already
-  # landed, so only the tiles that never got pushed rebuild). ccx63 (quota pending) makes it moot.
+  # resumes on re-dispatch by hydrating the LAST COMPLETED build's manifest (its artifacts skip as
+  # fresh) and rebuilding only what changed. A build interrupted before its pointer flips redoes
+  # its own new work (that new work isn't in any manifest yet), so resume granularity is "the last
+  # completed build" — fine for incrementals; ccx63 (quota pending) makes a forced full rebuild fit
+  # one window regardless.
   build:
     needs: image
     runs-on: ubuntu-latest
@@ -200,7 +205,7 @@ jobs:
           # ── toolchain: docker + the PINNED sha256-verified rclone (apt's 1.60.1 501s on R2's
           #    version-id responses — same pin as sources.yml/release.yml) ──
           apt-get update -qq
-          apt-get install -y -qq unzip e2fsprogs
+          apt-get install -y -qq unzip e2fsprogs jq   # jq: read the store pointer + manifest
           command -v docker >/dev/null || curl -fsSL https://get.docker.com | sh
           curl -fsSL -o /tmp/rclone.zip "https://downloads.rclone.org/v1.74.4/rclone-v1.74.4-linux-amd64.zip"
           echo "fe435e0c36228e7c2f116a8701f01127bb1f694005fc11d1f27186c8bca4115d  /tmp/rclone.zip" | sha256sum -c
@@ -261,39 +266,42 @@ jobs:
           # would break the completeness contract.
           XFER="--transfers 32 --checkers 64 --fast-list --retries 5 --stats 30s --stats-one-line"
           hydrate()    { rclone copy "$R2/$1" "$STORE/$2" $XFER "${@:3}"; }
-          # push in TWO passes, artifacts before their .key sidecars: the per-tile keys are
-          # markers, and markers land last. One bulk rclone copy has no intra-transfer ordering,
-          # so an interrupted single-pass push could land a .key whose artifact never made it —
-          # which the next hydrate would read as fresh-with-no-artifact, a permanent silent
-          # hole. Split, a partial push strands at worst an artifact with no key (reads stale,
-          # rebuilds). `|| return` keeps pass 2 from running over a failed pass 1 even where the
-          # caller suppresses errexit (the background push loop's `|| true`). copy, NEVER sync
-          # --delete.
-          push() {
-            rclone copy "$STORE/$1" "$R2/$2" $XFER --exclude '*.key' "${@:3}" || return $?
-            rclone copy "$STORE/$1" "$R2/$2" $XFER --include '*.key' "${@:3}"
-          }
+          # Content-addressed store: an unchanged key is skipped and a push is delta-sized. ONE
+          # pass, no ordering to get right — the per-tile artifacts self-mark (the key is IN the
+          # name) and the pointer flip (not push order) is the atomicity mechanism, so a partial
+          # push just strands unreferenced objects the GC collects. copy, NEVER sync --delete: a
+          # re-key leaves last build's object as garbage, never clobbers a concurrent write.
+          push() { rclone copy "$STORE/$1" "$R2/$2" $XFER "${@:3}"; }
           push_build() { rclone copyto "$STORE/bundle/$1" "$R2/build/$SHA/$1" $XFER; }
 
-          # ── HYDRATE (planet only): the incremental store (artifacts + their .key sidecars,
-          #    which live in the same prefixes) + each source's bounds.csv + catalog.json (the
-          #    tile keys read the item's recipe hash + flags) + the footprint gpkgs. Source COGs
-          #    + masks are hydrated selectively AFTER cover (the dirty-set list doesn't exist
-          #    yet — see the sources-manifest block below). No covering hydrate: the keys ARE
-          #    the incremental state, so the previous covering (the old diff baseline) is dead
-          #    weight. A bbox build rebuilds its window from scratch and streams sources, so it
-          #    only needs bounds + catalog + footprints. ──
+          # ── HYDRATE (planet only): MANIFEST-DRIVEN. Read the store pointer, fetch the manifest
+          #    it names, and rclone copy EXACTLY the artifacts it references (--files-from) — so
+          #    unreferenced garbage in the prefixes (superseded keys awaiting GC) costs no hydrate
+          #    bytes. Plus each source's bounds.csv + catalog.json (the tile keys read the item's
+          #    recipe hash + flags) + the footprint gpkgs. Source COGs + masks are hydrated
+          #    selectively AFTER cover (the dirty-set list doesn't exist yet — see the
+          #    sources-manifest block below). Bootstrap: no pointer yet = the FIRST immutable
+          #    build — hydrate nothing and clean-rebuild (the phase-4 rename makes every phase-3
+          #    artifact stale anyway, so a full re-key rebuild happens regardless; adopting the
+          #    old mutable names by renaming is not worth the fragility). Once this build's
+          #    manifest lands, the legacy names become GC debris. A bbox build rebuilds its window
+          #    from scratch and streams sources — bounds + catalog + footprints only, never a
+          #    planet-scoped pointer. ──
           if [ -z "${BBOX:-}" ]; then
             echo "── hydrate ──"
-            hydrate pmtiles pmtiles
-            hydrate contour contour
-            hydrate soundings soundings
-            hydrate depare depare
+            if rclone cat "$R2/store/manifest.json" > /tmp/pointer.json 2>/dev/null && [ -s /tmp/pointer.json ]; then
+              mref=$(jq -r '.manifest' /tmp/pointer.json)
+              rclone cat "$R2/store/$mref" > /tmp/manifest.json
+              jq -r '.entries[].name' /tmp/manifest.json > /tmp/hydrate-files.txt
+              n=$(wc -l < /tmp/hydrate-files.txt)
+              [ "$n" -gt 0 ] || { echo "store manifest $mref references 0 artifacts — refusing to hydrate an empty world" >&2; exit 1; }
+              echo "hydrating $n referenced store artifacts (manifest $mref)"
+              rclone copy "$R2" "$STORE" $XFER --files-from /tmp/hydrate-files.txt
+            else
+              echo "no store pointer in R2 — first immutable build, clean rebuild (nothing to hydrate)"
+            fi
             hydrate source source --include '*/bounds.csv' --include '*/catalog.json'
             hydrate polygon polygon
-            n=$(find "$STORE/pmtiles" -name '*.pmtiles' 2>/dev/null | wc -l)
-            [ "$n" -gt 0 ] || { echo "hydrate pulled 0 pmtiles for a planet build — refusing to rebuild the world from empty" >&2; exit 1; }
-            echo "hydrated $n pmtiles"
           else
             hydrate source source --include '*/bounds.csv' --include '*/catalog.json'
             hydrate polygon polygon
@@ -421,10 +429,28 @@ jobs:
           echo "── downsample ──"
           dr downsample
           if [ -z "${BBOX:-}" ]; then
-            # Overviews + their .key sidecars. No covering publish: the retired covering diff was
-            # the only consumer of a previous covering — keys carry all incremental state, and a
-            # re-dispatch's fresh covering + hydrated sidecars resume the build.
+            # Overviews. No covering publish: the retired covering diff was the only consumer of a
+            # previous covering — the content names carry all incremental state, and a re-dispatch
+            # hydrates the last manifest's artifacts and rebuilds only what never landed.
             push pmtiles pmtiles
+
+            # ── STORE PUBLISH: the content-addressed store is complete after downsample. Assemble
+            #    the manifest (a walk of the local store, in aggregate's key-affecting env so its
+            #    recomputed keys match the content names), push it, then flip the one-object pointer
+            #    LAST — one atomic PUT. A reader (the next hydrate, the GC) sees the whole old world
+            #    or the whole new one; a crash before the flip leaves the old pointer over a
+            #    complete old store, and this build's pushed-but-unreferenced objects are GC debris.
+            #    The bounds.csv-last / catalog-last pattern from sources.yml, generalized. ──
+            echo "── store manifest + pointer ──"
+            MANIFEST_ID=$(docker run --rm -v /root/seascape:/app -v "$STORE:/app/pipelines/store" \
+              -e BBOX -e FORCE_REBUILD -e TOOLCHAIN "${AGG_ENV[@]}" "$IMAGE:$IMAGE_TAG" just store-manifest | tail -1)
+            [ -n "$MANIFEST_ID" ] || { echo "store-manifest produced no id" >&2; exit 1; }
+            rclone copy "$STORE/manifests" "$R2/store/manifests" $XFER
+            n=$(jq -r '.entries | length' "$STORE/manifests/$MANIFEST_ID.json")
+            [ "$n" -gt 0 ] || { echo "store manifest $MANIFEST_ID references 0 artifacts — refusing to flip the pointer" >&2; exit 1; }
+            printf '{"manifest":"manifests/%s.json","sha":"%s","entries":%s}\n' "$MANIFEST_ID" "$SHA" "$n" \
+              | rclone rcat "$R2/store/manifest.json"
+            echo "store published: manifest $MANIFEST_ID ($n artifacts), pointer flipped"
           fi
 
           echo "── bundle (terrain) ──"
@@ -432,53 +458,22 @@ jobs:
           rclone copy "$STORE/bundle" "$R2/build/$SHA" $XFER --include 'planet.pmtiles' --include 'overlay-*.pmtiles'
 
           echo "── vector layers ──"
+          # Completeness is SELF-ENFORCED here, not step order: each bundler verifies every
+          # covering tile left an artifact or .empty marker (contour_run.verify_vector_complete)
+          # before bundling — the same invariant the store manifest hard-failed on above, so
+          # reordering these steps past the manifest can't silently bundle a holed layer.
           dr soundings                    # soundings + depare bundle BEFORE contours: the single
           dr depare                       # tile-join folds them into vector.pmtiles
           dr contours
           push_build vector.pmtiles
 
-          # ── PRUNE (planet only; skipped under bbox — a window covering reads every out-of-window
-          #    artifact as orphaned; phase 4 replaces these with GC). Port of the old plan-job
-          #    guards: list first, refuse a >25% orphan fraction (a real re-tile orphans a slice;
-          #    "most of the prefix" is a bad stems list), and prune pmtiles BEFORE the vector FGBs
-          #    — a wrongly-pruned pmtiles self-heals (missing → stale key → rebuilt), a wrongly-
-          #    pruned FGB does not. .key sidecars prune with their artifacts (an orphaned stem
-          #    orphans both). ──
-          if [ -z "${BBOX:-}" ]; then
-            id=$(ls "$STORE/aggregation" | sort | tail -1)
-            ls "$STORE/aggregation/$id"/*-aggregation.csv "$STORE/aggregation/$id"/*-downsampling.csv 2>/dev/null \
-              | sed 's#.*/##; s/-aggregation\.csv$//; s/-downsampling\.csv$//' | sort -u > /tmp/valid-pmt.txt
-            ls "$STORE/aggregation/$id"/*-aggregation.csv \
-              | sed 's#.*/##; s/-aggregation\.csv$//' | sort -u > /tmp/valid-agg.txt
-
-            prune_prefix() {   # <prefix> <ext> <valid-stems-file>
-              rclone lsf -R --files-only "$R2/$1" 2>/dev/null | grep -E "$2(\.key)?\$" > /tmp/r2-keys.txt || true
-              local total; total=$(wc -l < /tmp/r2-keys.txt)
-              [ "$total" -gt 0 ] || return 0
-              awk -v ext="$2" 'NR==FNR{ok[$0]=1;next}{s=$0; sub(/.*\//,"",s); sub(/\.key$/,"",s); sub(ext"$","",s); if(!(s in ok)) print}' \
-                "$3" /tmp/r2-keys.txt > /tmp/orphans.txt
-              local orph; orph=$(wc -l < /tmp/orphans.txt)
-              [ "$orph" -gt 0 ] || { echo "prune $1: no orphans of $total"; return 0; }
-              if [ $(( orph * 100 / total )) -gt 25 ]; then
-                echo "REFUSING to prune $1: $orph/$total orphaned (>25%) — a bad covering, not a re-tile" >&2
-                exit 1
-              fi
-              echo "prune $1: deleting $orph orphaned keys of $total"
-              rclone delete "$R2/$1" --files-from /tmp/orphans.txt
-            }
-            prune_prefix pmtiles   '\.pmtiles'  /tmp/valid-pmt.txt   # self-healing class first
-            prune_prefix contour   '\.fgb'      /tmp/valid-agg.txt
-            prune_prefix soundings '\.geojson'  /tmp/valid-agg.txt
-            prune_prefix depare    '\.fgb'      /tmp/valid-agg.txt
-
-            # Legacy coverings from the retired diff era: nothing pushes new ones, so keep the
-            # newest 3 and let phase 4's GC finish the cleanup (ULIDs sort chronologically).
-            ids=$(rclone lsf "$R2/aggregation" --dirs-only 2>/dev/null | tr -d /)
-            keep=$(echo "$ids" | sort | tail -3)
-            for cid in $ids; do
-              grep -qx "$cid" <<<"$keep" || { echo "prune covering $cid"; rclone purge "$R2/aggregation/$cid"; }
-            done
-          fi
+          # ── No prune here. Deletion is OUT-OF-BAND: gc.yml (weekly + dispatch, sharing the
+          #    r2-store concurrency group so it never runs during a build) is the ONLY deletion
+          #    path. A re-tile / re-key writes new content names + a new manifest and the pointer
+          #    flips to it; the superseded objects become unreferenced garbage the GC collects.
+          #    The phase-3 covering-orphan prunes (list, 25% guard, pmtiles-before-FGB ordering)
+          #    and the legacy-covering purge are gone — content addressing makes a re-tile
+          #    additive, never a delete. ──
 
           # ── manifest.json LAST — its presence marks a complete build (release.yml refuses a sha
           #    without one). Everything it references (planet + overlays + vector + coverage) is

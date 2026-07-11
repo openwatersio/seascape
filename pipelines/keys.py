@@ -3,10 +3,25 @@ are all unchanged.
 
 A stage computes ``stage_key(inputs, modules, config)`` — a short stable hash of the resolved
 config values, the bytes of each pipeline module it depends on, each input's own hash, and the
-toolchain identity — and writes it in a sidecar next to the artifact (``store/pmtiles/x.pmtiles``
-+ ``x.pmtiles.key``). An artifact is fresh iff it exists AND its sidecar matches the recomputed
-key; a stage skips a fresh artifact and rebuilds a stale/missing one. ``FORCE_REBUILD`` ignores
-the match — the escape hatch, no longer a correctness requirement.
+toolchain identity. That 12-hex key then rides IN the artifact's filename
+(``store/pmtiles/<stem>-<key>.pmtiles``, ``content_path``): the artifact is CONTENT-ADDRESSED, so
+freshness is simply "the content-named file exists" (``fork_fresh``) — no sidecar to match. A
+re-keyed rebuild (a config/input change) writes a NEW name and the old file becomes unreferenced
+garbage the GC collects; nothing is ever mutated in place, so a crash can't tear a live artifact
+and a partial store reads stale, never falsely fresh. ``publish`` renames a temp file into the
+content name atomically so the name only appears complete; a fork that legitimately produces
+nothing writes an ``empty_marker`` instead. ``FORCE_REBUILD`` ignores freshness — the escape
+hatch, not a correctness requirement.
+
+The per-build STORE MANIFEST (a walk of the store, ``store_manifest.py``) records every fork's
+content name / empty marker; the workflow publishes it and flips a pointer LAST, so a reader (the
+next build's hydrate, the GC) sees the complete old world or the complete new one. Manifests +
+GC live outside Python — this module knows only the local store.
+
+The ``sidecar`` / ``read_key`` / ``write_key`` / ``is_fresh`` helpers below are the ONE remaining
+sidecar user: the per-sha bundle outputs (``store/bundle/*``), which are never hydrated and are
+rebuilt every box build, so a local ``.key`` sidecar is the cheapest laptop skip. The
+content-addressed STORE (pmtiles / contour / soundings / depare / overviews) carries no sidecars.
 
 Module hashing is per-module and COARSE on purpose: a stage lists the ``pipelines/*.py`` it
 depends on and the key hashes those whole files, so a comment edit over-invalidates the stage.
@@ -24,9 +39,11 @@ local GDAL version so a laptop's keys stay honest about GDAL skew. No bucket nam
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from functools import lru_cache
+from glob import glob
 
 # This directory — listed modules are resolved against it.
 PIPELINES_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -135,6 +152,101 @@ def is_fresh(artifact, key, require_artifact=True):
     return read_key(artifact) == key
 
 
+# ── content-addressed store artifacts ────────────────────────────────────────
+# The store's pmtiles / FGB / geojson / overview artifacts carry their key in the filename
+# (below), so freshness is existence and there is no sidecar to match. `artifact` here is always
+# the LOGICAL base path ({z}-{x}-{y}-{child_z}.<ext>) — content_path splices the key in.
+
+_KEY_RE = re.compile(r"[0-9a-f]{12}")
+
+
+def content_path(artifact, key):
+    """The content-addressed path of a logical artifact: the 12-hex key spliced in before the
+    extension. ``store/contour/8-1-1-12.fgb`` + key -> ``store/contour/8-1-1-12-<key>.fgb``."""
+    root, ext = os.path.splitext(artifact)
+    return f"{root}-{key}{ext}"
+
+
+def empty_marker(artifact, key):
+    """The marker path for a fork that legitimately produced NO artifact under this key (an
+    all-land tile's contours). Same content-addressed name, ``.empty`` extension: its existence
+    alone means "this fork ran at this key and was empty" (the key is in the name, so the bytes
+    are irrelevant). A distinct extension keeps it out of every ``*.fgb`` / ``*.pmtiles`` glob and
+    makes the empty case explicit in a store listing — cleaner than a bytes-meaningless ``.key``
+    sidecar, and it can't be confused with a legacy sidecar the GC sweeps."""
+    root, _ = os.path.splitext(artifact)
+    return f"{root}-{key}.empty"
+
+
+def is_content_name(name):
+    """True iff ``name`` (a basename or path) is a content-addressed artifact/marker — its stem's
+    trailing ``-``-field is a 12-hex key. Filters legacy mutable names and torn logical writes out
+    of a store glob before ``stem_of`` / ``stem_and_key`` parse them."""
+    root = os.path.splitext(os.path.basename(name))[0]
+    return bool(_KEY_RE.fullmatch(root.rpartition("-")[2]))
+
+
+def stem_and_key(name):
+    """Split a content-addressed basename ``<stem>-<key12>.<ext>`` -> ``(stem, key)``. The stem is
+    the logical tile id ({z}-{x}-{y}-{child_z}); the key is the trailing 12-hex field. Raises on a
+    non-content-addressed name — callers glob-filter with ``is_content_name`` first."""
+    root = os.path.splitext(os.path.basename(name))[0]
+    stem, _, key = root.rpartition("-")
+    if not _KEY_RE.fullmatch(key):
+        raise ValueError(f"{name!r} is not a content-addressed artifact")
+    return stem, key
+
+
+def stem_of(name):
+    """The logical stem of a content-addressed name (everything before the ``-<key12>``)."""
+    return stem_and_key(name)[0]
+
+
+def fork_fresh(artifact, key):
+    """A fork is fresh iff its content-addressed artifact OR its empty marker exists under this
+    exact key (unless ``FORCE_REBUILD``). Existence IS the match — a dropped artifact self-heals
+    (gone -> stale -> rebuilt), a legitimately-empty fork is marked done by its ``.empty`` marker,
+    and a partial/torn write never reads fresh (publish renames atomically). Folds phase-3's
+    sidecar-match + the terrain-vs-vector ``require_artifact`` split into one existence check."""
+    if forced():
+        return False
+    return os.path.isfile(content_path(artifact, key)) or os.path.isfile(empty_marker(artifact, key))
+
+
+def publish(tmp_path, final_path):
+    """Atomically move a fully-written temp file to its content-addressed name (``os.replace``
+    within one filesystem is atomic). The final name only ever appears complete — a crash mid-write
+    leaves the temp, which no freshness check looks at, and the fork reads stale next run. The
+    content-addressed analog of phase-3's sidecar-last rule."""
+    os.makedirs(os.path.dirname(final_path), exist_ok=True)
+    os.replace(tmp_path, final_path)
+
+
+def write_empty(artifact, key):
+    """Atomically create the empty marker for a fork that produced no artifact under this key
+    (tmp + rename, so a crash before completion leaves no marker -> reads stale -> re-runs, never
+    a marker vouching for an empty result the fork never reached)."""
+    final = empty_marker(artifact, key)
+    os.makedirs(os.path.dirname(final), exist_ok=True)
+    tmp = final + ".tmp"
+    with open(tmp, "w"):
+        pass
+    os.replace(tmp, final)
+
+
+def supersede(artifact):
+    """Remove every content-addressed sibling (ALL keys) of an artifact's logical stem in its
+    store dir — content files AND empty markers — so exactly the current key survives locally. A
+    re-keyed rebuild would otherwise leave last build's file beside the new one under the same
+    logical stem, and the bundle globs by stem: two files, a doubled tile. Called before a fork
+    (re)writes; the crash-safety anchor (a crash after this, before publish, reads stale). In R2
+    the superseded object just lingers unreferenced for the GC (pushes never ``--delete``)."""
+    root, ext = os.path.splitext(artifact)
+    for p in glob(f"{root}-*{ext}") + glob(f"{root}-*.empty"):
+        if os.path.isfile(p):
+            os.remove(p)
+
+
 @lru_cache(maxsize=None)
 def _file_hash_cached(path):
     h = hashlib.sha256()
@@ -218,6 +330,45 @@ def _check():
         assert not is_fresh(art, base), "FORCE must ignore a match"
         assert not is_fresh(art, base, require_artifact=False), "FORCE must ignore a sidecar-only match too"
         os.environ.pop("FORCE_REBUILD")
+
+        # ── content-addressed store: name splicing, the content-name parse, fresh/publish/empty ──
+        k = "0123456789ab"  # a well-formed 12-hex key
+        logical = f"{d}/store/x/8-1-1-12.fgb"
+        cpath = content_path(logical, k)
+        assert cpath == f"{d}/store/x/8-1-1-12-{k}.fgb", cpath
+        assert empty_marker(logical, k) == f"{d}/store/x/8-1-1-12-{k}.empty"
+        assert is_content_name(os.path.basename(cpath)) and not is_content_name("8-1-1-12.fgb"), \
+            "the 12-hex trailing field distinguishes a content name from a legacy/logical one"
+        assert stem_and_key(os.path.basename(cpath)) == ("8-1-1-12", k)
+        assert stem_of("8-1-1-12-abcdef012345.pmtiles") == "8-1-1-12"
+        # a nested overview stem still round-trips (5-field logical stems don't occur, but the
+        # trailing-key parse is field-count agnostic — it strips exactly the last field)
+        assert stem_of("2-1-1-5-0011aabbccdd.pmtiles") == "2-1-1-5"
+
+        # fresh iff the content file OR the empty marker exists; publish is atomic
+        assert not fork_fresh(logical, k), "no artifact, no marker -> stale"
+        tmp = f"{d}/scratch.fgb"
+        open(tmp, "w").close()
+        publish(tmp, cpath)
+        assert os.path.isfile(cpath) and not os.path.isfile(tmp), "publish moves atomically"
+        assert fork_fresh(logical, k), "content file present -> fresh"
+        os.remove(cpath)
+        write_empty(logical, k)
+        assert os.path.isfile(empty_marker(logical, k)) and fork_fresh(logical, k), \
+            "an empty marker alone marks the fork fresh (the legitimately-empty fork)"
+        os.environ["FORCE_REBUILD"] = "1"
+        assert not fork_fresh(logical, k), "FORCE ignores an existing content name / empty marker"
+        os.environ.pop("FORCE_REBUILD")
+
+        # supersede clears ALL keys' siblings of a stem (content + empty), leaving only a fresh write
+        for other in ("aaaaaaaaaaaa", "bbbbbbbbbbbb"):
+            open(content_path(logical, other), "w").close()
+        open(content_path(f"{d}/store/x/8-1-1-13.fgb", k), "w").close()  # a DIFFERENT stem — untouched
+        supersede(logical)
+        assert not glob(f"{d}/store/x/8-1-1-12-*.fgb") and not glob(f"{d}/store/x/8-1-1-12-*.empty"), \
+            "supersede removes every sibling of the stem"
+        assert os.path.isfile(content_path(f"{d}/store/x/8-1-1-13.fgb", k)), \
+            "supersede must not touch a different logical stem"
         print("keys.py self-check ok")
     finally:
         PIPELINES_DIR = saved_dir

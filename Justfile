@@ -87,6 +87,14 @@ downsample:
 bundle:
     uv run python bundle.py
 
+# Walk the local store and write store/manifests/<covering-id>.json — the content name / empty
+# marker of every artifact this build's covering produced — printing the id. The workflow publishes
+# it and flips the store pointer LAST (the next build hydrates exactly these; the GC keeps them).
+# A bbox build never runs it: regional runs write no planet-scoped pointer. R2-agnostic — the id is
+# the covering ULID, the names are store-root-relative, and this step knows nothing about buckets.
+store-manifest:
+    uv run python store_manifest.py write
+
 # Contours, whole set: one global tippecanoe over every contour FGB, then one tile-join that
 # also folds in the soundings/depare pmtiles already bundled → vector.pmtiles.
 contours:
