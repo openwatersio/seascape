@@ -293,9 +293,17 @@ jobs:
           echo "── cover ──"
           dr cover                        # writes the covering; the diff falls out of the pipeline
 
-          echo "── coverage ──"
-          dr coverage
-          push_build coverage.pmtiles
+          # ── coverage ∥ aggregate ── the plan's sanctioned DAG overlap: coverage reads only
+          # footprints + the covering and aggregate never reads coverage, but its single-
+          # threaded tippecanoe ran ~47 min BEFORE aggregate on the first real build, idling
+          # every other core. Backgrounded here, joined after aggregate. set -e cannot see a
+          # background job's failure, so the explicit wait below propagates its rc — and it
+          # sits BEFORE the manifest push, preserving manifest-last completeness (a build
+          # without coverage.pmtiles must not get a manifest). Output is prefixed so the two
+          # stages' interleaved logs stay readable; pipefail (set above, inherited by the
+          # subshell) makes the subshell's status the failing command's, never sed's.
+          echo "── coverage (backgrounded alongside aggregate) ──"
+          ( { dr coverage && push_build coverage.pmtiles; } 2>&1 | sed -u 's/^/[coverage] /' ) & COV_PID=$!
 
           echo "── aggregate ──"
           # Periodic background pushes while aggregate runs. A forced planet rebuild can outlive
@@ -316,10 +324,18 @@ jobs:
             -e BBOX -e FORCE_REBUILD "${AGG_ENV[@]}" "$IMAGE:$IMAGE_TAG" just aggregate || agg_rc=$?
           # Kill the loop on BOTH exits (success or failure) before anything else runs.
           if [ -n "$PUSH_LOOP" ]; then kill "$PUSH_LOOP" 2>/dev/null || true; wait "$PUSH_LOOP" 2>/dev/null || true; fi
-          [ "$agg_rc" -eq 0 ] || exit "$agg_rc"
+          # First failure wins, as in the sequential version: on an aggregate failure, reap
+          # the in-flight coverage job and fail with aggregate's rc (destroy still runs).
+          if [ "$agg_rc" -ne 0 ]; then kill "$COV_PID" 2>/dev/null || true; exit "$agg_rc"; fi
           if [ -z "${BBOX:-}" ]; then
             push_agg
           fi
+
+          # Join the backgrounded coverage: propagate a nonzero rc so a coverage failure fails
+          # the build exactly as the sequential version did — well before manifest.json.
+          cov_rc=0
+          wait "$COV_PID" || cov_rc=$?
+          [ "$cov_rc" -eq 0 ] || { echo "coverage stage failed (rc=$cov_rc)" >&2; exit "$cov_rc"; }
 
           echo "── downsample ──"
           dr downsample
