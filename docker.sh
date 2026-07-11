@@ -14,9 +14,13 @@ docker build -t bathymetry .
 tty=""; if [ -t 0 ]; then tty="-it"; fi
 # `dev` serves the viewer/Worker — publish their ports to the host.
 ports=""; if [ "${1:-}" = "dev" ]; then ports="-p 5173:5173 -p 8787:8787"; fi
+# Toolchain identity for the cache keys (keys.py): the local image ID pins the exact
+# GDAL/tippecanoe build, like the GHCR image tag does on the build box.
+export TOOLCHAIN="${TOOLCHAIN:-$(docker image inspect -f '{{.Id}}' bathymetry)}"
 # node_modules is shadowed by a named volume: the host's install is
 # platform-specific (darwin vs linux binaries), so the container keeps its own.
 exec docker run --rm $tty $ports \
+  -e TOOLCHAIN \
   -e BBOX -e SOURCE_VSI_BASE -e BOUNDS_BASE -e LANDMASK -e FORCE_REBUILD \
   -e MACROTILE_Z -e OVERLAY_SPLIT_Z -e NUM_OVERVIEWS -e AGG_PROCESSES -e BUNDLE_PROCESSES -e GDAL_CACHEMAX \
   -e CPL_VSIL_CURL_CHUNK_SIZE -e CPL_VSIL_CURL_CACHE_SIZE -e GDAL_HTTP_MULTIPLEX -e GDAL_HTTP_VERSION \
