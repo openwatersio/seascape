@@ -147,32 +147,33 @@ jobs:
           # the RCLONE_CONFIG_R2_* vars for the store sync; the AWS_* vars are the S3-API
           # plumbing the pipeline expects for any /vsis3 read (source COGs are /vsicurl-public,
           # so they aren't used today, but they cost nothing to carry).
-          cat > build.env <<EOF
-          export RCLONE_CONFIG_R2_TYPE=s3
-          export RCLONE_CONFIG_R2_PROVIDER=Cloudflare
-          export RCLONE_CONFIG_R2_ENDPOINT=$R2_ENDPOINT
-          export RCLONE_CONFIG_R2_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID
-          export RCLONE_CONFIG_R2_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY
-          export RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true
-          export AWS_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID
-          export AWS_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY
-          export AWS_DEFAULT_REGION=auto
-          export AWS_ENDPOINT_URL=$R2_ENDPOINT
-          export GHCR_TOKEN=$GHCR_TOKEN
-          export GHCR_USER=$GHCR_USER
-          export IMAGE=$IMAGE
-          export IMAGE_TAG=$IMAGE_TAG
-          export DATA_BUCKET=$DATA_BUCKET
-          export PUBLIC_BASE=$PUBLIC_BASE
-          export SHA=$GITHUB_SHA
-          EOF
-          # Dispatch inputs are appended via %q, never verbatim: build.env is `source`d as bash
-          # on the box, so a raw write would let a crafted bbox ('x"; curl …|bash; echo "')
-          # execute with the R2 creds in the same file. %q emits a bash-quoted literal — the
-          # value stays data, never code. FORCE gets the same treatment: a "boolean" dispatch
-          # input is UI coercion only, not API-level validation.
-          printf 'export BBOX=%q\n' "$BBOX" >> build.env
-          printf 'export FORCE=%q\n' "$FORCE" >> build.env
+          #
+          # EVERY value is written via %q, never verbatim: build.env is `source`d as bash on
+          # the box, so anything written raw becomes code. The live vector is the dispatch
+          # inputs — a crafted bbox ('x"; curl …|bash; echo "') would execute with the R2 creds
+          # in the same file, and a "boolean" FORCE input is UI coercion only, not API-level
+          # validation — but quoting the secrets/config too makes the file safe by construction.
+          {
+            printf 'export RCLONE_CONFIG_R2_TYPE=%q\n'              s3
+            printf 'export RCLONE_CONFIG_R2_PROVIDER=%q\n'          Cloudflare
+            printf 'export RCLONE_CONFIG_R2_ENDPOINT=%q\n'          "$R2_ENDPOINT"
+            printf 'export RCLONE_CONFIG_R2_ACCESS_KEY_ID=%q\n'     "$R2_ACCESS_KEY_ID"
+            printf 'export RCLONE_CONFIG_R2_SECRET_ACCESS_KEY=%q\n' "$R2_SECRET_ACCESS_KEY"
+            printf 'export RCLONE_CONFIG_R2_NO_CHECK_BUCKET=%q\n'   true
+            printf 'export AWS_ACCESS_KEY_ID=%q\n'                  "$R2_ACCESS_KEY_ID"
+            printf 'export AWS_SECRET_ACCESS_KEY=%q\n'              "$R2_SECRET_ACCESS_KEY"
+            printf 'export AWS_DEFAULT_REGION=%q\n'                 auto
+            printf 'export AWS_ENDPOINT_URL=%q\n'                   "$R2_ENDPOINT"
+            printf 'export GHCR_TOKEN=%q\n'                         "$GHCR_TOKEN"
+            printf 'export GHCR_USER=%q\n'                          "$GHCR_USER"
+            printf 'export IMAGE=%q\n'                              "$IMAGE"
+            printf 'export IMAGE_TAG=%q\n'                          "$IMAGE_TAG"
+            printf 'export DATA_BUCKET=%q\n'                        "$DATA_BUCKET"
+            printf 'export PUBLIC_BASE=%q\n'                        "$PUBLIC_BASE"
+            printf 'export SHA=%q\n'                                "$GITHUB_SHA"
+            printf 'export BBOX=%q\n'                               "$BBOX"
+            printf 'export FORCE=%q\n'                              "$FORCE"
+          } > build.env
 
           rsync -az --delete --exclude .git --exclude node_modules --exclude data --exclude pipelines/store \
             -e "ssh $SSH_OPTS -i id_build" ./ "root@$IP:/root/gebco/"
