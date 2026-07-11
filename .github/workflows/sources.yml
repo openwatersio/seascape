@@ -169,7 +169,7 @@ jobs:
         run: |
           # directories only — sources/ also holds README.md. The dispatch input
           # filters to one source; a typo'd id fails loudly instead of no-oping.
-          all=$(ls -d sources/*/ | xargs -n1 basename)
+          all=$(basename -a sources/*/)
           if [ -n "$ONLY" ]; then
             echo "$all" | grep -qx "$ONLY" || { echo "unknown source '$ONLY'"; exit 1; }
             all="$ONLY"
