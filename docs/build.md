@@ -32,7 +32,7 @@ A manually-dispatched GitHub Actions workflow that boots one ephemeral Hetzner b
 | `contour/`, `soundings/`, `depare/` | Per-tile vector intermediates                                                      |
 | `build/<sha>/`                      | This build's outputs (below)                                                       |
 
-The box does **not** hydrate source COGs — `aggregate` range-reads them via `/vsicurl` from public R2 (`SOURCE_VSI_BASE`), exactly as the old matrix aggregate did. The land/water masks are read the same way (`LANDMASK`/`WATERMASK`), never hydrated. Only `bounds.csv` + the footprint gpkgs come down (the covering diff and coverage layer need them).
+Planet builds hydrate **selectively**: `bounds.csv` + footprints come down before `cover` (the covering diff and coverage layer need them); then, once the covering names the dirty tiles, `just sources-manifest` derives the exact `(source, filename)` union they reference and the box `rclone copy --files-from`s those files plus `land.fgb`/`water.fgb` into the local store — `aggregate` then reads everything from local disk (the preview-local path: no `SOURCE_VSI_BASE`/`LANDMASK`/`WATERMASK` env, so `config.source_path` and the landmask defaults resolve `store/…`). Two real runs that streamed sources per tile banked zero tiles in 2.5–3.9 healthy hours — a coastal macrotile re-read the same S-102/CUDEM bytes over `/vsicurl` for every tile. A legacy bounds row whose filename is already an absolute `/vsi` path is filtered out of the hydrate list, passes through `source_path` untouched, and still streams — acceptable fallback. `bbox` builds stay fully streaming (self-contained, no volume), exactly the old behavior.
 
 **Secrets**: `HCLOUD_TOKEN` (boot the box), `R2_ACCOUNT_ID` + `R2_ACCESS_KEY_ID` + `R2_SECRET_ACCESS_KEY` (rclone reads them as `RCLONE_CONFIG_R2_*`; the AWS S3-API vars ride along for any `/vsis3` path). `github.token` (with `packages: read`) logs the box into GHCR to pull the image. Secrets are written into a `build.env` and `scp`'d to the box, never placed on a command line.
 
@@ -52,10 +52,10 @@ A build from `main` auto-dispatches `release.yml` for its sha; feature-branch an
 
 The workflow is one `image` job (ensure the deps-keyed toolchain image is in GHCR) + one `build` job that follows the seamap `build-planet.yml` shape:
 
-1. **Boot** — generate a per-run SSH key, `hcloud server create` (type from `server_type`), and for a planet build attach a 250 GB volume (hydrate ~50 GiB store + bundle outputs, which roughly double during pmtiles finalize). A `bbox` build skips the volume and works on the root disk.
+1. **Boot** — generate a per-run SSH key, `hcloud server create` (type from `server_type`), and for a planet build attach a 400 GB volume (~50 GiB hydrated store + bundle outputs which roughly double during pmtiles finalize ≈ 100 GiB + the dirty-set source hydrate, ~100–200 GiB for the full coastal S-102+CUDEM subset, + headroom). A `bbox` build skips the volume and works on the root disk.
 2. **Ship** — `rsync` the repo (excluding `.git`/`node_modules`/`data`/`pipelines/store`) and `scp` a `build.env` of secrets + config.
-3. **Set up** — install Docker + the pinned rclone, log in to GHCR, `docker pull` the image, mount the volume at the store path, compute `AGG_PROCESSES = min(cores, RAM_GB/4)` and a scaled `GDAL_CACHEMAX` (in the workflow, not Python — pipelines stay host-agnostic).
-4. **Hydrate** — `rclone copy` the store prefixes down (planet only), untar the coverings.
+3. **Set up** — install Docker + the pinned rclone, log in to GHCR, `docker pull` the image, mount the volume at the store path, compute `AGG_PROCESSES` / `BUNDLE_PROCESSES` and `GDAL_CACHEMAX` from the box's cores + RAM (in the workflow, not Python — pipelines stay host-agnostic).
+4. **Hydrate** — `rclone copy` the store prefixes down (planet only), untar the coverings; after `cover`, hydrate the dirty tiles' source files + masks (see above).
 5. **Build + push** — run each stage through `docker run … just <stage>`, pushing to R2 between stages (below).
 6. **Prune** — planet only, after the build (below).
 7. **Destroy** — an `if: always()` step deletes the server, the volume (with a detach wait-loop), and the SSH key.

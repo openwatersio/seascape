@@ -5,7 +5,9 @@ tiles whose source set changed since the previous run (or all on the first run),
 skips those already marked done, and parallelizes across tiles with a process pool.
 
 CLI:
-  aggregation_run.py   process every dirty tile (one machine — the build box or a laptop)
+  aggregation_run.py                    process every dirty tile (one machine)
+  aggregation_run.py sources-manifest   write store/source-manifest.txt: the source files
+                                        the dirty tiles reference (see sources_manifest)
 """
 
 import os
@@ -95,6 +97,29 @@ def dirty_filepaths():
     return [fp for fp in covering_sorted() if is_dirty(fp)]
 
 
+def sources_manifest():
+    """Write store/source-manifest.txt: the unique ``<source>/<filename>`` rows the DIRTY
+    tiles' covering CSVs reference — exactly the source files this run's aggregate will
+    read, derived with the same dirty_filepaths() the run uses (FORCE_REBUILD, self-heal
+    and the covering diff all behave identically). Rows are written verbatim: a filename
+    that is already an absolute /vsi path passes through untouched, like source_path
+    treats it — this module only walks the local store and never decides what a caller
+    does with the list."""
+    dirty = dirty_filepaths()
+    files = set()
+    for fp in dirty:
+        with open(fp) as f:
+            for line in f.readlines()[1:]:  # skip header
+                line = line.strip()
+                if not line:
+                    continue
+                source, filename, _maxzoom = line.split(",")
+                files.add(f"{source}/{filename}")
+    with open("store/source-manifest.txt", "w") as f:
+        f.write("".join(k + "\n" for k in sorted(files)))
+    print(f"source manifest: {len(files)} file(s) across {len(dirty)} dirty tile(s)")
+
+
 def run_all(filepaths):
     if not filepaths:
         print("nothing to do.")
@@ -113,8 +138,10 @@ def run_all(filepaths):
 def main(argv):
     if not argv:
         run_all(dirty_filepaths())
+    elif argv == ["sources-manifest"]:
+        sources_manifest()
     else:
-        sys.exit("usage: aggregation_run.py  (no args — process every dirty tile)")
+        sys.exit("usage: aggregation_run.py [sources-manifest]")
 
 
 if __name__ == "__main__":

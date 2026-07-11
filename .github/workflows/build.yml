@@ -127,11 +127,13 @@ jobs:
             --ssh-key "$NAME"
           IP=$(hcloud server ip "$NAME")
           echo "IP=$IP" >> "$GITHUB_ENV"
-          # Planet builds hydrate the whole tile store (~50 GiB) + double it during pmtiles
-          # finalize; the root disk is too small, so attach a volume. A bbox build is
+          # Planet builds work on an attached volume; the root disk is too small. Sizing:
+          # ~50 GiB hydrated tile/vector store + bundle outputs which ~2x during pmtiles
+          # finalize (~100 GiB peak) + the dirty-set source hydrate (the full coastal
+          # S-102+CUDEM subset is ~100-200 GiB) → 400 GiB with headroom. A bbox build is
           # self-contained on the root disk (like seamap's AREA smoke), so skip the volume.
           if [ -z "$BBOX" ]; then
-            hcloud volume create --name "$NAME" --size 250 --server "$NAME"
+            hcloud volume create --name "$NAME" --size 400 --server "$NAME"
           fi
           for _ in $(seq 1 60); do
             # shellcheck disable=SC2086  # SSH_OPTS is intentionally word-split into flags
@@ -257,9 +259,10 @@ jobs:
           push_build() { rclone copyto "$STORE/bundle/$1" "$R2/build/$SHA/$1" $XFER; }
 
           # ── HYDRATE (planet only): the incremental store + each source's bounds.csv + the
-          #    footprint gpkgs. Source COGs are range-read via /vsicurl (SOURCE_VSI_BASE), never
-          #    hydrated; the land/water masks are /vsicurl too. A bbox build rebuilds its window
-          #    from scratch, so it only needs bounds + footprints. ──
+          #    footprint gpkgs. Source COGs + masks are hydrated selectively AFTER cover (the
+          #    dirty-set list doesn't exist yet — see the sources-manifest block below). A bbox
+          #    build rebuilds its window from scratch and streams sources, so it only needs
+          #    bounds + footprints. ──
           if [ -z "${BBOX:-}" ]; then
             echo "── hydrate ──"
             hydrate pmtiles pmtiles
@@ -280,20 +283,35 @@ jobs:
             hydrate polygon polygon
           fi
 
-          # ── flagged coarse sources (GEBCO/EMODnet) clamp land + subtract inland water over
-          #    /vsicurl, exactly like the old aggregate job. WATERMASK only when it exists in R2
-          #    (landmask._present assumes any /vsi path is reachable). ──
-          AGG_ENV=(-e SOURCE_VSI_BASE="/vsicurl/$PUBLIC_BASE/source"
-                   -e LANDMASK="/vsicurl/$PUBLIC_BASE/landmask/land.fgb"
-                   -e AGG_PROCESSES -e GDAL_CACHEMAX)
-          # Remote-read streaming tuning, measured-baseline: the first real run (29150115584)
-          # held ~1-1.5 of 8 cores through aggregate — workers /vsicurl latency-bound on GDAL's
-          # remote-read defaults (16 KB chunks, 16 MB curl cache, HTTP/1.1). That run's
-          # aggregate wall-clock is the baseline; the next run measures this block's delta.
-          # 5 MB range reads (S-102's HDF5 driver is the chattiest reader — big chunks amortize
-          # its many small requests), a real per-process curl cache and small per-open-dataset
-          # VSI cache (both budgeted in the RAM math above), HTTP/2 multiplexing (R2 speaks
-          # it), and a 512 KB first read at open instead of 16 KB (many opens per tile).
+          # ── aggregate env. Planet builds read sources + masks from LOCAL disk (hydrated
+          #    below, after cover names the dirty tiles): two real runs streaming per tile
+          #    banked ZERO tiles in 2.5-3.9 healthy hours — a coastal macrotile re-reads the
+          #    same S-102/CUDEM bytes over /vsicurl for every tile, >2.5 h each. With no
+          #    SOURCE_VSI_BASE / LANDMASK / WATERMASK set, config.source_path and the landmask
+          #    defaults resolve store/source/<id>/<file> and store/landmask/{land,water}.fgb —
+          #    the hydrated local copies (the preview-local read path). A legacy bounds row
+          #    whose filename is already an absolute /vsi path passes through source_path
+          #    untouched and still streams — acceptable fallback. bbox builds are
+          #    self-contained (no volume) and keep streaming everything, as before. ──
+          AGG_ENV=(-e AGG_PROCESSES -e GDAL_CACHEMAX)
+          if [ -n "${BBOX:-}" ]; then
+            # Flagged coarse sources (GEBCO/EMODnet) clamp land + subtract inland water over
+            # /vsicurl. WATERMASK only when it exists in R2 (landmask._present assumes any
+            # /vsi path is reachable).
+            AGG_ENV+=(-e SOURCE_VSI_BASE="/vsicurl/$PUBLIC_BASE/source"
+                      -e LANDMASK="/vsicurl/$PUBLIC_BASE/landmask/land.fgb")
+            if rclone lsf "$R2/landmask/" --include water.fgb 2>/dev/null | grep -q water.fgb; then
+              AGG_ENV+=(-e WATERMASK="/vsicurl/$PUBLIC_BASE/landmask/water.fgb")
+            else
+              echo "no water.fgb in R2 yet — inland-water subtraction degrades to land-only this build"
+            fi
+          fi
+          # Remote-read streaming tuning for whatever still goes over /vsicurl (bbox builds,
+          # legacy absolute-path rows): 5 MB range reads (S-102's HDF5 driver is the chattiest
+          # reader — big chunks amortize its many small requests), a real per-process curl
+          # cache and small per-open-dataset VSI cache (both budgeted in the RAM math above),
+          # HTTP/2 multiplexing (R2 speaks it), and a 512 KB first read at open instead of
+          # 16 KB (many opens per tile). Inert for local reads, so set unconditionally.
           AGG_ENV+=(-e CPL_VSIL_CURL_CHUNK_SIZE=5242880
                     -e CPL_VSIL_CURL_CACHE_SIZE=268435456
                     -e GDAL_HTTP_MULTIPLEX=YES -e GDAL_HTTP_VERSION=2
@@ -307,11 +325,6 @@ jobs:
           # (GDAL_HTTP_MAX_RETRY=5, GDAL_HTTP_RETRY_DELAY=1 — set in ONE place, for every
           # gdal invocation; deliberately not duplicated here).
           AGG_ENV+=(-e GDAL_HTTP_TIMEOUT=120 -e GDAL_HTTP_CONNECTTIMEOUT=30)
-          if rclone lsf "$R2/landmask/" --include water.fgb 2>/dev/null | grep -q water.fgb; then
-            AGG_ENV+=(-e WATERMASK="/vsicurl/$PUBLIC_BASE/landmask/water.fgb")
-          else
-            echo "no water.fgb in R2 yet — inland-water subtraction degrades to land-only this build"
-          fi
 
           # ── BUILD, stage by stage, pushing after each so an orchestrator timeout loses at most
           #    one stage. The stage order matches `just planet`; the box just interleaves pushes. ──
@@ -329,6 +342,30 @@ jobs:
           # subshell) makes the subshell's status the failing command's, never sed's.
           echo "── coverage (backgrounded alongside aggregate) ──"
           ( { dr coverage && push_build coverage.pmtiles; } 2>&1 | sed -u 's/^/[coverage] /' ) & COV_PID=$!
+
+          # ── selective source hydrate (planet only; overlaps the backgrounded coverage) ──
+          # Pull exactly the source files the dirty tiles reference, so aggregate reads them
+          # from local disk: sources-manifest derives the (source, filename) union with the
+          # same dirty diff the run itself uses (FORCE_REBUILD included). Legacy rows whose
+          # filename is an absolute /vsi path aren't R2 keys — filter them out of the
+          # files-from list; source_path streams them untouched (see the AGG_ENV note).
+          # The masks land at the container's DEFAULT store/landmask paths, so aggregate
+          # needs no LANDMASK/WATERMASK env: land.fgb is required (flagged coarse sources
+          # exist planet-wide — fail here, not per-tile), water.fgb optional (absent → the
+          # clamp degrades to land-only, exactly the old behavior).
+          if [ -z "${BBOX:-}" ]; then
+            echo "── hydrate dirty-set sources ──"
+            dr sources-manifest
+            grep -v -e '://' -e '/vsi' "$STORE/source-manifest.txt" > /tmp/source-files.txt || true
+            legacy=$(grep -c -e '://' -e '/vsi' "$STORE/source-manifest.txt" || true)
+            if [ "${legacy:-0}" -gt 0 ]; then
+              echo "$legacy legacy absolute-path row(s) keep streaming via /vsicurl"
+            fi
+            echo "hydrating $(wc -l < /tmp/source-files.txt) of $(wc -l < "$STORE/source-manifest.txt") referenced source file(s)"
+            rclone copy "$R2/source" "$STORE/source" --files-from /tmp/source-files.txt $XFER
+            hydrate landmask landmask --include 'land.fgb' --include 'water.fgb'
+            [ -f "$STORE/landmask/land.fgb" ] || { echo "no land.fgb in R2 — flagged coarse sources need the land mask" >&2; exit 1; }
+          fi
 
           echo "── aggregate ──"
           # Periodic background pushes while aggregate runs. A forced planet rebuild can outlive

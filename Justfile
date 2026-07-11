@@ -63,6 +63,11 @@ cover:
 aggregate:
     uv run python aggregation_run.py
 
+# Write store/source-manifest.txt: the source files the dirty tiles reference — lets the
+# build box hydrate exactly the dirty set from R2, then aggregate from local disk.
+sources-manifest:
+    uv run python aggregation_run.py sources-manifest
+
 # Single-machine terrain finish: overview pyramid -> planet/overlay bundles + manifest.
 combine:
     just downsample

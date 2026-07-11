@@ -104,7 +104,12 @@ def check_self_heal():
     interrupted build can leave a covering with no tile; without this the incremental diff would
     call it clean forever. On the build box this is what resumes an interrupted build: a
     re-dispatch's fresh covering matches the last one (no source change), so only the tiles whose
-    pmtiles never got pushed come back dirty."""
+    pmtiles never got pushed come back dirty.
+
+    Also covers sources-manifest, which rides the same dirty derivation: the manifest must be
+    exactly the dirty tiles' (source, filename) union — per-tile rows for dirty tiles only,
+    shared rows deduped, an absolute /vsi row passed through verbatim (the build box filters
+    those out of its hydrate list; source_path streams them untouched)."""
     import aggregation_run
     env_force = os.environ.pop("FORCE_REBUILD", None)  # this check is about the incremental path
     tmp = tempfile.mkdtemp()
@@ -113,12 +118,17 @@ def check_self_heal():
         os.chdir(tmp)
         prev, cur = "01AAAAAAAAAAAAAAAAAAAAAAAA", "01BBBBBBBBBBBBBBBBBBBBBBBB"
         tiles = [f"8-{x}-{y}-12" for x in range(10) for y in range(10)]  # 100 same-cost tiles
+        legacy = "/vsicurl/https://example.com/old.tif"
         for aid in (prev, cur):
             os.makedirs(f"store/aggregation/{aid}")
             for t in tiles:
-                open(f"store/aggregation/{aid}/{t}-aggregation.csv", "w").close()
-        # No coverage change (identical empty CSVs) → dirty is purely the self-heal set: tiles
-        # whose pmtiles is absent from the listing. Mark every other tile present.
+                with open(f"store/aggregation/{aid}/{t}-aggregation.csv", "w") as f:
+                    f.write("source,filename,maxzoom\n"
+                            f"sA,objects/dem/{t}.tif,12\n"  # per-tile file (mirrored-style path)
+                            "shared,common.tif,10\n"        # shared across every tile → dedup
+                            f"legacy,{legacy},9\n")         # absolute /vsi row → verbatim
+        # No coverage change (identical CSVs in both coverings) → dirty is purely the self-heal
+        # set: tiles whose pmtiles is absent from the listing. Mark every other tile present.
         present = tiles[::2]
         with open("store/pmtiles-keys.txt", "w") as f:
             f.write("".join(f"bathymetry/pmtiles/7-0-0/{t}.pmtiles\n" for t in present))
@@ -127,6 +137,13 @@ def check_self_heal():
         missing = {t for t in tiles if t not in present}
         assert dirty == missing, f"dirty != self-heal set (Δ {dirty ^ missing})"
         print(f"self-heal ok — {len(missing)} tiles with missing pmtiles marked dirty, rest clean")
+
+        aggregation_run.sources_manifest()
+        with open("store/source-manifest.txt") as f:
+            got = {line.strip() for line in f if line.strip()}
+        want = {f"sA/objects/dem/{t}.tif" for t in missing} | {"shared/common.tif", f"legacy/{legacy}"}
+        assert got == want, f"manifest != dirty tiles' source union (Δ {got ^ want})"
+        print(f"sources-manifest ok — {len(got)} unique files: dirty tiles only, shared deduped, /vsi verbatim")
     finally:
         os.chdir(cwd)
         shutil.rmtree(tmp, ignore_errors=True)
