@@ -230,3 +230,9 @@ test-engine:
     uv run python test_engine.py
     uv run python aggregation_reproject.py --check
     uv run python keys.py --check
+    uv run python store_manifest.py --check
+# Test the GC's Collect step (scripts/gc-collect.sh — the exact script gc.yml runs, local
+# backend) against a synthetic store tree: happy path + every refusal guard. Needs bash + jq;
+# ci.yml runs it on every push.
+test-gc:
+    bash test_gc.sh
