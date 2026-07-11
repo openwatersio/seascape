@@ -206,7 +206,7 @@ jobs:
           # retired .recipe-hash marker's successor). A source registered before the catalog
           # existed, or whose catalog carries no hash, reads as stale and rebuilds once.
           have=$(aws s3 cp "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/catalog.json" - 2>/dev/null \
-                 | jq -r '.properties["seascape:recipe_hash"] // empty' || true)
+                 | jq -r '.properties["seascape:recipe_hash"] // empty' 2>/dev/null || true)
           # A source whose recipe polygonizes must have its footprint in R2 (the
           # build's coverage tileset builds from bathymetry/polygon/). Missing means
           # the source last built before the polygon push existed — rebuild once.
