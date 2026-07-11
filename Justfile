@@ -134,6 +134,16 @@ preview bbox="-74.30,40.40,-73.75,40.80" local="":
             mkdir -p "store/source/$id"
             curl -fsS "$BOUNDS_BASE/$id/bounds.csv" -o "store/source/$id/bounds.csv" \
                 || { echo "skip $id (no bounds.csv in R2)"; rm -rf "store/source/$id"; }
+            # Catalog item (priority/offset/flags + recipe hash — the tile keys read it).
+            # Replace only on success; absent (a source registered before the catalog step
+            # existed) falls back to metadata.json. Note the fetched item SHADOWS local
+            # metadata.json knob edits (priority/max_zoom) — to iterate those against streamed
+            # sources, delete store/source/<id>/catalog.json so the metadata fallback applies.
+            if [ -d "store/source/$id" ]; then
+                curl -fsS "$BOUNDS_BASE/$id/catalog.json" -o "store/source/$id/catalog.json.tmp" \
+                    && mv "store/source/$id/catalog.json.tmp" "store/source/$id/catalog.json" \
+                    || rm -f "store/source/$id/catalog.json.tmp"
+            fi
             # Provenance footprint for the coverage tileset (mirrored sources have none).
             # Replace only on success — a 404 must not clobber a locally-prepared polygon.
             curl -fsS "$POLY_BASE/$id.gpkg" -o "store/polygon/$id.gpkg.tmp" \
