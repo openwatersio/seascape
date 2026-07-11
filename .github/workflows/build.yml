@@ -176,9 +176,9 @@ jobs:
           } > build.env
 
           rsync -az --delete --exclude .git --exclude node_modules --exclude data --exclude pipelines/store \
-            -e "ssh $SSH_OPTS -i id_build" ./ "root@$IP:/root/gebco/"
+            -e "ssh $SSH_OPTS -i id_build" ./ "root@$IP:/root/seascape/"
           # shellcheck disable=SC2086  # SSH_OPTS is intentionally word-split into flags
-          scp $SSH_OPTS -i id_build build.env "root@$IP:/root/gebco/build.env"
+          scp $SSH_OPTS -i id_build build.env "root@$IP:/root/seascape/build.env"
 
           # The remote script is single-quoted (<<'REMOTE'): nothing here is interpolated by
           # Actions or this shell — every value comes from build.env, sourced on the box.
@@ -186,7 +186,7 @@ jobs:
           ssh $SSH_OPTS -i id_build "root@$IP" bash -se <<'REMOTE'
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
-          cd /root/gebco
+          cd /root/seascape
           set -a; source build.env; set +a
 
           # ── toolchain: docker + the PINNED sha256-verified rclone (apt's 1.60.1 501s on R2's
@@ -213,7 +213,7 @@ jobs:
             mkfs.ext4 -qF "$DEV"; mkdir -p /mnt/store; mount "$DEV" /mnt/store
             STORE=/mnt/store
           else
-            STORE=/root/gebco/pipelines/store
+            STORE=/root/seascape/pipelines/store
           fi
           mkdir -p "$STORE"
 
@@ -235,7 +235,7 @@ jobs:
 
           # docker run wrapper: repo code at /app, the store bind-mounted, BBOX/FORCE forwarded
           # (+ BUNDLE_PROCESSES — only bundle.py reads it; harmless for the other stages).
-          dr() { docker run --rm -v /root/gebco:/app -v "$STORE:/app/pipelines/store" \
+          dr() { docker run --rm -v /root/seascape:/app -v "$STORE:/app/pipelines/store" \
             -e BBOX -e FORCE_REBUILD -e BUNDLE_PROCESSES "$IMAGE:$IMAGE_TAG" just "$@"; }
 
           R2="R2:$DATA_BUCKET/bathymetry"
@@ -308,7 +308,7 @@ jobs:
             ( while sleep 1200; do push_agg || true; done ) & PUSH_LOOP=$!
           fi
           agg_rc=0
-          docker run --rm -v /root/gebco:/app -v "$STORE:/app/pipelines/store" \
+          docker run --rm -v /root/seascape:/app -v "$STORE:/app/pipelines/store" \
             -e BBOX -e FORCE_REBUILD "${AGG_ENV[@]}" "$IMAGE:$IMAGE_TAG" just aggregate || agg_rc=$?
           # Kill the loop on BOTH exits (success or failure) before anything else runs.
           if [ -n "$PUSH_LOOP" ]; then kill "$PUSH_LOOP" 2>/dev/null || true; wait "$PUSH_LOOP" 2>/dev/null || true; fi
