@@ -2,7 +2,7 @@
 
 How `.github/workflows/build.yml` turns `sources/` into servable tilesets, on one ephemeral machine. Companion to [CONTRIBUTING.md](../CONTRIBUTING.md#ci--build--release), which covers the release flow; this documents the build itself and the constraints every change to it must respect.
 
-Point-in-time. This is **phase 2** of [the production-build plan](plans/2026-07-09-production-build.md) ("one box"): the matrix fan-out is gone, but the pipeline semantics are unchanged — the covering-diff still drives incrementality, the store is still a mutable shared R2 prefix, and the covering-retile prunes are still here. Phase 3 (content-hash keys) and phase 4 (immutable store + GC) later delete the covering diff, the `force`-for-correctness requirement, and the prunes; until then everything below holds.
+Point-in-time. This is **phase 3** of [the production-build plan](plans/2026-07-09-production-build.md) ("hash keys"): the matrix fan-out is gone (phase 2), and content-hash keys now drive incrementality — the covering diff, its `.done` markers, and the `force`-for-correctness requirement are deleted. The store is still a mutable shared R2 prefix and the covering-retile prunes are still here; phase 4 (immutable store + GC) deletes the prunes.
 
 ## What it is
 
@@ -15,7 +15,7 @@ A manually-dispatched GitHub Actions workflow that boots one ephemeral Hetzner b
 | Input         | Default | Meaning                                                                                  |
 | ------------- | ------- | ---------------------------------------------------------------------------------------- |
 | `bbox`        | empty   | `"W,S,E,N"` regional build; empty = full planet                                          |
-| `force`       | false   | Ignore the incremental diff, rebuild every tile (use after pipeline-code changes)        |
+| `force`       | false   | Ignore the content-hash keys, rebuild every tile (escape hatch only — the keys already see code/config changes) |
 | `server_type` | `ccx33` | Hetzner box size — `ccx33` (8 vCPU / 32 GB, today's dedicated-vCPU cap); `ccx63` later    |
 
 **Repository state**: `sources/<id>/` recipes + `metadata.json`, `pipelines/` code, the toolchain Docker image (deps-only, keyed on `Dockerfile`/`pyproject.toml`/`uv.lock`; code mounts at runtime). The box pulls this image from GHCR and runs everything through `docker run`, exactly like `ci.yml`.
@@ -24,15 +24,15 @@ A manually-dispatched GitHub Actions workflow that boots one ephemeral Hetzner b
 
 | Prefix                              | Contents                                                                          |
 | ----------------------------------- | --------------------------------------------------------------------------------- |
-| `source/<id>/`                      | Prepared/mirrored COGs + `bounds.csv` + `catalog.json` (sources.yml owns these)    |
+| `source/<id>/`                      | Prepared/mirrored COGs + `bounds.csv` + `catalog.json` (sources.yml owns these; the catalog item carries the recipe hash + flags the tile keys read) |
 | `polygon/<id>.gpkg`                 | Per-source provenance footprints                                                   |
 | `landmask/`                         | `land.fgb` + `water.fgb` (sources.yml owns these)                                  |
-| `aggregation/<ulid>/`               | Coverings (one `covering.tar.gz` of CSVs per build), newest 3 kept                 |
-| `pmtiles/`                          | Per-tile terrain pmtiles (the incremental store)                                  |
-| `contour/`, `soundings/`, `depare/` | Per-tile vector intermediates                                                      |
+| `aggregation/<ulid>/`               | Legacy coverings from the retired diff era (nothing pushes new ones; phase 4's GC cleans up) |
+| `pmtiles/`                          | Per-tile terrain pmtiles + their `.key` sidecars (the incremental store)          |
+| `contour/`, `soundings/`, `depare/` | Per-tile vector intermediates + their `.key` sidecars                              |
 | `build/<sha>/`                      | This build's outputs (below)                                                       |
 
-Planet builds hydrate **selectively**: `bounds.csv` + footprints come down before `cover` (the covering diff and coverage layer need them); then, once the covering names the dirty tiles, `just sources-manifest` derives the exact `(source, filename)` union they reference and the box `rclone copy --files-from`s those files plus `land.fgb`/`water.fgb` into the local store — `aggregate` then reads everything from local disk (the preview-local path: no `SOURCE_VSI_BASE`/`LANDMASK`/`WATERMASK` env, so `config.source_path` and the landmask defaults resolve `store/…`). Two real runs that streamed sources per tile banked zero tiles in 2.5–3.9 healthy hours — a coastal macrotile re-read the same S-102/CUDEM bytes over `/vsicurl` for every tile. A legacy bounds row whose filename is already an absolute `/vsi` path is filtered out of the hydrate list, passes through `source_path` untouched, and still streams — acceptable fallback. `bbox` builds stay fully streaming (self-contained, no volume), exactly the old behavior.
+Planet builds hydrate **selectively**: `bounds.csv` + `catalog.json` + footprints come down before `cover` (the covering, the tile keys, and the coverage layer need them); then the masks hydrate (their content hashes enter the tile keys, so the manifest step below must see the same mask state aggregate will), and once the covering exists, `just sources-manifest` derives the exact `(source, filename)` union the key-stale tiles reference and the box `rclone copy --files-from`s those files into the local store — `aggregate` then reads everything from local disk (the preview-local path: no `SOURCE_VSI_BASE`/`LANDMASK`/`WATERMASK` env, so `config.source_path` and the landmask defaults resolve `store/…`). Two real runs that streamed sources per tile banked zero tiles in 2.5–3.9 healthy hours — a coastal macrotile re-read the same S-102/CUDEM bytes over `/vsicurl` for every tile. A legacy bounds row whose filename is already an absolute `/vsi` path is filtered out of the hydrate list, passes through `source_path` untouched, and still streams — acceptable fallback. `bbox` builds stay fully streaming (self-contained, no volume), exactly the old behavior.
 
 **Secrets**: `HCLOUD_TOKEN` (boot the box), `R2_ACCOUNT_ID` + `R2_ACCESS_KEY_ID` + `R2_SECRET_ACCESS_KEY` (rclone reads them as `RCLONE_CONFIG_R2_*`; the AWS S3-API vars ride along for any `/vsis3` path). `github.token` (with `packages: read`) logs the box into GHCR to pull the image. Secrets are written into a `build.env` and `scp`'d to the box, never placed on a command line.
 
@@ -54,30 +54,31 @@ The workflow is one `image` job (ensure the deps-keyed toolchain image is in GHC
 
 1. **Boot** — generate a per-run SSH key, `hcloud server create` (type from `server_type`), and for a planet build attach a 400 GB volume (~50 GiB hydrated store + bundle outputs which roughly double during pmtiles finalize ≈ 100 GiB + the dirty-set source hydrate, ~100–200 GiB for the full coastal S-102+CUDEM subset, + headroom). A `bbox` build skips the volume and works on the root disk.
 2. **Ship** — `rsync` the repo (excluding `.git`/`node_modules`/`data`/`pipelines/store`) and `scp` a `build.env` of secrets + config.
-3. **Set up** — install Docker + the pinned rclone, log in to GHCR, `docker pull` the image, mount the volume at the store path, compute `AGG_PROCESSES` / `BUNDLE_PROCESSES` and `GDAL_CACHEMAX` from the box's cores + RAM (in the workflow, not Python — pipelines stay host-agnostic).
-4. **Hydrate** — `rclone copy` the store prefixes down (planet only), untar the coverings; after `cover`, hydrate the dirty tiles' source files + masks (see above).
+3. **Set up** — install Docker + the pinned rclone, log in to GHCR, `docker pull` the image, mount the volume at the store path, compute `AGG_PROCESSES` / `BUNDLE_PROCESSES` and `GDAL_CACHEMAX` from the box's cores + RAM, and export `TOOLCHAIN` = the image tag (in the workflow, not Python — pipelines stay host-agnostic).
+4. **Hydrate** — `rclone copy` the store prefixes down (planet only); the `.key` sidecars ride in the same prefixes. After `cover`, hydrate the masks + the stale tiles' source files (see above).
 5. **Build + push** — run each stage through `docker run … just <stage>`, pushing to R2 between stages (below).
 6. **Prune** — planet only, after the build (below).
 7. **Destroy** — an `if: always()` step deletes the server, the volume (with a detach wait-loop), and the SSH key.
 
-The `build` job has `timeout-minutes: 350` — the max available, since GitHub-hosted runners hard-cap jobs at 6 h. Routine incrementals fit easily; a full forced planet rebuild on `ccx33` may exceed it — the build resumes on re-dispatch thanks to the per-stage pushes, the periodic mid-aggregate pushes, and the covering diff's self-heal (below), and `ccx63` (quota pending) makes it moot. There is no self-detaching daemon machinery.
+The `build` job has `timeout-minutes: 350` — the max available, since GitHub-hosted runners hard-cap jobs at 6 h. Routine incrementals fit easily; a full forced planet rebuild on `ccx33` may exceed it — the build resumes on re-dispatch thanks to the per-stage pushes, the periodic mid-aggregate pushes, and the keys (an artifact whose `.key` sidecar landed is skipped), and `ccx63` (quota pending) makes it moot. There is no self-detaching daemon machinery.
 
 ## The incremental model
 
-Rebuilds are cheap because nothing clean is redone — identical to the old build, just scanned from the hydrated local store instead of an R2 listing:
+Rebuilds are cheap because every artifact carries a **content-hash key** ([pipelines/keys.py](../pipelines/keys.py)): a short hash of its inputs ‖ the pipeline modules that produce it ‖ the resolved config values the stage read ‖ the toolchain image tag, written to a `.key` sidecar next to the artifact in the same store prefix (so the existing hydrate/push carries it with zero extra plumbing). A stage recomputes each key and skips artifacts whose sidecar matches; anything else — missing artifact, changed input, changed code, changed config, bumped toolchain — rebuilds. The old covering diff, its `.done` markers, and the downsample mtime cascade are deleted; "the diff cannot see code" and "force after code changes" are historical.
 
-- `cover` diffs the new covering against the previous (hydrated) one; only tiles whose source coverage changed (or whose pmtiles are missing — **self-heal** — or whose overview is older than a child — the mtime cascade) are dirty.
-- Clean tiles' pmtiles/contours are reused straight from the hydrated store.
-- **Self-heal is also the resume mechanism.** Each stage is pushed as it finishes, and the long aggregate stage is additionally pushed every ~20 minutes by a background loop on the box — so even a stage that can't fit one orchestrator window makes monotonic progress across re-dispatches (destroy kills the volume; without the loop every retry would restart aggregate from tile 1). On re-dispatch the box hydrates the partial store, `cover` makes a fresh covering that matches the last one (no source change), and the covering diff's self-heal picks up from whatever landed — only the tiles whose pmtiles never got pushed come back dirty. (`.done` markers are within-covering state and aren't pushed — a re-dispatch's fresh covering wouldn't see them anyway.)
-- **The diff cannot see code.** A change to `pipelines/*.py` or config (contour levels, encode quantization) marks nothing dirty — dispatch with `force: true` after pipeline-code changes, or the store keeps serving output built by the old code. (Phase 3's content-hash keys retire this footgun; until then it holds.)
+- **Per-fork granularity.** Each aggregation tile carries four keys — terrain, contours, soundings, depare — sharing the merged DEM's determinants (covering row, each intersecting source's `catalog.json` recipe hash + priority/maxzoom/offset/land_clamp, the mask identity, smoothing knobs) plus each fork's own modules and config. A tile re-runs iff any fork key is stale; fresh forks within it are skipped. The merge itself is recomputed whenever any fork needs it (pre-mosaic, the merged DEM is ephemeral — phase 5 makes it durable), so what a fresh fork saves is its regenerate + rewrite. Consequence: a `CONTOUR_LEVELS` change re-merges tiles but rewrites no terrain pmtiles, so downsample and the terrain bundle skip entirely.
+- **The key cascade replaces the mtime cascade.** An overview's key hashes its children's keys, so a rebuilt child propagates upward by construction, and a missing artifact self-heals inherently (no artifact → no fresh key). Bundles key off their member artifacts' keys the same way; `manifest.json` is still written whenever anything changed (it's per-sha).
+- **Keys are also the resume mechanism.** Each stage is pushed as it finishes (artifact + sidecar together), and the long aggregate stage is additionally pushed every ~20 minutes by a background loop on the box — so even a stage that can't fit one orchestrator window makes monotonic progress across re-dispatches (destroy kills the volume; without the loop every retry would restart aggregate from tile 1). On re-dispatch the box hydrates whatever landed, `cover` makes a fresh covering, and only the tiles whose artifact or sidecar never got pushed come back stale.
+- **`force: true` survives as an escape hatch only** (`FORCE_REBUILD` ignores every key match). It is no longer required for correctness after code or config changes — the keys see those. Reach for it when the store itself is suspect (a bad artifact pushed under a valid key).
+- **Transition note:** artifacts built before phase 3 carry no sidecars, so the first phase-3 build re-runs everything once (correct — the store was built by old code paths) and stamps keys as it goes.
 
 ## The push protocol
 
-Stages push to R2 as they finish, so an orchestrator timeout loses at most one stage:
+Stages push to R2 as they finish, so an orchestrator timeout loses at most one stage (`.key` sidecars ride in the same prefixes as their artifacts):
 
 - `coverage` → `build/<sha>/coverage.pmtiles`
 - `aggregate` → `pmtiles/` + `contour/` + `soundings/` + `depare/` (also pushed every ~20 min mid-stage by a background loop; `rclone copy` is idempotent, and a file caught mid-write copies torn but is overwritten by the next pass — the final post-stage push is authoritative)
-- `downsample` → `pmtiles/` + the covering (`aggregation/<ulid>/covering.tar.gz`, both aggregate + downsample CSVs — the next build's baseline)
+- `downsample` → `pmtiles/` (no covering publish — the retired diff was the only consumer of a previous covering)
 - `bundle` → `build/<sha>/planet.pmtiles` + `overlay-*.pmtiles`
 - vector (`soundings`, `depare`, `contours`) → `build/<sha>/vector.pmtiles`
 - `manifest.json` → **last**, after everything it references is up
@@ -96,7 +97,7 @@ A dispatch with `bbox` set builds a regional slice — the primary way to test b
 - **Shared-metadata steps** (source prep / `bounds.csv`, the land + water masks) are **not in this build at all** — they moved to `sources.yml`, which is always global. A build never writes them.
 - **Store-reconciling steps** (the covering-retile prunes) **skip** when BBOX is set — a regional covering holds only the window's tiles, so every out-of-window artifact reads as orphaned. The prune block is guarded `if [ -z "$BBOX" ]`.
 
-A `bbox` build is otherwise **self-contained**: it skips the hydrate and pushes **nothing** to the shared store or the covering — only its window `build/<sha>/` outputs, which cannot corrupt the planet store. So `planet.pmtiles`/`vector.pmtiles` from a bbox build reflect only the window (compare a bbox build's tiles over the bbox, not against the planet); only `coverage.pmtiles` was ever window-scoped for other reasons. A bbox build never releases.
+A `bbox` build is otherwise **self-contained**: it skips the hydrate and pushes **nothing** to the shared store — only its window `build/<sha>/` outputs, which cannot corrupt the planet store. So `planet.pmtiles`/`vector.pmtiles` from a bbox build reflect only the window (compare a bbox build's tiles over the bbox, not against the planet); only `coverage.pmtiles` was ever window-scoped for other reasons. A bbox build never releases.
 
 ### One build at a time, globally
 
@@ -106,11 +107,11 @@ The workflow-level `concurrency: r2-store` group (no `cancel-in-progress`) exist
 
 - **No `--delete` on shared prefixes** (`pmtiles/`, `contour/`, `aggregation/`) — pushes are `rclone copy`, so a re-tile leaves the old tile's key behind rather than clobbering a concurrent write. Deletion is done deliberately by the prune.
 - **`manifest.json` last.** It's pushed only after planet + overlays + vector + coverage have all landed, so its presence is a true "complete build" marker for `release.yml`.
-- **The prune is guarded twice.** A covering re-tile (a source's footprint/maxzoom shift) orphans the old stems; the prune computes the full orphan list per prefix, **refuses to run if more than 25% of a prefix reads as orphaned** (a real re-tile orphans a slice; "most of the store" is always a bad stems list), and prunes **pmtiles before the vector FGBs** — a deleted pmtiles self-heals (missing → dirty → rebuilt, regenerating its vector FGBs), a deleted FGB does not, so a wrongful prune costs at most a rebuild, never a silent hole in `vector.pmtiles`. Any new deletion of shared state must follow the same shape. (`bundle.py` also filters orphans at bundle time via `covering_stems`, so the prune is storage hygiene, not correctness — but it keeps the store from growing dead keys.)
+- **The prune is guarded twice.** A covering re-tile (a source's footprint/maxzoom shift) orphans the old stems; the prune computes the full orphan list per prefix, **refuses to run if more than 25% of a prefix reads as orphaned** (a real re-tile orphans a slice; "most of the store" is always a bad stems list), and prunes **pmtiles before the vector FGBs** — a deleted pmtiles self-heals (missing → stale key → rebuilt, regenerating its vector FGBs), a deleted FGB does not, so a wrongful prune costs at most a rebuild, never a silent hole in `vector.pmtiles`. `.key` sidecars prune with their artifacts. Any new deletion of shared state must follow the same shape. (`bundle.py` also filters orphans at bundle time via `covering_stems`, so the prune is storage hygiene, not correctness — but it keeps the store from growing dead keys.)
 
-### Force after code changes
+### Code and config changes rebuild themselves
 
-Restated because it's the most common way to ship a stale planet: the covering diff only sees source coverage. If your change alters what a tile _contains_ (smoothing, contour levels, encoding, depare logic) rather than _which tiles exist_, the next build reuses every clean tile unless dispatched with `force: true`. (True until phase 3's content-hash keys land.)
+The historical footgun this replaces: the old covering diff only saw source coverage, so a change to what a tile _contains_ (smoothing, contour levels, encoding, depare logic) marked nothing dirty and shipped a stale planet unless someone remembered `force: true`. The content-hash keys close it — each stage's key hashes the modules and resolved config that produce it, so exactly the affected artifacts rebuild on the next dispatch. `force` remains only as the escape hatch for a corrupted store.
 
 ### Pipeline code stays R2-agnostic
 
