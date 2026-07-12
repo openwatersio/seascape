@@ -28,7 +28,14 @@ import numpy as np
 from pmtiles.reader import Reader, MmapSource
 
 import encode
+import keys
 import utils
+
+# An overview's key = H(its children's terrain/overview keys ‖ these modules ‖ config). A changed
+# child key propagates upward by construction (a rebuilt overview writes a new sidecar its parent
+# reads), so the mtime staleness-cascade is gone; missing-artifact self-heal is inherent (no
+# artifact → no fresh key).
+DOWNSAMPLE_MODULES = ["downsampling", "encode", "utils"]
 
 
 # ── cover ────────────────────────────────────────────────────────────────────
@@ -133,21 +140,24 @@ def create_tile(parent_x, parent_y, parent_z, tmp_folder, pmtiles_filenames):
 
 
 def run_one(filepath):
-    """Build one parent pmtiles. Returns the set of missing child filenames (empty if
-    already done). Pure per-filepath unit of work — safe to run in a process Pool."""
+    """Build one parent pmtiles. Returns the set of missing child filenames (empty if none).
+    Pure per-filepath unit of work — safe to run in a process Pool."""
     aggregation_id, filename = filepath.split("/")[-2:]
-    if os.path.isfile(filepath.replace("-downsampling.csv", "-downsampling.done")):
-        return set()
     z, x, y, parent_zoom = (int(a) for a in filename.replace("-downsampling.csv", "").split("-"))
     out_folder = utils.get_pmtiles_folder(x, y, z)
     utils.create_folder(out_folder)
     out_filepath = f"{out_folder}/{z}-{x}-{y}-{parent_zoom}.pmtiles"
+    # Invalidate before writing (the crash rule every keyed writer follows): under FORCE the
+    # key is unchanged, so a crash mid-archive would otherwise leave the old sidecar reading
+    # a torn overview as fresh forever.
+    sc = keys.sidecar(out_filepath)
+    if os.path.isfile(sc):
+        os.remove(sc)
 
     extent = mercantile.Tile(x=x, y=y, z=z)
     tmp_folder = filepath.replace("-downsampling.csv", "-tmp")
     utils.create_folder(tmp_folder)
-    with open(filepath) as f:
-        pmtiles_filenames = [a.strip() for a in f.readlines()[1:]]
+    pmtiles_filenames = _children(filepath)
 
     missing = set()
     parents = [extent] if z == parent_zoom else list(mercantile.children(extent, zoom=parent_zoom))
@@ -155,87 +165,64 @@ def run_one(filepath):
         missing |= create_tile(parent.x, parent.y, parent.z, tmp_folder, pmtiles_filenames)
     utils.create_archive(tmp_folder, out_filepath)
     shutil.rmtree(tmp_folder)
-    # Don't mark done when a referenced child was missing — leave it dirty so a rerun
-    # (after the upstream gap is fixed) rebuilds it instead of skipping it forever.
+    # Don't key it when a referenced child was missing — leave it stale so a rerun (after the
+    # upstream gap is fixed) rebuilds it. The children were all rebuilt earlier this run (finest
+    # first), so their sidecars are final now — _overview_key reads their settled keys.
     if not missing:
-        utils.run_command(f'touch {filepath.replace("-downsampling.csv", "-downsampling.done")}')
+        keys.write_key(out_filepath, _overview_key(filepath))
     return missing
 
 
-def tiles_intersect(a, b):
-    if a == b:
-        return True
-    if a.z < b.z and mercantile.parent(b, zoom=a.z) == a:
-        return True
-    if b.z < a.z and mercantile.parent(a, zoom=b.z) == b:
-        return True
-    return False
+def _children(filepath):
+    with open(filepath) as f:
+        return [line.strip() for line in f.readlines()[1:] if line.strip()]
+
+
+def _child_pmtiles_path(child_filename):
+    z, x, y, _cz = (int(a) for a in child_filename.replace(".pmtiles", "").split("-"))
+    return f"{utils.get_pmtiles_folder(x, y, z)}/{child_filename}"
+
+
+def _overview_key(filepath):
+    """A content-hash key from the children's own key sidecars — the terrain key of an aggregate
+    child, the overview key of a coarser child. A missing child sidecar contributes an empty key,
+    so the child's stem alone keeps a vanished/rebuilt child moving the overview key."""
+    inputs = sorted(f"{c}:{keys.read_key(_child_pmtiles_path(c)) or ''}" for c in _children(filepath))
+    return keys.stage_key(inputs, DOWNSAMPLE_MODULES, {"num_overviews": utils.num_overviews})
+
+
+def _overview_artifact(filepath):
+    z, x, y, parent_zoom = (int(a) for a in
+                            filepath.split("/")[-1].replace("-downsampling.csv", "").split("-"))
+    return f"{utils.get_pmtiles_folder(x, y, z)}/{z}-{x}-{y}-{parent_zoom}.pmtiles"
+
+
+def _parent_zoom(filepath):
+    return int(filepath.split("/")[-1].replace("-downsampling.csv", "").split("-")[3])
 
 
 def dirty_filepaths():
-    """Sorted -downsampling.csv to (re)build: changed tiles, OR whose pmtiles is gone, OR a
-    STALE overview — older than a child it averages, or reading a child about to be rebuilt.
-
-    The missing-pmtiles case is load-bearing (same as aggregation_run): a covering whose
-    pmtiles a prior run failed to produce/sync would otherwise diff clean forever.
-
-    The stale-overview cases are equally load-bearing and were the gap. The source-change diff
-    and the missing-own-pmtiles check only fire when a tile's OWN covering changes or its OWN
-    pmtiles vanishes — neither notices when a *child* is rebuilt for any other reason (a dropped
-    tile self-healing from current data, a re-tiling). So the coarse overview above kept
-    averaging the old child and went stale forever (observed: a z6 tile 4 days older than the
-    z7 it averages). So also rebuild an overview when a child it references is missing now
-    (about to self-heal) or is newer than it. Processing finest-overview-first and treating a
-    rebuilt overview as newest makes the staleness cascade all the way up the pyramid in one pass."""
-    aggregation_ids = utils.get_aggregation_ids()
-    aggregation_id = aggregation_ids[-1]
-
-    dirty_tiles = []
-    if len(aggregation_ids) >= 2:
-        for name in utils.get_dirty_aggregation_filenames(aggregation_id, aggregation_ids[-2]):
-            z, x, y, _ = (int(a) for a in name.replace("-aggregation.csv", "").split("-"))
-            dirty_tiles.append(mercantile.Tile(x=x, y=y, z=z))
-
-    have = utils.existing_pmtiles()
-    mtimes = utils.pmtiles_mtimes()
-
-    def base_dirty(tile, filename):
-        if filename.replace("-downsampling.csv", ".pmtiles") not in have:
-            return True
-        if len(aggregation_ids) < 2:
-            return True
-        if any(tiles_intersect(d, tile) for d in dirty_tiles):
-            return True
-        return len(glob(f"store/aggregation/{aggregation_ids[-2]}/{filename}")) == 0
-
-    def children_of(filepath):
-        with open(filepath) as f:
-            return [line.strip() for line in f.readlines()[1:] if line.strip()]
-
-    def parent_zoom(filepath):
-        return int(filepath.split("/")[-1].replace("-downsampling.csv", "").split("-")[3])
-
-    # Finest overview first (high parent_zoom -> low) so a child is decided before the overview
-    # that reads it; a child marked dirty here is bumped to "newest" so the rebuild cascades up.
+    """Sorted -downsampling.csv to (re)build: an overview whose own key is stale (its artifact
+    missing — self-heal — or its sidecar not matching the key its current children imply), OR any
+    of whose children will be rewritten this run (their key will change, so this overview's will
+    too). Processing finest-overview-first and carrying dirty stems forward makes the staleness
+    cascade all the way up the pyramid in one pass — the key equivalent of the old mtime cascade,
+    with no listing/mtime inputs: aggregate wrote each terrain child's sidecar before downsampling
+    runs, so the lowest overviews read settled child keys, and each dirty overview propagates."""
+    aggregation_id = utils.get_aggregation_ids()[-1]
+    dirty_stems = set()
     out = []
     for filepath in sorted(glob(f"store/aggregation/{aggregation_id}/*-downsampling.csv"),
-                           key=lambda fp: (-parent_zoom(fp), fp)):
-        filename = filepath.split("/")[-1]
-        z, x, y, _ = (int(a) for a in filename.replace("-downsampling.csv", "").split("-"))
-        own = filename.replace("-downsampling.csv", ".pmtiles")
-        dirty = base_dirty(mercantile.Tile(x=x, y=y, z=z), filename)
-        if not dirty:
-            children = children_of(filepath)
-            own_mt = mtimes.get(own)
-            if any(c not in have for c in children):
-                dirty = True  # a referenced child is missing -> self-healed this run -> so is this
-            elif own_mt is not None:
-                newest_child = max((mtimes[c] for c in children if c in mtimes), default=None)
-                if newest_child is not None and newest_child > own_mt:
-                    dirty = True  # overview older than a child it averages -> stale
+                           key=lambda fp: (-_parent_zoom(fp), fp)):
+        own_stem = filepath.split("/")[-1].replace("-downsampling.csv", "")
+        child_stems = [c.replace(".pmtiles", "") for c in _children(filepath)]
+        if any(cs in dirty_stems for cs in child_stems):
+            dirty = True  # a child overview will be rewritten (its key changes) -> so will this
+        else:
+            dirty = not keys.is_fresh(_overview_artifact(filepath), _overview_key(filepath))
         if dirty:
             out.append(filepath)
-            mtimes[own] = float("inf")  # rebuilt now = newest, so overviews above rebuild too
+            dirty_stems.add(own_stem)  # cascade to the coarser overview that averages this one
     return sorted(out)
 
 

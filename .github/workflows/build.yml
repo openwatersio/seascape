@@ -5,11 +5,13 @@ name: Build
 #   → push each stage back to R2 → always-destroy the box. The runner here only
 #   orchestrates; the compute is pay-per-build (~€2/hr, ~€10 for a forced planet rebuild).
 #
-# The store still lives in R2 under bathymetry/ and rebuilds are still incremental: the box
-# `rclone copy`s the tile/vector store down, `just cover` diffs the new covering against the
-# previous one, and only the changed aggregation tiles rebuild (clean tiles' pmtiles/contours
-# are reused). Source registration/mirroring + the land/water masks are sources.yml — a build
-# never contacts an upstream; it reads every byte (sources + masks) from R2 over /vsicurl.
+# The store still lives in R2 under bathymetry/ and rebuilds are incremental via CONTENT-HASH
+# KEYS (pipelines/keys.py): every artifact carries a .key sidecar in the same prefix, hashing
+# its inputs ‖ pipeline code ‖ resolved config ‖ the toolchain image tag (TOOLCHAIN below), so
+# a stage skips artifacts whose keys match and code/config changes invalidate exactly their
+# dependents — no covering diff, no force-for-correctness. Source registration/mirroring + the
+# land/water masks are sources.yml — a build never contacts an upstream; it reads every byte
+# (sources + masks) from R2 over /vsicurl.
 # Final bundles land in build/<sha>/; a release promotes that build (release.yml).
 #
 # Dispatch-only (a shared incremental store shouldn't be mutated by routine pushes); any branch
@@ -24,7 +26,7 @@ on:
         required: false
         default: ""
       force:
-        description: "Force full rebuild — ignore the incremental diff (use after pipeline-code changes)"
+        description: "Force full rebuild — ignore the content-hash keys (escape hatch; keys already see code/config changes)"
         type: boolean
         default: false
       server_type:
@@ -95,8 +97,8 @@ jobs:
   # available: GitHub-HOSTED runners hard-cap jobs at 6 h, so it cannot be raised. Routine
   # incrementals fit easily; a full forced planet rebuild on ccx33 may exceed it — the build
   # resumes on re-dispatch (each stage is pushed as it finishes, aggregate additionally every
-  # ~20 min mid-stage, and the covering-diff's missing-pmtiles self-heal rebuilds only the
-  # tiles that never got pushed). ccx63 (quota pending) makes it moot.
+  # ~20 min mid-stage, and the hash keys skip everything whose artifact + .key sidecar already
+  # landed, so only the tiles that never got pushed rebuild). ccx63 (quota pending) makes it moot.
   build:
     needs: image
     runs-on: ubuntu-latest
@@ -240,46 +242,60 @@ jobs:
           export AGG_PROCESSES=$AGG
           export BUNDLE_PROCESSES=$BND
           export GDAL_CACHEMAX=512
+          # The toolchain identity for the content-hash keys (pipelines/keys.py): the deps-keyed
+          # image tag pins one GDAL/tippecanoe, so bumping the toolchain correctly invalidates
+          # every key (dispatch a rebuild deliberately after a GDAL bump).
+          export TOOLCHAIN="$IMAGE:$IMAGE_TAG"
           if [ "${FORCE:-}" = "true" ]; then export FORCE_REBUILD=1; else export FORCE_REBUILD=; fi
           echo "box: ${CORES} cores / ${MEM_GB} GB → AGG_PROCESSES=$AGG_PROCESSES, BUNDLE_PROCESSES=$BUNDLE_PROCESSES, BBOX='${BBOX:-}', FORCE='${FORCE:-}'"
 
-          # docker run wrapper: repo code at /app, the store bind-mounted, BBOX/FORCE forwarded
-          # (+ BUNDLE_PROCESSES — only bundle.py reads it; harmless for the other stages).
+          # docker run wrapper: repo code at /app, the store bind-mounted, BBOX/FORCE/TOOLCHAIN
+          # forwarded (+ BUNDLE_PROCESSES — only bundle.py reads it; harmless elsewhere).
           dr() { docker run --rm -v /root/seascape:/app -v "$STORE:/app/pipelines/store" \
-            -e BBOX -e FORCE_REBUILD -e BUNDLE_PROCESSES "$IMAGE:$IMAGE_TAG" just "$@"; }
+            -e BBOX -e FORCE_REBUILD -e TOOLCHAIN -e BUNDLE_PROCESSES "$IMAGE:$IMAGE_TAG" just "$@"; }
 
           R2="R2:$DATA_BUCKET/bathymetry"
           # --retries 5: R2 occasionally returns a transient 500 InternalError; ride it out
           # instead of failing the stage (same convention as sources.yml's mirror). Applied to
           # EVERY transfer, the single-file copyto publishes included — a flake on manifest.json
-          # or the covering tarball would break the completeness/resume contracts.
+          # would break the completeness contract.
           XFER="--transfers 32 --checkers 64 --fast-list --retries 5 --stats 30s --stats-one-line"
           hydrate()    { rclone copy "$R2/$1" "$STORE/$2" $XFER "${@:3}"; }
-          push()       { rclone copy "$STORE/$1" "$R2/$2" $XFER "${@:3}"; }   # copy, NEVER sync --delete
+          # push in TWO passes, artifacts before their .key sidecars: the per-tile keys are
+          # markers, and markers land last. One bulk rclone copy has no intra-transfer ordering,
+          # so an interrupted single-pass push could land a .key whose artifact never made it —
+          # which the next hydrate would read as fresh-with-no-artifact, a permanent silent
+          # hole. Split, a partial push strands at worst an artifact with no key (reads stale,
+          # rebuilds). `|| return` keeps pass 2 from running over a failed pass 1 even where the
+          # caller suppresses errexit (the background push loop's `|| true`). copy, NEVER sync
+          # --delete.
+          push() {
+            rclone copy "$STORE/$1" "$R2/$2" $XFER --exclude '*.key' "${@:3}" || return $?
+            rclone copy "$STORE/$1" "$R2/$2" $XFER --include '*.key' "${@:3}"
+          }
           push_build() { rclone copyto "$STORE/bundle/$1" "$R2/build/$SHA/$1" $XFER; }
 
-          # ── HYDRATE (planet only): the incremental store + each source's bounds.csv + the
-          #    footprint gpkgs. Source COGs + masks are hydrated selectively AFTER cover (the
-          #    dirty-set list doesn't exist yet — see the sources-manifest block below). A bbox
-          #    build rebuilds its window from scratch and streams sources, so it only needs
-          #    bounds + footprints. ──
+          # ── HYDRATE (planet only): the incremental store (artifacts + their .key sidecars,
+          #    which live in the same prefixes) + each source's bounds.csv + catalog.json (the
+          #    tile keys read the item's recipe hash + flags) + the footprint gpkgs. Source COGs
+          #    + masks are hydrated selectively AFTER cover (the dirty-set list doesn't exist
+          #    yet — see the sources-manifest block below). No covering hydrate: the keys ARE
+          #    the incremental state, so the previous covering (the old diff baseline) is dead
+          #    weight. A bbox build rebuilds its window from scratch and streams sources, so it
+          #    only needs bounds + catalog + footprints. ──
           if [ -z "${BBOX:-}" ]; then
             echo "── hydrate ──"
             hydrate pmtiles pmtiles
             hydrate contour contour
             hydrate soundings soundings
             hydrate depare depare
-            hydrate aggregation aggregation
-            for t in "$STORE"/aggregation/*/covering.tar.gz; do
-              [ -e "$t" ] && tar -C "$(dirname "$t")" -xzf "$t"
-            done
-            hydrate source source --include '*/bounds.csv'
+            hydrate source source --include '*/bounds.csv' --include '*/catalog.json'
             hydrate polygon polygon
             n=$(find "$STORE/pmtiles" -name '*.pmtiles' 2>/dev/null | wc -l)
             [ "$n" -gt 0 ] || { echo "hydrate pulled 0 pmtiles for a planet build — refusing to rebuild the world from empty" >&2; exit 1; }
             echo "hydrated $n pmtiles"
           else
-            hydrate source source --include '*/bounds.csv'
+            hydrate source source --include '*/bounds.csv' --include '*/catalog.json'
             hydrate polygon polygon
           fi
 
@@ -329,7 +345,7 @@ jobs:
           # ── BUILD, stage by stage, pushing after each so an orchestrator timeout loses at most
           #    one stage. The stage order matches `just planet`; the box just interleaves pushes. ──
           echo "── cover ──"
-          dr cover                        # writes the covering; the diff falls out of the pipeline
+          dr cover                        # writes the covering (the tiling plan; keys drive dirtiness)
 
           # ── coverage ∥ aggregate ── the plan's sanctioned DAG overlap: coverage reads only
           # footprints + the covering and aggregate never reads coverage, but its single-
@@ -344,17 +360,22 @@ jobs:
           ( { dr coverage && push_build coverage.pmtiles; } 2>&1 | sed -u 's/^/[coverage] /' ) & COV_PID=$!
 
           # ── selective source hydrate (planet only; overlaps the backgrounded coverage) ──
-          # Pull exactly the source files the dirty tiles reference, so aggregate reads them
+          # Pull exactly the source files the stale tiles reference, so aggregate reads them
           # from local disk: sources-manifest derives the (source, filename) union with the
-          # same dirty diff the run itself uses (FORCE_REBUILD included). Legacy rows whose
-          # filename is an absolute /vsi path aren't R2 keys — filter them out of the
-          # files-from list; source_path streams them untouched (see the AGG_ENV note).
-          # The masks land at the container's DEFAULT store/landmask paths, so aggregate
-          # needs no LANDMASK/WATERMASK env: land.fgb is required (flagged coarse sources
-          # exist planet-wide — fail here, not per-tile), water.fgb optional (absent → the
-          # clamp degrades to land-only, exactly the old behavior).
+          # same key-based dirty derivation the run itself uses (FORCE_REBUILD included).
+          # The MASKS hydrate FIRST, before sources-manifest: local mask content hashes enter
+          # every fork key, so the manifest and aggregate must see identical mask state — a
+          # mask-less manifest run would compute different keys, call every tile stale, and
+          # hydrate the full planet source set. They land at the container's DEFAULT
+          # store/landmask paths, so aggregate needs no LANDMASK/WATERMASK env: land.fgb is
+          # required (flagged coarse sources exist planet-wide — fail here, not per-tile),
+          # water.fgb optional (absent → the clamp degrades to land-only, the old behavior).
+          # Legacy rows whose filename is an absolute /vsi path aren't R2 keys — filter them
+          # out of the files-from list; source_path streams them untouched (the AGG_ENV note).
           if [ -z "${BBOX:-}" ]; then
             echo "── hydrate dirty-set sources ──"
+            hydrate landmask landmask --include 'land.fgb' --include 'water.fgb'
+            [ -f "$STORE/landmask/land.fgb" ] || { echo "no land.fgb in R2 — flagged coarse sources need the land mask" >&2; exit 1; }
             dr sources-manifest
             grep -v -e '://' -e '/vsi' "$STORE/source-manifest.txt" > /tmp/source-files.txt || true
             legacy=$(grep -c -e '://' -e '/vsi' "$STORE/source-manifest.txt" || true)
@@ -363,8 +384,6 @@ jobs:
             fi
             echo "hydrating $(wc -l < /tmp/source-files.txt) of $(wc -l < "$STORE/source-manifest.txt") referenced source file(s)"
             rclone copy "$R2/source" "$STORE/source" --files-from /tmp/source-files.txt $XFER
-            hydrate landmask landmask --include 'land.fgb' --include 'water.fgb'
-            [ -f "$STORE/landmask/land.fgb" ] || { echo "no land.fgb in R2 — flagged coarse sources need the land mask" >&2; exit 1; }
           fi
 
           echo "── aggregate ──"
@@ -383,7 +402,7 @@ jobs:
           fi
           agg_rc=0
           docker run --rm -v /root/seascape:/app -v "$STORE:/app/pipelines/store" \
-            -e BBOX -e FORCE_REBUILD "${AGG_ENV[@]}" "$IMAGE:$IMAGE_TAG" just aggregate || agg_rc=$?
+            -e BBOX -e FORCE_REBUILD -e TOOLCHAIN "${AGG_ENV[@]}" "$IMAGE:$IMAGE_TAG" just aggregate || agg_rc=$?
           # Kill the loop on BOTH exits (success or failure) before anything else runs.
           if [ -n "$PUSH_LOOP" ]; then kill "$PUSH_LOOP" 2>/dev/null || true; wait "$PUSH_LOOP" 2>/dev/null || true; fi
           # First failure wins, as in the sequential version: on an aggregate failure, reap
@@ -402,13 +421,10 @@ jobs:
           echo "── downsample ──"
           dr downsample
           if [ -z "${BBOX:-}" ]; then
+            # Overviews + their .key sidecars. No covering publish: the retired covering diff was
+            # the only consumer of a previous covering — keys carry all incremental state, and a
+            # re-dispatch's fresh covering + hydrated sidecars resume the build.
             push pmtiles pmtiles
-            # Publish the covering LAST of the store writes (agg + downsample CSVs both exist now),
-            # tarred like the old plan job — the next build's incremental baseline. Not the .done
-            # markers: a re-dispatch makes a fresh covering, so resume rides self-heal, not markers.
-            id=$(ls "$STORE/aggregation" | sort | tail -1)
-            tar -C "$STORE/aggregation/$id" --exclude='*.done' --exclude='*-tmp' -czf /tmp/covering.tar.gz .
-            rclone copyto /tmp/covering.tar.gz "$R2/aggregation/$id/covering.tar.gz" $XFER
           fi
 
           echo "── bundle (terrain) ──"
@@ -422,10 +438,12 @@ jobs:
           push_build vector.pmtiles
 
           # ── PRUNE (planet only; skipped under bbox — a window covering reads every out-of-window
-          #    artifact as orphaned). Port of the old plan-job guards: list first, refuse a >25%
-          #    orphan fraction (a real re-tile orphans a slice; "most of the prefix" is a bad stems
-          #    list), and prune pmtiles BEFORE the vector FGBs — a wrongly-pruned pmtiles self-heals
-          #    (missing → dirty → rebuilt), a wrongly-pruned FGB does not. ──
+          #    artifact as orphaned; phase 4 replaces these with GC). Port of the old plan-job
+          #    guards: list first, refuse a >25% orphan fraction (a real re-tile orphans a slice;
+          #    "most of the prefix" is a bad stems list), and prune pmtiles BEFORE the vector FGBs
+          #    — a wrongly-pruned pmtiles self-heals (missing → stale key → rebuilt), a wrongly-
+          #    pruned FGB does not. .key sidecars prune with their artifacts (an orphaned stem
+          #    orphans both). ──
           if [ -z "${BBOX:-}" ]; then
             id=$(ls "$STORE/aggregation" | sort | tail -1)
             ls "$STORE/aggregation/$id"/*-aggregation.csv "$STORE/aggregation/$id"/*-downsampling.csv 2>/dev/null \
@@ -434,10 +452,10 @@ jobs:
               | sed 's#.*/##; s/-aggregation\.csv$//' | sort -u > /tmp/valid-agg.txt
 
             prune_prefix() {   # <prefix> <ext> <valid-stems-file>
-              rclone lsf -R --files-only "$R2/$1" 2>/dev/null | grep "$2\$" > /tmp/r2-keys.txt || true
+              rclone lsf -R --files-only "$R2/$1" 2>/dev/null | grep -E "$2(\.key)?\$" > /tmp/r2-keys.txt || true
               local total; total=$(wc -l < /tmp/r2-keys.txt)
               [ "$total" -gt 0 ] || return 0
-              awk -v ext="$2" 'NR==FNR{ok[$0]=1;next}{s=$0; sub(/.*\//,"",s); sub(ext"$","",s); if(!(s in ok)) print}' \
+              awk -v ext="$2" 'NR==FNR{ok[$0]=1;next}{s=$0; sub(/.*\//,"",s); sub(/\.key$/,"",s); sub(ext"$","",s); if(!(s in ok)) print}' \
                 "$3" /tmp/r2-keys.txt > /tmp/orphans.txt
               local orph; orph=$(wc -l < /tmp/orphans.txt)
               [ "$orph" -gt 0 ] || { echo "prune $1: no orphans of $total"; return 0; }
@@ -453,7 +471,8 @@ jobs:
             prune_prefix soundings '\.geojson'  /tmp/valid-agg.txt
             prune_prefix depare    '\.fgb'      /tmp/valid-agg.txt
 
-            # Old coverings accrue one dir per build; keep the newest 3 (ULIDs sort chronologically).
+            # Legacy coverings from the retired diff era: nothing pushes new ones, so keep the
+            # newest 3 and let phase 4's GC finish the cleanup (ULIDs sort chronologically).
             ids=$(rclone lsf "$R2/aggregation" --dirs-only 2>/dev/null | tr -d /)
             keep=$(echo "$ids" | sort | tail -3)
             for cid in $ids; do

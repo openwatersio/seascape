@@ -55,7 +55,7 @@ def negate_band1(filepath):
 def band_select(source):
     """`-b N ` (trailing space) if the source pins a band, else ''. S-102 is 2-band
     (depth/uncertainty); band 1 is depth (negated to elevation after warp)."""
-    band = config.load_metadata(source).get("band")
+    band = config.source_property(source, "band")
     return f"-b {band} " if band else ""
 
 
@@ -215,9 +215,9 @@ def reproject(filepath):
     buffer_3857_rounded = buffer_pixels * resolution
 
     for i, source_items in enumerate(grouped):
-        meta = config.load_metadata(source_items[0]["source"])
+        sid = source_items[0]["source"]
         out_tiff = f"{tmp_folder}/{i}-3857.tiff"
-        if meta.get("mixed_crs"):
+        if config.source_property(sid, "mixed_crs"):
             # Per-tile UTM zones: warp the per-tile VRTs straight to a raster (gdalwarp
             # reprojects each input), then the same translate makes the COG.
             merged = f"{tmp_folder}/{i}-3857-merged.tif"
@@ -231,9 +231,9 @@ def reproject(filepath):
             vrt_3857 = f"{tmp_folder}/{i}-3857.vrt"
             create_warp(vrt, vrt_3857, maxzoom, aggregation_tile, buffer_3857_rounded)
             translate(vrt_3857, out_tiff)
-        if meta.get("negate"):
+        if config.source_property(sid, "negate"):
             negate_band1(out_tiff)  # streamed positive-down source (S-102 depth) -> elevation
-        if meta.get("land_clamp"):
+        if config.source_property(sid, "land_clamp"):
             # Coarse source (GEBCO/EMODnet) with no land/water concept: its shoreline cells
             # read negative on land. Clamp valid ^ land ^ <0 -> 0 right after warp, so the
             # merge/contour/soundings never see the false water. The mask rasterizes onto the

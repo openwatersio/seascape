@@ -105,7 +105,7 @@ def require():
     opaque ogr2ogr error. A /vsi path is assumed reachable (CI publishes it; a genuinely bad
     URL still fails per-tile). Cheap — reads only metadata flags, not the covering."""
     import config
-    flagged = [s for s in config.sources() if config.load_metadata(s).get("land_clamp")]
+    flagged = [s for s in config.sources() if config.source_property(s, "land_clamp")]
     p = path()
     if flagged and not p.startswith("/vsi") and not os.path.isfile(p):
         raise SystemExit(

@@ -32,6 +32,7 @@ from glob import glob
 import mercantile
 
 import contour_run
+import keys
 import utils
 
 NODATA = -9999
@@ -154,6 +155,15 @@ def generate(filepath):
         print(f"soundings: no merged DEM for {filename}")
         return
 
+    # Drop a previous run's artifact AND its key sidecar up front: a re-run that now yields no
+    # points must not leave the old one behind to bundle stale, and a crash after this point
+    # must read STALE next run — under FORCE the key is unchanged, so a surviving sidecar would
+    # read fresh forever over the deleted artifact (see the contour fork; same rule all three).
+    out = f"store/soundings/{stem}.geojson"
+    for stale in (out, keys.sidecar(out)):
+        if os.path.isfile(stale):
+            os.remove(stale)
+
     bbox = mercantile.xy_bounds(tile)  # unbuffered, tile-aligned (EPSG:3857)
     with rasterio.open(dem) as src:
         nodata = src.nodata if src.nodata is not None else NODATA
@@ -173,7 +183,7 @@ def generate(filepath):
                       "geometry": {"type": "Point", "coordinates": [round(lon, 6), round(lat, 6)]}})
 
     utils.create_folder("store/soundings")
-    with open(f"store/soundings/{stem}.geojson", "w") as f:
+    with open(out, "w") as f:
         json.dump({"type": "FeatureCollection", "features": feats}, f)
     print(f"soundings: {filename} -> {len(feats)} points")
 
@@ -191,22 +201,43 @@ def bundle():
     """tippecanoe the per-tile soundings into store/bundle/soundings.pmtiles (layer `soundings`).
     Per-feature tippecanoe.minzoom places each point from the zoom the grid decimation assigned,
     so no density dropping is needed (-r1 keeps every surviving point). Bundled before the
-    contour tile-join, which folds this layer into vector.pmtiles."""
+    contour tile-join, which folds this layer into vector.pmtiles. Skips when every member
+    tile's key is unchanged and the pmtiles is already on disk (the local iterative loop; the
+    build box's store/bundle is never hydrated, so a box build always rebuilds it)."""
     gj = _live(sorted(glob("store/soundings/*.geojson")), contour_run._current_stems())
+    out = "store/bundle/soundings.pmtiles"
     if not gj:
+        # Empty input is a real state, not a no-op: a previously-built archive (and the sidecar
+        # vouching for it) must not survive — _finalize_contours folds this file into
+        # vector.pmtiles whenever it exists on disk, so a stale layer would ship as current.
+        # The invalidate discipline, extended to "the current state is nothing".
+        for stale in (out, keys.sidecar(out)):
+            if os.path.isfile(stale):
+                os.remove(stale)
         print("soundings bundle: no soundings")
         return
     # Shared tileset maxzoom (see contour_run.bundle_maxz): tiling only to this
     # layer's own regional max would truncate it out of deeper joined tiles.
     maxz = contour_run.bundle_maxz(
         max(int(g.split("/")[-1].replace(".geojson", "").split("-")[3]) for g in gj))
+    skey = keys.stage_key([f"{g}:{keys.read_key(g) or ''}" for g in gj],
+                          ["soundings_run", "contour_run", "utils"], {"maxz": maxz})
+    if keys.is_fresh(out, skey):
+        print("soundings bundle: inputs unchanged — skip")
+        return
     utils.create_folder("store/bundle")
-    out = "store/bundle/soundings.pmtiles"
+    # Invalidate before writing (the crash rule every keyed writer follows): under FORCE the
+    # key is unchanged, so a crash mid-tippecanoe would otherwise leave the old sidecar reading
+    # a torn archive as fresh forever.
+    for stale in (out, keys.sidecar(out)):
+        if os.path.isfile(stale):
+            os.remove(stale)
     subprocess.run(
         ["tippecanoe", "-o", out, "-f", "-l", "soundings",
          "-n", "Bathymetric soundings", "-A", utils.ATTRIBUTION, "-Z", "0", "-z", str(maxz),
          "-P", "-q", "-r1", "-y", "depth_m", "-y", "depth_ft", "-y", "depth_fm",
          *gj], check=True)
+    keys.write_key(out, skey)
     print(f"soundings bundle: {out} (z0-{maxz}, {len(gj)} tiles)")
 
 

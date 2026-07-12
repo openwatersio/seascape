@@ -57,9 +57,11 @@ planet:
 cover:
     uv run python aggregation_covering.py
 
-# Aggregate every dirty tile: reproject -> merge -> smooth -> encode terrain, forking
-# contours/soundings/depare off each merged DEM. AGG_PROCESSES caps concurrent tiles (each
-# holds a multi-GB merged DEM); unset = all cores. FORCE_REBUILD=1 rebuilds every tile.
+# Aggregate every stale tile: reproject -> merge -> smooth -> encode terrain, forking
+# contours/soundings/depare off each merged DEM. Staleness is per-fork content-hash keys
+# (keys.py: inputs ‖ code ‖ config ‖ toolchain); a fresh fork is skipped within the tile.
+# AGG_PROCESSES caps concurrent tiles (each holds a multi-GB merged DEM); unset = all cores.
+# FORCE_REBUILD=1 ignores the keys and rebuilds every tile (escape hatch).
 aggregate:
     uv run python aggregation_run.py
 
@@ -74,7 +76,8 @@ combine:
     just bundle
 
 # Overview pyramid below each source's native maxzoom: plan the parent tiles, then
-# 2x2-average each dirty overview (finest first, so each level feeds the next).
+# 2x2-average each stale overview (finest first, so each level feeds the next; an
+# overview's key hashes its children's keys, so child changes cascade up by construction).
 downsample:
     uv run python downsampling.py cover
     uv run python downsampling.py run
@@ -134,6 +137,16 @@ preview bbox="-74.30,40.40,-73.75,40.80" local="":
             mkdir -p "store/source/$id"
             curl -fsS "$BOUNDS_BASE/$id/bounds.csv" -o "store/source/$id/bounds.csv" \
                 || { echo "skip $id (no bounds.csv in R2)"; rm -rf "store/source/$id"; }
+            # Catalog item (priority/offset/flags + recipe hash — the tile keys read it).
+            # Replace only on success; absent (a source registered before the catalog step
+            # existed) falls back to metadata.json. Note the fetched item SHADOWS local
+            # metadata.json knob edits (priority/max_zoom) — to iterate those against streamed
+            # sources, delete store/source/<id>/catalog.json so the metadata fallback applies.
+            if [ -d "store/source/$id" ]; then
+                curl -fsS "$BOUNDS_BASE/$id/catalog.json" -o "store/source/$id/catalog.json.tmp" \
+                    && mv "store/source/$id/catalog.json.tmp" "store/source/$id/catalog.json" \
+                    || rm -f "store/source/$id/catalog.json.tmp"
+            fi
             # Provenance footprint for the coverage tileset (mirrored sources have none).
             # Replace only on success — a 404 must not clobber a locally-prepared polygon.
             curl -fsS "$POLY_BASE/$id.gpkg" -o "store/polygon/$id.gpkg.tmp" \
@@ -208,3 +221,4 @@ test-sources:
 test-engine:
     uv run python test_engine.py
     uv run python aggregation_reproject.py --check
+    uv run python keys.py --check
