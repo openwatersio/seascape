@@ -33,3 +33,27 @@ type = "CompiledWasm"
 [observability.logs]
 enabled = true
 invocation_logs = true
+
+# ── Build previews ──────────────────────────────────────────────────────────
+# One long-lived Worker fronting every per-commit build at
+# data.openwaters.io/bathymetry/build/<sha>/{z}/{x}/{y}.{webp,pbf} — the build's
+# leading path segment selects the bundle build.yml already published to the
+# public data bucket, so no per-build deploy is needed (deploy-preview-worker.yml
+# only redeploys when the Worker/style change). Bound to `data` (a fixed public
+# name, no secret); PREVIEW makes the handler read bathymetry/build/<sha>/ and run
+# uncached. The route stays off bathymetry/source|landmask/* (the build's /vsicurl
+# reads), so it can't shadow them. main/compatibility_*/rules are inherited.
+[env.preview]
+name = "seascape-preview"
+routes = [
+  {pattern = "data.openwaters.io/bathymetry/build/*", zone_name = "openwaters.io"},
+]
+
+[[env.preview.r2_buckets]]
+binding = "TILES"
+bucket_name = "data"
+
+[env.preview.vars]
+RELEASE_PREFIX = ""
+BASE_PATH = "/bathymetry/build"
+PREVIEW = "true"

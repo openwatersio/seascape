@@ -31,7 +31,7 @@ import { style as seascapeStyle } from "@openwaters/seascape";
 import { CachedSource, contentEtag, OVERZOOM_TAG_VERSION } from "./cache";
 import { coverageTileJSON } from "./coverage";
 import { unpackTerrarium, packTerrariumInto, cubicBSpline } from "./terrarium";
-import { OverlayIndex, overlayFor } from "./overlay";
+import { OverlayIndex, overlayFor, previewRoute } from "./overlay";
 import { limiter } from "./semaphore";
 // jSquash on Workers: WASM must be imported as a module and passed to init()
 // (no fetch-based instantiation in the Workers runtime).
@@ -55,6 +55,11 @@ export interface Env {
   TILES: R2Bucket;
   RELEASE_PREFIX?: string; // R2 key prefix selecting which release to serve, e.g. "seascape/<sha>/"; default ""
   BASE_PATH?: string; // URL mount path = the Cloudflare route prefix; default "/seascape"
+  // Preview Worker: when set, TILES is the public data bucket and the leading path
+  // segment is a build's sha — serve that build straight from bathymetry/build/<sha>/.
+  // Runs uncached (like local dev) so a re-pushed build shows up immediately and the
+  // release-scoped colo cache (keyed on tiles.openwaters.io) is never touched.
+  PREVIEW?: string;
 }
 
 interface BundleMeta {
@@ -91,11 +96,13 @@ class R2Source implements Source {
 const pmCache = new Map<string, PMTiles>();
 function pm(env: Env, file: string): PMTiles {
   const key = (env.RELEASE_PREFIX ?? "") + file;
-  // Dev (no RELEASE_PREFIX): don't reuse the isolate cache. A local reseed replaces the
-  // pmtiles under the same key, and a cached instance's stale header/directory would then
-  // read the new bytes at old offsets (garbage / 500s) until wrangler restarts. A fresh
-  // instance re-reads them. Prod keys are release-immutable, so the cache is safe there.
-  if (!env.RELEASE_PREFIX) return new PMTiles(new R2Source(env.TILES, key));
+  // Dev (no RELEASE_PREFIX) and preview (a re-pushed build): don't reuse the isolate
+  // cache. A local reseed / rebuild replaces the pmtiles under the same key, and a cached
+  // instance's stale header/directory would then read the new bytes at old offsets
+  // (garbage / 500s) until wrangler restarts. A fresh instance re-reads them. Prod keys are
+  // release-immutable, so the cache is safe there.
+  if (!env.RELEASE_PREFIX || env.PREVIEW)
+    return new PMTiles(new R2Source(env.TILES, key));
   let p = pmCache.get(key);
   if (!p) {
     // Range reads go through the colo cache (CachedSource) so directory walks
@@ -114,16 +121,19 @@ function pm(env: Env, file: string): PMTiles {
 
 let manifestCache: Manifest | undefined;
 async function manifest(env: Env): Promise<Manifest> {
-  // Dev (no RELEASE_PREFIX): re-read every call — a local reseed replaces manifest.json under
-  // the running wrangler, and the isolate cache would otherwise pin the old one (e.g. an old
-  // contour max_zoom) until restart. Prod caches it (immutable within a release).
-  if (manifestCache && env.RELEASE_PREFIX) return manifestCache;
+  // Dev (no RELEASE_PREFIX) and preview: re-read every call — a local reseed / rebuild
+  // replaces manifest.json under the running Worker, and the isolate cache would otherwise
+  // pin the old one (e.g. an old contour max_zoom) until restart. Also, preview serves many
+  // builds from one isolate, so a shared singleton would cross builds. Prod caches it
+  // (immutable within a release).
+  const cacheable = !!env.RELEASE_PREFIX && !env.PREVIEW;
+  if (manifestCache && cacheable) return manifestCache;
   const obj = await env.TILES.get((env.RELEASE_PREFIX ?? "") + "manifest.json");
   if (!obj) throw new Error("manifest.json missing");
   const m: Manifest = JSON.parse(await obj.text());
   // Tolerate a pre-grid manifest (old release / local seed): planet-only, no 500s.
   m.overlay ??= { split_z: 0, cells: {} };
-  if (env.RELEASE_PREFIX) manifestCache = m;
+  if (cacheable) manifestCache = m;
   return m;
 }
 
@@ -307,7 +317,9 @@ export default {
     // show up immediately, but the ETag would be a constant "dev" that 304s stale bodies across
     // reseeds (browser cache), and long stale-while-revalidate would keep serving them. Prod
     // keeps the per-release ETag + long cache (every resource is deterministic within a release).
-    const dev = !env.RELEASE_PREFIX;
+    // Preview is uncached like dev: builds are re-pushed under the same sha and the colo
+    // cache key is hardcoded to the tiles.openwaters.io zone, not this Worker's data host.
+    const dev = !env.RELEASE_PREFIX || !!env.PREVIEW;
     // Colo cache: repeat tiles are served without touching R2 or the codecs.
     // Only tile responses are put (below) — the JSON endpoints stay
     // release-validated. The key embeds the release, so a deploy atomically
@@ -364,19 +376,36 @@ export default {
     const base = (env.BASE_PATH ?? "/seascape").replace(/\/+$/, "");
     const mounted =
       base !== "" && (path === base || path.startsWith(base + "/"));
-    const rel = mounted ? path.slice(base.length) : path;
-    const mount = mounted ? base : "";
+    let rel = mounted ? path.slice(base.length) : path;
+    let mount = mounted ? base : "";
+    // Preview Worker: peel the build sha off the path and read that build's bundle
+    // straight from the data bucket. `renv` carries the per-request R2 prefix so the
+    // shared pm()/manifest()/tile() helpers resolve bathymetry/build/<sha>/*; the base
+    // Worker leaves it as `env`. See previewRoute (overlay.ts) for the sha guard.
+    let renv = env;
+    if (env.PREVIEW) {
+      const p = previewRoute(rel, mount);
+      if (!p)
+        return new Response(`usage: ${base}/<sha>/{z}/{x}/{y}.{webp,pbf}`, {
+          status: 404,
+          headers: CORS,
+        });
+      renv = { ...env, RELEASE_PREFIX: p.prefix };
+      rel = p.rel;
+      mount = p.mount;
+    }
     // Absolute endpoint base echoed into TileJSON/style URLs. `wrangler dev`
     // rewrites the request URL *and* Host header to the configured route host
-    // (tiles.openwaters.io), leaving no truthful origin in a local request —
-    // so dev pins localhost at the port the dev script binds
-    // (worker/package.json); prod trusts the request origin.
-    const tilesBase = dev
-      ? `http://localhost:8787${mount}`
-      : `${url.origin}${mount}`;
+    // (tiles.openwaters.io), leaving no truthful origin in a local request — so
+    // LOCAL dev pins localhost at the port the dev script binds (worker/package.json);
+    // preview and prod are deployed on a real host, so they trust the request origin.
+    const tilesBase =
+      !env.RELEASE_PREFIX && !env.PREVIEW
+        ? `http://localhost:8787${mount}`
+        : `${url.origin}${mount}`;
 
     if (rel === "/manifest.json") {
-      return json(await manifest(env));
+      return json(await manifest(renv));
     }
     // Drop-in MapLibre style for these tiles — the same style the viewer
     // renders (assembled by @openwaters/seascape); the endpoint base is derived
@@ -426,7 +455,7 @@ export default {
     // TileJSON per representation — point MapLibre/Mapbox at these directly.
     // A TileJSON is single-format, so raster and vector get separate docs.
     if (rel === "/raster.json") {
-      const mf = await manifest(env);
+      const mf = await manifest(renv);
       return json({
         tilejson: "3.0.0",
         name: "Open Waters Bathymetry (raster)",
@@ -447,8 +476,8 @@ export default {
       });
     }
     if (rel === "/vector.json") {
-      const mf = await manifest(env);
-      const h = await pm(env, "vector.pmtiles").getHeader();
+      const mf = await manifest(renv);
+      const h = await pm(renv, "vector.pmtiles").getHeader();
       return json({
         tilejson: "3.0.0",
         name: "Open Waters Bathymetry",
@@ -499,10 +528,10 @@ export default {
     // the layer either minted millions of deep-ocean fill tiles or vanished
     // above its zoom — a joined archive shares one zoom range).
     if (rel === "/coverage.json") {
-      const mf = await manifest(env);
+      const mf = await manifest(renv);
       // Absent coverage.pmtiles (a pre-coverage release) → empty TileJSON, not
       // a 500 — same tolerance manifest() extends to pre-grid releases.
-      const h = await pm(env, "coverage.pmtiles")
+      const h = await pm(renv, "coverage.pmtiles")
         .getHeader()
         .catch(() => null);
       return json(coverageTileJSON(h, tilesBase, mf.attribution ?? ""));
@@ -545,7 +574,7 @@ export default {
         cx = +cov[2],
         cy = +cov[3];
       if (cx >= 2 ** cz || cy >= 2 ** cz) return noTile();
-      const t = await tile(env, "coverage.pmtiles", cz, cx, cy).catch(
+      const t = await tile(renv, "coverage.pmtiles", cz, cx, cy).catch(
         () => undefined,
       );
       return t ? sendTile(t, MVT, await contentEtag(t)) : noTile();
@@ -570,7 +599,7 @@ export default {
       srcMax: number,
     ): Promise<Response | null> => {
       const levels = z - srcMax;
-      const parent = await tile(env, srcFile, srcMax, x >> levels, y >> levels);
+      const parent = await tile(renv, srcFile, srcMax, x >> levels, y >> levels);
       if (!parent) return null; // ancestor missing; caller tries the next source
       const tag = await contentEtag(parent, OVERZOOM_TAG_VERSION + "-");
       if (inm === tag) return notModified(tag);
@@ -591,15 +620,15 @@ export default {
         : sendTile(await seaLevelBytes(), WEBP, await seaLevelEtag(), false);
 
     if (isVector) {
-      const t = await tile(env, "vector.pmtiles", z, x, y);
+      const t = await tile(renv, "vector.pmtiles", z, x, y);
       return t ? sendTile(t, MVT, await contentEtag(t)) : noTile();
     }
 
     // Terrain always returns a valid 512px tile (sea-level/land on a miss)
     // so raster-dem never sees a 0-dim neighbour during border backfill.
-    const mf = await manifest(env);
+    const mf = await manifest(renv);
     if (z <= mf.planet.max_zoom) {
-      const t = await tile(env, "planet.pmtiles", z, x, y);
+      const t = await tile(renv, "planet.pmtiles", z, x, y);
       return t
         ? sendTile(t, WEBP, await contentEtag(t))
         : sendTile(await seaLevelBytes(), WEBP, await seaLevelEtag());
@@ -614,7 +643,7 @@ export default {
     if (ov) {
       if (z <= ov.maxZoom) {
         try {
-          const t = await tile(env, ov.file, z, x, y);
+          const t = await tile(renv, ov.file, z, x, y);
           if (t) return sendTile(t, WEBP, await contentEtag(t));
         } catch (e) {
           console.log(`overlay ${ov.file} failed at ${z}/${x}/${y}: ${e}`);

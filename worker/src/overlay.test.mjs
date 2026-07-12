@@ -1,6 +1,6 @@
 // Run: node src/overlay.test.mjs   (Node ≥22.18 strips the imported .ts)
 import assert from "node:assert/strict";
-import { overlayFor } from "./overlay.ts";
+import { overlayFor, previewRoute } from "./overlay.ts";
 
 const ov = {
   split_z: 5,
@@ -32,3 +32,25 @@ assert.equal(overlayFor(ov, 14, (10 << 9) - 1, (12 << 9) - 1).file, "overlay-5-9
 assert.equal(overlayFor(ov, 14, 10 << 9, (12 << 9) - 1), null);
 
 console.log("overlay.ts ok — cell routing, misses, corners, over-max resolution");
+
+// ── previewRoute: leading sha segment → build prefix + rewritten rel/mount ────
+const B = "/bathymetry/build";
+const sha = "a".repeat(40);
+assert.deepEqual(previewRoute(`/${sha}/3/1/2.webp`, B), {
+  prefix: `bathymetry/build/${sha}/`,
+  rel: "/3/1/2.webp",
+  mount: `${B}/${sha}`,
+});
+// A bare sha strips to "/"; a JSON endpoint keeps its path.
+assert.equal(previewRoute(`/${sha}`, B).rel, "/");
+assert.equal(previewRoute(`/${sha}/manifest.json`, B).rel, "/manifest.json");
+// A 7-char short sha is accepted; the 7-char floor is what stops a bare z/x/y
+// path (single-digit zoom) from ever being read as a build id.
+assert.equal(
+  previewRoute("/abc1234/0/0/0.pbf", B).prefix,
+  "bathymetry/build/abc1234/",
+);
+assert.equal(previewRoute("/3/1/2.webp", B), null); // no sha → 404
+assert.equal(previewRoute("/NOTHEX0/0/0/0.pbf", B), null); // non-hex → 404
+
+console.log("previewRoute ok — sha peel, rel/mount rewrite, hex+length guard");

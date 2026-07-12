@@ -1,0 +1,98 @@
+name: Deploy preview worker
+
+# One long-lived Worker serves every build preview at
+# data.openwaters.io/bathymetry/build/<sha>/... by reading each build straight from
+# the public data bucket (build.yml writes bathymetry/build/<sha>/). So there is no
+# per-build deploy — a build is previewable the moment its manifest.json lands.
+# Redeploy only when the Worker (or the @openwaters/seascape style it bundles) changes.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "worker/**"
+      - "style/**"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/deploy-preview-worker.yml"
+  workflow_dispatch:
+
+# Never let two preview deploys race the same Worker; a newer push wins.
+concurrency:
+  group: deploy-preview-worker
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: Install workspace (runs the style package's prepare — tsc → style/dist)
+        run: npm ci
+      - name: wrangler deploy --env preview
+        working-directory: worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+        # The env binds the `data` bucket by name in wrangler.toml — no bucket sed
+        # (that's a prod-only concern for the secret-named serving bucket).
+        run: npx wrangler deploy --env preview
+
+  # Probe the live preview against one real build: confirms the route intercepts
+  # data.openwaters.io/bathymetry/build/* (vs the R2 custom domain serving raw
+  # objects), the Worker reads the data bucket, and per-build prefix resolution +
+  # planet overzoom work. Only format-stable endpoints (raster tile, raster.json,
+  # manifest) are probed — vector.pmtiles is absent in pre-refactor builds, and a
+  # preview must serve any historical build the bucket still holds, so any complete
+  # build proves the plumbing; no need to find the newest.
+  smoke-test:
+    needs: deploy
+    runs-on: ubuntu-latest
+    env:
+      DATA_BUCKET: data
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      AWS_ENDPOINT_URL: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+    steps:
+      - name: Probe a build's preview
+        run: |
+          set -uo pipefail
+          # List only the build dirs (delimiter → one cheap LIST of ~N prefixes, NOT a
+          # --recursive walk of every build's thousands of tiles/shards — that's a big
+          # payload and dozens of Class-A ops), then take the first whose manifest.json
+          # exists. manifest.json is written last, so its presence marks a complete build;
+          # HEAD is a cheap Class-B op and complete builds are the norm, so this is usually
+          # a single HEAD. Lexical (sha) order — recency doesn't matter for the probe.
+          sha=""
+          for c in $(aws s3 ls "s3://$DATA_BUCKET/bathymetry/build/" | awk '/ PRE /{print $2}' | tr -d /); do
+            if aws s3api head-object --bucket "$DATA_BUCKET" \
+                 --key "bathymetry/build/$c/manifest.json" >/dev/null 2>&1; then
+              sha=$c; break
+            fi
+          done
+          if [ -z "$sha" ]; then
+            echo "::notice::no complete build/<sha>/ in the data bucket — skipping preview smoke test"
+            exit 0
+          fi
+          BASE="https://data.openwaters.io/bathymetry/build/$sha"
+          echo "probing preview of build $sha"
+          fail=0
+          # HEAD only (-I): exercises the route/binding without pulling tile bytes.
+          # No -f, so we read the real status code ourselves.
+          check() { # label want-code url [want-content-type-substr]
+            local label=$1 want=$2 url=$3 want_ct=${4:-} out code ct
+            out=$(curl -sS -I -o /dev/null -w '%{http_code} %{content_type}' "$url") || out="000 -"
+            code=${out%% *}; ct=${out#* }
+            if [ "$code" = "$want" ] && { [ -z "$want_ct" ] || [[ "$ct" == *"$want_ct"* ]]; }; then
+              echo "ok   $label → $code $ct"
+            else
+              echo "::error::$label → got '$code $ct', want '$want ${want_ct:-any}'  ($url)"
+              fail=1
+            fi
+          }
+          check "raster tile" 200 "$BASE/0/0/0.webp"     image/webp
+          check "raster.json" 200 "$BASE/raster.json"    json
+          check "manifest"    200 "$BASE/manifest.json"  json
+          exit $fail
