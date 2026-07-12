@@ -8,6 +8,7 @@ Vendored from mapterhorn (BSD-3, (c) 2025 mapterhorn; see LICENSE.mapterhorn).
 import subprocess
 from pathlib import Path
 from glob import glob
+import gzip
 import math
 import os
 import hashlib
@@ -16,8 +17,31 @@ import numpy as np
 
 from rasterio.warp import transform_bounds
 import mercantile
+import pmtiles.tile as _pmtiles_tile
+import pmtiles.writer as _pmtiles_writer
 from pmtiles.tile import zxy_to_tileid, tileid_to_zxy, TileType, Compression
 from pmtiles.writer import Writer
+
+
+# Reproducible pmtiles: the Writer gzip-compresses its directory + metadata with gzip's
+# default mtime = wall-clock, so two archives with byte-identical tiles differed in the 4
+# mtime bytes of each gzip header — non-reproducible builds (the bundle md5s in
+# manifest.json churned every run) and a whole-file diff that couldn't confirm identical
+# content. Pin mtime=0 for pmtiles' gzip only (rebind the name in the two library modules,
+# not the process-wide gzip — source tarballs etc. keep their real mtimes), so an archive
+# is a pure function of its tiles. Both modules reference module-level `gzip.compress` /
+# `gzip.decompress` at call time, so rebinding the attribute suffices.
+class _DeterministicGzip:
+    @staticmethod
+    def compress(data, *args, **kwargs):
+        kwargs.setdefault("mtime", 0)
+        return gzip.compress(data, *args, **kwargs)
+
+    decompress = staticmethod(gzip.decompress)
+
+
+_pmtiles_tile.gzip = _DeterministicGzip
+_pmtiles_writer.gzip = _DeterministicGzip
 
 # macrotile_z is the covering granularity AND the universal tiling floor: every
 # source is tiled to at least this zoom, so aggregation-tile zoom never exceeds a
