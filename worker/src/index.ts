@@ -2,7 +2,7 @@
  * Unified bathymetry tile endpoint.
  *
  *   GET /seascape/{z}/{x}/{y}.webp  (or .png)  → Terrarium WebP (raster terrain)
- *   GET /seascape/{z}/{x}/{y}.pbf   (or .mvt)  → MVT (vector — contours, soundings, drying)
+ *   GET /seascape/{z}/{x}/{y}.pbf   (or .mvt)  → MVT (vector — contours, soundings, depare)
  *   GET /seascape/coverage/{z}/{x}/{y}.pbf     → MVT (source-provenance footprints)
  *
  * Extension picks the representation: webp/png → raster, pbf/mvt → vector.
@@ -32,6 +32,7 @@ import { CachedSource, contentEtag, OVERZOOM_TAG_VERSION } from "./cache";
 import { coverageTileJSON } from "./coverage";
 import { unpackTerrarium, packTerrariumInto, cubicBSpline } from "./terrarium";
 import { OverlayIndex, overlayFor, previewRoute } from "./overlay";
+import { limiter } from "./semaphore";
 // jSquash on Workers: WASM must be imported as a module and passed to init()
 // (no fetch-based instantiation in the Workers runtime).
 import decodeWebp, { init as initWebpDecode } from "@jsquash/webp/decode";
@@ -157,6 +158,14 @@ async function tile(
 // handler can derive the tile's validator from the ancestor bytes (the output
 // is a pure function of them) and skip this work entirely on a matching
 // revalidation.
+// Decode + B-spline + re-encode each hold several MB of libwebp working memory.
+// A request burst over a detailed region ran enough concurrently to exhaust the
+// isolate — malloc returned null and jsquash threw "Decoding error" on tiles that
+// are perfectly valid (they decode fine one at a time). Cap the concurrency so the
+// slow overzoom path queues instead of OOMing.
+// ponytail: fixed cap; raise it if bursts still starve throughput.
+const overzoomGate = limiter(4);
+
 async function synthesize(
   parent: ArrayBuffer,
   srcMax: number,
@@ -254,9 +263,14 @@ const CORS = { "access-control-allow-origin": "*" };
 // serving them (refreshing in the background) so a nav app shows stale bathymetry over a blank tile.
 // s-maxage governs the colo cache: entries live long because cache keys are
 // release-scoped — a deploy switches namespaces, so freshness comes from the
-// key, not the TTL. Browsers ignore s-maxage and keep the 1 h max-age.
+// key, not the TTL. Browsers ignore s-maxage and keep the 1 day max-age.
+// max-age is 1 day, not 1 h: every browser-cache expiry fires a conditional
+// request that still bills as a Worker invocation (cache hits are billed), so a
+// longer window cuts revalidation traffic ~24×. The trade is a released
+// bathymetry correction can take up to a day to reach a client that already
+// cached the tile; stale-if-error still serves the old tile if a fetch fails.
 const TILE_CACHE =
-  "public, max-age=3600, s-maxage=2592000, stale-while-revalidate=31536000, stale-if-error=31536000";
+  "public, max-age=86400, s-maxage=2592000, stale-while-revalidate=31536000, stale-if-error=31536000";
 const WEBP = {
   "content-type": "image/webp",
   "cache-control": TILE_CACHE,
@@ -491,18 +505,18 @@ export default {
             },
           },
           {
-            // Green-foreshore polygons (drying areas) — geometry only, no attributes.
-            id: "drying",
-            fields: {},
-          },
-          {
-            // Depth-band partitions (ENC DEPARE): water between charted
-            // isobaths, drval1/drval2 = shallow/deep bound (positive-down m).
+            // Depth-area partitions (ENC DEPARE): three feature kinds keyed by
+            // attribute presence — depth bands (drval1/drval2 = shallow/deep
+            // bound, positive-down m; sys tags the m/ft ladder), drying (negative
+            // drval1, no sys), and unknown-depth water (no drval1, `kind` carries
+            // the OSM water subtype). `rank` orders them within the fill.
             id: "depare",
             fields: {
               drval1: "Number",
               drval2: "Number",
               sys: "String",
+              kind: "String",
+              rank: "Number",
             },
           },
         ],
@@ -589,7 +603,10 @@ export default {
       if (!parent) return null; // ancestor missing; caller tries the next source
       const tag = await contentEtag(parent, OVERZOOM_TAG_VERSION + "-");
       if (inm === tag) return notModified(tag);
-      return sendTile(await synthesize(parent, srcMax, z, x, y), WEBP, tag);
+      const body = await overzoomGate(() =>
+        synthesize(parent, srcMax, z, x, y),
+      );
+      return sendTile(body, WEBP, tag);
     };
 
     const isVector = ext === "pbf" || ext === "mvt";

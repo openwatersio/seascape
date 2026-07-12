@@ -1,0 +1,109 @@
+name: GC
+
+# Out-of-band garbage collection for the immutable, content-addressed store (build.yml's phase-4
+# design). Deletion is done HERE and nowhere else: a build only ever ADDS content names + a new
+# store manifest and flips the pointer, so superseded keys accumulate as unreferenced garbage that
+# this collects.
+#
+# Deletes:
+#   - store artifacts under pmtiles/ contour/ soundings/ depare/ NOT referenced by the union of the
+#     last N=3 store manifests (keeps a couple of builds of hydrate/rollback headroom). Pre-phase-4
+#     mutable-named artifacts + their .key sidecars fall out for free here — they sit in those
+#     prefixes and no manifest names them.
+#   - retired diff-era aggregation/<ulid>/ coverings (phase 4 hydrates from the manifest, so nothing
+#     reads a covering from R2 any more).
+#   - volatile sources' retired source/<id>/.recipe-hash markers (their hash lives in catalog.json
+#     now — sources.yml).
+# NEVER touches: build/<sha>/ (an R2 lifecycle rule collects it after 7 days — see release.yml — and
+# releases live in the separate tiles bucket, so keeping build/<sha>/ out of GC scope is the
+# conservative choice), source COGs/bounds.csv/catalog.json (sources.yml owns them), the LIVE
+# landmask/.recipe-hash, the store manifests, or the pointer.
+#
+# Guards: refuse to delete anything unless the pointer AND every one of the last N manifests fetch
+# as valid JSON, and unless the referenced set actually matches objects present in the store (a
+# path/listing mismatch must never delete the world); log a full per-prefix inventory before
+# deleting; delete in bounded batches. Shares build.yml/sources.yml's r2-store concurrency group, so
+# it can never run during a build or a source refresh.
+#
+# The referenced-set arithmetic + every refusal guard live in scripts/gc-collect.sh — ONE
+# implementation, invoked here with the rclone backend and by pipelines/test_gc.sh with the local
+# backend (ci.yml runs the test on every push), so this workflow and its test cannot drift.
+
+on:
+  schedule:
+    - cron: "17 4 * * 2" # weekly Tuesday 04:17 UTC — a day off sources.yml (Mon) and no build overlap
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "List what would be deleted without deleting (manual runs default to a dry run; the weekly cron always deletes)"
+        type: boolean
+        default: true
+
+env:
+  DATA_BUCKET: data # the public data bucket (data.openwaters.io), bathymetry/ store
+  # rclone reads these for the R2 remote (same pattern as release.yml).
+  RCLONE_CONFIG_R2_TYPE: s3
+  RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+  RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  RCLONE_CONFIG_R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+  RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
+  # schedule → always delete; manual dispatch → honor the dry_run input (default true).
+  DRY_RUN: ${{ github.event_name == 'schedule' && 'false' || inputs.dry_run }}
+  KEEP_MANIFESTS: "3" # union of the last N store manifests = the referenced set
+
+# The store is shared: GC deletes, a build/source-refresh writes, so they must never interleave —
+# ONE concurrency group with build.yml and sources.yml. No cancel-in-progress: queue, never cancel.
+concurrency:
+  group: r2-store
+  cancel-in-progress: false
+
+jobs:
+  gc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6 # for scripts/gc-collect.sh
+
+      - name: Install pinned rclone
+        run: |
+          set -euo pipefail
+          # Pinned, sha256-verified rclone 1.74.4 — apt's 1.60.1 501s on R2's version-id responses
+          # (same pin as build.yml/sources.yml/release.yml). jq is preinstalled on the runner.
+          curl -fsSL -o /tmp/rclone.zip "https://downloads.rclone.org/v1.74.4/rclone-v1.74.4-linux-amd64.zip"
+          echo "fe435e0c36228e7c2f116a8701f01127bb1f694005fc11d1f27186c8bca4115d  /tmp/rclone.zip" | sha256sum -c
+          unzip -q -j /tmp/rclone.zip '*/rclone' -d /tmp/rclone-bin
+          sudo install /tmp/rclone-bin/rclone /usr/local/bin/rclone
+
+      - name: Collect + delete
+        run: |
+          set -euo pipefail
+          R2="R2:$DATA_BUCKET/bathymetry"
+          echo "GC dry_run=$DRY_RUN, keeping the last $KEEP_MANIFESTS store manifests"
+
+          # The referenced-set arithmetic, refusal guards, and inventory all live in
+          # scripts/gc-collect.sh (one implementation, shared with pipelines/test_gc.sh — see the
+          # header comment). It writes /tmp/gc-delete.txt + /tmp/gc-purge-dirs.txt and exits
+          # nonzero on any refusal; a pre-immutable store (no pointer) yields empty outputs.
+          bash scripts/gc-collect.sh rclone "$R2" "$KEEP_MANIFESTS"
+          del=$(grep -c . /tmp/gc-delete.txt || true)
+          dirs=$(grep -c . /tmp/gc-purge-dirs.txt || true)
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "dry run — nothing deleted ($del objects + $dirs covering dir(s) flagged). Re-dispatch with dry_run=false (or wait for the weekly cron) to collect."
+            exit 0
+          fi
+
+          # Delete in bounded batches (files via --files-from, coverings via purge).
+          if [ "$del" -gt 0 ]; then
+            split -l 1000 -d /tmp/gc-delete.txt /tmp/gc-batch-
+            for b in /tmp/gc-batch-*; do
+              echo "deleting $(wc -l < "$b") objects"
+              rclone delete "$R2" --files-from "$b"
+            done
+          fi
+          while IFS= read -r d; do
+            [ -n "$d" ] || continue
+            echo "purging covering $d"
+            rclone purge "$R2/aggregation/$d"
+          done < /tmp/gc-purge-dirs.txt
+          echo "GC complete: deleted $del objects + $dirs covering dir(s)"

@@ -30,20 +30,17 @@ def run(tmp, *args):
 
 
 def check_remote_parsers():
-    """Streaming-source URL/name parsing — the bits that bit us (mixed n39x00/n25X75 case,
-    .shx sidecars in the manifest, virtual-host vs s3:// URLs, newest-gpkg resolution)."""
+    """Mirrored-source URL/name parsing — the bits that bite (virtual-host vs s3://
+    URLs, the fixed-width S-102 issue field that defeats a trailing-digits strip).
+    Import-level sanity too: source_mirror's own --check covers its behavior in depth."""
+    import source_mirror as sm
     import source_remote as sr
-    import source_register_remote_urllist as ru
-    import source_register_remote_geopkg as rg
     assert sr.to_vsicurl("https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/X/t.tif") \
         == "/vsicurl/https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/X/t.tif"
     assert sr.to_vsicurl("s3://b/k/t.tif") == "/vsicurl/https://b.s3.amazonaws.com/k/t.tif"
-    assert ru.tile_lonlat("ncei19_n39x00_w075x25_2014v1.tif") == (-75.25, 39.0)
-    assert ru.tile_lonlat("ncei19_n25X75_w080X25_2018v1.tif") == (-80.25, 25.75)  # uppercase X
-    assert ru.tile_lonlat("southeast_topobathy_19.shx") is None  # sidecar, unparseable
-    assert rg._newest_key(
-        "<r><Contents><Key>a/x_20240101.gpkg</Key></Contents>"
-        "<Contents><Key>a/x_20260616.gpkg</Key></Contents></r>").endswith("20260616.gpkg")
+    assert sm.cell_key("ed3.0.0/x/102US004LA1DO2622F7.h5") == "102US004LA1DO"
+    assert sm._split_bucket_key("https://noaa-s102-pds.s3.amazonaws.com/ed3.0.0/") \
+        == ("noaa-s102-pds", "ed3.0.0/")
     print("remote parsers ok")
 
 
@@ -68,7 +65,7 @@ def main():
         for step in (["source_datum.py", sid, "--negate", "--offset", "-1"],
                      ["source_normalize.py", sid, "--crs", "EPSG:4326", "--nodata", "-9999"],
                      ["source_bounds.py", sid], ["source_polygonize.py", sid, "2"],
-                     ["source_create_tarball.py", sid]):
+                     ["source_create_tarball.py", sid], ["source_catalog.py", sid]):
             run(tmp, *step)
 
         norm = f"{tmp}/store/source/{sid}/{sid}_0.tif"
@@ -79,9 +76,19 @@ def main():
         assert out[0, 0] == -6.0 and out[1, 2] == -101.0, out  # negate then -1 m
         assert not valid[0, 2], "nodata pixel should remain nodata"
         for artifact in (f"{tmp}/store/source/{sid}/bounds.csv",
+                         f"{tmp}/store/source/{sid}/datum.json",
+                         f"{tmp}/store/source/{sid}/catalog.json",
                          f"{tmp}/store/polygon/{sid}.gpkg",
                          f"{tmp}/store/tar/{sid}.tar"):
             assert os.path.exists(artifact), artifact
+        # The catalog folds in the recorded transform (negate + −1 m offset), the assigned CRS,
+        # and the file count — the datum offset was invisible downstream before it was recorded.
+        with open(f"{tmp}/store/source/{sid}/catalog.json") as jf:
+            item = json.load(jf)
+        p = item["properties"]
+        assert item["id"] == sid and item["bbox"], item
+        assert p["seascape:negate"] is True and p["seascape:datum_offset_m"] == -1.0, p
+        assert p["proj:epsg"] == 4326 and p["seascape:file_count"] == 1, p
         print("source stage e2e ok")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

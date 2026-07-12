@@ -50,7 +50,12 @@ jobs:
           RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true" # don't HEAD/create the bucket (R2 perms)
         run: |
           set -euo pipefail
-          sudo apt-get install -y rclone
+          # Pinned current rclone — apt ships 1.60.1 (2022), stale against R2's API
+          # (see the mirror step in sources.yml).
+          curl -fsSL -o /tmp/rclone.zip "https://downloads.rclone.org/v1.74.4/rclone-v1.74.4-linux-amd64.zip"
+          echo "fe435e0c36228e7c2f116a8701f01127bb1f694005fc11d1f27186c8bca4115d  /tmp/rclone.zip" | sha256sum -c
+          unzip -q -j /tmp/rclone.zip '*/rclone' -d /tmp/rclone-bin
+          sudo install /tmp/rclone-bin/rclone /usr/local/bin/rclone
           src="R2:$DATA_BUCKET/bathymetry/build/$SHA"
           dst="R2:$TILES_BUCKET/seascape/$SHA"
           echo "publishing $src → $dst"

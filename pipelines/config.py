@@ -14,11 +14,16 @@ SOURCES_DIR = os.environ.get("SOURCES_DIR", "../sources")
 
 # Standard INT isobaths (IHO S-4 B-411), metres, most-negative first. The shallow
 # ladder (2/5/10/20/30) is also the S-52 safety-contour value set; fine depth detail
-# between curves is the soundings layer's job, not extra isobaths.
-CONTOUR_LEVELS = [int(x) for x in (
+# between curves is the soundings layer's job, not extra isobaths. Env-tunable like the
+# other contour knobs; the resolved list enters the contour/depare tile keys. The style
+# hand-mirrors the DEFAULT (style/index.ts DEPARE_LADDER_M/FT), so contour_run/depare_run
+# warn when an override diverges from CONTOUR_LEVELS_DEFAULT.
+_CONTOUR_LEVELS_DEFAULT = (
     "-10000 -8000 -6000 -5000 -4000 -3000 -2000 -1000 -500 -300 -200 "
     "-100 -50 -30 -20 -10 -5 -2"
-).split()]
+)
+CONTOUR_LEVELS_DEFAULT = [int(x) for x in _CONTOUR_LEVELS_DEFAULT.split()]
+CONTOUR_LEVELS = [int(x) for x in os.environ.get("CONTOUR_LEVELS", _CONTOUR_LEVELS_DEFAULT).split()]
 
 # Drying areas (green foreshore): seabed above chart datum that covers/uncovers with the tide —
 # elevation in [0, DRYING_CAP] seaward of the OSM land line. The cap (metres, ~the Bay of Fundy
@@ -52,6 +57,68 @@ def sources():
 def load_metadata(source):
     with open(f"{SOURCES_DIR}/{source}/metadata.json") as f:
         return json.load(f)
+
+
+# Cache the generated catalog item per (cwd, source): a build hydrates it once and never
+# rewrites it, and the tile keys read it per source per tile. cwd is in the key so a test that
+# chdirs between tmp stores never sees another store's item.
+_catalog_cache = {}
+
+
+def load_catalog(source):
+    """The generated ``store/source/<id>/catalog.json`` item if present, else None. The item is
+    the single machine-facing view of a source (bounds + recorded datum offset + flags + recipe
+    hash); phase 3 re-points the build's per-source reads at it, with metadata.json as fallback."""
+    ck = (os.getcwd(), source)
+    if ck not in _catalog_cache:
+        path = f"store/source/{source}/catalog.json"
+        item = None
+        if os.path.isfile(path):
+            with open(path) as f:
+                item = json.load(f)
+        _catalog_cache[ck] = item
+    return _catalog_cache[ck]
+
+
+# Build property -> the catalog item's seascape:* field. The catalog item is generated from
+# metadata.json (+ the datum sidecar) at source-prep time, so the two agree; metadata.json stays
+# the fallback until every source has re-registered with an item.
+_CATALOG_KEY = {
+    "priority": "seascape:priority",
+    "max_zoom": "seascape:max_zoom",
+    "land_clamp": "seascape:land_clamp",
+    "offset": "seascape:datum_offset_m",
+    "negate": "seascape:negate",
+    "volatile": "seascape:volatile",
+    "band": "seascape:band",
+    "mixed_crs": "seascape:mixed_crs",
+}
+
+
+def source_property(source, name, default=None):
+    """A source's build property (priority/max_zoom/land_clamp/offset/negate/volatile/band/
+    mixed_crs), read from the catalog item's seascape:<field> when present, else metadata.json.
+    ``offset`` lives only in the catalog (recorded by source_datum at prep time), so it defaults
+    to 0 without an item."""
+    cat = load_catalog(source)
+    if cat is not None:
+        val = cat.get("properties", {}).get(_CATALOG_KEY[name])
+        if val is not None:  # a genuinely-null field (an uncapped max_zoom) falls through
+            return val
+    if name == "offset":
+        return default if default is not None else 0.0
+    return load_metadata(source).get(name, default)
+
+
+def source_recipe_hash(source):
+    """The content hash the source stage stamped into the catalog item (seascape:recipe_hash) —
+    the per-source input the tile keys read. None locally (RECIPE_HASH is empty on a laptop) and
+    with no item: the covering row + resolved props still key the tile, so a local build stays
+    incremental on source-file/metadata changes."""
+    cat = load_catalog(source)
+    if cat is None:
+        return None
+    return cat.get("properties", {}).get("seascape:recipe_hash")
 
 
 def source_path(source, filename):

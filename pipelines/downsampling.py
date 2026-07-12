@@ -7,17 +7,14 @@ keep full Terrarium precision (no per-zoom quantization) but route through
 encode.py so the conservative (never-deepen) rounding still applies. WebP is
 decoded with imagecodecs (no PIL dependency).
 
-``run`` builds the whole dirty pyramid on one machine; ``run shard i n`` /
-``run tail`` split it across CI runners (see ``run`` for the cut).
+``run`` builds the whole dirty pyramid on one machine, high child_zoom first so each
+level feeds the next.
 
 Usage (from pipelines/):
   downsampling.py cover
-  downsampling.py run [shard <i> <n> | tail]
-  downsampling.py matrix <max>            # CI shard matrix JSON, sized to the dirt
+  downsampling.py run
 """
 
-import json
-import math
 import os
 import shutil
 import sys
@@ -31,7 +28,15 @@ import numpy as np
 from pmtiles.reader import Reader, MmapSource
 
 import encode
+import keys
 import utils
+
+# An overview's key = H(its children's terrain/overview keys ‖ these modules ‖ config), and it
+# rides in the overview's content name (keys.content_path). A changed child gets a new content name
+# -> a new key here -> a new overview name that isn't present yet -> stale, so the mtime staleness-
+# cascade is gone and missing-artifact self-heal is inherent (no file -> stale). The child key is
+# read straight off the child's content filename, not a sidecar.
+DOWNSAMPLE_MODULES = ["downsampling", "encode", "utils"]
 
 
 # ── cover ────────────────────────────────────────────────────────────────────
@@ -110,15 +115,13 @@ def create_tile(parent_x, parent_y, parent_z, tmp_folder, pmtiles_filenames):
             if child not in tile_to_filename:
                 continue
             filename = tile_to_filename[child]
-            fz, fx, fy, _ = (int(a) for a in filename.replace(".pmtiles", "").split("-"))
-            folder = utils.get_pmtiles_folder(fx, fy, fz)
-            child_path = f"{folder}/{filename}"
-            # A tile the covering referenced but no aggregate/downsample shard produced
-            # (or that didn't sync): record it and leave this quadrant empty for now —
-            # execute() raises once the level finishes, failing the build rather than
+            child_path = _child_content(filename)
+            # A tile the covering referenced but the aggregate/downsample run never produced
+            # (a prior failed/interrupted build): record it and leave this quadrant empty for
+            # now — execute() raises once the level finishes, failing the build rather than
             # publishing a holed pyramid (the Worker overzooms GEBCO into such holes, so
             # they surface as missing high-zoom terrain).
-            if not os.path.isfile(child_path):
+            if child_path is None:
                 missing.add(filename)
                 continue
             with open(child_path, "r+b") as f:
@@ -136,207 +139,114 @@ def create_tile(parent_x, parent_y, parent_z, tmp_folder, pmtiles_filenames):
 
 
 def run_one(filepath):
-    """Build one parent pmtiles. Returns the set of missing child filenames (empty if
-    already done). Pure per-filepath unit of work — safe to run in a process Pool."""
-    aggregation_id, filename = filepath.split("/")[-2:]
-    if os.path.isfile(filepath.replace("-downsampling.csv", "-downsampling.done")):
-        return set()
-    z, x, y, parent_zoom = (int(a) for a in filename.replace("-downsampling.csv", "").split("-"))
-    out_folder = utils.get_pmtiles_folder(x, y, z)
-    utils.create_folder(out_folder)
-    out_filepath = f"{out_folder}/{z}-{x}-{y}-{parent_zoom}.pmtiles"
+    """Build one parent pmtiles. Returns the set of missing child filenames (empty if none).
+    Pure per-filepath unit of work — safe to run in a process Pool."""
+    # Content-addressed now — the base's "invalidate the sidecar before writing" (72c4034) is
+    # subsumed: keys.supersede clears last build's content name before the atomic publish below, so
+    # a crash mid-archive leaves nothing at the current key and the overview reads stale next run.
+    z, x, y, parent_zoom = (int(a) for a in
+                            filepath.split("/")[-1].replace("-downsampling.csv", "").split("-"))
+    logical = _overview_artifact(filepath)       # {folder}/{z}-{x}-{y}-{parent_zoom}.pmtiles (base)
 
     extent = mercantile.Tile(x=x, y=y, z=z)
     tmp_folder = filepath.replace("-downsampling.csv", "-tmp")
     utils.create_folder(tmp_folder)
-    with open(filepath) as f:
-        pmtiles_filenames = [a.strip() for a in f.readlines()[1:]]
+    pmtiles_filenames = _children(filepath)
 
     missing = set()
     parents = [extent] if z == parent_zoom else list(mercantile.children(extent, zoom=parent_zoom))
     for parent in parents:
         missing |= create_tile(parent.x, parent.y, parent.z, tmp_folder, pmtiles_filenames)
-    utils.create_archive(tmp_folder, out_filepath)
-    shutil.rmtree(tmp_folder)
-    # Don't mark done when a referenced child was missing — leave it dirty so a rerun
-    # (after the upstream gap is fixed) rebuilds it instead of skipping it forever.
+    # Don't publish when a referenced child was missing — leave the overview stale so a rerun
+    # (after the upstream gap is fixed) rebuilds it. The children were all rebuilt earlier this
+    # run (finest first), so their content names are final now — _overview_key reads their
+    # settled keys. supersede clears last build's overview key before the atomic publish.
     if not missing:
-        utils.run_command(f'touch {filepath.replace("-downsampling.csv", "-downsampling.done")}')
+        tmp_archive = f"{tmp_folder}/overview.pmtiles"   # not *.webp, so create_archive skips it
+        utils.create_archive(tmp_folder, tmp_archive)
+        keys.supersede(logical)
+        keys.publish(tmp_archive, keys.content_path(logical, _overview_key(filepath)))
+    shutil.rmtree(tmp_folder)
     return missing
 
 
-def tiles_intersect(a, b):
-    if a == b:
-        return True
-    if a.z < b.z and mercantile.parent(b, zoom=a.z) == a:
-        return True
-    if b.z < a.z and mercantile.parent(a, zoom=b.z) == b:
-        return True
-    return False
+def _children(filepath):
+    with open(filepath) as f:
+        return [line.strip() for line in f.readlines()[1:] if line.strip()]
 
 
-# Below this zoom an overview archive's parent spans 4 different ancestors, so the
-# work can't be partitioned spatially — every aggregation work tile sits at or above
-# it (it's the covering's seed zoom). At or above it, extent zoom only ever climbs as
-# tiles coarsen along a lineage, so a finer child shares its parent's ancestor: a
-# shard owning an ancestor reads only tiles already inside it. So: z >= here → shard
-# by ancestor; below → the single-runner tail (a few cheap global levels).
-SHARD_ROOT_Z = max(utils.macrotile_z - utils.num_overviews, 0)
+def _child_logical(child_filename):
+    """The LOGICAL base path of a child ('8-77-95-8.pmtiles' -> 'store/pmtiles/7-38-47/8-77-95-8.pmtiles')
+    — content_path splices a key onto this."""
+    z, x, y, _cz = (int(a) for a in child_filename.replace(".pmtiles", "").split("-"))
+    return f"{utils.get_pmtiles_folder(x, y, z)}/{child_filename}"
 
 
-def ancestor_id(z, x, y):
-    """The SHARD_ROOT_Z-ancestor id of a tile, or None if below the root zoom."""
-    if z < SHARD_ROOT_Z:
-        return None
-    tile = mercantile.Tile(x=x, y=y, z=z)
-    a = tile if z == SHARD_ROOT_Z else mercantile.parent(tile, zoom=SHARD_ROOT_Z)
-    return f"{a.z}-{a.x}-{a.y}"
+def _child_content(child_filename):
+    """Resolve a covering's LOGICAL child name ('8-77-95-8.pmtiles') to its content-addressed
+    file on disk ('.../8-77-95-8-<key>.pmtiles'), or None if absent. The per-stem sweep guarantees
+    at most one content file per logical stem — enforced here, because two matches would make the
+    parent's key depend on glob order (nondeterministic run-to-run)."""
+    logical = _child_logical(child_filename)
+    root, ext = os.path.splitext(logical)
+    matches = sorted(glob(f"{root}-*{ext}"))
+    if len(matches) > 1:
+        raise SystemExit(f"{logical}: {len(matches)} content files for one logical child "
+                         f"({', '.join(os.path.basename(m) for m in matches)}) — the per-stem "
+                         "sweep guarantees at most one; refusing a nondeterministic overview key")
+    return matches[0] if matches else None
 
 
-def shard_ancestor(filepath):
-    """The SHARD_ROOT_Z-ancestor id a deep downsampling csv belongs to, or None if
-    it's a tail csv (extent below the root zoom, so its output spans ancestors)."""
-    z, x, y, _ = (int(a) for a in filepath.split("/")[-1].replace("-downsampling.csv", "").split("-"))
-    return ancestor_id(z, x, y)
+def _child_key(child_filename):
+    """The 12-hex key of a child, read straight off its content filename (the terrain key of an
+    aggregate child, the overview key of a coarser one). Empty string when the child is absent, so
+    the child's stem alone still keeps a vanished/rebuilt child moving the overview key."""
+    p = _child_content(child_filename)
+    return keys.stem_and_key(p)[1] if p else ""
 
 
-def ancestor_weights():
-    """Dirty deep work per SHARD_ROOT_Z ancestor: each -downsampling.csv at extent z
-    builds 4**(parent_zoom - z) parent webps of uniform cost. Striding by ancestor
-    *count* ignored this and put a deep hi-res subtree (77 min) next to hundreds of
-    couple-of-overview shards (~2 min, all runner spin-up)."""
-    weights = {}
-    for fp in work_list():
-        a = shard_ancestor(fp)
-        if a is None:
-            continue
-        z, _, _, parent_zoom = (int(v) for v in fp.split("/")[-1]
-                                .replace("-downsampling.csv", "").split("-"))
-        weights[a] = weights.get(a, 0) + 4 ** (parent_zoom - z)
-    return weights
+def _overview_key(filepath):
+    """A content-hash key from the children's own keys (in their content filenames). A rebuilt
+    child gets a new content name -> a new key here -> a new overview name, cascading the change up
+    by construction; a missing child contributes an empty key on its stem."""
+    inputs = sorted(f"{c}:{_child_key(c)}" for c in _children(filepath))
+    return keys.stage_key(inputs, DOWNSAMPLE_MODULES, {"num_overviews": utils.num_overviews})
 
 
-def owned_ancestors(i, n):
-    """The dirty deep ancestors shard i of n owns — the same weighted bin-packing
-    run() and matrix() use, so shard-keys and run agree on what a shard touches.
-    Derived from the frozen work list, so every shard computes the identical split."""
-    return set(utils.lpt_bins(ancestor_weights(), n)[i])
+def _overview_artifact(filepath):
+    z, x, y, parent_zoom = (int(a) for a in
+                            filepath.split("/")[-1].replace("-downsampling.csv", "").split("-"))
+    return f"{utils.get_pmtiles_folder(x, y, z)}/{z}-{x}-{y}-{parent_zoom}.pmtiles"
 
 
-def shard_keys(i, n):
-    """Filter store/pmtiles-keys.txt (the listing of already-built tiles) to the tiles shard i reads —
-    those under its owned ancestors — and write them to store/shard-keys.txt. Lets CI
-    pull a shard's slice of the pmtiles store instead of the whole tens-of-GB store
-    (a tile's extent zoom is monotonic with content, so everything a shard reads sits
-    under one of its ancestors)."""
-    owned = owned_ancestors(i, n)
-    with open("store/pmtiles-keys.txt") as f:
-        keys = [line.strip() for line in f if line.strip()]
-    out = []
-    for key in keys:
-        name = key.split("/")[-1]
-        if not name.endswith(".pmtiles"):
-            continue
-        try:
-            z, x, y, _ = (int(a) for a in name.replace(".pmtiles", "").split("-"))
-        except ValueError:
-            continue
-        if ancestor_id(z, x, y) in owned:
-            out.append(key)
-    with open("store/shard-keys.txt", "w") as f:
-        f.write("".join(k + "\n" for k in out))
-    print(f"shard {i}/{n}: {len(out)} of {len(keys)} pmtiles selected")
+def _parent_zoom(filepath):
+    return int(filepath.split("/")[-1].replace("-downsampling.csv", "").split("-")[3])
 
 
 def dirty_filepaths():
-    """Sorted -downsampling.csv to (re)build: changed tiles, OR whose pmtiles is gone, OR a
-    STALE overview — older than a child it averages, or reading a child about to be rebuilt.
-
-    The missing-pmtiles case is load-bearing (same as aggregation_run): a covering whose
-    pmtiles a prior run failed to produce/sync would otherwise diff clean forever.
-
-    The stale-overview cases are equally load-bearing and were the gap. The source-change diff
-    and the missing-own-pmtiles check only fire when a tile's OWN covering changes or its OWN
-    pmtiles vanishes — neither notices when a *child* is rebuilt for any other reason (a dropped
-    shard self-healing from current data, a re-tiling). So the coarse overview above kept
-    averaging the old child and went stale forever (observed: a z6 tile 4 days older than the
-    z7 it averages). So also rebuild an overview when a child it references is missing now
-    (about to self-heal) or is newer than it. Processing finest-overview-first and treating a
-    rebuilt overview as newest makes the staleness cascade all the way up the pyramid in one pass."""
-    aggregation_ids = utils.get_aggregation_ids()
-    aggregation_id = aggregation_ids[-1]
-
-    dirty_tiles = []
-    if len(aggregation_ids) >= 2:
-        for name in utils.get_dirty_aggregation_filenames(aggregation_id, aggregation_ids[-2]):
-            z, x, y, _ = (int(a) for a in name.replace("-aggregation.csv", "").split("-"))
-            dirty_tiles.append(mercantile.Tile(x=x, y=y, z=z))
-
-    have = utils.existing_pmtiles()
-    mtimes = utils.pmtiles_mtimes()
-
-    def base_dirty(tile, filename):
-        if filename.replace("-downsampling.csv", ".pmtiles") not in have:
-            return True
-        if len(aggregation_ids) < 2:
-            return True
-        if any(tiles_intersect(d, tile) for d in dirty_tiles):
-            return True
-        return len(glob(f"store/aggregation/{aggregation_ids[-2]}/{filename}")) == 0
-
-    def children_of(filepath):
-        with open(filepath) as f:
-            return [line.strip() for line in f.readlines()[1:] if line.strip()]
-
-    def parent_zoom(filepath):
-        return int(filepath.split("/")[-1].replace("-downsampling.csv", "").split("-")[3])
-
-    # Finest overview first (high parent_zoom -> low) so a child is decided before the overview
-    # that reads it; a child marked dirty here is bumped to "newest" so the rebuild cascades up.
+    """Sorted -downsampling.csv to (re)build: an overview whose content name is absent (its
+    artifact missing — self-heal — or its key moved because its current children imply a new one),
+    OR any of whose children will be rewritten this run (their key will change, so this overview's
+    will too). Processing finest-overview-first and carrying dirty stems forward makes the staleness
+    cascade all the way up the pyramid in one pass — the key equivalent of the old mtime cascade,
+    with no listing/mtime inputs: aggregate published each terrain child's content name before
+    downsampling runs, so the lowest overviews read settled child keys, and each dirty overview
+    propagates."""
+    aggregation_id = utils.get_aggregation_ids()[-1]
+    dirty_stems = set()
     out = []
     for filepath in sorted(glob(f"store/aggregation/{aggregation_id}/*-downsampling.csv"),
-                           key=lambda fp: (-parent_zoom(fp), fp)):
-        filename = filepath.split("/")[-1]
-        z, x, y, _ = (int(a) for a in filename.replace("-downsampling.csv", "").split("-"))
-        own = filename.replace("-downsampling.csv", ".pmtiles")
-        dirty = base_dirty(mercantile.Tile(x=x, y=y, z=z), filename)
-        if not dirty:
-            children = children_of(filepath)
-            own_mt = mtimes.get(own)
-            if any(c not in have for c in children):
-                dirty = True  # a referenced child is missing -> self-healed this run -> so is this
-            elif own_mt is not None:
-                newest_child = max((mtimes[c] for c in children if c in mtimes), default=None)
-                if newest_child is not None and newest_child > own_mt:
-                    dirty = True  # overview older than a child it averages -> stale
+                           key=lambda fp: (-_parent_zoom(fp), fp)):
+        own_stem = filepath.split("/")[-1].replace("-downsampling.csv", "")
+        child_stems = [c.replace(".pmtiles", "") for c in _children(filepath)]
+        if any(cs in dirty_stems for cs in child_stems):
+            dirty = True  # a child overview will be rewritten (its key changes) -> so will this
+        else:
+            dirty = not keys.fork_fresh(_overview_artifact(filepath), _overview_key(filepath))
         if dirty:
             out.append(filepath)
-            mtimes[own] = float("inf")  # rebuilt now = newest, so overviews above rebuild too
+            dirty_stems.add(own_stem)  # cascade to the coarser overview that averages this one
     return sorted(out)
-
-
-FROZEN = "_dirty-downsample.txt"
-
-
-def freeze():
-    """Write the dirty downsampling work list into the covering dir, computed once, so it
-    travels with the covering to every shard + the tail — see aggregation_run.freeze."""
-    aggregation_id = utils.get_aggregation_ids()[-1]
-    with open(f"store/aggregation/{aggregation_id}/{FROZEN}", "w") as f:
-        f.write("".join(fp + "\n" for fp in dirty_filepaths()))
-
-
-def work_list():
-    """The frozen dirty list if present — so every deep shard AND the tail derive the SAME
-    owned-ancestor split and the SAME work, instead of each recomputing it as the store filled
-    in underneath them (which left tiles owned by no shard). Live fallback for local runs.
-    See aggregation_run.work_list."""
-    aggregation_id = utils.get_aggregation_ids()[-1]
-    path = f"store/aggregation/{aggregation_id}/{FROZEN}"
-    if os.path.isfile(path):
-        with open(path) as f:
-            return [line.strip() for line in f if line.strip()]
-    return dirty_filepaths()
 
 
 def execute(filepaths):
@@ -354,9 +264,9 @@ def execute(filepaths):
     missing = set()
     # SPAWN, not fork: downsampling imports rasterio (utils), which inits GDAL at module
     # load — GDAL is not fork-safe, so forked workers carry a broken copy that segfaults at
-    # teardown (no Python traceback, just exit 1 after the work prints). The deep shards on
-    # small runners happened to survive it; the tail on the full-store runner forks Pool()=
-    # all-cores and reliably crashed. Spawned workers re-import GDAL fresh, so teardown is clean.
+    # teardown (no Python traceback, just exit 1 after the work prints). A Pool()=all-cores
+    # fork over the full store reliably crashed this way; spawned workers re-import GDAL fresh,
+    # so teardown is clean.
     with get_context("spawn").Pool() as pool:
         for child_zoom in sorted(by_child_zoom, reverse=True):
             level = by_child_zoom[child_zoom]
@@ -368,60 +278,26 @@ def execute(filepaths):
                     print(f"  {done}/{total} parents built", flush=True)
                     last = time.monotonic()
             # Fail at the level barrier (before the gap cascades into blank parents one
-            # level down): a referenced child missing here means a failed/unsynced
-            # aggregate or downsample shard, not a publishable pyramid.
+            # level down): a referenced child missing here means a failed/interrupted
+            # aggregate or downsample run, not a publishable pyramid.
             if missing:
                 sample = ", ".join(sorted(missing)[:15])
                 raise SystemExit(
                     f"pyramid incomplete at child_zoom={child_zoom}: {len(missing)} referenced "
-                    f"child pmtiles missing (a failed/unsynced shard). Fix the gap and rerun — "
+                    f"child pmtiles missing (a failed/interrupted run). Fix the gap and rerun — "
                     f"the affected parents stay dirty: {sample}{' …' if len(missing) > 15 else ''}")
 
 
-def run(shard=None, tail=False):
-    """Build the dirty overview pyramid. Default = everything on one machine.
-
-    Across CI runners (the cut keeps the level barrier inside one machine):
-      ``shard=(i, n)`` — only the deep levels under the i-th work-weighted bin of
-        SHARD_ROOT_Z ancestors; each shard's subtree is read-closed, so they run
-        concurrently with no coordination and push disjoint tiles.
-      ``tail=True``    — only the coarse levels whose archives span ancestors
-        (extent < SHARD_ROOT_Z); a few cheap global levels, run on one runner once
-        every shard has landed (a tail parent reads tiles the shards built)."""
-    filepaths = work_list()
-    if tail:
-        filepaths = [fp for fp in filepaths if shard_ancestor(fp) is None]
-    elif shard is not None:
-        owned = owned_ancestors(*shard)
-        filepaths = [fp for fp in filepaths if shard_ancestor(fp) in owned]
-    execute(filepaths)
-
-
-def matrix(maxn):
-    """Print the CI deep-shard matrix JSON: <= maxn shards, >= 1, with n sized so
-    each shard carries about the heaviest single ancestor — the wall-clock floor
-    anyway, since an ancestor's read-closed subtree can't split across shards."""
-    weights = ancestor_weights()
-    n = min(maxn, math.ceil(sum(weights.values()) / max(weights.values()))) if weights else 1
-    print(json.dumps([{"i": i, "n": n} for i in range(n)]))
+def run():
+    """Build the whole dirty overview pyramid on one machine."""
+    execute(dirty_filepaths())
 
 
 if __name__ == "__main__":
     argv = sys.argv[1:]
     if argv == ["cover"]:
         cover()
-    elif argv == ["freeze"]:
-        freeze()
     elif argv == ["run"]:
         run()
-    elif argv[:2] == ["run", "tail"]:
-        run(tail=True)
-    elif argv[:2] == ["run", "shard"] and len(argv) == 4:
-        run(shard=(int(argv[2]), int(argv[3])))
-    elif argv[:1] == ["matrix"] and len(argv) == 2:
-        matrix(int(argv[1]))
-    elif argv[:1] == ["shard-keys"] and len(argv) == 3:
-        shard_keys(int(argv[1]), int(argv[2]))
     else:
-        sys.exit("usage: downsampling.py <cover | freeze | run [shard <i> <n> | tail] | "
-                 "matrix <max> | shard-keys <i> <n>>")
+        sys.exit("usage: downsampling.py <cover | run>")

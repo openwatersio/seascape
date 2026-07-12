@@ -1,6 +1,6 @@
 """Shared helpers: PMTiles archive writing, the aggregation covering store, the
-z7-sharded pmtiles layout, terrarium tile encode, and the dirty-diff for
-incremental rebuilds.
+z7-sharded pmtiles layout, terrarium tile encode, and priority-grouped source items.
+Incrementality is content-hash keys now (keys.py), not a covering diff.
 
 Vendored from mapterhorn (BSD-3, (c) 2025 mapterhorn; see LICENSE.mapterhorn).
 """
@@ -142,44 +142,6 @@ def create_archive(tmp_folder, out_filepath):
         )
 
 
-def get_aggregation_item_string(aggregation_id, filename):
-    filepath = f'store/aggregation/{aggregation_id}/{filename}'
-    if not os.path.isfile(filepath):
-        return None
-    with open(filepath) as f:
-        return ''.join([l.strip() for l in f.readlines()]).strip()
-
-
-def get_dirty_aggregation_filenames(current_aggregation_id, last_aggregation_id):
-    filepaths = sorted(glob(f'store/aggregation/{current_aggregation_id}/*-aggregation.csv'))
-    # FORCE_REBUILD treats every tile as changed — the escape hatch for pipeline-code
-    # changes (smoothing, contour generation), which the source-coverage diff can't see.
-    if last_aggregation_id is None or os.environ.get("FORCE_REBUILD"):
-        return [filepath.split('/')[-1] for filepath in filepaths]
-    dirty_filenames = []
-    for filepath in filepaths:
-        filename = filepath.split('/')[-1]
-        current = get_aggregation_item_string(current_aggregation_id, filename)
-        last = get_aggregation_item_string(last_aggregation_id, filename)
-        if current != last:
-            dirty_filenames.append(filename)
-    return dirty_filenames
-
-
-def lpt_bins(weights, n):
-    """Deterministically bin-pack {name: weight} into n bins, heaviest item first
-    into the lightest bin (LPT greedy). Callers size n to ceil(total / max), so each
-    bin carries about the heaviest single item — the floor any partition has, since
-    one item can't split across shards. Guarantees a complete, disjoint partition and
-    (for n <= len(weights), all weights > 0) no empty bins."""
-    bins, loads = [[] for _ in range(n)], [0] * n
-    for name in sorted(weights, key=lambda k: (-weights[k], k)):
-        j = min(range(n), key=lambda k: (loads[k], k))
-        bins[j].append(name)
-        loads[j] += weights[name]
-    return bins
-
-
 def get_pmtiles_folder(x, y, z):
     if z < 7:
         return 'store/pmtiles'
@@ -187,48 +149,6 @@ def get_pmtiles_folder(x, y, z):
         return f'store/pmtiles/{z}-{x}-{y}'
     parent = mercantile.parent(mercantile.Tile(x=x, y=y, z=z), zoom=7)
     return f'store/pmtiles/{parent.z}-{parent.x}-{parent.y}'
-
-
-def existing_pmtiles():
-    """Basenames of pmtiles already in the store. From a CI-provided listing
-    (store/pmtiles-keys.txt = the R2 keys) when present, else a local scan. Shared by the
-    aggregate and downsample dirty-diffs so both agree on what's actually built — a
-    covering whose pmtiles isn't here is rebuilt, which is how a dropped/unsynced shard's
-    hole self-heals instead of staying 'clean' forever."""
-    keyfile = "store/pmtiles-keys.txt"
-    if os.path.isfile(keyfile):
-        with open(keyfile) as f:
-            return {line.strip().split("/")[-1] for line in f if line.strip()}
-    return {p.split("/")[-1] for p in glob("store/pmtiles/**/*.pmtiles", recursive=True)}
-
-
-def pmtiles_mtimes():
-    """Basename -> last-modified epoch seconds, for the overview staleness check. From a
-    prebuilt store/pmtiles-mtimes.txt listing (``<YYYY-MM-DD HH:MM:SS>\\t<key>`` per line) when
-    present, else each pmtiles' own file mtime. The downsample dirty-diff rebuilds any overview
-    older than a child it averages: a child rebuilt by a later run/self-heal never re-dirtied its
-    parent, so the coarse overview kept averaging the old child and went stale. Empty/absent =>
-    {}, and the diff falls back to its other signals (so a missing listing never marks all stale)."""
-    import calendar
-    import time
-
-    path = "store/pmtiles-mtimes.txt"
-    out = {}
-    if os.path.isfile(path):
-        with open(path) as f:
-            for line in f:
-                line = line.rstrip("\n")
-                if "\t" not in line:
-                    continue
-                ts, key = line.split("\t", 1)
-                try:
-                    out[key.split("/")[-1]] = calendar.timegm(time.strptime(ts, "%Y-%m-%d %H:%M:%S"))
-                except ValueError:
-                    continue
-        return out
-    for p in glob("store/pmtiles/**/*.pmtiles", recursive=True):
-        out[p.split("/")[-1]] = os.path.getmtime(p)
-    return out
 
 
 def get_grouped_source_items(filepath):
@@ -245,7 +165,7 @@ def get_grouped_source_items(filepath):
     for line in lines:
         source, filename, maxzoom = line.strip().split(',')
         if source not in prio:
-            prio[source] = config.load_metadata(source).get('priority', 0)
+            prio[source] = config.source_property(source, 'priority', 0)
         line_tuples.append((-prio[source], -int(maxzoom), source, filename))
     line_tuples = sorted(line_tuples)
 

@@ -113,7 +113,6 @@ test("layer ids are stable — consumers key toggles/queries off them", () => {
     "depth-shading",
     "depth-areas",
     "hillshade",
-    "drying-areas",
     "contour-lines",
     "contour-labels",
     "soundings",
@@ -124,21 +123,77 @@ test("layer ids are stable — consumers key toggles/queries off them", () => {
   ]);
 });
 
-test("shading picks relief or bands, never both at once", () => {
+test("depare fill unifies bands, drying, and unknown-depth water in one layer", () => {
+  // The standalone drying-areas / unsurveyed-areas layers are gone; the depare source-layer
+  // now carries all three, distinguished by attribute presence and ordered by `rank`.
+  const ls = layers(day, { shading: "bands", unit: "m", safety: 0 });
+  expect(ls.find((l) => l.id === "drying-areas")).toBeUndefined();
+  expect(ls.find((l) => l.id === "unsurveyed-areas")).toBeUndefined();
+  const da = ls.find((l) => l.id === "depth-areas") as {
+    type: string;
+    source: string;
+    "source-layer": string;
+    layout: Record<string, unknown>;
+    paint: Record<string, unknown>;
+  };
+  expect(da.type).toBe("fill");
+  expect(da["source-layer"]).toBe("depare");
+  // rank orders within-layer overlaps deterministically (nodata < bands < drying).
+  expect(da.layout["fill-sort-key"]).toEqual(["get", "rank"]);
+  // fill-color is a case: nodata (no drval1) → the provisional flat tint, drying
+  // (drval1 < 0) → foreshore green, else the band ramp keyed off drval1.
+  const color = raw(da.paint["fill-color"]);
+  expect(color[0]).toBe("case");
+  expect(color[1]).toEqual(["!", ["has", "drval1"]]);
+  expect(color[2]).toBe(day.nodata);
+  expect(color[3]).toEqual(["<", ["get", "drval1"], 0]);
+  expect(color[4]).toBe(day.drying);
+  // The band ramp is the case fallback — the same expression depthAreasColor emits.
+  expect(JSON.stringify(color[color.length - 1])).toBe(
+    JSON.stringify(depthAreasColor(day, { unit: "m", safety: 0 })),
+  );
+  // nodata keeps a lighter provisional wash; bands + drying at the depth-fill opacity.
+  expect(da.paint["fill-opacity"]).toEqual([
+    "case",
+    ["!", ["has", "drval1"]],
+    0.55,
+    0.85,
+  ]);
+});
+
+test("shading gates the depare bands via filter, never compounding with the relief", () => {
   const get = (ls: ReturnType<typeof layers>, id: string) =>
     ls.find((l) => l.id === id) as {
+      filter?: unknown;
       maxzoom?: number;
       minzoom?: number;
       layout?: { visibility?: string };
     };
-  const relief = layers(); // default
-  expect(get(relief, "depth-areas").layout?.visibility).toBe("none");
+  const relief = layers(); // default (unit m)
+  // Relief mode: the raster ramp carries depth, so the depare fill drops the bands (they
+  // carry `sys`) and keeps only the unit-less drying/nodata features — no double 0.85 fill.
+  expect(get(relief, "depth-areas").filter).toEqual(["!", ["has", "sys"]]);
   expect(get(relief, "depth-shading").maxzoom).toBeUndefined();
-  const bands = layers(day, { shading: "bands" });
-  expect(get(bands, "depth-areas").layout?.visibility).toBe("visible");
-  // Handoff at the bands' z6 data floor: relief below, bands above.
+  // Bands mode: the fill adds the active-sys ladder to the unit-less features, and the raster
+  // hands off at the z6 floor (relief below, bands above).
+  const bands = layers(day, { shading: "bands", unit: "m" });
+  expect(get(bands, "depth-areas").filter).toEqual([
+    "any",
+    ["!", ["has", "sys"]],
+    ["==", ["get", "sys"], "m"],
+  ]);
   expect(get(bands, "depth-shading").maxzoom).toBe(6);
   expect(get(bands, "depth-areas").minzoom).toBe(6);
+  // The fill is always visible in both modes — the filter, not visibility, gates the bands.
+  expect(get(relief, "depth-areas").layout?.visibility).toBeUndefined();
+  expect(get(bands, "depth-areas").layout?.visibility).toBeUndefined();
+  // ft/fm mode selects the fathom-curve band ladder.
+  const ftBands = layers(day, { shading: "bands", unit: "ft" });
+  expect(get(ftBands, "depth-areas").filter).toEqual([
+    "any",
+    ["!", ["has", "sys"]],
+    ["==", ["get", "sys"], "ft"],
+  ]);
 });
 
 test("depthAreasColor tints bands off drval1 and snaps safety deeper", () => {
@@ -173,18 +228,21 @@ test("applyState re-derives every unit/safety-dependent property", () => {
     getLayer: () => ({}),
   };
 
-  applyState(map, { unit: "fm", safety: 5 });
+  applyState(map, { unit: "fm", safety: 5, shading: "bands" });
   // Ramp: fathom-curve band edges active, hazard band folded.
   const ramp = raw(
     calls.find((c) => c.fn === "paint" && c.layer === "depth-shading")!.value,
   );
   expect(ramp).toContain(-30 * 1.8288);
   expect(ramp).toContain(day.hazard);
-  // Isobath filters flip to the fathom-curve set — lines, labels, and the
-  // depth bands together.
-  for (const id of ["contour-lines", "contour-labels", "depth-areas"])
+  // Isobath filters flip to the fathom-curve set — the contour lines and labels.
+  for (const id of ["contour-lines", "contour-labels"])
     expect(calls.find((c) => c.fn === "filter" && c.layer === id)!.value)
       .toEqual(["==", ["get", "sys"], "ft"]);
+  // The depare fill adds the ft band ladder alongside the unit-less drying/nodata features.
+  expect(
+    calls.find((c) => c.fn === "filter" && c.layer === "depth-areas")!.value,
+  ).toEqual(["any", ["!", ["has", "sys"]], ["==", ["get", "sys"], "ft"]]);
   // Band fill recolours with the snapped safety contour (5 m is a rung).
   expect(
     JSON.stringify(

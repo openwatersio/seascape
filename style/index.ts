@@ -43,6 +43,7 @@ export interface Flavor {
   hazard: string;
   land: string;
   drying: string;
+  nodata: string;
   contour: string;
   label: string;
   labelHalo: string;
@@ -81,6 +82,10 @@ export const day: Flavor = {
   // Drying areas (INT-1 foreshore green): seabed above chart datum that covers
   // and uncovers with the tide.
   drying: "#a8d5ba",
+  // Unknown-depth water (ENC DEPARE nodata): mapped water we hold no depth for. A flat,
+  // desaturated slate-blue — reads as water but distinct from the crisp surveyed depth
+  // bands, and deliberately provisional (S-52's NODATA fill is the eventual reference).
+  nodata: "#a9bccb",
   contour: "#4a7a9c",
   label: "#036",
   labelHalo: "#fff",
@@ -330,6 +335,40 @@ export function layers(
 
   const coverageColor = flavor.coverage;
 
+  // The depare layer carries three ENC DEPARE feature kinds in one fill, keyed by attribute
+  // presence: depth bands (drval1/drval2, sys-tagged per m/ft ladder, drval1 >= 0), drying
+  // foreshore (drval1 < 0, no sys), and unknown-depth water (no drval1, no sys). Bands
+  // duplicate per sys, so only the active ladder shows, and only in bands mode; drying +
+  // nodata have NO sys and ship once, so `!has sys` selects them and they render in BOTH
+  // shading modes — relief filters the bands out (the raster ramp carries depth; two 0.85
+  // fills would compound) but keeps the honesty fills, since a #24-cleared lake must read as
+  // unknown water, not the 0-filled raster's land wash.
+  const bandSys = unit === "m" ? "m" : "ft";
+  const depareFilter = (
+    shading === "bands"
+      ? ["any", ["!", ["has", "sys"]], ["==", ["get", "sys"], bandSys]]
+      : ["!", ["has", "sys"]]
+  ) as unknown as ExpressionSpecification;
+  // Fill: nodata (no drval1) → provisional flat tint; drying (drval1 < 0) → foreshore green;
+  // else the band ramp keyed off drval1. `case` short-circuits, so the drval1 comparison only
+  // runs once the no-drval1 branch has ruled nodata out.
+  const depareColor = [
+    "case",
+    ["!", ["has", "drval1"]],
+    flavor.nodata,
+    ["<", ["get", "drval1"], 0],
+    flavor.drying,
+    depthAreasColor(flavor, { unit, safety }),
+  ] as unknown as ExpressionSpecification;
+  // nodata carries the provisional lighter wash it had as its own layer; bands + drying stay
+  // at the depth-fill opacity.
+  const depareOpacity = [
+    "case",
+    ["!", ["has", "drval1"]],
+    0.55,
+    0.85,
+  ] as unknown as ExpressionSpecification;
+
   return [
     {
       id: "depth-shading",
@@ -345,20 +384,27 @@ export function layers(
       },
     },
     {
-      // ENC DEPARE depth bands: the vector twin of depth-shading — crisp band
-      // edges on the charted isobaths, safety recolour snapped to the next-
-      // deeper charted level. Hidden in relief mode (never rendered under the
-      // relief — the opacities would compound).
+      // ENC DEPARE fill — the vector twin of depth-shading, carrying all three depare
+      // feature kinds keyed by attribute presence (see the expressions above): depth bands
+      // (crisp tint per drval1, safety recolour snapped to the next-deeper charted level),
+      // drying foreshore (INT-1 green, negative drval1), and unknown-depth water (provisional
+      // flat tint, no drval1). The three are disjoint by construction, so `fill-sort-key: rank`
+      // is only a stable tie-breaker at an incidental simplification-wobble edge — nodata under
+      // bands (real depth wins), drying over the shoal band it abuts along their shared 0 m seam.
+      // Bands are filtered out in relief mode (the raster ramp carries depth); drying
+      // + nodata stay in both modes. Where no drying/nodata polygon covers a >=0 pixel the DEM
+      // ramp still paints the land wash, so a mask miss degrades to plain land, never to
+      // water-over-land.
       id: "depth-areas",
       type: "fill",
       source: vector,
       "source-layer": "depare",
-      filter: contourLineFilter,
+      filter: depareFilter,
       minzoom: BANDS_MIN_ZOOM,
-      layout: { visibility: shading === "bands" ? "visible" : "none" },
+      layout: { "fill-sort-key": ["get", "rank"] },
       paint: {
-        "fill-color": depthAreasColor(flavor, { unit, safety }),
-        "fill-opacity": 0.85,
+        "fill-color": depareColor,
+        "fill-opacity": depareOpacity,
       },
     },
     {
@@ -372,17 +418,6 @@ export function layers(
         "hillshade-highlight-color": "#ffffff",
         "hillshade-illumination-direction": 315,
       },
-    },
-    {
-      // Green foreshore fill, above depth-shading and below the contour lines.
-      // Where no drying polygon covers a >=0 pixel the DEM ramp still paints
-      // the land wash, so a mask miss degrades to plain land rendering, never
-      // to water-over-land.
-      id: "drying-areas",
-      type: "fill",
-      source: vector,
-      "source-layer": "drying",
-      paint: { "fill-color": flavor.drying, "fill-opacity": 0.85 },
     },
     {
       id: "contour-lines",
@@ -558,14 +593,21 @@ export interface ChartMap {
 // sounding emphasis) and set them in place — the in-place equivalent of
 // reloading a regenerated style. Takes the full settings each call: nothing
 // map-side stores the previous values, so callers pass what their controls
-// currently show. Layers absent from the map (composed subsets) are skipped.
+// currently show. `shading` also gates the depare fill's filter (relief hides
+// the depth bands but keeps drying/nodata), so pass the current mode — it
+// defaults to the relief mode when omitted. Layers absent from the map
+// (composed subsets) are skipped.
 export function applyState(
   map: ChartMap,
-  { unit, safety }: { unit: Unit; safety: number },
+  {
+    unit,
+    safety,
+    shading = DEFAULT_SHADING,
+  }: { unit: Unit; safety: number; shading?: Shading },
   flavor: Flavor = day,
 ): void {
   const spec = Object.fromEntries(
-    layers(flavor, { unit, safety }).map((l) => [l.id, l]),
+    layers(flavor, { unit, safety, shading }).map((l) => [l.id, l]),
   ) as Record<string, { filter?: unknown; layout?: any; paint?: any }>;
   if (map.getLayer("depth-shading"))
     map.setPaintProperty(

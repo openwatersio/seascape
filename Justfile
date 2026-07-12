@@ -5,15 +5,26 @@
 
 set working-directory := 'pipelines'
 
-# Prepare one source: fetch -> datum -> normalize -> bounds -> polygon -> tarball.
+# Prepare one source: fetch -> datum -> normalize -> bounds -> polygon -> tarball, then
+# assemble catalog.json. The catalog step is the shared tail, so every source (prepared or
+# mirrored) gets a generated catalog item without editing each recipe. RECIPE_HASH (the
+# source's recipe content hash, supplied by the caller; empty locally) rides into the item.
 source id:
     just ../sources/{{id}}/
+    uv run python source_catalog.py {{id}}
 
 # Prepare the OSM land mask once (download -> unzip -> EPSG:3857 FlatGeobuf at
 # store/landmask/land.fgb). Flagged coarse sources (GEBCO/EMODnet) clamp negative
 # land pixels against it during aggregation. LANDMASK overrides the output path.
 landmask:
     uv run python landmask.py prep
+
+# Prepare the inland-water mask once (Overture water theme -> EPSG:3857 FlatGeobuf at
+# store/landmask/water.fgb). The land clamp subtracts it so flagged coarse sources keep
+# their depths inside mapped rivers/lakes. Optional — absent, the clamp stays land-only.
+# WATERMASK overrides the output path.
+watermask:
+    uv run python landmask.py prep-water
 
 # Prepare every source under sources/.
 sources:
@@ -25,17 +36,20 @@ sources:
     done
 
 # Planet build: cover -> aggregate -> downsample -> bundle -> vector layers (BBOX="W,S,E,N"
-# for a region). Soundings + drying + depare bundle BEFORE contours: the contours tile-join
-# folds their pmtiles into vector.pmtiles in the same single pass. Coverage right after cover
-# (it needs only footprints + the covering) so missing footprints fail in the first minute,
-# not after hours of aggregation.
+# for a region). Soundings + depare bundle BEFORE contours: the contours tile-join folds their
+# pmtiles into vector.pmtiles in the same single pass. Drying rides inside depare (a DEPARE band
+# with negative drval1) — aggregation_run generates its per-tile FGB, which depare consumes.
+# Coverage right after cover (it needs only footprints + the covering) so missing footprints
+# fail in the first minute, not after hours of aggregation. Coverage honors BBOX, so a preview
+# builds only the region's footprints (the build box builds the whole planet).
+# The build box runs these same recipes one at a time, pushing to R2 between stages so an
+# interrupted build resumes — see docs/build.md.
 planet:
     just cover
     just coverage
-    uv run python aggregation_run.py
+    just aggregate
     just combine
     just soundings
-    just drying
     just depare
     just contours
 
@@ -43,114 +57,80 @@ planet:
 cover:
     uv run python aggregation_covering.py
 
-# Freeze the aggregate + downsample dirty work lists into the covering dir (plan job, after
-# cover, before the covering tarball is pushed). Every shard then reads the SAME list from the
-# covering instead of re-listing R2 itself — one partition, computed once, so no self-heal tile
-# slips between shards whose listings drifted across matrix waves.
-freeze-work:
-    uv run python aggregation_run.py freeze
-    uv run python downsampling.py freeze
+# Aggregate every stale tile: reproject -> merge -> smooth -> encode terrain, forking
+# contours/soundings/depare off each merged DEM. Staleness is per-fork content-hash keys
+# (keys.py: inputs ‖ code ‖ config ‖ toolchain); a fresh fork is skipped within the tile.
+# AGG_PROCESSES caps concurrent tiles (each holds a multi-GB merged DEM); unset = all cores.
+# FORCE_REBUILD=1 ignores the keys and rebuilds every tile (escape hatch).
+aggregate:
+    uv run python aggregation_run.py
 
-# Run one aggregate shard i of n — the CI fan-out unit (`aggregation_run.py` alone = all dirty).
-aggregate i n:
-    uv run python aggregation_run.py shard {{i}} {{n}}
+# Write store/source-manifest.txt: the source files the dirty tiles reference — lets the
+# build box hydrate exactly the dirty set from R2, then aggregate from local disk.
+sources-manifest:
+    uv run python aggregation_run.py sources-manifest
 
-# Print the CI aggregate shard matrix as JSON (<= max shards, sized to the dirt).
-shard-matrix max:
-    @uv run python aggregation_run.py matrix {{max}}
-
-# Single-runner terrain finish: overview pyramid -> planet/overlay bundles + manifest.
+# Single-machine terrain finish: overview pyramid -> planet/overlay bundles + manifest.
 combine:
+    just downsample
+    just bundle
+
+# Overview pyramid below each source's native maxzoom: plan the parent tiles, then
+# 2x2-average each stale overview (finest first, so each level feeds the next; an
+# overview's key hashes its children's keys, so child changes cascade up by construction).
+downsample:
     uv run python downsampling.py cover
     uv run python downsampling.py run
+
+# Concat the single-zoom pmtiles into planet.pmtiles + one overlay per populated
+# OVERLAY_SPLIT_Z grid cell + manifest.json (groups bundled in parallel).
+bundle:
     uv run python bundle.py
 
-# CI downsampling fan-out (deep levels shard by ancestor, coarse tail on the bundler):
-#   plan job   -> just downsample-cover   (writes -downsampling.csv beside the covering)
-#   plan job   -> just downsample-matrix N (the shard matrix, sized to the dirt)
-#   matrix job -> just downsample-shard-keys i n  (pick this shard's pmtiles to pull)
-#   matrix job -> just downsample-shard i n
-#   plan  job  -> just downsample-tail + bundle-matrix   (coarse tail, then the matrix)
-downsample-cover:
-    uv run python downsampling.py cover
-downsample-matrix max:
-    @uv run python downsampling.py matrix {{max}}
-# Filter store/pmtiles-keys.txt -> store/shard-keys.txt (only the tiles shard i reads),
-# so CI pulls a shard's slice of store/pmtiles instead of the whole tens-of-GB store.
-downsample-shard-keys i n:
-    uv run python downsampling.py shard-keys {{i}} {{n}}
-downsample-shard i n:
-    uv run python downsampling.py run shard {{i}} {{n}}
-downsample-tail:
-    uv run python downsampling.py run tail
+# Walk the local store and write store/manifests/<covering-id>.json — the content name / empty
+# marker of every artifact this build's covering produced — printing the id. The workflow publishes
+# it and flips the store pointer LAST (the next build hydrates exactly these; the GC keeps them).
+# A bbox build never runs it: regional runs write no planet-scoped pointer. R2-agnostic — the id is
+# the covering ULID, the names are store-root-relative, and this step knows nothing about buckets.
+store-manifest:
+    uv run python store_manifest.py write
 
-# CI terrain bundle fan-out (planet + one overlay per OVERLAY_SPLIT_Z grid cell; each
-# matrix job loops its chunk of groups pull->bundle->push->clean one group at a time, so
-# a runner's disk is bounded by ONE group's tiles + output no matter how many sources land):
-#   plan job   -> just downsample-tail + bundle-matrix N (tail, verify, emit chunk matrix)
-#   matrix job -> just bundle-group-keys <name>          (pick this group's pmtiles to pull)
-#   matrix job -> just bundle-group <name>               (bundle one group + its fragment)
-#   merge job  -> just bundle-merge                      (fragments -> manifest.json)
-bundle-matrix max:
-    @uv run python bundle.py matrix {{max}}
-bundle-group-keys name:
-    uv run python bundle.py group-keys {{name}}
-bundle-group name:
-    uv run python bundle.py group {{name}}
-bundle-merge:
-    uv run python bundle.py merge
-
-# Contours, whole set (local/regional); the final tile-join also folds in any
-# soundings/drying pmtiles already bundled. CI shards these across runners — see below.
+# Contours, whole set: one global tippecanoe over every contour FGB, then one tile-join that
+# also folds in the soundings/depare pmtiles already bundled → vector.pmtiles.
 contours:
     uv run python contour_run.py bundle
 
-# Soundings: bundle the per-tile points into soundings.pmtiles. Run BEFORE the contours
-# bundle/merge — its single tile-join folds the layer into vector.pmtiles (a separate
-# fold re-joined the whole planet archive per layer).
+# Soundings: bundle the per-tile points into soundings.pmtiles. Run BEFORE contours —
+# their single tile-join folds this layer into vector.pmtiles (a separate fold re-joined
+# the whole planet archive per layer).
 soundings:
     uv run python soundings_run.py bundle
 
-# Drying areas (green foreshore): bundle the per-tile polygons into drying.pmtiles
-# (folded into vector.pmtiles by the contours tile-join, same as soundings).
-drying:
-    uv run python drying_run.py bundle
-
-# Depth areas (ENC DEPARE bands): bundle the per-tile partitions into depare.pmtiles
-# (folded into vector.pmtiles by the contours tile-join, same as soundings/drying).
+# Depth areas (ENC DEPARE): bundle the per-tile partitions into depare.pmtiles (folded into
+# vector.pmtiles by the contours tile-join, same as soundings). Carries three feature kinds in
+# one layer — depth bands, drying (negative drval1), and nodata (no drval1) — built per tile by
+# aggregation_run off the merged DEM + the OSM land + inland-water polygons.
 depare:
     uv run python depare_run.py bundle
 
 # Source-provenance footprints -> their own store/bundle/coverage.pmtiles (z0-8;
 # the renderer overzooms it deeper). Needs store/polygon/*.gpkg + a covering;
 # fails loudly without footprints — a build without them ships a dead layer.
+# Honors BBOX: a preview builds only the region's footprints (whole planet if unset).
 coverage:
     uv run python contour_run.py coverage
 
-# tippecanoe this shard's local slice of every vector layer -> {contours,soundings,
-# drying,depare}-shard-{i}.pmtiles (CI pulls only the shard's slices + writes
-# store/contour-maxz.txt so all layers tile to one depth; merged by contour-merge).
-# Four invocations, not one -L run: the layers need different tippecanoe flags
-# (soundings -r1, drying --drop-densest-as-needed, depare --detect-shared-borders,
-# contours' per-zoom filter).
-vector-shard i:
-    uv run python contour_run.py bundle-shard {{i}}
-    uv run python soundings_run.py bundle-shard {{i}}
-    uv run python drying_run.py bundle-shard {{i}}
-    uv run python depare_run.py bundle-shard {{i}}
-
-# tile-join the per-shard pmtiles (all layers) into vector.pmtiles.
-contour-merge:
-    uv run python contour_run.py bundle-merge
-
 # Build a regional preview into the local Worker R2 — a faithful slice of the planet
 # build for BBOX="W,S,E,N" (default: NY harbor; e.g. Chesapeake = "-76.5,37.0,-76.0,37.5").
-# Refreshes each source's tiny bounds.csv from R2 and range-reads the COGs from R2 (prepared
-# sources) / NOAA (streaming) via SOURCE_VSI_BASE — the same read path as CI's aggregate, so
-# no local source prep. `just preview-local` instead builds from already-prepared sources in
-# store/source (no R2; SOURCE_VSI_BASE unset). Override SOURCE_VSI_BASE/BOUNDS_BASE for a mirror.
+# Refreshes each source's tiny bounds.csv from R2 and range-reads the COGs from R2 (mirrored
+# and prepared sources alike) via SOURCE_VSI_BASE — the same read path as CI's aggregate, so
+# no local source prep and no upstream traffic. `just preview-local` instead builds from
+# already-prepared sources in store/source (no R2; SOURCE_VSI_BASE unset). Override
+# SOURCE_VSI_BASE/BOUNDS_BASE for a mirror.
 # The coarse-source land clamp needs the land mask: streamed from R2 when published, else built
-# locally once (a 700 MB OSM download; override with LANDMASK to reuse an existing copy).
+# locally once (a 700 MB OSM download; override with LANDMASK to reuse an existing copy). The
+# inland-water mask (clamp subtraction, #24 inverse clamp, depare nodata) is streamed from R2
+# when published, else built bbox-scoped from Overture in seconds (override with WATERMASK).
 # View with `just dev` (tile Worker on :8787 + Vite viewer on :5173).
 preview bbox="-74.30,40.40,-73.75,40.80" local="":
     #!/usr/bin/env bash
@@ -165,14 +145,22 @@ preview bbox="-74.30,40.40,-73.75,40.80" local="":
             mkdir -p "store/source/$id"
             curl -fsS "$BOUNDS_BASE/$id/bounds.csv" -o "store/source/$id/bounds.csv" \
                 || { echo "skip $id (no bounds.csv in R2)"; rm -rf "store/source/$id"; }
-            # Provenance footprint for the coverage tileset (streaming sources have none).
+            # Catalog item (priority/offset/flags + recipe hash — the tile keys read it).
+            # Replace only on success; absent (a source registered before the catalog step
+            # existed) falls back to metadata.json. Note the fetched item SHADOWS local
+            # metadata.json knob edits (priority/max_zoom) — to iterate those against streamed
+            # sources, delete store/source/<id>/catalog.json so the metadata fallback applies.
+            if [ -d "store/source/$id" ]; then
+                curl -fsS "$BOUNDS_BASE/$id/catalog.json" -o "store/source/$id/catalog.json.tmp" \
+                    && mv "store/source/$id/catalog.json.tmp" "store/source/$id/catalog.json" \
+                    || rm -f "store/source/$id/catalog.json.tmp"
+            fi
+            # Provenance footprint for the coverage tileset (mirrored sources have none).
             # Replace only on success — a 404 must not clobber a locally-prepared polygon.
             curl -fsS "$POLY_BASE/$id.gpkg" -o "store/polygon/$id.gpkg.tmp" \
                 && mv "store/polygon/$id.gpkg.tmp" "store/polygon/$id.gpkg" \
                 || rm -f "store/polygon/$id.gpkg.tmp"
         done
-        # S-102 re-registers from a live catalog (and may not be in R2 yet), so re-sync it
-        just source noaa_s102
         # Land mask for the coarse-source clamp: prefer a local copy if it's already there,
         # else stream it from R2 like the sources; if neither exists, it's built locally (below).
         r2mask="https://data.openwaters.io/bathymetry/landmask/land.fgb"
@@ -181,13 +169,32 @@ preview bbox="-74.30,40.40,-73.75,40.80" local="":
         else
             export LANDMASK="${LANDMASK:-store/landmask/land.fgb}"
         fi
+        # Inland-water mask (the clamp subtraction, the #24 inverse clamp, and depare's nodata
+        # areas all read it): stream from R2 when published, else build it locally SCOPED TO THE
+        # PREVIEW BBOX — prep-water honors BBOX as a -spat prefilter, so it pulls only this window
+        # (seconds), and it's rebuilt each run since it's region-specific. A WATERMASK override is
+        # honored untouched; whole-planet R2 always wins over a stale regional local copy.
+        r2water="https://data.openwaters.io/bathymetry/landmask/water.fgb"
+        if [ -n "${WATERMASK:-}" ]; then
+            :
+        elif curl -fsI "$r2water" >/dev/null 2>&1; then
+            export WATERMASK="/vsicurl/$r2water"
+        else
+            export WATERMASK="store/landmask/water.fgb"
+            rm -f "$WATERMASK"
+        fi
     else
         unset SOURCE_VSI_BASE  # read prepared COGs from store/source on disk
         export LANDMASK="${LANDMASK:-store/landmask/land.fgb}"
+        # Offline preview: use a local water mask only if it's already there (prep-water needs
+        # the network); absent, the clamp/nodata degrade to land-only.
+        export WATERMASK="${WATERMASK:-store/landmask/water.fgb}"
     fi
-    # Build the mask locally (one-time OSM download) if we're pointed at a local path with no file.
+    # Build each mask locally if we're pointed at a local path with no file — the land mask is a
+    # one-time OSM download; the water mask is the bbox-scoped Overture pull (skipped offline).
     case "$LANDMASK" in /vsicurl/*) : ;; *) [ -f "$LANDMASK" ] || just landmask ;; esac
-    rm -rf store/aggregation store/pmtiles store/bundle store/meta store/contour store/soundings store/drying store/depare
+    case "${WATERMASK:-}" in /vsicurl/*|"") : ;; *) [ -f "$WATERMASK" ] || { [ -z "{{local}}" ] && just watermask || echo "no water mask (offline preview) — clamp/nodata degrade to land-only"; } ;; esac
+    rm -rf store/aggregation store/pmtiles store/bundle store/meta store/contour store/soundings store/depare
     just planet
     ../worker/seed.sh
 
@@ -216,7 +223,16 @@ dev:
 # Offline self-checks (synthetic data, no network).
 test-sources:
     uv run python test_source_stage.py
-    uv run python source_register_remote_geopkg.py --check
+    uv run python source_mirror.py --check
+    uv run python source_catalog.py --check
+    uv run python source_remote.py
 test-engine:
     uv run python test_engine.py
     uv run python aggregation_reproject.py --check
+    uv run python keys.py --check
+    uv run python store_manifest.py --check
+# Test the GC's Collect step (scripts/gc-collect.sh — the exact script gc.yml runs, local
+# backend) against a synthetic store tree: happy path + every refusal guard. Needs bash + jq;
+# ci.yml runs it on every push.
+test-gc:
+    bash test_gc.sh

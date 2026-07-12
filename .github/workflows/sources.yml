@@ -1,0 +1,331 @@
+name: Sources
+
+# Source registration + preparation, split out of the build (see
+# docs/plans/2026-07-08-sources-mirror.md): builds must never contact a source
+# upstream, so this workflow owns everything under bathymetry/source/ in R2.
+# Prepared sources are fetched → normalized → pushed exactly as they were in
+# build.yml (recipe-hash-gated, so an unchanged source is a no-op). Volatile
+# sources (NOAA S-102, CUDEM — upstream catalogs that drift) re-register on every
+# run: enumerate the public bucket → MIRROR the objects into the data bucket →
+# push registration files → publish bounds.csv → publish catalog.json LAST.
+#
+# That publish order is the atomicity mechanism. bounds.csv drives the build's
+# covering, and every object a row references is verified-present in R2 before the
+# one-PUT bounds.csv lands — so a build dispatched mid-refresh sees either the
+# previous complete registration or the new one, never a half-mirror. catalog.json
+# publishes LAST, after even bounds.csv, because it is ALSO the staleness marker:
+# its seascape:recipe_hash replaces the retired .recipe-hash object, and whatever
+# vouches "this source is current" must land after every artifact it vouches for —
+# a crash anywhere above leaves a stale hash, so the next run redoes the source
+# instead of trusting a half-push. The cost is a crash window where bounds.csv is
+# one refresh ahead of catalog.json; consumers degrade gracefully (the build's tile
+# keys pick up the new hash on the run after the catalog lands), and the shared
+# r2-store concurrency group means a live build never interleaves with this push.
+# Upstream churn (deleted products, half-published editions, NOAA outages) turns
+# THIS workflow red — the alert channel — while builds keep reading the last-good
+# state. A 404 against our own mirror mid-build is our bug, and hard-fails there.
+#
+# NOTE: a volatile refresh changes bounds.csv filenames + the catalog's recipe
+# hash, so the next build's tile keys re-aggregate the affected coastal tiles once.
+# Expected, not a bug.
+
+on:
+  schedule:
+    - cron: "23 6 * * 1" # weekly, Monday 06:23 UTC (upstreams drift slowly)
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Only refresh this source id (empty = all)"
+        required: false
+        default: ""
+      force:
+        description: "Force re-registration: ignore the recipe-hash short-circuit and the volatile shrink guard"
+        type: boolean
+        default: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+  # The public "data" bucket (data.openwaters.io) — the same store build.yml
+  # reads; see build.yml for the bucket layout.
+  DATA_BUCKET: data
+  # Volatile registration refuses to publish a >5% row shrink (a mass upstream
+  # disappearance) unless deliberately forced — see pipelines/source_mirror.py.
+  MIRROR_ALLOW_SHRINK: ${{ github.event.inputs.force == 'true' && '1' || '' }}
+  # R2 via the S3 API (aws-cli v2 honours AWS_ENDPOINT_URL).
+  AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  AWS_DEFAULT_REGION: auto
+  AWS_ENDPOINT_URL: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+  # R2 occasionally returns a transient 500 InternalError; the CLI default (~3 tries)
+  # gives up mid-sync. Adaptive retry + a high ceiling rides it out across every aws s3 call.
+  AWS_RETRY_MODE: adaptive
+  AWS_MAX_ATTEMPTS: "10"
+
+# The store is shared with the build: prepared-source syncs use --delete, which
+# must never run under an active build's aggregate shards — so this workflow and
+# build.yml share ONE concurrency group and queue behind each other instead of
+# interleaving. cancel-in-progress: false → a new run queues, never cancels.
+concurrency:
+  group: r2-store
+  cancel-in-progress: false
+
+jobs:
+  # Ensure the deps-only toolchain image exists (code is mounted at runtime), keyed on
+  # the files that define the deps (IMAGE_TAG, exported by ghcr-login; shared with
+  # ci.yml/build.yml, so a push-built image is reused here). Skipped when the tag is
+  # in GHCR. Copied from build.yml — ~25 lines, not worth a reusable workflow.
+  image:
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: write }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/ghcr-login
+      - name: Already in GHCR?
+        id: have
+        run: |
+          if docker manifest inspect "$IMAGE:$IMAGE_TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"; echo "image current: $IMAGE:$IMAGE_TAG"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: docker/setup-buildx-action@v3
+        if: steps.have.outputs.exists != 'true'
+      - uses: docker/build-push-action@v6
+        if: steps.have.outputs.exists != 'true'
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE }}:${{ env.IMAGE_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Mirror the OSM land mask AND the Overture inland-water mask to R2, rebuilding both when
+  # landmask.py's recipe changes. They belong here, not in the build: they are source-shaped
+  # inputs fetched from upstream (OSM/Overture), on their own upstream cadence, and a build must
+  # never fetch from an upstream — it consumes land.fgb/water.fgb from R2 via /vsicurl like any
+  # prepared source. Recipe-hash-gated with the same marker the sources use (a new OSM/Overture
+  # snapshot, MERC_LAT, or the inland-water code all live in landmask.py, so hashing it catches
+  # every refresh; the pinned URL + Overture release mean the data can't drift underneath an
+  # unchanged recipe), so an unchanged run is a no-op. One hash for both artifacts is correct: one
+  # file (prep + prep_water) builds both, so they can never mirror different snapshots of the
+  # module. Flagged coarse sources (GEBCO/EMODnet) clamp negative land pixels against the land mask
+  # and keep their genuine depths inside the water mask. The build's tile keys hash landmask.py —
+  # the module IS the masks' identity, same reasoning as this marker — so a mask refresh (which
+  # only ever follows a landmask.py change) re-aggregates the flagged tiles on the next build with
+  # no force dispatch. This job keeps its own .recipe-hash object: the masks have no catalog item
+  # to absorb it. force here doesn't apply: the pinned inputs can't drift under an unchanged recipe.
+  landmask:
+    needs: image
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: read }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/ghcr-login
+      # prep-water spools EVERY non-ocean Overture water feature (rivers, lakes, canals, plus the
+      # river/stream centerlines the second pass filters out) into a temp .raw.gpkg before the
+      # polygon-only filter — tens of GB planet-wide, more than a stock runner's free root disk.
+      # Free it, so the raw copy can't fill the disk mid-refresh. The recipe-skip path exits before
+      # writing anything, so running this unconditionally is harmless and off the hot path.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+      - name: Ensure land + water masks in R2
+        env:
+          RECIPE_HASH: ${{ hashFiles('pipelines/landmask.py') }}
+        run: |
+          have=$(aws s3 cp "s3://$DATA_BUCKET/bathymetry/landmask/.recipe-hash" - 2>/dev/null || true)
+          if [ -n "$RECIPE_HASH" ] && [ "$have" = "$RECIPE_HASH" ]; then
+            echo "land + water masks current in R2 (recipe unchanged)"; exit 0
+          fi
+          echo "masks stale or missing (recipe=$RECIPE_HASH r2=${have:-none}) — rebuilding both"
+          mkdir -p store
+          # No `|| true` / continue-on-error on either build: a broken water mask fails the job
+          # exactly like a broken land mask, and the marker below is written last so a failure
+          # anywhere leaves the hash stale → next run retries instead of trusting a half-mirror.
+          docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just landmask
+          docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just watermask
+          aws s3 cp store/landmask/land.fgb "s3://$DATA_BUCKET/bathymetry/landmask/land.fgb"
+          aws s3 cp store/landmask/water.fgb "s3://$DATA_BUCKET/bathymetry/landmask/water.fgb"
+          # Marker last, only after BOTH uploads land: a crash in between re-runs next time
+          # rather than parking a "current" hash over a missing/stale water.fgb.
+          printf '%s' "$RECIPE_HASH" | aws s3 cp - "s3://$DATA_BUCKET/bathymetry/landmask/.recipe-hash"
+
+  # Enumerate the sources (one dir per source) into a matrix.
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      sources: ${{ steps.l.outputs.sources }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: l
+        env:
+          ONLY: ${{ github.event.inputs.source || '' }}
+        run: |
+          # directories only — sources/ also holds README.md. The dispatch input
+          # filters to one source; a typo'd id fails loudly instead of no-oping.
+          all=$(ls -d sources/*/ | xargs -n1 basename)
+          if [ -n "$ONLY" ]; then
+            echo "$all" | grep -qx "$ONLY" || { echo "unknown source '$ONLY'"; exit 1; }
+            all="$ONLY"
+          fi
+          echo "sources=$(echo "$all" | jq -R -s -c 'split("\n")|map(select(length>0))')" >> "$GITHUB_OUTPUT"
+
+  # Prepare each source and push its store/source/<id> to R2. One source failing
+  # doesn't sink the rest (fail-fast: false): a failed source simply doesn't
+  # refresh its R2 state, so builds keep covering from its last successful
+  # bounds.csv. The recipe hash in the published catalog.json skips sources whose
+  # recipe (and, for non-volatile sources, data) can't have changed.
+  sources:
+    needs: [image, discover]
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: read }
+    strategy:
+      fail-fast: false
+      matrix:
+        source: ${{ fromJSON(needs.discover.outputs.sources) }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/ghcr-login
+      # Volatile sources re-register on EVERY run — their upstream drifts under an
+      # unchanged recipe, and tracking that drift is this workflow's whole purpose.
+      # The rest short-circuit when the recipe hash in R2 matches.
+      - name: Already current in R2?
+        id: check
+        env:
+          RECIPE_HASH: ${{ hashFiles(format('sources/{0}/**', matrix.source)) }}
+          FORCE: ${{ github.event.inputs.force == 'true' && 'true' || 'false' }}
+        run: |
+          volatile=$(jq -r '.volatile // false' "sources/${{ matrix.source }}/metadata.json")
+          # The recipe hash lives IN the published catalog.json (seascape:recipe_hash — the
+          # retired .recipe-hash marker's successor). A source registered before the catalog
+          # existed, or whose catalog carries no hash, reads as stale and rebuilds once.
+          have=$(aws s3 cp "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/catalog.json" - 2>/dev/null \
+                 | jq -r '.properties["seascape:recipe_hash"] // empty' 2>/dev/null || true)
+          # A source whose recipe polygonizes must have its footprint in R2 (the
+          # build's coverage tileset builds from bathymetry/polygon/). Missing means
+          # the source last built before the polygon push existed — rebuild once.
+          poly_ok=true
+          if grep -q source_polygonize "sources/${{ matrix.source }}/Justfile"; then
+            aws s3 ls "s3://$DATA_BUCKET/bathymetry/polygon/${{ matrix.source }}.gpkg" >/dev/null || poly_ok=false
+          fi
+          if [ "$volatile" = "true" ] || [ "$FORCE" = "true" ]; then current=false
+          elif [ -n "$RECIPE_HASH" ] && [ "$have" = "$RECIPE_HASH" ] && [ "$poly_ok" = "true" ]; then current=true
+          else current=false; fi
+          {
+            echo "current=$current"
+            echo "hash=$RECIPE_HASH"
+            echo "volatile=$volatile"
+          } >> "$GITHUB_OUTPUT"
+          echo "${{ matrix.source }}: recipe=$RECIPE_HASH r2=${have:-none} volatile=$volatile force=$FORCE → current=$current"
+      # Seed the previous bounds.csv so re-registration is incremental: a mirrored
+      # source carries every still-listed row forward with zero header reads, and
+      # the shrink guard has a baseline to diff against. Harmless for the rest: a
+      # prepared source overwrites it.
+      - name: Seed previous bounds
+        if: steps.check.outputs.current != 'true'
+        run: |
+          mkdir -p "store/source/${{ matrix.source }}"
+          aws s3 cp "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/bounds.csv" \
+            "store/source/${{ matrix.source }}/bounds.csv" 2>/dev/null || true
+      # `just source` ends in source_catalog.py, which stamps the source's recipe hash into
+      # the generated catalog.json (the staleness marker the check above reads back). Pass it
+      # in; the pipeline stays R2-agnostic — RECIPE_HASH is just "the recipe content hash" to
+      # it, and it's empty on a laptop.
+      - name: Prepare ${{ matrix.source }}
+        if: steps.check.outputs.current != 'true'
+        env:
+          RECIPE_HASH: ${{ steps.check.outputs.hash }}
+        run: |
+          mkdir -p store
+          docker run --rm -v "$PWD:/app" -e MIRROR_ALLOW_SHRINK -e RECIPE_HASH \
+            -v "$PWD/store:/app/pipelines/store" \
+            "$IMAGE:$IMAGE_TAG" just source ${{ matrix.source }}
+      # Mirror the upstream objects the registration just enumerated. mirror.txt is
+      # the FULL upstream key list (not just new keys), so a partial prior mirror
+      # self-heals here every refresh. rclone streams object→object with no runner
+      # disk (CUDEM is ~188 GB), skips keys already present (size + preserved
+      # upstream mtime), verifies each transfer against the upstream MD5 ETag
+      # (NOAA's objects are single-part uploads, so the ETag is a real MD5), and
+      # NEVER deletes — superseded objects are ~$3/month of hoarding, and pruning
+      # under a concurrent build would be a delete race.
+      - name: Mirror upstream objects to R2
+        if: steps.check.outputs.current != 'true' && steps.check.outputs.volatile == 'true'
+        run: |
+          for f in mirror.txt mirror-bucket.txt; do
+            test -s "store/source/${{ matrix.source }}/$f" || {
+              echo "volatile source produced no $f — registration is broken"; exit 1; }
+          done
+          # Pinned release, sha256-verified — not apt: Ubuntu 24.04's rclone (1.60.1,
+          # 2022) records the x-amz-version-id R2 now returns on uploads, then 501s on
+          # its post-upload `HEAD ?versionId=` verification. The object still lands, so
+          # every transfer errors once and the retry pass goes green — noise that would
+          # bury a real failure.
+          curl -fsSL -o /tmp/rclone.zip "https://downloads.rclone.org/v1.74.4/rclone-v1.74.4-linux-amd64.zip"
+          echo "fe435e0c36228e7c2f116a8701f01127bb1f694005fc11d1f27186c8bca4115d  /tmp/rclone.zip" | sha256sum -c
+          unzip -q -j /tmp/rclone.zip '*/rclone' -d /tmp/rclone-bin
+          sudo install /tmp/rclone-bin/rclone /usr/local/bin/rclone
+          # source_mirror enumerated the objects, enforced that they live on ONE
+          # bucket, and wrote its name here — one URL parser, not a second in sed.
+          bucket=$(cat "store/source/${{ matrix.source }}/mirror-bucket.txt")
+          echo "mirroring $(wc -l < "store/source/${{ matrix.source }}/mirror.txt") objects from $bucket"
+          # Two remotes, no secrets on disk: the NOAA side is anonymous —
+          # env_auth=false so the R2 credentials in the env can't sign its requests —
+          # and the R2 side reads the standard AWS_* env vars + endpoint.
+          cat > /tmp/rclone.conf <<EOF
+          [upstream]
+          type = s3
+          provider = AWS
+          region = us-east-1
+          env_auth = false
+          [r2]
+          type = s3
+          provider = Cloudflare
+          env_auth = true
+          region = auto
+          endpoint = $AWS_ENDPOINT_URL
+          EOF
+          rclone --config /tmp/rclone.conf copy \
+            "upstream:$bucket" "r2:$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/objects" \
+            --files-from "store/source/${{ matrix.source }}/mirror.txt" \
+            --transfers 16 --checkers 32 --retries 5 --stats 60s --stats-one-line -v
+      # Push the registration files — everything EXCEPT bounds.csv and catalog.json, which
+      # publish last (below). Volatile sources sync without --delete: their objects/ tree
+      # lives under the same prefix and must never be swept by a registration sync.
+      # Prepared sources keep --delete so retired artifacts don't linger (this also sweeps
+      # the retired .recipe-hash object — its hash now rides inside catalog.json).
+      - name: Push source to R2
+        if: steps.check.outputs.current != 'true'
+        run: |
+          if [ "${{ steps.check.outputs.volatile }}" = "true" ]; then
+            aws s3 sync "store/source/${{ matrix.source }}" "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}" \
+              --exclude 'bounds.csv' --exclude 'catalog.json'
+          else
+            aws s3 sync "store/source/${{ matrix.source }}" "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}" \
+              --delete --exclude 'bounds.csv' --exclude 'catalog.json'
+          fi
+          # Provenance footprint → bathymetry/polygon/ (the build's coverage tileset
+          # reads them all). Guarded: mirrored sources register remote objects and
+          # build none.
+          if [ -f "store/polygon/${{ matrix.source }}.gpkg" ]; then
+            aws s3 cp "store/polygon/${{ matrix.source }}.gpkg" "s3://$DATA_BUCKET/bathymetry/polygon/${{ matrix.source }}.gpkg"
+          fi
+      # bounds.csv then catalog.json, in that order, LAST. bounds.csv is the atomic pointer
+      # (every object a row references is already verified-present above, so a build
+      # dispatched at any moment sees a complete registration). catalog.json lands after
+      # even that because its seascape:recipe_hash IS the staleness marker (the retired
+      # .recipe-hash): a crash anywhere above leaves the published hash stale, and the next
+      # run redoes the source instead of trusting a half-push. See the header comment for
+      # the (benign) bounds-ahead-of-catalog crash window this ordering accepts.
+      - name: Publish bounds.csv + catalog marker
+        if: steps.check.outputs.current != 'true'
+        run: |
+          aws s3 cp "store/source/${{ matrix.source }}/bounds.csv" \
+            "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/bounds.csv"
+          aws s3 cp "store/source/${{ matrix.source }}/catalog.json" \
+            "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/catalog.json"

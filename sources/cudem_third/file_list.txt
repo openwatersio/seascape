@@ -1,7 +1,8 @@
 # NOAA CUDEM 1/3 arc-second national topobathy — a *filelist* (manifest): one tile
-# URL per line, 372 tiles (~8.5 GB), ~10 m. The offshore/deeper band that telescopes
+# URL per line, ~370 tiles (~8.5 GB), ~10 m. The offshore/deeper band that telescopes
 # out beyond the 1/9 nearshore zone (zero tile-cell overlap with cudem 1/9), plus the
 # primary high-res Alaska coverage (98 tiles vs 16 in 1/9). NAVD88 / NAD83 (EPSG:4269),
-# NoData -99999. source_register_remote_urllist reads each tile's header via /vsicurl
-# and registers it as a streaming reference — no download.
+# NoData -99999. source_mirror registers each tile as a relative objects/<key> row
+# (header reads for newly-listed tiles only) + a mirror manifest; the bytes are copied
+# into the store's object mirror — no build-time NOAA reads.
 https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_third_Topobathy_2014_8580/urllist8580.txt

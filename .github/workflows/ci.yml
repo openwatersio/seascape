@@ -56,6 +56,12 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/app" "$IMAGE:$IMAGE_TAG" just test-sources
           docker run --rm -v "$PWD:/app" "$IMAGE:$IMAGE_TAG" just test-engine
+      # The GC set-logic simulation exercises scripts/gc-collect.sh — the exact Collect step
+      # gc.yml runs, the repo's only automated deletion — happy path + every refusal guard. Bare
+      # bash + jq (both preinstalled on the runner); the toolchain image carries no jq, so no
+      # docker run here.
+      - name: GC collect simulation
+        run: bash pipelines/test_gc.sh
 
   # Compile-check the viewer (it's built + deployed on release; see release.yml)
   # and run the Worker's dependency-free self-checks (plain node assert scripts).

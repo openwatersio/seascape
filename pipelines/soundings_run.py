@@ -32,6 +32,7 @@ from glob import glob
 import mercantile
 
 import contour_run
+import keys
 import utils
 
 NODATA = -9999
@@ -141,14 +142,17 @@ def _pyramid(src, nodata, bbox, min_depth, z, child_z):
     return pts
 
 
-def generate(filepath):
+def generate(filepath, out):
+    """Sound one aggregation tile's merged DEM into ``out`` (the caller's content-addressed
+    geojson name). Writes ``out`` atomically only when there ARE points — a dry / all-land tile
+    returns having written nothing, and the caller records the empty marker. The caller superseded
+    this stem's old-key siblings before calling, so a crash here leaves the fork reading stale."""
     import rasterio
     from pyproj import Transformer
     agg_id, filename = filepath.split("/")[-2:]
     z, x, y, child_z = (int(a) for a in filename.replace("-aggregation.csv", "").split("-"))
     tile = mercantile.Tile(x=x, y=y, z=z)
     tmp = f"store/aggregation/{agg_id}/{z}-{x}-{y}-{child_z}-tmp"
-    stem = f"{z}-{x}-{y}-{child_z}"
     dem = f"{tmp}/{len(glob(f'{tmp}/*.tiff')) - 1}-3857.tiff"
     if not os.path.exists(dem):
         print(f"soundings: no merged DEM for {filename}")
@@ -172,44 +176,66 @@ def generate(filepath):
                       "properties": _depths(d),
                       "geometry": {"type": "Point", "coordinates": [round(lon, 6), round(lat, 6)]}})
 
-    utils.create_folder("store/soundings")
-    with open(f"store/soundings/{stem}.geojson", "w") as f:
+    # Write into the tmp folder, then atomically publish into the content name.
+    final = f"{tmp}/soundings.geojson"
+    with open(final, "w") as f:
         json.dump({"type": "FeatureCollection", "features": feats}, f)
+    keys.publish(final, out)
     print(f"soundings: {filename} -> {len(feats)} points")
 
 
 def _live(paths, stems):
     """Drop soundings orphaned by a covering re-tiling (same class as contour's _live_fgbs: a
     re-tiled source area leaves the old stem's file behind, sync has no --delete, and bundling it
-    alongside the new tiling doubles up). Keep only current-covering stems; keep all when None."""
+    alongside the new tiling doubles up). Keep only current-covering stems (parsed off the
+    content-addressed name); keep all when None; drop non-content debris either way."""
+    live = [p for p in paths if keys.is_content_name(p)]
     if stems is None:
-        return paths
-    return [p for p in paths if p.split("/")[-1].rsplit(".", 1)[0] in stems]
+        return live
+    return [p for p in live if keys.stem_of(p) in stems]
 
 
-def bundle(shard=None):
+def bundle():
     """tippecanoe the per-tile soundings into store/bundle/soundings.pmtiles (layer `soundings`).
     Per-feature tippecanoe.minzoom places each point from the zoom the grid decimation assigned,
-    so no density dropping is needed (-r1 keeps every surviving point). With a shard index →
-    soundings-shard-{shard}.pmtiles from this shard's local slice, tiled to the shared global
-    maxz (store/contour-maxz.txt, like the contour shards): a slice's own max child_z can
-    undershoot it, and the join would then drop the layer from tiles deeper than the slice."""
+    so no density dropping is needed (-r1 keeps every surviving point). Bundled before the
+    contour tile-join, which folds this layer into vector.pmtiles. Skips when every member
+    tile's key is unchanged and the pmtiles is already on disk (the local iterative loop; the
+    build box's store/bundle is never hydrated, so a box build always rebuilds it)."""
     gj = _live(sorted(glob("store/soundings/*.geojson")), contour_run._current_stems())
+    contour_run.verify_vector_complete("soundings", gj)  # self-enforcing, before the fresh-skip
+    out = "store/bundle/soundings.pmtiles"
     if not gj:
+        # Empty input is a real state, not a no-op: a previously-built archive (and the sidecar
+        # vouching for it) must not survive — _finalize_contours folds this file into
+        # vector.pmtiles whenever it exists on disk, so a stale layer would ship as current.
+        # The invalidate discipline, extended to "the current state is nothing".
+        for stale in (out, keys.sidecar(out)):
+            if os.path.isfile(stale):
+                os.remove(stale)
         print("soundings bundle: no soundings")
         return
     # Shared tileset maxzoom (see contour_run.bundle_maxz): tiling only to this
     # layer's own regional max would truncate it out of deeper joined tiles.
-    maxz = contour_run.bundle_maxz(
-        max(int(g.split("/")[-1].replace(".geojson", "").split("-")[3]) for g in gj))
+    maxz = contour_run.bundle_maxz(max(int(keys.stem_of(g).split("-")[3]) for g in gj))
+    skey = keys.stage_key([os.path.basename(g) for g in gj],  # the key rides in each member's name
+                          ["soundings_run", "contour_run", "utils"], {"maxz": maxz})
+    if keys.is_fresh(out, skey):
+        print("soundings bundle: inputs unchanged — skip")
+        return
     utils.create_folder("store/bundle")
-    out = "store/bundle/soundings.pmtiles" if shard is None \
-        else f"store/bundle/soundings-shard-{shard}.pmtiles"
+    # Invalidate before writing (the crash rule every keyed writer follows): under FORCE the
+    # key is unchanged, so a crash mid-tippecanoe would otherwise leave the old sidecar reading
+    # a torn archive as fresh forever.
+    for stale in (out, keys.sidecar(out)):
+        if os.path.isfile(stale):
+            os.remove(stale)
     subprocess.run(
         ["tippecanoe", "-o", out, "-f", "-l", "soundings",
          "-n", "Bathymetric soundings", "-A", utils.ATTRIBUTION, "-Z", "0", "-z", str(maxz),
          "-P", "-q", "-r1", "-y", "depth_m", "-y", "depth_ft", "-y", "depth_fm",
          *gj], check=True)
+    keys.write_key(out, skey)
     print(f"soundings bundle: {out} (z0-{maxz}, {len(gj)} tiles)")
 
 
@@ -257,10 +283,12 @@ def _check():
     assert min(d for d, x, y, mz in pts if mz == 8) == 3.0      # block shoal survives to coarse zoom
     assert _jit(1, 1) == _jit(1, 1) and 0 <= _jit(3, 7) < 1     # jitter deterministic + in range
 
-    # orphan filter: keep only current-covering stems; passthrough when stems is None
-    paths = ["store/soundings/4-5-6-8.geojson", "store/soundings/11-300-400-13.geojson"]
-    assert _live(paths, {"11-300-400-13"}) == ["store/soundings/11-300-400-13.geojson"]
+    # orphan filter (content-addressed names): keep only current-covering stems; passthrough when
+    # stems is None; a non-content name (legacy/torn) is dropped either way.
+    paths = ["store/soundings/4-5-6-8-aaaaaaaaaaaa.geojson", "store/soundings/11-300-400-13-bbbbbbbbbbbb.geojson"]
+    assert _live(paths, {"11-300-400-13"}) == ["store/soundings/11-300-400-13-bbbbbbbbbbbb.geojson"]
     assert _live(paths, None) == paths
+    assert _live(["store/soundings/9-1-1-9.geojson"], None) == [], "a legacy logical name is dropped"
 
     # zoom placement: coarser levels swap out at their own zoom; the finest level
     # (minz == child_z) is uncapped so it persists above the local source ceiling
@@ -273,9 +301,7 @@ if __name__ == "__main__":
     a = sys.argv[1:]
     if a[:1] == ["bundle"]:
         bundle()
-    elif a[:1] == ["bundle-shard"]:
-        bundle(int(a[1]))
     elif a[:1] == ["check"]:
         _check()
     else:
-        sys.exit("usage: soundings_run.py bundle | bundle-shard <i> | check")
+        sys.exit("usage: soundings_run.py bundle | check")
