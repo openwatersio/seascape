@@ -198,6 +198,7 @@ def check_self_heal():
                         "shared,common.tif,10\n"        # shared across every tile → dedup
                         f"legacy,{legacy},9\n")         # absolute /vsi row → verbatim
             fps.append(fp)
+        fp_by_tile = dict(zip(tiles, fps))
         # Mark every fork of every tile fresh by materializing its content-addressed file (existence
         # is the freshness marker — no sidecar). A vector fork could instead leave a .empty marker;
         # a content file works for all four here.
