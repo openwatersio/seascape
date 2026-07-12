@@ -237,7 +237,7 @@ test-engine:
 
 # Lint the GitHub Actions workflows.
 test-workflows:
-    cd {{justfile_directory()}} && actionlint
+    cd "{{justfile_directory()}}" && actionlint
 
 # Test the GC's Collect step (scripts/gc-collect.sh — the exact script gc.yml runs, local
 # backend) against a synthetic store tree: happy path + every refusal guard. Needs bash + jq;

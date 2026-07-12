@@ -29,8 +29,9 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh \
       | bash -s -- --to /usr/local/bin
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
 
-# actionlint — lints .github/workflows (`just test-workflows`).
-RUN curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash \
+# actionlint — lints .github/workflows (`just test-workflows`). Installer script pinned to
+# the same tag as the version it fetches, so neither can drift under an unchanged image hash.
+RUN curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash \
       | bash -s -- 1.7.12 /usr/local/bin
 
 # Node 22 — lets the dev servers (`just dev`) and the preview seed step run in-container,
