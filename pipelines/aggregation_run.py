@@ -2,9 +2,10 @@
 
 Vendored from mapterhorn (BSD-3). Picks the latest aggregation id and, for every tile in the
 covering, computes a content-hash key per FORK — terrain / contours / soundings / depare — from
-the merged DEM's determinants plus each fork's own modules and config. A tile re-runs iff ANY of
-its fork keys is stale (a missing artifact or a mismatched key sidecar); within the run, forks
-whose key is already fresh are skipped. The merge (reproject + merge + smooth) is shared by every
+the merged DEM's determinants plus each fork's own modules and config. Each fork's key rides IN
+its artifact filename (``store/pmtiles/<stem>-<key>.pmtiles``, keys.content_path), so a tile
+re-runs iff ANY fork's content-named file (or its empty marker) is absent; within the run, forks
+already present are skipped. The merge (reproject + merge + smooth) is shared by every
 fork, so it re-runs whenever any fork is stale — what a fresh fork saves is its own regenerate +
 rewrite, not the merge. Consequence worth stating: a contour-config change re-merges the affected
 tiles but leaves the terrain pmtiles' keys untouched, so downsample + terrain-bundle skip
@@ -139,10 +140,11 @@ def _artifact(fork, stem):
 
 
 def plan_forks(filepath):
-    """Per fork: its artifact, computed key, and whether to (re)run it — stale (or FORCEd), and not
-    hard-skipped by a SKIP_* run mode. Only terrain requires its artifact to exist to be fresh
-    (self-heal, as the old covering diff did); a vector fork may legitimately produce nothing, so
-    its key sidecar alone marks it done."""
+    """Per fork: its LOGICAL artifact base, computed key, and whether to (re)run it — stale (or
+    FORCEd), and not hard-skipped by a SKIP_* run mode. Freshness is content-addressed and uniform:
+    the content-named file OR the empty marker exists under the key (keys.fork_fresh) — self-heal
+    (a dropped artifact rebuilds) and the legitimately-empty vector fork both fall out of one
+    existence check, so the phase-3 terrain-vs-vector require_artifact split is gone."""
     stem = filepath.split("/")[-1].replace("-aggregation.csv", "")
     skips = {"contour": SKIP_CONTOURS, "soundings": SKIP_SOUNDINGS, "depare": SKIP_DEPARE}
     plan = {}
@@ -152,16 +154,8 @@ def plan_forks(filepath):
             continue
         art = _artifact(fork, stem)
         key = _KEYFN[fork](filepath)
-        fresh = keys.is_fresh(art, key, require_artifact=(fork == "terrain"))
-        plan[fork] = {"art": art, "key": key, "do": not fresh}
+        plan[fork] = {"art": art, "key": key, "do": not keys.fork_fresh(art, key)}
     return plan
-
-
-def _record(entry):
-    """Write a fork's key sidecar next to its artifact, creating the store dir first (a fork that
-    produced nothing still records its key so it stops re-running)."""
-    utils.create_folder(os.path.dirname(entry["art"]))
-    keys.write_key(entry["art"], entry["key"])
 
 
 def run(filepath):
@@ -177,18 +171,17 @@ def run(filepath):
     if not SKIP_SMOOTH:
         smooth.smooth_merged(tmp_folder)         # slope-selective blur, shared by every fork
     if plan["terrain"]["do"]:
-        # Invalidate before writing (the crash rule every fork follows): a crash mid-archive
-        # must read stale on the next run, never fresh-with-a-torn-artifact — under FORCE the
-        # key is unchanged, so a surviving sidecar would vouch for whatever half-write remains.
-        sc = keys.sidecar(plan["terrain"]["art"])
-        if os.path.isfile(sc):
-            os.remove(sc)
-        aggregation_tile.main(filepath)          # raster Terrain-RGB tiles
-        _record(plan["terrain"])
+        e = plan["terrain"]
+        keys.supersede(e["art"])                 # clear last build's key before the atomic publish
+        aggregation_tile.main(filepath, keys.content_path(e["art"], e["key"]))  # Terrain-RGB, published atomically
     for fork, mod in (("contour", contour_run), ("soundings", soundings_run), ("depare", depare_run)):
         if plan[fork]["do"]:
-            mod.generate(filepath)               # vector fork off the same merged DEM
-            _record(plan[fork])
+            e = plan[fork]
+            cpath = keys.content_path(e["art"], e["key"])
+            keys.supersede(e["art"])             # clear last build's key BEFORE generating (crash -> stale)
+            mod.generate(filepath, cpath)        # vector fork off the same merged DEM; writes cpath atomically, or nothing
+            if not os.path.isfile(cpath):
+                keys.write_empty(e["art"], e["key"])  # legitimately empty -> mark it done
     if not os.environ.get("KEEP_TMP"):           # KEEP_TMP=1 preserves the merged DEM for re-running a fork
         shutil.rmtree(tmp_folder)
     print(f"{stem} end")

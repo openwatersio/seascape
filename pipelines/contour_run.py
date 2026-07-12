@@ -141,27 +141,19 @@ def smooth_and_enrich(sources, out_fgb, tol):
     gdf.to_file(out_fgb, driver="FlatGeobuf")
 
 
-def generate(filepath):
+def generate(filepath, out):
+    """Contour one aggregation tile's merged DEM into ``out`` (the caller's content-addressed FGB
+    name). Writes ``out`` atomically only when there ARE features — an all-land / all-deep tile
+    returns having written nothing, and the caller records the empty marker. The caller superseded
+    this stem's old-key siblings before calling, so a crash here leaves the fork reading stale."""
     agg_id, filename = filepath.split("/")[-2:]
     z, x, y, child_z = (int(a) for a in filename.replace("-aggregation.csv", "").split("-"))
     tile = mercantile.Tile(x=x, y=y, z=z)
     tmp = f"store/aggregation/{agg_id}/{z}-{x}-{y}-{child_z}-tmp"
-    name = f"{z}-{x}-{y}-{child_z}"
     dem = f"{tmp}/{len(glob(f'{tmp}/*.tiff')) - 1}-3857.tiff"
     if not os.path.exists(dem):
         print(f"contour: no merged DEM for {filename}")
         return
-
-    # Drop a previous run's FGB AND its key sidecar up front, in the same breath: FlatGeobuf
-    # has no DeleteLayer (ogr2ogr -overwrite fails on an existing file), a config change that
-    # now yields no features must not leave the old artifact behind to bundle stale, and a
-    # crash after this point must read STALE next run — under FORCE the key is unchanged, so a
-    # surviving sidecar would read fresh forever over the deleted artifact (a permanent silent
-    # hole). aggregation_run re-records the sidecar only after this fork completes.
-    out = f"store/contour/{name}.fgb"
-    for stale in (out, keys.sidecar(out)):
-        if os.path.isfile(stale):
-            os.remove(stale)
 
     levels = " ".join(str(l) for l in config.CONTOUR_LEVELS)
     raw = f"{tmp}/contour-raw.fgb"
@@ -190,11 +182,12 @@ def generate(filepath):
         print(f"contour: no features in tile bbox for {filename}")
         return
 
-    # Tile-keyed (not agg_id-scoped) so clean tiles' contours persist across
-    # incremental runs, exactly like store/pmtiles — bundle() globs them all.
-    utils.create_folder("store/contour")
-    _run(f"ogr2ogr -f FlatGeobuf -overwrite -nlt PROMOTE_TO_MULTI -t_srs EPSG:4326 {out} {clipped}",
+    # Reproject into the tmp folder, then atomically publish into the content name — the content
+    # file only ever appears complete (a crash mid-reproject leaves the temp, reads stale).
+    final = f"{tmp}/contour-final.fgb"
+    _run(f"ogr2ogr -f FlatGeobuf -overwrite -nlt PROMOTE_TO_MULTI -t_srs EPSG:4326 {final} {clipped}",
          "ogr2ogr reproject")
+    keys.publish(final, out)
     print(f"contour: {filename} -> {feature_count(out)} features")
 
 
@@ -250,7 +243,7 @@ def _tippecanoe(fgbs, minz, maxz, out):
 
 
 def _global_maxz(fgbs):
-    return max(int(f.split("/")[-1].replace(".fgb", "").split("-")[3]) for f in fgbs)
+    return max(int(keys.stem_of(f).split("-")[3]) for f in fgbs)
 
 
 def _stems_maxz(stems):
@@ -393,13 +386,38 @@ def _current_stems():
 
 
 def _live_fgbs(fgbs, stems):
-    """Drop FGBs orphaned by a covering re-tiling. A source's footprint/maxzoom shift
-    re-tiles its area (different z/x/y/child_z), but the store keeps no --delete, so the
-    superseded FGB lingers; bundling it alongside the new tiling draws two overlapping
-    contour sets. Keep only current-covering stems; keep all when stems is None."""
+    """Drop FGBs orphaned by a covering re-tiling. A source's footprint/maxzoom shift re-tiles its
+    area (different z/x/y/child_z), but the store keeps no --delete, so the superseded FGB lingers;
+    bundling it alongside the new tiling draws two overlapping contour sets. Keep only
+    current-covering stems (parsed off the content-addressed name); keep all when stems is None.
+    Non-content-addressed debris (a torn logical write) is dropped either way."""
+    live = [f for f in fgbs if keys.is_content_name(f)]
     if stems is None:
-        return fgbs
-    return [f for f in fgbs if f.split("/")[-1].replace(".fgb", "") in stems]
+        return live
+    return [f for f in live if keys.stem_of(f) in stems]
+
+
+def verify_vector_complete(layer, paths):
+    """Every stem in the current covering must carry this fork's artifact OR its .empty marker, or
+    the layer has a silent hole — the vector twin of bundle.verify_complete (a tile whose fork
+    never completed would simply vanish from vector.pmtiles). build.yml enforces the same invariant
+    via the store manifest's hard-fail, which happens to run before the vector bundlers — but that
+    is step ORDER; this gate makes each bundler SELF-enforcing, so a reordered workflow or a local
+    run fails loudly instead of publishing a hole. Runs before each bundler's fresh-skip, so a
+    fresh key can't paper over a gap. No covering locally (ad-hoc bundling of whatever exists)
+    skips the gate; a fork hard-skipped at aggregate time (SKIP_CONTOURS et al.) left no markers,
+    so bundling it fails here — correct: you asked to bundle a fork you never built."""
+    stems = _current_stems()
+    if stems is None:
+        return
+    have = {keys.stem_of(p) for p in paths}
+    have |= {keys.stem_of(p) for p in glob(f"store/{layer}/*.empty") if keys.is_content_name(p)}
+    missing = sorted(stems - have)
+    if missing:
+        raise SystemExit(
+            f"{layer} incomplete: {len(missing)} of {len(stems)} covering tiles have neither an "
+            f"artifact nor an empty marker (a failed/interrupted aggregate run) — e.g. "
+            f"{', '.join(missing[:15])}{' …' if len(missing) > 15 else ''}")
 
 
 # vector.pmtiles depends on every per-tile contour/sounding/depare artifact's key + the three
@@ -414,10 +432,16 @@ def _vector_key(maxz):
     inputs = []
     for folder, ext in (("contour", "fgb"), ("soundings", "geojson"), ("depare", "fgb")):
         for path in sorted(glob(f"store/{folder}/*.{ext}")):
-            stem = path.split("/")[-1].rsplit(".", 1)[0]
+            if not keys.is_content_name(path):  # legacy/torn debris — never a bundle input
+                continue
+            stem = keys.stem_of(path)
             if stems is not None and stem not in stems:  # orphan from a re-tiled covering
                 continue
-            inputs.append(f"{folder}/{stem}:{keys.read_key(path) or ''}")
+            # The key rides in the filename now (empty forks carry only a .empty marker, which
+            # this *.fgb / *.geojson glob skips — an empty->non-empty transition adds a content
+            # file and moves the key, the meaningful change). Layer folder included: contour and
+            # depare are both .fgb, so the folder keeps each input's identity unambiguous.
+            inputs.append(os.path.relpath(path, "store"))
     cfg = {"maxz": maxz,
            "contour_simplification": os.environ.get("CONTOUR_SIMPLIFICATION", "8"),
            "depare_simplification": os.environ.get("DEPARE_SIMPLIFICATION", "8")}
@@ -432,6 +456,7 @@ def bundle():
     every per-tile vector artifact's key is unchanged and vector.pmtiles is already on disk (the
     local iterative loop; the box's store/bundle is never hydrated, so a box build always runs)."""
     fgbs = _live_fgbs(sorted(glob("store/contour/*.fgb")), _current_stems())
+    verify_vector_complete("contour", fgbs)  # self-enforcing, before the fresh-skip (see the gate)
     vec = "store/bundle/vector.pmtiles"
     if not fgbs:
         # Empty input is a real state, not a no-op: a previously-built vector.pmtiles (and the
@@ -473,10 +498,12 @@ def _check():
     assert _drop_small_rings(ring(100), MIN_RING_AREA_M2) is None        # ~0.03 km² → drop
     assert _drop_small_rings(ring(3000), MIN_RING_AREA_M2) is not None   # ~28 km²  → keep
     assert _drop_small_rings(LineString([(0, 0), (5e3, 0), (1e4, 5e3)]), MIN_RING_AREA_M2) is not None  # open line kept
-    # orphan-FGB filter: keep only current-covering stems; passthrough when stems is None
-    fgbs = ["store/contour/4-5-6-8.fgb", "store/contour/11-300-400-13.fgb"]
-    assert _live_fgbs(fgbs, {"11-300-400-13"}) == ["store/contour/11-300-400-13.fgb"]
+    # orphan-FGB filter (content-addressed names): keep only current-covering stems; passthrough
+    # when stems is None; a non-content name (legacy/torn) is dropped either way.
+    fgbs = ["store/contour/4-5-6-8-aaaaaaaaaaaa.fgb", "store/contour/11-300-400-13-bbbbbbbbbbbb.fgb"]
+    assert _live_fgbs(fgbs, {"11-300-400-13"}) == ["store/contour/11-300-400-13-bbbbbbbbbbbb.fgb"]
     assert _live_fgbs(fgbs, None) == fgbs
+    assert _live_fgbs(["store/contour/9-1-1-9.fgb"], None) == [], "a legacy logical name is dropped"
     # the shared bundle maxzoom reads child_z off covering stems
     assert _stems_maxz({"4-5-6-8", "11-300-400-13"}) == 13
     # navigable-band contours skip Chaikin (never bow a shoal deeper); deeper ones smooth

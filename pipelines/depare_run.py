@@ -143,7 +143,12 @@ def partitions(dem, levels, raw_fgb):
     return g
 
 
-def generate(filepath):
+def generate(filepath, out):
+    """Partition one aggregation tile's merged DEM into depth-area / drying / nodata polygons at
+    ``out`` (the caller's content-addressed FGB name). Writes ``out`` atomically only when there
+    ARE rows — an all-ocean-deep / all-land tile returns having written nothing, and the caller
+    records the empty marker. The caller superseded this stem's old-key siblings before calling,
+    so a crash here leaves the fork reading stale."""
     import geopandas as gpd
     import landmask
     from shapely import make_valid
@@ -153,20 +158,10 @@ def generate(filepath):
     z, x, y, child_z = (int(a) for a in filename.replace("-aggregation.csv", "").split("-"))
     tile = mercantile.Tile(x=x, y=y, z=z)
     tmp = f"store/aggregation/{agg_id}/{z}-{x}-{y}-{child_z}-tmp"
-    stem = f"{z}-{x}-{y}-{child_z}"
     dem = f"{tmp}/{len(glob(f'{tmp}/*.tiff')) - 1}-3857.tiff"
     if not os.path.exists(dem):
         print(f"depare: no merged DEM for {filename}")
         return
-
-    # Drop a previous run's FGB AND its key sidecar up front: a re-run that now yields no rows
-    # must not leave the old artifact behind to bundle stale, and a crash after this point must
-    # read STALE next run — under FORCE the key is unchanged, so a surviving sidecar would read
-    # fresh forever over the deleted artifact (see the contour fork; same rule all three).
-    out = f"store/depare/{stem}.fgb"
-    for stale in (out, keys.sidecar(out)):
-        if os.path.isfile(stale):
-            os.remove(stale)
 
     clip = box(*mercantile.xy_bounds(tile))  # unbuffered, tile-aligned (EPSG:3857)
     with rasterio.open(dem) as d:
@@ -268,11 +263,13 @@ def generate(filepath):
         print(f"depare: no water in tile bbox for {filename}")
         return
 
-    utils.create_folder("store/depare")  # tile-keyed, so clean tiles persist across incremental runs
     # A mixed schema across the three kinds: a row omits a key it doesn't carry, geopandas writes
     # the gap as NULL (NaN for float drval, None for str sys/kind), and FlatGeobuf -> tippecanoe
     # encode that as an ABSENT MVT property — so nodata truly has no drval1, the fill's switch key.
-    gpd.GeoDataFrame(rows, crs="EPSG:3857").to_crs("EPSG:4326").to_file(out, driver="FlatGeobuf")
+    # Write into the tmp folder, then atomically publish into the content name.
+    final = f"{tmp}/depare-final.fgb"
+    gpd.GeoDataFrame(rows, crs="EPSG:3857").to_crs("EPSG:4326").to_file(final, driver="FlatGeobuf")
+    keys.publish(final, out)
     print(f"depare: {filename} -> {len(rows)} polygons")
 
 
@@ -291,6 +288,7 @@ def bundle():
     FlatGeobuf Integer64, so -T rank:int keeps it numeric in the MVT (else it lands as a string,
     like the contour depth ints)."""
     fgbs = contour_run._live_fgbs(sorted(glob("store/depare/*.fgb")), contour_run._current_stems())
+    contour_run.verify_vector_complete("depare", fgbs)  # self-enforcing, before the fresh-skip
     out = "store/bundle/depare.pmtiles"
     if not fgbs:
         # Empty input is a real state, not a no-op: a previously-built archive (and the sidecar
@@ -302,11 +300,11 @@ def bundle():
                 os.remove(stale)
         print("depare bundle: no depare FGBs")
         return
-    maxz = contour_run.bundle_maxz(
-        max(int(f.split("/")[-1].replace(".fgb", "").split("-")[3]) for f in fgbs))
+    maxz = contour_run.bundle_maxz(max(int(keys.stem_of(f).split("-")[3]) for f in fgbs))
     # Skip when every member tile's key is unchanged and the pmtiles is on disk (the local
     # iterative loop; the box's store/bundle is never hydrated, so a box build always rebuilds).
-    dkey = keys.stage_key([f"{f}:{keys.read_key(f) or ''}" for f in fgbs],
+    # The key rides in each member's content name.
+    dkey = keys.stage_key([os.path.basename(f) for f in fgbs],
                           ["depare_run", "contour_run", "utils"],
                           {"maxz": maxz, "min_zoom": MIN_ZOOM,
                            "simplification": os.environ.get("DEPARE_SIMPLIFICATION", "8")})

@@ -88,11 +88,14 @@ def covering_stems(aggregation_id):
 
 def group_filepaths(aggregation_id):
     """{'planet': [...], '<z>-<x>-<y>': [...]} — the grid partition of every
-    single-zoom pmtiles in the local store."""
+    single-zoom pmtiles in the local store. Content-addressed names carry the key; the sweep leaves
+    one file per logical stem, so grouping by the parsed stem never doubles a tile."""
     stems = covering_stems(aggregation_id)
     groups = {}
     for fp in sorted(glob("store/pmtiles/*.pmtiles") + glob("store/pmtiles/*/*.pmtiles")):
-        stem = fp.split("/")[-1].replace(".pmtiles", "")
+        if not keys.is_content_name(fp):  # legacy mutable name / torn logical write — skip
+            continue
+        stem = keys.stem_of(fp)
         if stem not in stems:  # orphan from a re-tiled covering (see covering_stems)
             continue
         for name in stem_groups(stem):
@@ -124,7 +127,7 @@ def create_archive(filepaths, name):
 
         tile_ids_and_filepaths = []
         for filepath in filepaths:
-            z, x, y, child_z = (int(a) for a in filepath.split("/")[-1].replace(".pmtiles", "").split("-"))
+            z, x, y, child_z = (int(a) for a in keys.stem_of(filepath).split("-"))
             parent = mercantile.Tile(x=x, y=y, z=z)
             tiles = [parent] if z == child_z else list(mercantile.children(parent, zoom=child_z))
             if name != "planet":
@@ -183,8 +186,9 @@ def verify_complete(aggregation_id):
     publish it. (downsampling.execute catches gaps a *running* pass sees; this catches a
     covering that produced nothing at all, which leaves nothing for execute to notice.)"""
     coverings = covering_stems(aggregation_id)
-    have = {fp.split("/")[-1].replace(".pmtiles", "")
-            for fp in glob("store/pmtiles/*.pmtiles") + glob("store/pmtiles/*/*.pmtiles")}
+    have = {keys.stem_of(fp)
+            for fp in glob("store/pmtiles/*.pmtiles") + glob("store/pmtiles/*/*.pmtiles")
+            if keys.is_content_name(fp)}
     missing = sorted(coverings - have)
     if missing:
         raise SystemExit(
@@ -231,8 +235,9 @@ def _bundle_key(groups):
     inputs = []
     for name in sorted(groups):
         for fp in sorted(groups[name]):
-            stem = fp.split("/")[-1].replace(".pmtiles", "")
-            inputs.append(f"{name}/{stem}:{keys.read_key(fp) or ''}")
+            # The member's key rides in its content filename, so the basename IS its identity —
+            # a re-keyed member (a re-merged tile) enters under a new name and moves this key.
+            inputs.append(f"{name}/{os.path.basename(fp)}")
     inputs += [f"source:{s}" for s in config.sources()]
     cfg = {"planet_max_zoom": PLANET_MAX_ZOOM, "split_z": SPLIT_Z,
            "macrotile_z": utils.macrotile_z, "num_overviews": utils.num_overviews}

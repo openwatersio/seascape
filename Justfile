@@ -87,6 +87,14 @@ downsample:
 bundle:
     uv run python bundle.py
 
+# Walk the local store and write store/manifests/<covering-id>.json — the content name / empty
+# marker of every artifact this build's covering produced — printing the id. The workflow publishes
+# it and flips the store pointer LAST (the next build hydrates exactly these; the GC keeps them).
+# A bbox build never runs it: regional runs write no planet-scoped pointer. R2-agnostic — the id is
+# the covering ULID, the names are store-root-relative, and this step knows nothing about buckets.
+store-manifest:
+    uv run python store_manifest.py write
+
 # Contours, whole set: one global tippecanoe over every contour FGB, then one tile-join that
 # also folds in the soundings/depare pmtiles already bundled → vector.pmtiles.
 contours:
@@ -222,3 +230,9 @@ test-engine:
     uv run python test_engine.py
     uv run python aggregation_reproject.py --check
     uv run python keys.py --check
+    uv run python store_manifest.py --check
+# Test the GC's Collect step (scripts/gc-collect.sh — the exact script gc.yml runs, local
+# backend) against a synthetic store tree: happy path + every refusal guard. Needs bash + jq;
+# ci.yml runs it on every push.
+test-gc:
+    bash test_gc.sh
