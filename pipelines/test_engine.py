@@ -1296,6 +1296,54 @@ def main():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def check_pmtiles_reproducible():
+    """The pmtiles Writer gzips its root+leaf directories; stock gzip stamps a wall-clock mtime
+    into each header, so two builds of byte-identical tiles used to differ in those 4 bytes
+    (and the manifest md5s churned every run). utils.py pins mtime=0 by rebinding the pmtiles
+    gzip binding. That monkey-patch is easy to lose silently on a pmtiles upgrade, so guard it:
+    two archives built from the same tiles must be byte-for-byte identical."""
+    import time as _time
+    import utils  # applies the deterministic-gzip monkey-patch at import time
+    from pmtiles.writer import Writer
+    from pmtiles.tile import zxy_to_tileid, TileType, Compression
+
+    def build(path):
+        # enough tiles to force a real (gzipped) directory — the part the patch targets
+        tiles = {zxy_to_tileid(14, x, y): bytes([(x + y) % 256]) * 16
+                 for x in range(48) for y in range(48)}
+        with open(path, "wb") as f:
+            w = Writer(f)
+            for tid in sorted(tiles):
+                w.write_tile(tid, tiles[tid])
+            w.finalize(
+                {"tile_type": TileType.WEBP, "tile_compression": Compression.NONE,
+                 "min_zoom": 14, "max_zoom": 14,
+                 "min_lon_e7": 0, "min_lat_e7": 0, "max_lon_e7": 10, "max_lat_e7": 10,
+                 "center_zoom": 14, "center_lon_e7": 5, "center_lat_e7": 5},
+                {"attribution": utils.ATTRIBUTION})
+
+    # Drive the two builds under DIFFERENT clocks: stock gzip stamps time.time() into its header,
+    # so if the patch ever silently stops pinning mtime=0, the two archives diverge here. (Both
+    # builds within one wall-second would otherwise mask the bug — this makes it timing-independent.)
+    tmp = tempfile.mkdtemp()
+    orig_time = _time.time
+    try:
+        a, b = f"{tmp}/a.pmtiles", f"{tmp}/b.pmtiles"
+        _time.time = lambda: 1_000_000_000.0
+        build(a)
+        _time.time = lambda: 2_000_000_000.0
+        build(b)
+        _time.time = orig_time
+        ba, bb = open(a, "rb").read(), open(b, "rb").read()
+        assert ba == bb, (f"pmtiles NOT reproducible ({len(ba)} vs {len(bb)} bytes) under two "
+                          "clocks — the deterministic-gzip patch in utils.py likely broke on a "
+                          "pmtiles upgrade")
+        print(f"pmtiles-reproducible ok — byte-identical {len(ba)}-byte archive across two clocks")
+    finally:
+        _time.time = orig_time
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     import depare_run
     import landmask
@@ -1313,4 +1361,5 @@ if __name__ == "__main__":
     check_depare()
     check_depare_drying()
     check_depare_water()
+    check_pmtiles_reproducible()
     main()

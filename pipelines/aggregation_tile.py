@@ -22,10 +22,10 @@ NODATA = -9999
 
 # Threads for the per-tile Terrarium/WebP encode. rasterio's block reads and
 # imagecodecs.webp_encode both release the GIL, so the ~43 ms/tile encode of the
-# 4096 z14 tiles parallelizes without process-spawn overhead. All threads share
-# the process's one open DEM; each task holds only its own 512x512 window (~1 MB),
-# so the added memory ceiling is workers x ~1 MB — negligible against the tile's
-# multi-GB merged DEM.
+# 4096 z14 tiles parallelizes without process-spawn overhead. Each task opens the
+# DEM COG independently and reads only its own 512x512 window (~1 MB) — the OS page
+# cache shares the underlying file across threads, so the added memory ceiling is
+# workers x ~1 MB, negligible against the tile's multi-GB merged DEM.
 ENCODE_THREADS = min(os.cpu_count() or 1, 8)
 
 
