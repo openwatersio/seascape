@@ -172,6 +172,7 @@ def check_self_heal():
     import aggregation_run
     import config
     import keys
+    import mosaic
     import utils
     env_force = os.environ.pop("FORCE_REBUILD", None)  # this check is about the incremental path
     saved_land = os.environ.pop("LANDMASK", None)      # a dev mask's file hash would enter the keys
@@ -211,6 +212,11 @@ def check_self_heal():
                                           aggregation_run._KEYFN[fork](fp))
                 utils.create_folder(os.path.dirname(cpath))
                 open(cpath, "w").close()
+            # The stage-2 mosaic tile is a content-addressed product too — a fully-built store has
+            # it, so a fresh store means zero work only once it's present alongside the forks.
+            mpath = keys.content_path(mosaic.tile_artifact(t), mosaic.mosaic_key(fp))
+            utils.create_folder(os.path.dirname(mpath))
+            open(mpath, "w").close()
         assert aggregation_run.dirty_filepaths() == [], "fresh keys must mean zero work"
 
         missing = set(tiles[1::2])

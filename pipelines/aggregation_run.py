@@ -31,6 +31,7 @@ import contour_run
 import depare_run
 import keys
 import landmask
+import mosaic
 import smooth
 import soundings_run
 import utils
@@ -161,13 +162,20 @@ def plan_forks(filepath):
 def run(filepath):
     stem = filepath.split("/")[-1].replace("-aggregation.csv", "")
     plan = plan_forks(filepath)
-    if not any(p["do"] for p in plan.values()):
+    # The mosaic is an ADDITIVE stage-2 product persisted ALONGSIDE the forks (the merged Float32
+    # truth layer), keyed independently (mosaic.mosaic_key — no smoothing in its key). It shares the
+    # same reproject+merge, so a stale mosaic (even with all forks fresh) must run the tile too.
+    mosaic_key = mosaic.mosaic_key(filepath)
+    do_mosaic = not keys.fork_fresh(mosaic.tile_artifact(stem), mosaic_key)
+    if not any(p["do"] for p in plan.values()) and not do_mosaic:
         print(f"{stem} fresh — skip")
         return
     print(f"{stem} start")
     aggregation_reproject.reproject(filepath)
     aggregation_merge.merge(filepath)
     tmp_folder = filepath.replace("-aggregation.csv", "-tmp")
+    if do_mosaic:
+        mosaic.produce(filepath, tmp_folder, mosaic_key)  # persist BEFORE smooth (unsmoothed truth)
     if not SKIP_SMOOTH:
         smooth.smooth_merged(tmp_folder)         # slope-selective blur, shared by every fork
     if plan["terrain"]["do"]:
@@ -203,8 +211,11 @@ def dirty_filepaths():
     """Every tile with a stale fork, heaviest-first — the work list for a single-machine `just
     planet`. Spatial change detection falls out of the keys: only a tile whose intersecting source
     hashes / covering row / smooth config changed gets new fork keys, so a no-change rerun returns
-    []. FORCE_REBUILD makes every tile stale (keys.is_fresh ignores the match)."""
-    return [fp for fp in covering_sorted() if any(p["do"] for p in plan_forks(fp).values())]
+    []. FORCE_REBUILD makes every tile stale (keys.is_fresh ignores the match). A tile whose ONLY
+    stale product is the mosaic (a merge/precedence change that leaves the smoothed forks untouched)
+    counts as dirty too — mosaic.stale reuses the same content-addressed freshness."""
+    return [fp for fp in covering_sorted()
+            if any(p["do"] for p in plan_forks(fp).values()) or mosaic.stale(fp)]
 
 
 def sources_manifest():

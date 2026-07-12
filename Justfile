@@ -48,6 +48,7 @@ planet:
     just cover
     just coverage
     just aggregate
+    just mosaic-index
     just combine
     just soundings
     just depare
@@ -69,6 +70,13 @@ aggregate:
 # build box hydrate exactly the dirty set from R2, then aggregate from local disk.
 sources-manifest:
     uv run python aggregation_run.py sources-manifest
+
+# Assemble the stage-2 mosaic index from the tile COGs `aggregate` persisted: the GeoParquet
+# tile index (= manifest), the planet z8 overview COG, and the mosaic.gti pointer (written last).
+# Run after `aggregate`. A bbox build produces a window-scoped GTI (QGIS-inspectable) but writes
+# no planet-scoped pointer flip — that's a workflow concern (see mosaic._write_gti / 5b).
+mosaic-index:
+    uv run python mosaic.py index
 
 # Single-machine terrain finish: overview pyramid -> planet/overlay bundles + manifest.
 combine:
@@ -233,6 +241,7 @@ test-engine:
     uv run python test_engine.py
     uv run python aggregation_reproject.py --check
     uv run python keys.py --check
+    uv run python mosaic.py --check
     uv run python store_manifest.py --check
 
 # Lint the GitHub Actions workflows.
