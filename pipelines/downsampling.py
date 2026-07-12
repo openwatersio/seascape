@@ -184,11 +184,16 @@ def _child_logical(child_filename):
 
 def _child_content(child_filename):
     """Resolve a covering's LOGICAL child name ('8-77-95-8.pmtiles') to its content-addressed
-    file on disk ('.../8-77-95-8-<key>.pmtiles'), or None if absent. After the per-stem sweep at
-    most one content file per logical stem exists locally, so the match is unambiguous."""
+    file on disk ('.../8-77-95-8-<key>.pmtiles'), or None if absent. The per-stem sweep guarantees
+    at most one content file per logical stem — enforced here, because two matches would make the
+    parent's key depend on glob order (nondeterministic run-to-run)."""
     logical = _child_logical(child_filename)
     root, ext = os.path.splitext(logical)
-    matches = glob(f"{root}-*{ext}")
+    matches = sorted(glob(f"{root}-*{ext}"))
+    if len(matches) > 1:
+        raise SystemExit(f"{logical}: {len(matches)} content files for one logical child "
+                         f"({', '.join(os.path.basename(m) for m in matches)}) — the per-stem "
+                         "sweep guarantees at most one; refusing a nondeterministic overview key")
     return matches[0] if matches else None
 
 

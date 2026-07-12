@@ -290,8 +290,10 @@ jobs:
           if [ -z "${BBOX:-}" ]; then
             echo "── hydrate ──"
             if rclone cat "$R2/store/manifest.json" > /tmp/pointer.json 2>/dev/null && [ -s /tmp/pointer.json ]; then
-              mref=$(jq -r '.manifest' /tmp/pointer.json)
-              rclone cat "$R2/store/$mref" > /tmp/manifest.json
+              mref=$(jq -r '.manifest // empty' /tmp/pointer.json)
+              [ -n "$mref" ] || { echo "store pointer exists but names no manifest — corrupt pointer.json, refusing to guess" >&2; exit 1; }
+              rclone cat "$R2/store/$mref" > /tmp/manifest.json \
+                || { echo "pointer names $mref but it failed to fetch — pointer/manifest mismatch, refusing to hydrate" >&2; exit 1; }
               jq -r '.entries[].name' /tmp/manifest.json > /tmp/hydrate-files.txt
               n=$(wc -l < /tmp/hydrate-files.txt)
               [ "$n" -gt 0 ] || { echo "store manifest $mref references 0 artifacts — refusing to hydrate an empty world" >&2; exit 1; }

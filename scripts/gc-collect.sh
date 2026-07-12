@@ -56,7 +56,7 @@ echo "pointer → $current"
 bk_files store/manifests | grep '\.json$' | sort > "$GC_OUT/gc-all-manifests.txt" || true
 [ -s "$GC_OUT/gc-all-manifests.txt" ] || refuse "no store manifests listed — refusing to GC"
 tail -n "$KEEP" "$GC_OUT/gc-all-manifests.txt" > "$GC_OUT/gc-keep-manifests.txt"
-grep -qx "${current#manifests/}" "$GC_OUT/gc-keep-manifests.txt" \
+grep -qxF "${current#manifests/}" "$GC_OUT/gc-keep-manifests.txt" \
   || refuse "pointer manifest $current not among the newest $KEEP — stale/corrupt listing, refusing to GC"
 
 # 3) Referenced set = union of those manifests' names. Each must fetch and be valid JSON with

@@ -439,8 +439,9 @@ def _vector_key(maxz):
                 continue
             # The key rides in the filename now (empty forks carry only a .empty marker, which
             # this *.fgb / *.geojson glob skips — an empty->non-empty transition adds a content
-            # file and moves the key, the meaningful change).
-            inputs.append(os.path.basename(path))
+            # file and moves the key, the meaningful change). Layer folder included: contour and
+            # depare are both .fgb, so the folder keeps each input's identity unambiguous.
+            inputs.append(os.path.relpath(path, "store"))
     cfg = {"maxz": maxz,
            "contour_simplification": os.environ.get("CONTOUR_SIMPLIFICATION", "8"),
            "depare_simplification": os.environ.get("DEPARE_SIMPLIFICATION", "8")}

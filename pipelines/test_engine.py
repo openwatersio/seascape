@@ -67,7 +67,10 @@ def content_names(tmp, *patterns):
         for p in glob(f"{tmp}/{pattern}", recursive=True):
             base = os.path.basename(p)
             if keys.is_content_name(base):
-                out[keys.stem_of(base)] = base
+                stem = keys.stem_of(base)
+                assert stem not in out, (f"{stem}: two content files for one stem "
+                                         f"({out[stem]}, {base}) — supersede must have failed")
+                out[stem] = base
     return out
 
 
