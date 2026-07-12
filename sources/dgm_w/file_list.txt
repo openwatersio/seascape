@@ -1,0 +1,139 @@
+# German Federal Waterway Bathymetry — WSV DGM-W (Digitales Geländemodell des Wasserlaufs), 2 m.
+# Source: WSV INSPIRE "Höhe" (Elevation) pre-defined Atom download service.
+#   Browse : https://via.bund.de/wsv/inspire/  ->  "INSPIRE Höhe – Höhenmodell Bundeswasserstraßen"
+#   Feed   : https://via.bund.de/wsv/inspire/resttpl/client?request=getTableData&serviceId=1c4c7ffc-cdd8-11eb-8fb7-005056a877b6
+#
+# 93 DEM tiles, each a .zip holding one GeoTIFF (terrain + riverbed merged, 2 m, Float32,
+# nodata -32768). The feed also carries "Höhenlinien" (contour) zips — deliberately excluded;
+# Seascape generates its own contours from the DEM.
+#
+# Per-tile CRS varies (DHDN/Gauss-Krüger and UTM/ETRS89 zones) -> mixed_crs source.
+# Values are orthometric NHN elevation (up-positive, GEBCO convention) -> no negate, no offset.
+# Tidal/estuary reaches (Nordsee, Außenelbe, Jade, Außenweser, Unter-/Außenems) read as true
+# depth; inland reaches sit above MSL and render as land unless referenced to a per-reach water
+# surface. To subset (e.g. tidal reaches only), comment out whole waterway blocks below.
+# License: GeoNutzV — attribute "© Wasserstraßen- und Schifffahrtsverwaltung des Bundes (WSV)".
+
+
+# Dortmund-Ems-Kanal — 2 tile(s)
+https://via.bund.de/wsv/inspire/download/el/0501_km202_214.zip
+https://via.bund.de/wsv/inspire/download/el/0501_km214_226.zip
+
+# Elbe — 35 tile(s)
+https://via.bund.de/wsv/inspire/download/el/0701_km0_20.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km20_40.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km40_60.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km60_80.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km80_100.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km100_120.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km120_140.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km140_160.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km160_180.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km180_200.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km200_230.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km230_260.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km260_290.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km290_320.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km320_350.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km350_380.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km380_410.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km410_440.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km440_460.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km460_480.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km480_500.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km500_520.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km520_540.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km540_560.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km560_590.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km585_600.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km600_610.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km639_650.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km650_670.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km670_690.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km690_710.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km710_728.zip
+https://via.bund.de/wsv/inspire/download/el/0792_km607_620.zip
+https://via.bund.de/wsv/inspire/download/el/0792_km620_639.zip
+https://via.bund.de/wsv/inspire/download/el/0794_km610_626.zip
+
+# Ems — 4 tile(s)
+https://via.bund.de/wsv/inspire/download/el/1191_km0_20.zip
+https://via.bund.de/wsv/inspire/download/el/1191_km20_40.zip
+https://via.bund.de/wsv/inspire/download/el/1191_km40_60.zip
+https://via.bund.de/wsv/inspire/download/el/1191_km60_68.zip
+
+# Grenzoder — 8 tile(s)
+https://via.bund.de/wsv/inspire/download/el/6201_km542_560.zip
+https://via.bund.de/wsv/inspire/download/el/6201_km560_580.zip
+https://via.bund.de/wsv/inspire/download/el/6201_km580_600.zip
+https://via.bund.de/wsv/inspire/download/el/6201_km600_620.zip
+https://via.bund.de/wsv/inspire/download/el/6201_km620_640.zip
+https://via.bund.de/wsv/inspire/download/el/6201_km640_660.zip
+https://via.bund.de/wsv/inspire/download/el/6201_km660_680.zip
+https://via.bund.de/wsv/inspire/download/el/6201_km680_705.zip
+
+# Havel-Oder — 3 tile(s)
+https://via.bund.de/wsv/inspire/download/el/5801_km80_100.zip
+https://via.bund.de/wsv/inspire/download/el/5801_km100_120.zip
+https://via.bund.de/wsv/inspire/download/el/5801_km120_136.zip
+
+# Jade — 1 tile(s)
+https://via.bund.de/wsv/inspire/download/el/7060_7061.zip
+
+# Lahn — 3 tile(s)
+https://via.bund.de/wsv/inspire/download/el/2401_km80_100.zip
+https://via.bund.de/wsv/inspire/download/el/2401_km100_120.zip
+https://via.bund.de/wsv/inspire/download/el/2401_km120_136.zip
+
+# Main — 4 tile(s)
+https://via.bund.de/wsv/inspire/download/el/2901_km0_20.zip
+https://via.bund.de/wsv/inspire/download/el/2901_km20_40.zip
+https://via.bund.de/wsv/inspire/download/el/2901_km40_60.zip
+https://via.bund.de/wsv/inspire/download/el/2901_km60_78.zip
+
+# Main-2 — 2 tile(s)
+https://via.bund.de/wsv/inspire/download/el/2901_km77_90.zip
+https://via.bund.de/wsv/inspire/download/el/2901_km90_102.zip
+
+# Mosel — 1 tile(s)
+https://via.bund.de/wsv/inspire/download/el/3201.zip
+
+# Nordsee — 4 tile(s)
+https://via.bund.de/wsv/inspire/download/el/7040_km727_740.zip
+https://via.bund.de/wsv/inspire/download/el/7040_km740_753.zip
+https://via.bund.de/wsv/inspire/download/el/7080_km67_80.zip
+https://via.bund.de/wsv/inspire/download/el/7080_km80_100.zip
+
+# Ober-/Mittelweser — 1 tile(s)
+https://via.bund.de/wsv/inspire/download/el/5201.zip
+
+# Rhein — 19 tile(s)
+https://via.bund.de/wsv/inspire/download/el/3901_km164_174.zip
+https://via.bund.de/wsv/inspire/download/el/3901_km226_235.zip
+https://via.bund.de/wsv/inspire/download/el/3901_km242_249.zip
+https://via.bund.de/wsv/inspire/download/el/3901_km259_268.zip
+https://via.bund.de/wsv/inspire/download/el/3901_km273_284.zip
+https://via.bund.de/wsv/inspire/download/el/3901_km291_308.zip
+https://via.bund.de/wsv/inspire/download/el/3901_km311_326.zip
+https://via.bund.de/wsv/inspire/download/el/3901_km326_337.zip
+https://via.bund.de/wsv/inspire/download/el/3901_km332_560.zip
+https://via.bund.de/wsv/inspire/download/el/3901_km639_739.zip
+https://via.bund.de/wsv/inspire/download/el/3901_km739_865.zip
+https://via.bund.de/wsv/inspire/download/el/3902_km173_190.zip
+https://via.bund.de/wsv/inspire/download/el/3902_km190_205.zip
+https://via.bund.de/wsv/inspire/download/el/3902_km205_227.zip
+https://via.bund.de/wsv/inspire/download/el/3903_km234_243.zip
+https://via.bund.de/wsv/inspire/download/el/3904_km248_260.zip
+https://via.bund.de/wsv/inspire/download/el/3905_km267_274.zip
+https://via.bund.de/wsv/inspire/download/el/3906_km283_292.zip
+https://via.bund.de/wsv/inspire/download/el/3907_km307_312.zip
+
+# Saar — 5 tile(s)
+https://via.bund.de/wsv/inspire/download/el/4201_km0_20.zip
+https://via.bund.de/wsv/inspire/download/el/4201_km20_40.zip
+https://via.bund.de/wsv/inspire/download/el/4201_km40_60.zip
+https://via.bund.de/wsv/inspire/download/el/4201_km60_80.zip
+https://via.bund.de/wsv/inspire/download/el/4201_km80_94.zip
+
+# Unter-/Außenweser — 1 tile(s)
+https://via.bund.de/wsv/inspire/download/el/5298_7050.zip

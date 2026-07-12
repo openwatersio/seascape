@@ -1,0 +1,17 @@
+# German Federal Waterway Bathymetry — WSV DGM-W (Digitales Geländemodell des Wasserlaufs), 2 m.
+# Run from pipelines/:  just ../sources/dgm_w/
+# 93 zipped GeoTIFF tiles from the WSV INSPIRE "Höhe" Atom download service (file_list.txt),
+# one .tif per zip, terrain + riverbed merged. Per-tile CRS (DHDN/Gauss-Krüger and UTM/ETRS89
+# zones) -> mixed_crs: normalize WITHOUT --crs to keep each file's embedded CRS; aggregation
+# reprojects each tile from its own frame. Values are orthometric NHN elevation (up-positive,
+# GEBCO convention) -> no negate, no offset; nodata -32768. Tidal/estuary reaches read as depth;
+# inland reaches sit above MSL (see metadata.json datum note). License: GeoNutzV, attribute the WSV.
+# NOTE: source_download.py is not resumable — a mid-run network failure re-pulls all tiles.
+[no-cd]
+default:
+    uv run python source_download.py dgm_w
+    uv run python source_unzip.py dgm_w
+    uv run python source_normalize.py dgm_w --nodata -32768
+    uv run python source_bounds.py dgm_w
+    uv run python source_polygonize.py dgm_w 8
+    uv run python source_create_tarball.py dgm_w

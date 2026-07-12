@@ -22,6 +22,7 @@ Selection rule: **resolution sets the zoom cap, an openly-redistributable licens
 | [Vaklodingen](vaklodingen/)                                        | 20 m        | z12       | Netherlands                         | NAP (~MSL)              |
 | INFOMAR ([10 m](infomar_10m/), [25 m](infomar_25m/))               | 10 m / 25 m | z13 / z11 | Ireland inshore + shelf             | **LAT**                 |
 | [UK SurfZone](uk_surfzone/)                                        | 2 m         | z14       | England intertidal                  | ODN (~MSL)              |
+| [WSV DGM-W (Germany)](dgm_w/)                                       | 2 m         | z14       | German federal waterways (Rhine, Elbe, …) | NHN (tidal reaches; inland needs offset) |
 | [GSC Atlantic](gsc_atlantic/)                                      | 100 m       | ~z10      | Scotian Shelf + NL                  | unverified              |
 | [GSC Pacific](gsc_pacific/)                                        | 10 m        | z13       | BC coast + Salish Sea               | unverified              |
 | [gbr30](gbr30/)                                                    | 30 m        | z12       | GBR + Coral Sea                     | MSL                     |

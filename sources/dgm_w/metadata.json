@@ -1,0 +1,9 @@
+{
+    "name": "German Federal Waterway Bathymetry (WSV DGM-W, 2 m)",
+    "producer": "Wasserstraßen- und Schifffahrtsverwaltung des Bundes (WSV) / Bundesanstalt für Gewässerkunde (BfG)",
+    "website": "https://via.bund.de/wsv/inspire/",
+    "license": "GeoNutzV (attribution: © Wasserstraßen- und Schifffahrtsverwaltung des Bundes)",
+    "max_zoom": 14,
+    "datum": "orthometric NHN height (DHHN2016), bed elevation up-positive — GEBCO convention, so no negate/offset. Tidal/estuary reaches read as depth; inland reaches sit at true elevation above MSL and would need per-reach water-surface referencing to render as depth.",
+    "mixed_crs": true
+}
