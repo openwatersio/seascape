@@ -220,6 +220,9 @@ dev:
     trap 'exit 0' INT TERM
     npm run dev -- --host
 
+# The whole test suite.
+test: test-sources test-engine test-workflows
+
 # Offline self-checks (synthetic data, no network).
 test-sources:
     uv run python test_source_stage.py
@@ -231,6 +234,11 @@ test-engine:
     uv run python aggregation_reproject.py --check
     uv run python keys.py --check
     uv run python store_manifest.py --check
+
+# Lint the GitHub Actions workflows.
+test-workflows:
+    cd "{{justfile_directory()}}" && actionlint
+
 # Test the GC's Collect step (scripts/gc-collect.sh — the exact script gc.yml runs, local
 # backend) against a synthetic store tree: happy path + every refusal guard. Needs bash + jq;
 # ci.yml runs it on every push.

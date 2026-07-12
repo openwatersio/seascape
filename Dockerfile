@@ -10,6 +10,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl git \
     build-essential libsqlite3-dev zlib1g-dev \
+    shellcheck \
   && rm -rf /var/lib/apt/lists/*
 
 # Every source is read over /vsicurl (R2/NOAA), so a transient HTTP/curl blip — an R2
@@ -27,6 +28,11 @@ RUN git clone --depth 1 https://github.com/felt/tippecanoe.git /tmp/tippecanoe \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh \
       | bash -s -- --to /usr/local/bin
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+
+# actionlint — lints .github/workflows (`just test-workflows`). Installer script pinned to
+# the same tag as the version it fetches, so neither can drift under an unchanged image hash.
+RUN curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash \
+      | bash -s -- 1.7.12 /usr/local/bin
 
 # Node 22 — lets the dev servers (`just dev`) and the preview seed step run in-container,
 # so Docker is the only local dependency needed to see the map (`./docker.sh dev`).
