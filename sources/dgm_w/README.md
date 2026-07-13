@@ -75,7 +75,7 @@ Pipeline steps (after `source_unzip`, before `source_normalize`):
 
 1. `build_reference.py` (bespoke, lives in this source dir) builds the low-water surface into
    `store/source/dgm_w/reference/` (a subdir, so the pipeline's `*.tif` globs never treat it as a
-   data tile). Two reaches, each its own EPSG:4326 GeoTIFF, stitched into `reference.vrt` (a VRT so
+   data tile). Three reaches, each its own EPSG:4326 GeoTIFF, stitched into `reference.vrt` (a VRT so
    each keeps its own extent/resolution and warp reads whichever overlaps a tile):
    - **Tidal — `skn_reference.tif`.** Outer estuaries + open Bight from the BSH **SKN-Fläche
      Nordsee 2026** ("Chart datum for the German Bight") grid of SKN in NHN, fetched at build time
@@ -88,32 +88,48 @@ Pipeline steps (after `source_unzip`, before `source_normalize`):
    - **Free-flowing Rhein — `glw_rhein.tif`.** Below the Iffezheim barrage (km 336) the Rhein runs
      free, so its datum is GlW. No packaged grid: the low-water longitudinal profile is assembled
      from the per-gauge GlW-in-NHN values in `rhein_glw.csv` (harvested from PEGELONLINE by
-     `harvest_rhein_glw.py` — see below), interpolated along the gauge polyline the same way as the
+     `harvest_gauges.py` — see below), interpolated along the gauge polyline the same way as the
      inner Elbe. 17 gauges, Maxau (km 362) → Emmerich (km 852); GlW-in-NHN ~101 m tapering to ~9 m.
+   - **Impounded Main — `zs_main.tif`.** The canalised Main (km 0–102 here) is a staircase of
+     pools, each held at a fixed **Stauziel** by its barrage, so the datum is a **step function**,
+     not a ramp: flat within a pool, jumping at each weir. Three data files, each addressing a
+     different gap:
+     - **Levels — `main_stau.csv`** (transcribed from Wikipedia "Liste der Mainstaustufen"): the
+       DEM reach has more pools than PEGELONLINE gauges (the Eddersheim/Offenbach pools have none),
+       so one Stauziel per barrage gives a complete set. `main_zs.csv` (harvested ZS_I gauges) is an
+       independent cross-check `build_reference` asserts — each gauge's ZS_I equals its pool's
+       Stauziel to within a few cm.
+     - **Dividers — the OSM `man_made=weir` line per barrage** (endpoints in `main_stau.csv`,
+       fetched from the OSM /map API): a pixel takes the Stauziel of the barrage whose weir line is
+       immediately downstream of it (how many weir lines it lies upstream of). So each pool step
+       lands *exactly on its dam*, not on an interpolated point.
+     - **Corridor — `main_centerline.wkt`** (the real OSM Main centerline): the reference is filled
+       only within ~1.5 km of it, so the band hugs every meander instead of a coarse gauge chord the
+       river escapes at bends. Stauziel 83.9 m (Kostheim pool) → 116.5 m (Wallstadt).
 2. `source_datum --offset-surface reference/reference.vrt --clamp-positive` reprojects the
    reference onto each tile (bilinear, cross-CRS), subtracts it, and drops above-datum cells.
 3. `source_normalize` (no `--crs`, keep per-tile CRS) → COG.
 
 Validated end-to-end on real tiles: outer Elbe km710–728 (BSH grid) and inner Elbe km620–639
-(Hamburg, assembled fill) for SKN, plus a Rhein bed at Köln through the VRT for GlW — all yielding
-water-only depths below their datum with land clamped off.
+(Hamburg, assembled fill) for SKN, a Rhein bed at Köln for GlW, and a Main bed in the Griesheim pool
+for the Stauziel step — all through the VRT, yielding water-only depths below their datum with land
+clamped off (the Main's flat pools reading a uniform depth below Stauziel).
 
 **Clamp caveat / follow-up.** `--clamp-positive` drops everything above chart datum, which removes
 the surrounding land *and* intertidal drying flats a chart would show. Follow-up: instead of a
 blunt `>0` clamp, reconcile against the OSM land–water mask (`landmask.py`) so genuine drying areas
 inside mapped water survive while dike/land terrain is dropped.
 
-**Remaining inland reaches (deferred).** The free-flowing Rhein above uses **GlW**; the reaches
-still commented out in `file_list.txt` need **Stauziel** (impoundment target level) per barrage
-pool — a step function, constant within a pool and jumping at each weir, not a smooth ramp. Good
-news for sourcing: PEGELONLINE (`pegelonline.wsv.de/webservices/rest-api/v2`) exposes each gauge's
-`gaugeZero` (PNP in NHN) and its characteristic values including GlW, so the Rhein needed no PDF
-tables — `harvest_rhein_glw.py` reads it straight from the API. Stauziel is not a PEGELONLINE
-characteristic value, so the impounded reaches (Rhein km 164–337, Main, Mosel, Saar, Lahn) still
-need the per-pool target levels + barrage locations from WSV/ELWIS; the Elbe-upper/Oder/Weser/Ems
-reaches publish no GlW/Stauziel at all (MNW/MW only) and need another source or an MNW proxy.
-Each follow-up reuses the same `build_reference.py` corridor machinery — assemble per-gauge
-low-water NHN values, interpolate along the gauge line, subtract — tracked separately from this PR.
+**Remaining inland reaches (deferred).** Active so far: free-flowing Rhein (**GlW**) and the lower
+Main (**Stauziel** step). Sourcing note: PEGELONLINE (`pegelonline.wsv.de/webservices/rest-api/v2`)
+exposes each gauge's `gaugeZero` (PNP in NHN) and its characteristic values — both **GlW** *and*
+**ZS_I** (Stauziel) — so `harvest_gauges.py` reads them straight from the API; where the gauges are
+too sparse for the pool structure (as on the Main) a checked-in barrage-level table fills the gaps.
+Still commented out in `file_list.txt`: the **Rhein upper** (km 164–337, impounded — needs the
+Basel–Iffezheim pool Stauziele) and **Mosel / Saar / Lahn** (impounded, only 2–3 gauges each, so
+they'll lean on barrage tables like the Main); the **Elbe-upper / Oder / Weser / Ems** reaches
+publish no GlW/Stauziel at all (MNW/MW only) and need another source or an MNW proxy. Each reuses
+the same `build_reference.py` machinery (spine + per-km value → subtract) — tracked separately.
 
 ## Pipeline
 

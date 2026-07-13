@@ -43,11 +43,21 @@ https://via.bund.de/wsv/inspire/download/el/5298_7050.zip
 
 # Rhein free-flowing — 3 tile(s) (below the Iffezheim barrage, km 336; GlW-referenced)
 # Low-water datum = GlW (gleichwertiger Wasserstand), assembled from PEGELONLINE gauges in
-# rhein_glw.csv (see build_reference.py / harvest_rhein_glw.py). The upper impounded reach
+# rhein_glw.csv (see build_reference.py / harvest_gauges.py). The upper impounded reach
 # (km 164–337, 3901/3902… below) still needs Stauziel and stays deferred.
 https://via.bund.de/wsv/inspire/download/el/3901_km332_560.zip
 https://via.bund.de/wsv/inspire/download/el/3901_km639_739.zip
 https://via.bund.de/wsv/inspire/download/el/3901_km739_865.zip
+
+# Main — 6 tile(s) (impounded, km 0–102; Stauziel step surface)
+# Low-water datum = per-pool Stauziel from main_stau.csv (barrage levels, Wikipedia) with a
+# main_zs.csv gauge cross-check; build_reference.py steps the pool level at each barrage.
+https://via.bund.de/wsv/inspire/download/el/2901_km0_20.zip
+https://via.bund.de/wsv/inspire/download/el/2901_km20_40.zip
+https://via.bund.de/wsv/inspire/download/el/2901_km40_60.zip
+https://via.bund.de/wsv/inspire/download/el/2901_km60_78.zip
+https://via.bund.de/wsv/inspire/download/el/2901_km77_90.zip
+https://via.bund.de/wsv/inspire/download/el/2901_km90_102.zip
 
 
 # ============================================================================================
@@ -111,16 +121,6 @@ https://via.bund.de/wsv/inspire/download/el/3901_km739_865.zip
 # https://via.bund.de/wsv/inspire/download/el/2401_km80_100.zip
 # https://via.bund.de/wsv/inspire/download/el/2401_km100_120.zip
 # https://via.bund.de/wsv/inspire/download/el/2401_km120_136.zip
-
-# Main — 4 tile(s) (inland, deferred)
-# https://via.bund.de/wsv/inspire/download/el/2901_km0_20.zip
-# https://via.bund.de/wsv/inspire/download/el/2901_km20_40.zip
-# https://via.bund.de/wsv/inspire/download/el/2901_km40_60.zip
-# https://via.bund.de/wsv/inspire/download/el/2901_km60_78.zip
-
-# Main-2 — 2 tile(s) (inland, deferred)
-# https://via.bund.de/wsv/inspire/download/el/2901_km77_90.zip
-# https://via.bund.de/wsv/inspire/download/el/2901_km90_102.zip
 
 # Mosel — 1 tile(s) (inland, deferred)
 # https://via.bund.de/wsv/inspire/download/el/3201.zip

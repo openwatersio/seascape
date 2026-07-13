@@ -1,0 +1,28 @@
+# Main impounded-pool low-water datum: Stauziel (impoundment target level) per barrage, in NHN,
+# plus the barrage's weir line (two endpoints across the channel) used as the exact pool divider.
+# The lower/canalised Main is a staircase of pools; each barrage holds the reach UPSTREAM of its
+# weir at a fixed Stauziel. build_reference.py assigns each pixel the Stauziel of the barrage whose
+# weir line is immediately downstream of it — so the step lands exactly on the dam, not on an
+# interpolated point. Complete where the PEGELONLINE gauges (main_zs.csv, ZS_I) are too sparse (the
+# Eddersheim and Offenbach pools have no gauge).
+#
+# km + stauziel: Wikipedia "Liste der Mainstaustufen" (Stauziel in m ü. NN ~= NHN), transcribed like
+#   tideelbe_skn.csv. https://de.wikipedia.org/wiki/Liste_der_Mainstaustufen
+# lon1,lat1,lon2,lat2: endpoints of the OSM `man_made=weir` way across the channel (WGS84), fetched
+#   from the OpenStreetMap /map API (Mühlheim's weir sits by its lock way 183420904, river-km 53.2,
+#   source=WSV). Blank = above the DEM (Klingenberg), so no divider is needed there.
+# Cross-check (build_reference asserts it): each gauge's ZS_I in main_zs.csv matches its pool's
+#   Stauziel here to within a few cm (Raunheim 83.90/83.92, Frankfurt 92.00/92.02, Krotzenburg
+#   98.95/98.97, Mainflingen 101.69/101.71, Obernau 108.49/108.51). Refresh together.
+# Covers the DEM reach (km 0-102); Klingenberg bounds the uppermost pool. Not for navigation.
+barrage,km,stauziel_nhn_m,lon1,lat1,lon2,lat2
+Kostheim,3.209,83.92,8.33429,50.00084,8.33398,49.99991
+Eddersheim,15.551,87.53,8.47603,50.03944,8.47468,50.04022
+Griesheim,28.687,92.02,8.59943,50.09027,8.59943,50.08910
+Offenbach,38.514,95.20,8.72661,50.10825,8.72590,50.10931
+Mühlheim,53.185,98.97,8.87028,50.12643,8.87012,50.12529
+Krotzenburg,63.850,101.71,8.96062,50.07921,8.96067,50.07816
+Kleinostheim,77.905,108.51,9.04663,50.00758,9.04574,50.00669
+Obernau,93.040,112.52,9.12776,49.93303,9.12864,49.93389
+Wallstadt,101.203,116.52,9.15963,49.86876,9.16121,49.86855
+Klingenberg,113.050,120.52,,,,
