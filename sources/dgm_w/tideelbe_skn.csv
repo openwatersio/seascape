@@ -1,0 +1,19 @@
+# Tidal-Elbe Seekartennull (SKN — German chart datum, ~LAT) reference gauges for dgm_w.
+# Used by build_reference.py to extend the BSH SKN-Fläche grid (which stops at ~9.5°E) east
+# over the inner tidal Elbe to the Geesthacht weir. Ordered downstream -> upstream.
+#
+# skn_nhn_m = SKN height in NHN (negative = below NHN). Source: GDWS "Aktuelles Seekartennull
+#   an den Tidepegeln ... ab 2026":
+#   https://www.gdws.wsv.bund.de/SharedDocs/Downloads/DE/Karten/SKN/SKN_Nordsee.pdf
+# lon/lat/km: PEGELONLINE (https://www.pegelonline.wsv.de/webservices/rest-api/v2/), water=ELBE.
+#
+# Refresh both columns when BSH/GDWS republish (this is the 2026 edition).
+gauge,lon,lat,km,skn_nhn_m
+Cuxhaven Steubenhöft,8.717425,53.867686,724.0,-2.01
+Glückstadt,9.409430,53.784361,674.0,-1.93
+Stadersand,9.526602,53.629729,654.9,-1.92
+Seemannshöft,9.880859,53.540164,628.9,-1.92
+Hamburg St. Pauli,9.969965,53.545442,623.1,-1.90
+Hamburg-Harburg,9.991826,53.472726,615.0,-1.92
+Over,10.101120,53.428692,605.273,-1.73
+Zollenspieker,10.185374,53.398709,598.159,-1.23

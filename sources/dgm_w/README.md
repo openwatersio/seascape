@@ -71,20 +71,18 @@ Pipeline steps (after `source_unzip`, before `source_normalize`):
 
 1. `build_reference.py` (bespoke, lives in this source dir) builds the SKN surface into
    `store/source/dgm_w/reference/` (a subdir, so the pipeline's `*.tif` globs never treat it as a
-   data tile). Every value is fetched from an authoritative source at build time — nothing
-   hard-coded but the source URLs and the tidal-Elbe gauge names. Two pieces merged into one
-   EPSG:4326 raster:
+   data tile). Two pieces merged into one EPSG:4326 raster:
    - **Outer estuaries + open Bight** — BSH **SKN-Fläche Nordsee 2026** ("Chart datum for the
-     German Bight"), a published grid of SKN in NHN. **CC-BY 4.0.** Atom
+     German Bight"), a published grid of SKN in NHN, fetched at build time. **CC-BY 4.0.** Atom
      `https://gdi.bsh.de/de/feed/Chart-datum-for-the-German-Bight-2026.xml` (also WCS / ZIP). Its
      east edge is ~9.5° E, so it covers Nordsee, Jade, Außenweser, and the outer Elbe.
    - **Inner tidal Elbe (Hamburg reach, east of the grid to the Geesthacht weir)** — no grid
-     reaches here, so it is assembled from the **GDWS per-gauge SKN** table ("Aktuelles
-     Seekartennull an den Tidepegeln … ab 2026", parsed from the PDF) placed at each gauge's
-     position/river-km (PEGELONLINE) and interpolated along the gauge polyline. SKN there is
-     ~−1.9 m NHN tapering to ~−1.2 m near Zollenspieker; above the weir is non-tidal, so the
-     profile is clamped at the most-upstream gauge. Both sources point at the current (2026)
-     edition, so a re-run picks up republished values automatically.
+     reaches here, so it is assembled from the per-gauge SKN values in `tideelbe_skn.csv`
+     (transcribed from the GDWS "Seekartennull an den Tidepegeln … ab 2026" table, positions from
+     PEGELONLINE — see the CSV header for links), interpolated along the gauge polyline. SKN there
+     is ~−1.9 m NHN tapering to ~−1.2 m near Zollenspieker; above the weir is non-tidal, so the
+     profile is clamped at the most-upstream gauge. Refresh the BSH grid edition and the CSV
+     together when BSH/GDWS republish.
 2. `source_datum --offset-surface reference/skn_reference.tif --clamp-positive` reprojects the
    reference onto each tile (bilinear, cross-CRS), subtracts it, and drops above-datum cells.
 3. `source_normalize` (no `--crs`, keep per-tile CRS) → COG.

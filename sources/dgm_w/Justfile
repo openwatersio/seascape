@@ -18,7 +18,7 @@
 default:
     uv run python source_download.py dgm_w
     uv run python source_unzip.py dgm_w
-    uv run --with pdfplumber python ../sources/dgm_w/build_reference.py
+    uv run python ../sources/dgm_w/build_reference.py
     uv run python source_datum.py dgm_w --offset-surface reference/skn_reference.tif --clamp-positive
     uv run python source_normalize.py dgm_w --nodata -32768
     uv run python source_bounds.py dgm_w
