@@ -1,15 +1,15 @@
-"""Run the aggregation: reproject -> merge -> tile, per aggregation tile, keyed per fork.
+"""Stage 2 + vector forks: reproject -> merge -> persist mosaic + contour/soundings/depare.
 
 Vendored from mapterhorn (BSD-3). Picks the latest aggregation id and, for every tile in the
-covering, computes a content-hash key per FORK — terrain / contours / soundings / depare — from
-the merged DEM's determinants plus each fork's own modules and config. Each fork's key rides IN
-its artifact filename (``store/pmtiles/<stem>-<key>.pmtiles``, keys.content_path), so a tile
-re-runs iff ANY fork's content-named file (or its empty marker) is absent; within the run, forks
-already present are skipped. The merge (reproject + merge + smooth) is shared by every
-fork, so it re-runs whenever any fork is stale — what a fresh fork saves is its own regenerate +
-rewrite, not the merge. Consequence worth stating: a contour-config change re-merges the affected
-tiles but leaves the terrain pmtiles' keys untouched, so downsample + terrain-bundle skip
-entirely (only vector.pmtiles re-runs). Tiles parallelize across a process pool.
+covering, produces the stage-2 MOSAIC tile (mosaic.produce — the persisted unsmoothed truth) and
+computes a content-hash key per VECTOR FORK — contours / soundings / depare — from the merged DEM's
+determinants plus each fork's own modules and config. Each fork's key rides IN its artifact filename
+(``store/contour/<stem>-<key>.fgb``, keys.content_path), so a tile re-runs iff ANY fork's (or the
+mosaic's) content-named file (or its empty marker) is absent; within the run, forks already present
+are skipped. The merge (reproject + merge + smooth) is shared, so it re-runs whenever the mosaic or
+any vector fork is stale. The TERRAIN raster is no longer produced here — terrain.py renders it
+per-zoom from the persisted mosaic (stage 3), so a smoothing/quantization change re-renders terrain
+against a fully cached mosaic with no re-merge. Tiles parallelize across a process pool.
 
 CLI:
   aggregation_run.py                    process every tile with a stale fork (one machine)
@@ -25,7 +25,6 @@ from multiprocessing import Pool
 
 import aggregation_merge
 import aggregation_reproject
-import aggregation_tile
 import config
 import contour_run
 import depare_run
@@ -50,16 +49,19 @@ SKIP_SMOOTH = os.environ.get("SKIP_SMOOTH", "")
 # hashFiles(landmask.py) (sources.yml gates their mirror on it), so hashing the module is hashing
 # the mask identity.
 MERGE_MODULES = ["aggregation_reproject", "aggregation_merge", "smooth", "landmask", "utils"]
-TERRAIN_MODULES = MERGE_MODULES + ["aggregation_tile", "encode"]
 CONTOUR_MODULES = MERGE_MODULES + ["contour_run"]
 SOUNDINGS_MODULES = MERGE_MODULES + ["soundings_run"]
 DEPARE_MODULES = MERGE_MODULES + ["depare_run"]
 
-FORKS = ("terrain", "contour", "soundings", "depare")
+# The terrain raster is no longer a fork here: it's stage 3's per-zoom render from the persisted
+# mosaic (terrain.py), keyed off the mosaic tile hashes, not the transient merge. The aggregate is
+# the stage-2 mosaic PRODUCER plus the vector forks (which still read the shared smoothed merge —
+# their outputs stay identical, and their keys already re-merge only their own tiles).
+FORKS = ("contour", "soundings", "depare")
 
 
 def _merge_inputs_config(filepath):
-    """The inputs + config shared by every fork of a tile: all four read the SAME merged, smoothed
+    """The inputs + config shared by every fork of a tile: all three read the SAME merged, smoothed
     DEM, so its determinants key them all — the covering row (a re-tile / source-file change flips
     it), each intersecting source's recipe hash + every resolved build prop the reproject/merge
     reads (priority/maxzoom/offset/land_clamp/negate/band/mixed_crs), the smoothing + resample
@@ -92,11 +94,6 @@ def _merge_inputs_config(filepath):
     return inputs, cfg
 
 
-def terrain_key(filepath):
-    inputs, cfg = _merge_inputs_config(filepath)
-    return keys.stage_key(inputs, TERRAIN_MODULES, {**cfg, "fork": "terrain"})
-
-
 def contour_key(filepath):
     inputs, cfg = _merge_inputs_config(filepath)
     cfg = {**cfg, "fork": "contour", "contour_levels": config.CONTOUR_LEVELS,
@@ -122,20 +119,16 @@ def depare_key(filepath):
     return keys.stage_key(inputs, DEPARE_MODULES, cfg)
 
 
-_KEYFN = {"terrain": terrain_key, "contour": contour_key,
-          "soundings": soundings_key, "depare": depare_key}
+_KEYFN = {"contour": contour_key, "soundings": soundings_key, "depare": depare_key}
 
 
-# store dir + extension per vector fork (terrain is the z7-sharded pmtiles store).
+# store dir + extension per vector fork.
 _VECTOR_ARTIFACT = {"contour": ("contour", "fgb"),
                     "soundings": ("soundings", "geojson"),
                     "depare": ("depare", "fgb")}
 
 
 def _artifact(fork, stem):
-    if fork == "terrain":
-        z, x, y, _child_z = (int(a) for a in stem.split("-"))
-        return f"{utils.get_pmtiles_folder(x, y, z)}/{stem}.pmtiles"
     folder, ext = _VECTOR_ARTIFACT[fork]
     return f"store/{folder}/{stem}.{ext}"
 
@@ -145,7 +138,7 @@ def plan_forks(filepath):
     FORCEd), and not hard-skipped by a SKIP_* run mode. Freshness is content-addressed and uniform:
     the content-named file OR the empty marker exists under the key (keys.fork_fresh) — self-heal
     (a dropped artifact rebuilds) and the legitimately-empty vector fork both fall out of one
-    existence check, so the phase-3 terrain-vs-vector require_artifact split is gone."""
+    existence check, so the phase-3 require_artifact split is gone."""
     stem = filepath.split("/")[-1].replace("-aggregation.csv", "")
     skips = {"contour": SKIP_CONTOURS, "soundings": SKIP_SOUNDINGS, "depare": SKIP_DEPARE}
     plan = {}
@@ -177,11 +170,9 @@ def run(filepath):
     if do_mosaic:
         mosaic.produce(filepath, tmp_folder, mosaic_key)  # persist BEFORE smooth (unsmoothed truth)
     if not SKIP_SMOOTH:
-        smooth.smooth_merged(tmp_folder)         # slope-selective blur, shared by every fork
-    if plan["terrain"]["do"]:
-        e = plan["terrain"]
-        keys.supersede(e["art"])                 # clear last build's key before the atomic publish
-        aggregation_tile.main(filepath, keys.content_path(e["art"], e["key"]))  # Terrain-RGB, published atomically
+        smooth.smooth_merged(tmp_folder)         # slope-selective blur, shared by every vector fork
+    # Terrain is no longer produced here — terrain.py renders it per-zoom from the mosaic (stage 3),
+    # keyed off the mosaic tile hashes. The vector forks still read the smoothed merge below.
     for fork, mod in (("contour", contour_run), ("soundings", soundings_run), ("depare", depare_run)):
         if plan[fork]["do"]:
             e = plan[fork]
