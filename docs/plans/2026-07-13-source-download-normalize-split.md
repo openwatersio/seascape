@@ -105,35 +105,48 @@ is thrown away), so the concrete payoff is local iteration.
 
 ## Gotchas
 
-- **CI gets no caching benefit.** [sources.yml](../../.github/workflows/sources.yml) runs
-  `just source <id>` in one container and pushes only `store/source/<id>` to R2 (`aws s3 sync`,
-  line ~306); `store/download/` is never persisted and the runner is destroyed after. So the
-  split is purely a local-iteration win. Persisting the cache (R2 or `actions/cache`) is a
-  separate follow-up, out of scope here. Keep `just source` = download + normalize precisely so
+- **Disk**: the raw cache now persists (DGM-W raw ≈ the zip sizes; the free-flowing Rhein
+  overview tiles are the large ones). Add `just clean-download` and a `.gitignore` / `store/` note.
+  `store/` runs cwd-relative to `pipelines/`, and `.gitignore` already ignores `pipelines/store/`,
+  so `store/download/` is untracked and the `aws s3 sync store/source ...` push naturally excludes
+  it — the note is to keep it that way, not to fix a leak.
+- **Recipe-hash gate**: CI's "Already current in R2?" hashes `sources/<id>/`. Splitting a recipe
+  changes the hash → one rebuild per source (expected). The hash still covers the normalize logic,
+  so a masking tweak correctly invalidates the source.
+- **In-place mutation stays** inside `normalize`, operating on freshly staged raw each run — so
+  `source_datum` / `source_normalize` need no change beyond reading the staged copy. The corollary:
+  staging must **copy**, not move (`source_datum:54` / `source_normalize:41` both `os.replace` over
+  the staged file), or the first datum run eats the cache.
+- **Member naming**: `source_unzip` flattens archives by basename; the download-cache key
+  (`<id>_<i>`) vs the archive's internal tif names must stay consistent, because `bounds.csv` and
+  `catalog.json` reference the final tif names.
+
+Two more sharp edges found reading the current pipeline + workflows:
+
+- **CI gets no caching benefit either way.** [sources.yml](../../.github/workflows/sources.yml)
+  runs `just source <id>` in one container, pushes only `store/source/<id>` to R2, then throws the
+  runner away — `store/download/` never persists across runs. The win is purely local iteration;
+  an R2-backed cross-run cache is a separate follow-up. Keeping `just source` = both phases means
   the CI invocation line doesn't change.
-- **Peak disk roughly doubles for zip sources during normalize.** Today `source_unzip` deletes
-  each zip as it extracts; keeping the archive in `store/download/` *and* the extracted tifs in
-  `store/source/` holds both at once. EMODnet already flags disk pressure (~7 GB zipped / tens
-  unzipped) — on a standard runner this could tip it over. Mitigation where the cache doesn't
-  help anyway (CI): let normalize consume-and-delete from `download/`, or keep the persistent
-  cache local-only.
-- **Copy, don't move, when staging.** `source_datum:54` and `source_normalize:41` both
-  `os.replace(tmp, filepath)` over the staged file. If `source-normalize` *moves* raw out of the
-  cache instead of copying, the first datum run destroys the cache and defeats the whole point.
-- **Splitting each Justfile changes its bytes → one-time re-registration.** `sources.yml`
-  short-circuits on `RECIPE_HASH = hashFiles('sources/<id>/**')`, which includes the Justfile.
-  Editing every recipe moves every hash, so the next `sources.yml` run re-prepares all sources
-  once. Expected and one-time; note it in the dispatch (same pattern the sources-mirror plan
-  called out).
-- **`store/download/` must be gitignored and stay out of the R2 push.** The existing
-  `aws s3 sync store/source ...` naturally excludes it, but the `.gitignore` and any tarball/
-  manifest globs should be checked so raw archives don't leak into an artifact.
-- **Mirrored sources have no local `store/download/`.** Their "cache" is R2. Don't force
-  `source_mirror` through the extract/stage dance — its download-phase mapping is the whole
-  recipe, and its normalize phase is empty.
-- **`source_datum` writes `datum.json` into `store/source/<id>/`**, not the cache — correct, it's
-  a normalize-phase provenance artifact and gets regenerated each run. Staging must not clobber
-  it with a stale copy from a previous run (clearing `store/source/<id>/` first handles this).
+- **Peak disk transiently doubles for zip sources during normalize.** Today `source_unzip` deletes
+  each zip as it extracts; holding the archive in `store/download/` *and* the extracted tifs in
+  `store/source/` keeps both at once. EMODnet already flags disk pressure (~7 GB zipped / tens
+  unzipped). Where the cache doesn't help anyway (CI), let normalize consume-and-delete from
+  `download/`, or keep the persistent cache local-only.
+
+Mirrored sources (`cudem`, `cudem_third`, `noaa_s102`) sidestep all of the above — `source_mirror`
+fetches straight to R2, so their `download:` group is the whole recipe and `normalize:` is empty.
+
+## Scope
+
+Small per-script (~30 lines across download/unzip/stage), but it touches **every source recipe** —
+the real cost and risk. Suggested order:
+
+1. Add the two new scripts + top-level `source-download` / `source-normalize` recipes.
+2. Migrate `sources/*/Justfile` one at a time — `dgm_w` first, as the motivating case.
+3. Add `clean-download` + the gitignore note.
+
+Backward-compatible throughout, since `source` keeps composing both phases.
 
 ## Open questions
 
