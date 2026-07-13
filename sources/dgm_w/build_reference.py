@@ -133,7 +133,7 @@ def build_tidal(out_dir):
 def build_rhein(out_dir):
     """GlW surface: free-flowing Rhein gauge corridor on its own grid -> glw_rhein.tif."""
     ref_path = f"{out_dir}/glw_rhein.tif"
-    gauges = read_gauges(RHEIN_CSV, "glw_nhn_m")
+    gauges = read_gauges(RHEIN_CSV, "datum_nhn_m")
 
     lons_g = [g[0] for g in gauges]
     lats_g = [g[1] for g in gauges]
