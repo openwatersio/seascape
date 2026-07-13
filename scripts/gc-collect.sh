@@ -75,10 +75,28 @@ ref=$(wc -l < "$GC_OUT/gc-referenced.txt")
 [ "$ref" -gt 0 ] || refuse "referenced set is empty — refusing to GC"
 echo "referenced by the last $KEEP manifests: $ref artifacts"
 
+# 3b) MOSAIC pointer set. The mosaic tile COGs + planet-z8 overview are content-addressed and named
+#     by the store manifests (kept via the union above). But the mosaic.gti POINTER and the per-build
+#     index parquet it names are NOT content-addressed — one current pointer, one index per build —
+#     so keep the current pair explicitly, parsed from the LIVE pointer; every older index +
+#     superseded tile/overview then falls to collection (the unbounded-growth fix). Absent mosaic.gti
+#     = pre-mosaic store, nothing extra to keep.
+if bk_cat mosaic/mosaic.gti > "$GC_OUT/gc-mosaic-gti.xml" 2>/dev/null && [ -s "$GC_OUT/gc-mosaic-gti.xml" ]; then
+  # || true: a match-less grep exits 1 and (pipefail + set -e) would abort silently before the
+  # explicit refuse below — swallow it so the empty-midx guard reports the real reason.
+  midx=$(grep -o '<IndexDataset>[^<]*</IndexDataset>' "$GC_OUT/gc-mosaic-gti.xml" | sed -E 's#</?IndexDataset>##g' || true)
+  [ -n "$midx" ] || refuse "mosaic.gti has no <IndexDataset> — corrupt mosaic pointer, refusing to GC"
+  # midx is relative to the .gti dir (index/<ulid>.parquet) → its store path is mosaic/<midx>.
+  printf 'mosaic/mosaic.gti\nmosaic/%s\n' "$midx" >> "$GC_OUT/gc-referenced.txt"
+  sort -u -o "$GC_OUT/gc-referenced.txt" "$GC_OUT/gc-referenced.txt"
+  echo "mosaic pointer → mosaic/$midx (+ mosaic.gti) kept"
+fi
+
 # 4) Every store object in the content-addressed prefixes, path relative to <root> (matching the
-#    manifest 'name' form).
+#    manifest 'name' form). mosaic/ is included: its tiles + planet-z8 are content-addressed, and
+#    its non-content pointer/index are held by the mosaic pointer set (3b) so they're never flagged.
 : > "$GC_OUT/gc-all.txt"
-for p in pmtiles contour soundings depare; do
+for p in mosaic pmtiles contour soundings depare; do
   bk_files "$p" | sed "s#^#$p/#" >> "$GC_OUT/gc-all.txt"
 done
 sort -u -o "$GC_OUT/gc-all.txt" "$GC_OUT/gc-all.txt"
@@ -107,7 +125,7 @@ dirs=$(grep -c . "$GC_OUT/gc-purge-dirs.txt" || true)
 
 # ── Full inventory (per content prefix) BEFORE anything deletes ──
 echo "── inventory ──"
-for p in pmtiles contour soundings depare; do
+for p in mosaic pmtiles contour soundings depare; do
   pt=$(grep -c "^$p/" "$GC_OUT/gc-all.txt" || true)
   pd=$(grep -c "^$p/" "$GC_OUT/gc-delete.txt" || true)
   echo "  $p: $pt objects, $((pt - pd)) kept, $pd to delete"

@@ -438,19 +438,15 @@ jobs:
           wait "$COV_PID" || cov_rc=$?
           [ "$cov_rc" -eq 0 ] || { echo "coverage stage failed (rc=$cov_rc)" >&2; exit "$cov_rc"; }
 
-          # ── mosaic index (stage 2 pointer) ── build the GTI + planet z8 + index parquet from the
-          #    mosaic tiles the aggregate persisted; terrain (stage 3) reads the GTI, so this MUST
-          #    run before it. The mosaic is also a published product: push the per-build index, then
-          #    flip the mosaic.gti pointer LAST (tiles already pushed by push_agg) — the bounds.csv-
-          #    last / catalog-last atomic-pointer discipline, so GDAL opens the planet mosaic straight
-          #    from mosaic.gti for QA / preview-from-mosaic and never sees a half-written world.
-          echo "── mosaic index ──"
+          # ── mosaic index (LOCAL, for the on-box terrain render) ── build the GTI + planet z8 +
+          #    index parquet from the mosaic tiles the aggregate persisted; terrain (stage 3) reads
+          #    the GTI, so this MUST run before it. NO MOSAIC_VSI_BASE here on purpose: the index
+          #    records LOCAL absolute tile paths so terrain reads the mosaic off local disk (the
+          #    plan's "build entirely against local disk"). The PUBLISHED index — with /vsicurl tile
+          #    URLs — is rebuilt at the mosaic-publish step below (after terrain), so a consumer
+          #    opening the published mosaic.gti resolves its tiles over the CDN, not a box-local path.
+          echo "── mosaic index (local) ──"
           dr mosaic-index
-          if [ -z "${BBOX:-}" ]; then
-            push mosaic/index mosaic/index
-            rclone copyto "$STORE/mosaic/mosaic.gti" "$R2/mosaic/mosaic.gti" $XFER   # pointer LAST
-            echo "mosaic published: index + planet z8 pushed, mosaic.gti pointer flipped"
-          fi
 
           # ── terrain (stage 3) ── the per-zoom Terrarium render from the mosaic (native + coalesced
           #    overviews), replacing the old 2x2-average downsample pyramid. TERRAIN_PROCESSES caps
@@ -481,6 +477,26 @@ jobs:
             printf '{"manifest":"manifests/%s.json","sha":"%s","entries":%s}\n' "$MANIFEST_ID" "$SHA" "$n" \
               | rclone rcat "$R2/store/manifest.json"
             echo "store published: manifest $MANIFEST_ID ($n artifacts), pointer flipped"
+
+            # ── MOSAIC PUBLISH ── the mosaic is a GDAL-openable published product (QA in QGIS,
+            #    preview-from-mosaic, any third party). Re-run mosaic-index with MOSAIC_VSI_BASE set
+            #    to the PUBLIC /vsicurl base for the mosaic TILES prefix, so the GeoParquet `location`
+            #    column records the real published tile URLs (the build-time index above used local
+            #    paths, which are invalid off-box). planet-z8 is content-addressed, so this reuses it
+            #    (no re-decimation, no /vsicurl read). The .gti's IndexDataset + planet-z8 <Overview>
+            #    refs are RELATIVE, so they resolve against the published mosaic/ dir automatically.
+            #    Push order = the pointer-last / bounds.csv-last discipline: everything the .gti
+            #    references (tiles + planet-z8 overview + index) BEFORE the mosaic.gti pointer.
+            echo "── mosaic publish (/vsicurl index) ──"
+            docker run --rm -v /root/seascape:/app -v "$STORE:/app/pipelines/store" \
+              -e BBOX -e FORCE_REBUILD -e TOOLCHAIN "${AGG_ENV[@]}" \
+              -e MOSAIC_VSI_BASE="/vsicurl/$PUBLIC_BASE/mosaic/tiles" \
+              "$IMAGE:$IMAGE_TAG" just mosaic-index
+            push mosaic/tiles mosaic/tiles                       # immutable tile COGs (dedup; push_agg already sent these)
+            push mosaic mosaic --include 'planet-z8-*.tif'       # the z8 overview COG (the .gti <Overview>)
+            push mosaic/index mosaic/index                       # the /vsicurl GeoParquet index
+            rclone copyto "$STORE/mosaic/mosaic.gti" "$R2/mosaic/mosaic.gti" $XFER   # the mosaic pointer, LAST
+            echo "mosaic published: tiles + planet-z8 + index pushed, mosaic.gti pointer flipped"
           fi
 
           echo "── bundle (terrain) ──"

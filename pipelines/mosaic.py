@@ -92,6 +92,13 @@ def tile_artifact(stem):
     return f"{tiles_dir()}/{stem}.tif"
 
 
+def planet_artifact():
+    """The LOGICAL planet-z8 overview COG path; keys.content_path splices the planet key in before
+    .tif. Content-addressed like the tiles, so it belongs in the store manifest (hydrate reuses it
+    across builds instead of re-decimating; the GC keeps the referenced one)."""
+    return "store/mosaic/planet-z8.tif"
+
+
 def vsi_base():
     """The absolute base the GTI `location` column resolves against — MOSAIC_VSI_BASE when set (CI
     passes a /vsicurl bucket URL for the mosaic tiles prefix), else the tiles dir's local abspath so
@@ -287,7 +294,7 @@ def _build_planet_z8(index_path, tile_keys):
     COG. Reads the index-as-GTI so the decimation picks each tile's own `average` overviews (never a
     full-res read). Content-addressed, so an unchanged mosaic reuses it."""
     key = _planet_key(tile_keys)
-    logical = "store/mosaic/planet-z8.tif"
+    logical = planet_artifact()
     cpath = keys.content_path(logical, key)
     if keys.fork_fresh(logical, key):
         return cpath, key

@@ -73,6 +73,14 @@ def entries():
                 continue
             out.append(_entry(stem, fork, plan["key"], plan["art"]))
     agg_keys = terrain._aggregation_mosaic_keys(aggregation_id)
+    # The planet z8 overview COG is content-addressed (keyed on every tile key), so it belongs in
+    # the manifest: the next build's manifest-driven hydrate then pulls it instead of re-decimating
+    # the whole mosaic, and the GC keeps the referenced one. Its key hashes the same tile-key set
+    # mosaic.build_index feeds _build_planet_z8. (The per-build index parquet + mosaic.gti pointer
+    # are NOT content-addressed — regenerated each build, GC'd via the mosaic pointer — so they are
+    # deliberately absent here.)
+    out.append(_entry("planet-z8", "planet_z8", mosaic._planet_key(list(agg_keys.values())),
+                      mosaic.planet_artifact()))
     for tstem in sorted(terrain._render_stems(aggregation_id)):
         out.append(_entry(tstem, "terrain", terrain.terrain_key(tstem, agg_keys),
                           terrain._artifact(tstem)))
@@ -149,13 +157,15 @@ def _check():
                 else:
                     touch(keys.content_path(art, key))
         agg_keys = terrain._aggregation_mosaic_keys(aid)
+        # the content-addressed planet z8 overview COG (keyed on every tile's mosaic key)
+        touch(keys.content_path(mosaic.planet_artifact(), mosaic._planet_key(list(agg_keys.values()))))
         render_stems = sorted(terrain._render_stems(aid))
         for tstem in render_stems:
             touch(keys.content_path(terrain._artifact(tstem), terrain.terrain_key(tstem, agg_keys)))
 
         e = entries()
-        # per tile: 1 mosaic + len(FORKS) vector forks; plus one terrain entry per render stem.
-        assert len(e) == len(tiles) * (1 + len(aggregation_run.FORKS)) + len(render_stems), \
+        # per tile: 1 mosaic + len(FORKS) vector forks; + 1 planet-z8; + one terrain per render stem.
+        assert len(e) == len(tiles) * (1 + len(aggregation_run.FORKS)) + 1 + len(render_stems), \
             f"entry count {len(e)}"
         assert serialize(e) == serialize(entries()), "manifest not byte-deterministic across a re-walk"
         empties = [x for x in e if x["empty"]]
@@ -165,7 +175,9 @@ def _check():
             "non-empty entries name a content-addressed artifact"
         assert all(x["name"].startswith(("pmtiles/", "mosaic/", "contour/", "soundings/", "depare/"))
                    for x in e), "names are store-root-relative"
-        assert {"mosaic", "terrain", "contour", "soundings", "depare"} == {x["fork"] for x in e}, \
+        assert [x for x in e if x["fork"] == "planet_z8"][0]["name"].startswith("mosaic/planet-z8-"), \
+            "the planet z8 overview COG must be a content-addressed mosaic/ entry"
+        assert {"mosaic", "planet_z8", "terrain", "contour", "soundings", "depare"} == {x["fork"] for x in e}, \
             f"manifest missing a store kind: {sorted({x['fork'] for x in e})}"
 
         # completeness: drop one terrain artifact -> assembly fails (the gate bundle.verify_complete mirrors)
