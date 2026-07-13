@@ -41,6 +41,7 @@ import os
 import shutil
 import sys
 import time
+from functools import lru_cache
 from glob import glob
 from multiprocessing import get_context
 
@@ -111,7 +112,7 @@ def _read_window(anchor, cz, halo, out_tif):
     aggregation_reproject._run(
         f"GDAL_CACHEMAX=512 gdalwarp -q -overwrite -r average -t_srs EPSG:3857 "
         f"-tr {res} {res} -te {left} {bottom} {right} {top} -dstnodata {NODATA} "
-        f"-of GTiff -co TILED=YES -co BLOCKSIZE=512 -co COMPRESS=ZSTD -co PREDICTOR=3 "
+        f"-of GTiff -co TILED=YES -co BLOCKXSIZE=512 -co BLOCKYSIZE=512 -co COMPRESS=ZSTD -co PREDICTOR=3 "
         f"-co NUM_THREADS=ALL_CPUS {_q(gti_abspath())} {out_tif}",
         f"terrain window {anchor.z}-{anchor.x}-{anchor.y}@z{cz}")
     return core, halo
@@ -257,6 +258,18 @@ def _aggregation_mosaic_keys(aid):
     return out
 
 
+@lru_cache(maxsize=None)
+def _tile_bounds(stem):
+    """mercantile lon/lat bounds of a 'z-x-y-cz' stem, memoised. `_intersecting_keys` runs once per
+    render stem over the SAME aggregation tiles, so without the cache a planet build recomputes each
+    tile's projected bounds thousands of times — the cost Copilot flagged. The cache makes the
+    expensive `mercantile.bounds` O(unique tiles); the per-stem loop is then only cheap float
+    compares. (A macrotile-grid spatial index would cut the loop to O(stems × 9) too, but the
+    compares are already sub-second at planet scale — deferred until measured to dominate.)"""
+    z, x, y, _cz = (int(a) for a in stem.split("-"))
+    return mercantile.bounds(mercantile.Tile(x=x, y=y, z=z))
+
+
 def _intersecting_keys(stem, agg_keys):
     """The mosaic tile keys a render stem reads INTO — every aggregation tile whose mercantile tile
     overlaps OR EDGE/CORNER-TOUCHES the stem's anchor. The touch case is load-bearing for chart
@@ -267,13 +280,10 @@ def _intersecting_keys(stem, agg_keys):
     == the anchor's east), and the halo (65 px) is far under the 512 px minimum tile width, so it
     never reaches past the immediate neighbours — the touch test is both necessary and sufficient.
     Sorted, so the terrain key is order-independent."""
-    z, x, y, _cz = (int(a) for a in stem.split("-"))
-    anchor = mercantile.Tile(x=x, y=y, z=z)
-    ab = mercantile.bounds(anchor)
+    ab = _tile_bounds(stem)
     keyset = []
     for astem, k in agg_keys.items():
-        az, ax, ay, _acz = (int(a) for a in astem.split("-"))
-        bb = mercantile.bounds(mercantile.Tile(x=ax, y=ay, z=az))
+        bb = _tile_bounds(astem)
         # lon/lat bbox overlap-or-touch (tiles share a global grid); >=/<= so an edge/corner
         # neighbour the halo reads is included, not just a strictly-overlapping ancestor/descendant.
         if bb.west <= ab.east and bb.east >= ab.west and bb.south <= ab.north and bb.north >= ab.south:
