@@ -41,6 +41,14 @@ https://via.bund.de/wsv/inspire/download/el/7040_km740_753.zip
 # Unter-/Außenweser — 1 tile(s)
 https://via.bund.de/wsv/inspire/download/el/5298_7050.zip
 
+# Rhein free-flowing — 3 tile(s) (below the Iffezheim barrage, km 336; GlW-referenced)
+# Low-water datum = GlW (gleichwertiger Wasserstand), assembled from PEGELONLINE gauges in
+# rhein_glw.csv (see build_reference.py / harvest_rhein_glw.py). The upper impounded reach
+# (km 164–337, 3901/3902… below) still needs Stauziel and stays deferred.
+https://via.bund.de/wsv/inspire/download/el/3901_km332_560.zip
+https://via.bund.de/wsv/inspire/download/el/3901_km639_739.zip
+https://via.bund.de/wsv/inspire/download/el/3901_km739_865.zip
+
 
 # ============================================================================================
 # INLAND — deferred: bed elevation far above MSL, needs GlW/Stauziel low-water referencing.
@@ -120,7 +128,8 @@ https://via.bund.de/wsv/inspire/download/el/5298_7050.zip
 # Ober-/Mittelweser — 1 tile(s) (inland, deferred)
 # https://via.bund.de/wsv/inspire/download/el/5201.zip
 
-# Rhein — 19 tile(s) (inland, deferred)
+# Rhein upper / impounded — 16 tile(s) (inland, deferred: km 164–337, Basel–Iffezheim barrages,
+# needs Stauziel per pool — not GlW. The free-flowing reach km 336–865 is active above.)
 # https://via.bund.de/wsv/inspire/download/el/3901_km164_174.zip
 # https://via.bund.de/wsv/inspire/download/el/3902_km173_190.zip
 # https://via.bund.de/wsv/inspire/download/el/3902_km190_205.zip
@@ -137,9 +146,6 @@ https://via.bund.de/wsv/inspire/download/el/5298_7050.zip
 # https://via.bund.de/wsv/inspire/download/el/3907_km307_312.zip
 # https://via.bund.de/wsv/inspire/download/el/3901_km311_326.zip
 # https://via.bund.de/wsv/inspire/download/el/3901_km326_337.zip
-# https://via.bund.de/wsv/inspire/download/el/3901_km332_560.zip
-# https://via.bund.de/wsv/inspire/download/el/3901_km639_739.zip
-# https://via.bund.de/wsv/inspire/download/el/3901_km739_865.zip
 
 # Saar — 5 tile(s) (inland, deferred)
 # https://via.bund.de/wsv/inspire/download/el/4201_km0_20.zip

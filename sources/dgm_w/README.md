@@ -44,7 +44,9 @@ negative. That splits the waterways in two:
   weir, Ems, Dortmund-Ems-Kanal, Ober-/Mittelweser) have beds tens of metres above MSL (the Saar
   bed is ~+130 m). As trusted data they keep their true elevation and render as **land, not
   water**. There is no single offset that fixes this — a river's water surface slopes downstream —
-  so these tiles are **commented out** in `file_list.txt` pending the inland datum work below.
+  so a per-reach low-water surface is subtracted instead (see below). The **free-flowing Rhein**
+  below the Iffezheim barrage (km 336–865, 3 tiles) is now referenced to **GlW** and active; the
+  remaining inland tiles stay **commented out** in `file_list.txt` pending their datum work.
 
 Not for navigation: NHN/SKN depths are approximate and unreduced to chart standards. This source
 is visualization-only, consistent with Seascape's non-navigational disclaimer.
@@ -59,51 +61,59 @@ supersede the estuary tiles here if desired.
 ## Datum normalization
 
 `just source dgm_w` emits a **low-water-referenced** COG: raw DGM-W is orthometric NHN, and the
-prep subtracts the SKN-in-NHN reference so the synced COG is depth below chart datum (SKN ≈ LAT),
-needing no special handling downstream. This is the scalar lake `--offset` (Bodensee) generalized
-to a spatially-varying reference **surface**.
+prep subtracts a **low-water reference surface** — the local low-water datum expressed in NHN — so
+the synced COG is depth below that datum, needing no special handling downstream. The datum differs
+by reach: **SKN** (Seekartennull ≈ LAT) for the tidal estuaries, **GlW** (gleichwertiger
+Wasserstand) for the free-flowing Rhein. This is the scalar lake `--offset` (Bodensee) generalized
+to a spatially-varying surface.
 
-Per pixel: `bed_chartdatum = bed_NHN − SKN_NHN(x, y)`. Result is bed elevation referenced to chart
-datum (negative = depth below datum, same convention as the MLLW/LAT sources); above-datum cells
+Per pixel: `bed_depth = bed_NHN − datum_NHN(x, y)`. Result is bed elevation referenced to the local
+low water (negative = depth below datum, same convention as the MLLW/LAT sources); above-datum cells
 (land, drying flats) are clamped to nodata.
 
 Pipeline steps (after `source_unzip`, before `source_normalize`):
 
-1. `build_reference.py` (bespoke, lives in this source dir) builds the SKN surface into
+1. `build_reference.py` (bespoke, lives in this source dir) builds the low-water surface into
    `store/source/dgm_w/reference/` (a subdir, so the pipeline's `*.tif` globs never treat it as a
-   data tile). Two pieces merged into one EPSG:4326 raster:
-   - **Outer estuaries + open Bight** — BSH **SKN-Fläche Nordsee 2026** ("Chart datum for the
-     German Bight"), a published grid of SKN in NHN, fetched at build time. **CC-BY 4.0.** Atom
-     `https://gdi.bsh.de/de/feed/Chart-datum-for-the-German-Bight-2026.xml` (also WCS / ZIP). Its
-     east edge is ~9.5° E, so it covers Nordsee, Jade, Außenweser, and the outer Elbe.
-   - **Inner tidal Elbe (Hamburg reach, east of the grid to the Geesthacht weir)** — no grid
-     reaches here, so it is assembled from the per-gauge SKN values in `tideelbe_skn.csv`
-     (transcribed from the GDWS "Seekartennull an den Tidepegeln … ab 2026" table, positions from
-     PEGELONLINE — see the CSV header for links), interpolated along the gauge polyline. SKN there
-     is ~−1.9 m NHN tapering to ~−1.2 m near Zollenspieker; above the weir is non-tidal, so the
-     profile is clamped at the most-upstream gauge. Refresh the BSH grid edition and the CSV
-     together when BSH/GDWS republish.
-2. `source_datum --offset-surface reference/skn_reference.tif --clamp-positive` reprojects the
+   data tile). Two reaches, each its own EPSG:4326 GeoTIFF, stitched into `reference.vrt` (a VRT so
+   each keeps its own extent/resolution and warp reads whichever overlaps a tile):
+   - **Tidal — `skn_reference.tif`.** Outer estuaries + open Bight from the BSH **SKN-Fläche
+     Nordsee 2026** ("Chart datum for the German Bight") grid of SKN in NHN, fetched at build time
+     (**CC-BY 4.0**; Atom `https://gdi.bsh.de/de/feed/Chart-datum-for-the-German-Bight-2026.xml`,
+     also WCS / ZIP; east edge ~9.5° E covering Nordsee, Jade, Außenweser, outer Elbe). East of the
+     grid to the Geesthacht weir, the **inner tidal Elbe** is assembled from the per-gauge SKN
+     values in `tideelbe_skn.csv` (transcribed from the GDWS "Seekartennull an den Tidepegeln … ab
+     2026" table; SKN ~−1.9 m NHN tapering to ~−1.2 m near Zollenspieker, clamped at the most-
+     upstream gauge above the weir). Refresh the BSH grid edition and the CSV together.
+   - **Free-flowing Rhein — `glw_rhein.tif`.** Below the Iffezheim barrage (km 336) the Rhein runs
+     free, so its datum is GlW. No packaged grid: the low-water longitudinal profile is assembled
+     from the per-gauge GlW-in-NHN values in `rhein_glw.csv` (harvested from PEGELONLINE by
+     `harvest_rhein_glw.py` — see below), interpolated along the gauge polyline the same way as the
+     inner Elbe. 17 gauges, Maxau (km 362) → Emmerich (km 852); GlW-in-NHN ~101 m tapering to ~9 m.
+2. `source_datum --offset-surface reference/reference.vrt --clamp-positive` reprojects the
    reference onto each tile (bilinear, cross-CRS), subtracts it, and drops above-datum cells.
 3. `source_normalize` (no `--crs`, keep per-tile CRS) → COG.
 
-Validated end-to-end on two real tiles: outer Elbe km710–728 (BSH grid) and inner Elbe km620–639
-(Hamburg, assembled fill — 0 % → covered), both yielding water-only depths below chart datum.
+Validated end-to-end on real tiles: outer Elbe km710–728 (BSH grid) and inner Elbe km620–639
+(Hamburg, assembled fill) for SKN, plus a Rhein bed at Köln through the VRT for GlW — all yielding
+water-only depths below their datum with land clamped off.
 
 **Clamp caveat / follow-up.** `--clamp-positive` drops everything above chart datum, which removes
 the surrounding land *and* intertidal drying flats a chart would show. Follow-up: instead of a
 blunt `>0` clamp, reconcile against the OSM land–water mask (`landmask.py`) so genuine drying areas
 inside mapped water survive while dike/land terrain is dropped.
 
-**Inland (deferred).** The reference is the WSV low-water longitudinal profile: **GlW**
-(Gleichwertiger Wasserstand) for free-flowing rivers, **Stauziel** for impounded reaches — NHN vs
-river-km. Unlike the tidal surface, there is no packaged download: GlW is published as ELWIS PDF
-tables and computed in BfG's FLYS web tool, and per-gauge values sit in gauge datasheets.
-PEGELONLINE's REST API (`pegelonline.wsv.de/webservices/rest-api/v2`) gives every gauge's river-km
-and coordinates but not the GlW value. So the inland step must **assemble** a longitudinal profile
-from published GlW/Stauziel gauge values, interpolate along km, project across the channel width,
-then apply the same subtraction. Bounded (gauges are finite and km-referenced) but real work —
-tracked separately from this PR.
+**Remaining inland reaches (deferred).** The free-flowing Rhein above uses **GlW**; the reaches
+still commented out in `file_list.txt` need **Stauziel** (impoundment target level) per barrage
+pool — a step function, constant within a pool and jumping at each weir, not a smooth ramp. Good
+news for sourcing: PEGELONLINE (`pegelonline.wsv.de/webservices/rest-api/v2`) exposes each gauge's
+`gaugeZero` (PNP in NHN) and its characteristic values including GlW, so the Rhein needed no PDF
+tables — `harvest_rhein_glw.py` reads it straight from the API. Stauziel is not a PEGELONLINE
+characteristic value, so the impounded reaches (Rhein km 164–337, Main, Mosel, Saar, Lahn) still
+need the per-pool target levels + barrage locations from WSV/ELWIS; the Elbe-upper/Oder/Weser/Ems
+reaches publish no GlW/Stauziel at all (MNW/MW only) and need another source or an MNW proxy.
+Each follow-up reuses the same `build_reference.py` corridor machinery — assemble per-gauge
+low-water NHN values, interpolate along the gauge line, subtract — tracked separately from this PR.
 
 ## Pipeline
 
