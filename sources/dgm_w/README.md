@@ -70,7 +70,7 @@ clamp values above the reference to nodata to drop the terrain fringe.
 Proposed step (extends `source_datum` with an `--offset-surface <ref>` mode, or a small
 `source_datum_lowwater.py`), inserted **after `source_unzip`, before `source_normalize`**:
 
-1. **Fetch + cache the reference surface** into `store/reference/` (a `reference_fetch.py`):
+1. **Fetch + cache the reference surface** into `store/source/dgm_w/` alongside the processed COGs:
    - **Tidal — ready today.** BSH **SKN-Fläche Nordsee 2026** ("Chart datum for the German
      Bight"), a gridded surface of Seekartennull (≈ LAT) in NHN covering the sea, Watten, and
      estuaries. **CC-BY 4.0.** Atom `https://gdi.bsh.de/de/feed/Chart-datum-for-the-German-Bight-2026.xml`,
