@@ -44,9 +44,9 @@ on:
         type: boolean
         default: false
       server_type:
-        description: "Hetzner type — ccx33 (8 vCPU/32 GB, the account's dedicated-vCPU cap today); ccx63 once the quota is raised"
+        description: "Hetzner type — ccx63 (48 vCPU/192 GB, dedicated-vCPU quota approved); ccx33 (8/32) for a cheaper smoke. Worker knobs (AGG/TERRAIN/BUNDLE_PROCESSES, GDAL_CACHEMAX) auto-size from the box's RAM."
         required: false
-        default: ccx33
+        default: ccx63
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
