@@ -10,8 +10,14 @@
 # COGs (one-time, on a build runner). Regenerate file_list.txt with harvest.py if the dspui key
 # rotates or the EA ships a new vintage.
 [no-cd]
-default:
+default: download normalize
+
+[no-cd]
+download:
     uv run python source_download.py uk_surfzone
+
+[no-cd]
+normalize:
     uv run python source_unzip.py uk_surfzone
     uv run python source_normalize.py uk_surfzone --crs EPSG:27700
     uv run python source_bounds.py uk_surfzone

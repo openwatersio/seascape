@@ -2,8 +2,14 @@
 # One zip of 4 COG tiles; values are MSL elevation (seafloor negative, like GEBCO) →
 # no datum transform. Already EPSG:4326; normalize re-asserts it, warp happens in aggregation.
 [no-cd]
-default:
+default: download normalize
+
+[no-cd]
+download:
     uv run python source_download.py gbr30
+
+[no-cd]
+normalize:
     uv run python source_unzip.py gbr30
     uv run python source_normalize.py gbr30 --crs EPSG:4326
     uv run python source_bounds.py gbr30

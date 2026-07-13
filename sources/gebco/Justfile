@@ -2,8 +2,14 @@
 #   just ../sources/gebco/
 # Fetched as a zip, then extracted. No datum transform.
 [no-cd]
-default:
+default: download normalize
+
+[no-cd]
+download:
     uv run python source_download.py gebco
+
+[no-cd]
+normalize:
     uv run python source_unzip.py gebco
     uv run python source_normalize.py gebco --crs EPSG:4326
     uv run python source_bounds.py gebco

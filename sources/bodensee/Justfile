@@ -5,8 +5,15 @@
 # surrounding-terrain fringe. EPSG:25832 (DHHN92-UTM32N) assigned in normalize. Isolated lake,
 # no ocean seam. (PANGAEA also ships an ETRS89 variant — ellipsoidal height — avoid: messier offset.)
 [no-cd]
-default:
+default: download normalize
+
+[no-cd]
+download:
     uv run python source_download_swissbathy.py bodensee
+
+[no-cd]
+normalize:
+    uv run python source_stage.py bodensee
     uv run python source_datum.py bodensee --offset -395.2 --clamp-positive
     uv run python source_normalize.py bodensee --crs EPSG:25832
     uv run python source_bounds.py bodensee

@@ -4,5 +4,11 @@
 # ~10 m, NAVD88 / NAD83; already COGs → no normalize/datum/tarball.
 # Priority derives from (maxzoom, id): cudem (z13) wins over cudem_third (z12) over gebco.
 [no-cd]
-default:
+default: download normalize
+
+[no-cd]
+download:
     uv run python source_mirror.py cudem_third
+
+[no-cd]
+normalize:

@@ -4,8 +4,15 @@
 # the surface ~0, the bed negative. EPSG:2056 (CH1903+ LV95) assigned in normalize.
 # Lake is hydraulically isolated, so no ocean seam.
 [no-cd]
-default:
+default: download normalize
+
+[no-cd]
+download:
     uv run python source_download_swissbathy.py lac_leman
+
+[no-cd]
+normalize:
+    uv run python source_stage.py lac_leman
     uv run python source_datum.py lac_leman --offset -372
     uv run python source_normalize.py lac_leman --crs EPSG:2056
     uv run python source_bounds.py lac_leman

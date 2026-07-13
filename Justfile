@@ -5,13 +5,29 @@
 
 set working-directory := 'pipelines'
 
-# Prepare one source: fetch -> datum -> normalize -> bounds -> polygon -> tarball, then
-# assemble catalog.json. The catalog step is the shared tail, so every source (prepared or
-# mirrored) gets a generated catalog item without editing each recipe. RECIPE_HASH (the
-# source's recipe content hash, supplied by the caller; empty locally) rides into the item.
-source id:
-    just ../sources/{{id}}/
+# Prepare one source end to end: download (fetch raw into the cache) then normalize (stage
+# raw -> datum -> normalize -> bounds -> polygon -> tarball) then the shared catalog.json tail.
+# The catalog step is the shared tail, so every source (prepared or mirrored) gets a generated
+# catalog item without editing each recipe. RECIPE_HASH (the source's recipe content hash,
+# supplied by the caller; empty locally) rides into the item.
+source id: (source-download id) (source-normalize id)
+
+# Download phase: fetch a source's raw bytes into store/download/<id>/ (idempotent — a cached
+# file is skipped; source_download.py --force re-fetches). Mirrored sources (cudem/noaa_s102)
+# register + push to R2 here instead. Run once; normalize reruns off the cache.
+source-download id:
+    just ../sources/{{id}}/download
+
+# Normalize phase: stage raw from the cache into store/source/<id> and run the transform chain,
+# then the catalog tail. Network-free and re-runnable — this is the fast datum/masking loop.
+source-normalize id:
+    just ../sources/{{id}}/normalize
     uv run python source_catalog.py {{id}}
+
+# Drop the raw download cache (store/download/). Frees disk after prep; the next source-download
+# re-fetches. store/source/ (the normalized output) is untouched.
+clean-download:
+    rm -rf store/download
 
 # Prepare the OSM land mask once (download -> unzip -> EPSG:3857 FlatGeobuf at
 # store/landmask/land.fgb). Flagged coarse sources (GEBCO/EMODnet) clamp negative
@@ -232,6 +248,8 @@ test: test-sources test-engine test-workflows
 # Offline self-checks (synthetic data, no network).
 test-sources:
     uv run python test_source_stage.py
+    uv run python source_download.py --check
+    uv run python source_stage.py --check
     uv run python source_mirror.py --check
     uv run python source_catalog.py --check
     uv run python source_remote.py

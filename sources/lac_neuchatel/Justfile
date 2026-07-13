@@ -5,8 +5,15 @@
 # Lake is hydraulically isolated, so no ocean seam. The zip carries a surrounding-terrain
 # fringe (cells above lake level), so --clamp-positive drops post-offset >0 cells to nodata.
 [no-cd]
-default:
+default: download normalize
+
+[no-cd]
+download:
     uv run python source_download_swissbathy.py lac_neuchatel
+
+[no-cd]
+normalize:
+    uv run python source_stage.py lac_neuchatel
     uv run python source_datum.py lac_neuchatel --offset -429.3 --clamp-positive
     uv run python source_normalize.py lac_neuchatel --crs EPSG:2056
     uv run python source_bounds.py lac_neuchatel

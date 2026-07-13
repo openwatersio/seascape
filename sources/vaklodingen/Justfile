@@ -3,8 +3,15 @@
 # like GEBCO) → no datum transform. EPSG:28992 is embedded; normalize re-asserts it and
 # the warp to web mercator happens later in aggregation.
 [no-cd]
-default:
+default: download normalize
+
+[no-cd]
+download:
     uv run python source_download.py vaklodingen
+
+[no-cd]
+normalize:
+    uv run python source_stage.py vaklodingen
     uv run python source_normalize.py vaklodingen --crs EPSG:28992
     uv run python source_bounds.py vaklodingen
     uv run python source_polygonize.py vaklodingen 8

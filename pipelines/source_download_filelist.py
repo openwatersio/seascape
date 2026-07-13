@@ -3,7 +3,7 @@
 For sources published as a tile collection with a maintained URL manifest (e.g.
 NOAA CUDEM's ``urllist8483.txt``: 942 tile URLs across all US coastal regions).
 ``file_list.txt`` holds the URL(s) of the *filelist(s)*; this step downloads each
-manifest, then downloads every file it names into ``store/source/<id>/``. Pointing
+manifest, then downloads every file it names into ``store/download/<id>/``. Pointing
 at NOAA's manifest (vs vendoring ~942 lines) means coverage tracks their periodic
 re-tiling automatically. The download is idempotent — a finished file is skipped,
 so a re-run after a flaky tile resumes instead of re-pulling everything.
@@ -32,7 +32,7 @@ def main():
     manifests = config.file_list(source)
     if not manifests:
         sys.exit(f"no filelist URLs in {config.SOURCES_DIR}/{source}/file_list.txt")
-    os.makedirs(f"store/source/{source}", exist_ok=True)
+    os.makedirs(f"store/download/{source}", exist_ok=True)
 
     urls = []
     for m in manifests:
@@ -43,7 +43,7 @@ def main():
     print(f"downloading {source}: {len(urls)} file(s) from {len(manifests)} filelist(s)")
 
     for i, url in enumerate(urls):
-        dest = f"store/source/{source}/{source}_{i}.{ext_for(url)}"
+        dest = f"store/download/{source}/{source}_{i}.{ext_for(url)}"
         if os.path.exists(dest):
             continue
         print(f"  [{i}/{len(urls)}] {url} -> {dest}")

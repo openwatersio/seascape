@@ -2,7 +2,8 @@ data/
 work/
 output/
 dist/
-# pipeline stages + bundle output all write under pipelines/store/
+# pipeline stages + bundle output all write under pipelines/store/ — this includes the raw
+# source download cache (store/download/) and the normalized source work dir (store/source/)
 pipelines/store/
 .venv/
 node_modules

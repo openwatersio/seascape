@@ -3,8 +3,15 @@
 # transform. Fully populated (no nodata holes). normalize re-asserts the CRS; the warp to
 # web mercator happens in aggregation. Native ~250 m → z9 (omit max_zoom, let cover derive).
 [no-cd]
-default:
+default: download normalize
+
+[no-cd]
+download:
     uv run python source_download.py swiobc
+
+[no-cd]
+normalize:
+    uv run python source_stage.py swiobc
     uv run python source_normalize.py swiobc --crs EPSG:4326
     uv run python source_bounds.py swiobc
     uv run python source_polygonize.py swiobc 8

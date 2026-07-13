@@ -38,7 +38,7 @@ def main():
     urls = config.file_list(source)
     if not urls:
         sys.exit(f"no URLs in {config.SOURCES_DIR}/{source}/file_list.txt")
-    out_dir = f"store/source/{source}"
+    out_dir = f"store/download/{source}"
     os.makedirs(out_dir, exist_ok=True)
 
     archive = f"{out_dir}/Bathymetric_Rasters.7z"

@@ -26,7 +26,7 @@ def main():
     urls = config.file_list(source)
     if not urls:
         sys.exit(f"no URLs in {config.SOURCES_DIR}/{source}/file_list.txt")
-    out_dir = f"store/source/{source}"
+    out_dir = f"store/download/{source}"
     tiles_dir = f"{out_dir}/asc"
     os.makedirs(tiles_dir, exist_ok=True)
 

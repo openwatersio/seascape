@@ -4,5 +4,11 @@
 # store's object mirror separately, and aggregation range-reads them from there). Tiles
 # are already COGs (NAVD88 / NAD83), so no normalize/datum/tarball.
 [no-cd]
-default:
+default: download normalize
+
+[no-cd]
+download:
     uv run python source_mirror.py cudem
+
+[no-cd]
+normalize:

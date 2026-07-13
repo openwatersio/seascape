@@ -5,8 +5,15 @@
 # each from its own zone). Values are bed elevation on the local tidal datum (~MLLW),
 # already GEBCO convention (bed negative, intertidal positive) → no negate, no offset.
 [no-cd]
-default:
+default: download normalize
+
+[no-cd]
+download:
     uv run python source_download_estuarine.py noaa_estuarine
+
+[no-cd]
+normalize:
+    uv run python source_stage.py noaa_estuarine
     uv run python source_normalize.py noaa_estuarine
     uv run python source_bounds.py noaa_estuarine
     uv run python source_polygonize.py noaa_estuarine 8

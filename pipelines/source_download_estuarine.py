@@ -35,7 +35,7 @@ def main():
     urls = config.file_list(source)
     if not urls:
         sys.exit(f"no URLs in {config.SOURCES_DIR}/{source}/file_list.txt")
-    out_dir = f"store/source/{source}"
+    out_dir = f"store/download/{source}"
     os.makedirs(out_dir, exist_ok=True)
     print(f"downloading {source}: {len(urls)} estuary netCDF(s)")
     for i, url in enumerate(urls):

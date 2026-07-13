@@ -6,8 +6,15 @@
 # (LWD is already the low-water/chart datum). CRS is a .prj sidecar we drop → normalize
 # assigns EPSG:4269 (NAD83 ≈ WGS84). Lakes are isolated → no ocean seam.
 [no-cd]
-default:
+default: download normalize
+
+[no-cd]
+download:
     uv run python source_download_greatlakes.py great_lakes
+
+[no-cd]
+normalize:
+    uv run python source_stage.py great_lakes
     uv run python source_datum.py great_lakes --clamp-positive
     uv run python source_normalize.py great_lakes --crs EPSG:4269
     uv run python source_bounds.py great_lakes

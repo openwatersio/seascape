@@ -4,8 +4,15 @@
 # so the coverage polygon is one solid footprint. Topo-bathy → elevation (seafloor negative,
 # like GEBCO) → no datum transform. (Verify sign on first build; vertical datum unconfirmed.)
 [no-cd]
-default:
+default: download normalize
+
+[no-cd]
+download:
     uv run python source_download.py gsc_atlantic
+
+[no-cd]
+normalize:
+    uv run python source_stage.py gsc_atlantic
     uv run python source_normalize.py gsc_atlantic
     uv run python source_bounds.py gsc_atlantic
     uv run python source_polygonize.py gsc_atlantic 8

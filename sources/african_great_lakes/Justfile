@@ -6,8 +6,15 @@
 # aggregation reprojects each lake from its own frame. Lakes are hydraulically isolated,
 # so no ocean seam.
 [no-cd]
-default:
+default: download normalize
+
+[no-cd]
+download:
     uv run python source_download_african_lakes.py african_great_lakes
+
+[no-cd]
+normalize:
+    uv run python source_stage.py african_great_lakes
     uv run python source_datum.py african_great_lakes --negate
     uv run python source_normalize.py african_great_lakes
     uv run python source_bounds.py african_great_lakes

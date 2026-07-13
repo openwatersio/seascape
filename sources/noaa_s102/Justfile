@@ -6,5 +6,11 @@
 # mixed_crs + band 1 + negate (depth->elevation at reproject, since mirrored sources skip
 # source_datum). Already MLLW — no datum offset. Sibling of BlueTopo but datum-clean.
 [no-cd]
-default:
+default: download normalize
+
+[no-cd]
+download:
     uv run python source_mirror.py noaa_s102
+
+[no-cd]
+normalize:
