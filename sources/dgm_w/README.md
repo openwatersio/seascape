@@ -69,20 +69,22 @@ datum (negative = depth below datum, same convention as the MLLW/LAT sources); a
 
 Pipeline steps (after `source_unzip`, before `source_normalize`):
 
-1. `source_reference_dgmw.py` builds the SKN surface into `store/source/dgm_w/reference/`
-   (a subdir, so the pipeline's `*.tif` globs never treat it as a data tile). Two pieces merged
-   into one EPSG:4326 raster:
+1. `build_reference.py` (bespoke, lives in this source dir) builds the SKN surface into
+   `store/source/dgm_w/reference/` (a subdir, so the pipeline's `*.tif` globs never treat it as a
+   data tile). Every value is fetched from an authoritative source at build time — nothing
+   hard-coded but the source URLs and the tidal-Elbe gauge names. Two pieces merged into one
+   EPSG:4326 raster:
    - **Outer estuaries + open Bight** — BSH **SKN-Fläche Nordsee 2026** ("Chart datum for the
      German Bight"), a published grid of SKN in NHN. **CC-BY 4.0.** Atom
      `https://gdi.bsh.de/de/feed/Chart-datum-for-the-German-Bight-2026.xml` (also WCS / ZIP). Its
      east edge is ~9.5° E, so it covers Nordsee, Jade, Außenweser, and the outer Elbe.
    - **Inner tidal Elbe (Hamburg reach, east of the grid to the Geesthacht weir)** — no grid
-     reaches here, so it is assembled from the **GDWS per-gauge SKN** values ("Aktuelles
-     Seekartennull an den Tidepegeln … ab 2026") placed at each gauge's river-km/position
-     (PEGELONLINE) and interpolated along the gauge polyline. SKN there is ~−1.9 m NHN tapering to
-     ~−1.2 m near Zollenspieker; above the weir is non-tidal, so the profile is clamped at the
-     most-upstream gauge. Both pieces are the 2026 vintage — refresh the grid URL and gauge table
-     together when BSH republishes.
+     reaches here, so it is assembled from the **GDWS per-gauge SKN** table ("Aktuelles
+     Seekartennull an den Tidepegeln … ab 2026", parsed from the PDF) placed at each gauge's
+     position/river-km (PEGELONLINE) and interpolated along the gauge polyline. SKN there is
+     ~−1.9 m NHN tapering to ~−1.2 m near Zollenspieker; above the weir is non-tidal, so the
+     profile is clamped at the most-upstream gauge. Both sources point at the current (2026)
+     edition, so a re-run picks up republished values automatically.
 2. `source_datum --offset-surface reference/skn_reference.tif --clamp-positive` reprojects the
    reference onto each tile (bilinear, cross-CRS), subtracts it, and drops above-datum cells.
 3. `source_normalize` (no `--crs`, keep per-tile CRS) → COG.
@@ -107,6 +109,6 @@ tracked separately from this PR.
 
 ## Pipeline
 
-Run from `pipelines/`: `just ../sources/dgm_w/`. Standard prepared path, modeled on
-`noaa_estuarine` (the other `mixed_crs` source). The datum step above is not yet wired in; until it
-lands the active tidal tiles ingest at NHN (≈ MSL).
+Run from `pipelines/`: `just ../sources/dgm_w/`. Prepared path modeled on `noaa_estuarine` (the
+other `mixed_crs` source), with the datum step (above) inserted after unzip so the synced COG is
+already referenced to chart datum.

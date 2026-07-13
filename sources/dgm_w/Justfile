@@ -8,7 +8,7 @@
 # SCOPE: only the tidal/estuary reaches are active in file_list.txt (16 tiles: Nordsee, Außenelbe
 # below Elbe-km 586, Jade, Unter-/Außenweser). Inland reaches are commented out (bed above MSL).
 #
-# DATUM: source_reference_dgmw builds the SKN (chart datum ~= LAT) surface in NHN — the BSH
+# DATUM: build_reference.py builds the SKN (chart datum ~= LAT) surface in NHN — the BSH
 # SKN-Fläche grid for the outer estuaries, extended over the inner tidal Elbe from the GDWS
 # per-gauge SKN values — into store/source/dgm_w/reference/. source_datum then subtracts it
 # (bed - SKN = depth below chart datum) and --clamp-positive drops above-datum land/drying to
@@ -18,7 +18,7 @@
 default:
     uv run python source_download.py dgm_w
     uv run python source_unzip.py dgm_w
-    uv run python source_reference_dgmw.py
+    uv run --with pdfplumber python ../sources/dgm_w/build_reference.py
     uv run python source_datum.py dgm_w --offset-surface reference/skn_reference.tif --clamp-positive
     uv run python source_normalize.py dgm_w --nodata -32768
     uv run python source_bounds.py dgm_w
