@@ -1,9 +1,9 @@
 {
-    "name": "German Federal Waterway Bathymetry (WSV DGM-W, 2 m)",
+    "name": "German Federal Waterway Bathymetry (WSV DGM-W, 2 m) — tidal reaches",
     "producer": "Wasserstraßen- und Schifffahrtsverwaltung des Bundes (WSV) / Bundesanstalt für Gewässerkunde (BfG)",
     "website": "https://via.bund.de/wsv/inspire/",
     "license": "GeoNutzV (attribution: © Wasserstraßen- und Schifffahrtsverwaltung des Bundes)",
     "max_zoom": 14,
-    "datum": "orthometric NHN height (DHHN2016), bed elevation up-positive — GEBCO convention, so no negate/offset. Tidal/estuary reaches read as depth; inland reaches sit at true elevation above MSL and would need per-reach water-surface referencing to render as depth.",
+    "datum": "orthometric NHN height (DHHN2016), bed elevation up-positive. Scope is the tidal/estuary reaches (Nordsee, Außenelbe below Elbe-km 586, Jade, Unter-/Außenweser), which read as depth near/below MSL; interim ~1-3 m shallow vs chart datum. Planned datum step subtracts the BSH SKN-Fläche (LAT) surface -> true chart datum. Inland reaches deferred (need GlW/Stauziel referencing). See README.",
     "mixed_crs": true
 }

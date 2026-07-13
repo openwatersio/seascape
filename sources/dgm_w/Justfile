@@ -1,11 +1,20 @@
 # German Federal Waterway Bathymetry — WSV DGM-W (Digitales Geländemodell des Wasserlaufs), 2 m.
 # Run from pipelines/:  just ../sources/dgm_w/
-# 93 zipped GeoTIFF tiles from the WSV INSPIRE "Höhe" Atom download service (file_list.txt),
-# one .tif per zip, terrain + riverbed merged. Per-tile CRS (DHDN/Gauss-Krüger and UTM/ETRS89
-# zones) -> mixed_crs: normalize WITHOUT --crs to keep each file's embedded CRS; aggregation
-# reprojects each tile from its own frame. Values are orthometric NHN elevation (up-positive,
-# GEBCO convention) -> no negate, no offset; nodata -32768. Tidal/estuary reaches read as depth;
-# inland reaches sit above MSL (see metadata.json datum note). License: GeoNutzV, attribute the WSV.
+# Zipped GeoTIFF tiles from the WSV INSPIRE "Höhe" Atom download service (file_list.txt), one .tif
+# per zip, terrain + riverbed merged. Per-tile CRS (DHDN/Gauss-Krüger and UTM/ETRS89 zones) ->
+# mixed_crs: normalize WITHOUT --crs to keep each file's embedded CRS; aggregation reprojects each
+# tile from its own frame. Values are orthometric NHN elevation (up-positive); nodata -32768.
+#
+# SCOPE: only the tidal/estuary reaches are active in file_list.txt (16 tiles: Nordsee, Außenelbe
+# below Elbe-km 586, Jade, Unter-/Außenweser). They render as depth near/below MSL; interim they
+# ingest at NHN (~1-3 m shallow vs chart datum). Inland reaches are commented out — bed above MSL,
+# they'd render as land until referenced to a low-water surface. License: GeoNutzV, attribute the WSV.
+#
+# PLANNED (see README.md "Datum normalization"): insert a low-water datum step after source_unzip
+# that subtracts a reference surface (tidal: BSH SKN-Fläche, CC-BY; inland: WSV GlW/Stauziel) so the
+# synced COG is depth-below-chart-datum. Not wired in yet; until then the tidal tiles ingest at NHN.
+#   e.g.  uv run python source_datum.py dgm_w --offset-surface skn-nordsee   # <- future
+#
 # NOTE: source_download.py is not resumable — a mid-run network failure re-pulls all tiles.
 [no-cd]
 default:
