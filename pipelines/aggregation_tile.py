@@ -9,6 +9,7 @@ single-zoom PMTiles in the z7-sharded store/pmtiles.
 import json
 import math
 import os
+from concurrent.futures import ThreadPoolExecutor
 from glob import glob
 
 import mercantile
@@ -18,6 +19,14 @@ import keys
 import utils
 
 NODATA = -9999
+
+# Threads for the per-tile Terrarium/WebP encode. rasterio's block reads and
+# imagecodecs.webp_encode both release the GIL, so the ~43 ms/tile encode of the
+# 4096 z14 tiles parallelizes without process-spawn overhead. Each task opens the
+# DEM COG independently and reads only its own 512x512 window (~1 MB) — the OS page
+# cache shares the underlying file across threads, so the added memory ceiling is
+# workers x ~1 MB, negligible against the tile's multi-GB merged DEM.
+ENCODE_THREADS = min(os.cpu_count() or 1, 8)
 
 
 def create_tile(i, j, tiff_filepath, out_filepath, buffer_pixels):
@@ -39,9 +48,17 @@ def create_tiles(tmp_folder, aggregation_tile, tiff_filepath, buffer_pixels):
     span = 2 ** (child_z - aggregation_tile.z)
     x_min = aggregation_tile.x * span
     y_min = aggregation_tile.y * span
-    for i, x in enumerate(range(x_min, x_min + span)):
-        for j, y in enumerate(range(y_min, y_min + span)):
-            create_tile(i, j, tiff_filepath, f"{tmp_folder}/{child_z}-{x}-{y}.webp", buffer_pixels)
+    # Each task writes its own {z}-{x}-{y}.webp; create_archive re-globs and packs
+    # tiles in sorted tile-id order, so encode order can't change the archive bytes.
+    # Waiting on futures in submission order re-raises the first failure like the serial loop.
+    with ThreadPoolExecutor(max_workers=ENCODE_THREADS) as pool:
+        futures = [
+            pool.submit(create_tile, i, j, tiff_filepath, f"{tmp_folder}/{child_z}-{x}-{y}.webp", buffer_pixels)
+            for i, x in enumerate(range(x_min, x_min + span))
+            for j, y in enumerate(range(y_min, y_min + span))
+        ]
+        for future in futures:
+            future.result()
 
 
 def main(filepath, out_filepath):
