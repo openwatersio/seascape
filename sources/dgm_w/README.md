@@ -56,37 +56,44 @@ the hillshade layer caps at 2015). Newer high-resolution project DEMs ship separ
 e.g. **DGM-W Elbe 2022** on Zenodo (`10.5281/zenodo.17378778`) and via GovData/BfG — and could
 supersede the estuary tiles here if desired.
 
-## Datum normalization (planned)
+## Datum normalization
 
-Goal: make `just source dgm_w` emit a **low-water-referenced** COG, so the source synced to R2 is
-already depth-below-chart-datum and needs no special handling downstream. This generalizes the
-scalar lake `--offset` (Bodensee) to a spatially-varying reference **surface**.
+`just source dgm_w` emits a **low-water-referenced** COG: raw DGM-W is orthometric NHN, and the
+prep subtracts the SKN-in-NHN reference so the synced COG is depth below chart datum (SKN ≈ LAT),
+needing no special handling downstream. This is the scalar lake `--offset` (Bodensee) generalized
+to a spatially-varying reference **surface**.
 
-Core transform, per pixel: `bed_chartdatum = bed_NHN − reference_NHN(x, y)`, where
-`reference_NHN` is the low-water surface height in NHN at that location. Result is bed elevation
-referenced to low water (negative = depth below datum, same convention as MLLW/LAT sources);
-clamp values above the reference to nodata to drop the terrain fringe.
+Per pixel: `bed_chartdatum = bed_NHN − SKN_NHN(x, y)`. Result is bed elevation referenced to chart
+datum (negative = depth below datum, same convention as the MLLW/LAT sources); above-datum cells
+(land, drying flats) are clamped to nodata.
 
-Proposed step (extends `source_datum` with an `--offset-surface <ref>` mode, or a small
-`source_datum_lowwater.py`), inserted **after `source_unzip`, before `source_normalize`**:
+Pipeline steps (after `source_unzip`, before `source_normalize`):
 
-1. **Fetch + cache the reference surface** into `store/source/dgm_w/` alongside the processed COGs:
-   - **Tidal — ready today.** BSH **SKN-Fläche Nordsee 2026** ("Chart datum for the German
-     Bight"), a gridded surface of Seekartennull (≈ LAT) in NHN covering the sea, Watten, and
-     estuaries. **CC-BY 4.0.** Atom `https://gdi.bsh.de/de/feed/Chart-datum-for-the-German-Bight-2026.xml`,
-     also a WCS and a direct ZIP. One fetch covers every active tidal tile.
-2. **Reproject/resample** the reference onto each DEM tile's grid and CRS (bilinear — it's a smooth
-   continuous surface, unlike categorical data), giving a per-tile `reference_NHN` raster.
-3. **Subtract** (`bed_NHN − reference_NHN`), set nodata where the reference doesn't cover the tile,
-   clamp positives to nodata. Record the applied datum in the catalog sidecar so `metadata.datum`
-   reflects "SKN (LAT) via BSH SKN-Fläche subtraction."
-4. `source_normalize` (no `--crs`, keep per-tile CRS) → COG, as today.
+1. `source_reference_dgmw.py` builds the SKN surface into `store/source/dgm_w/reference/`
+   (a subdir, so the pipeline's `*.tif` globs never treat it as a data tile). Two pieces merged
+   into one EPSG:4326 raster:
+   - **Outer estuaries + open Bight** — BSH **SKN-Fläche Nordsee 2026** ("Chart datum for the
+     German Bight"), a published grid of SKN in NHN. **CC-BY 4.0.** Atom
+     `https://gdi.bsh.de/de/feed/Chart-datum-for-the-German-Bight-2026.xml` (also WCS / ZIP). Its
+     east edge is ~9.5° E, so it covers Nordsee, Jade, Außenweser, and the outer Elbe.
+   - **Inner tidal Elbe (Hamburg reach, east of the grid to the Geesthacht weir)** — no grid
+     reaches here, so it is assembled from the **GDWS per-gauge SKN** values ("Aktuelles
+     Seekartennull an den Tidepegeln … ab 2026") placed at each gauge's river-km/position
+     (PEGELONLINE) and interpolated along the gauge polyline. SKN there is ~−1.9 m NHN tapering to
+     ~−1.2 m near Zollenspieker; above the weir is non-tidal, so the profile is clamped at the
+     most-upstream gauge. Both pieces are the 2026 vintage — refresh the grid URL and gauge table
+     together when BSH republishes.
+2. `source_datum --offset-surface reference/skn_reference.tif --clamp-positive` reprojects the
+   reference onto each tile (bilinear, cross-CRS), subtracts it, and drops above-datum cells.
+3. `source_normalize` (no `--crs`, keep per-tile CRS) → COG.
 
-Open items for the tidal step:
-- Confirm the SKN-Fläche grid encodes SKN **height in NHN** (expected) and its eastern extent —
-  the published envelope stops near 9.5° E, so the inner tidal Elbe toward Hamburg/Geesthacht
-  (~10° E) may fall outside it; those pixels fall back to nodata or ~MSL until confirmed via the
-  WCS `DescribeCoverage`.
+Validated end-to-end on two real tiles: outer Elbe km710–728 (BSH grid) and inner Elbe km620–639
+(Hamburg, assembled fill — 0 % → covered), both yielding water-only depths below chart datum.
+
+**Clamp caveat / follow-up.** `--clamp-positive` drops everything above chart datum, which removes
+the surrounding land *and* intertidal drying flats a chart would show. Follow-up: instead of a
+blunt `>0` clamp, reconcile against the OSM land–water mask (`landmask.py`) so genuine drying areas
+inside mapped water survive while dike/land terrain is dropped.
 
 **Inland (deferred).** The reference is the WSV low-water longitudinal profile: **GlW**
 (Gleichwertiger Wasserstand) for free-flowing rivers, **Stauziel** for impounded reaches — NHN vs
