@@ -133,6 +133,11 @@ def _encode_tile(i, j, src_path, halo, out_webp, cz):
     row = j * 512 + halo
     with rasterio.open(src_path) as src:
         data = src.read(1, window=rasterio.windows.Window(col, row, 512, 512))
+    # GEBCO (priority 0, global) is inside the mosaic, so any surviving interior nodata is genuinely
+    # UNCOVERED — no source has it. Resolving it to 0 m = shoreline/datum, which is shallow and
+    # chart-safe (never a false DEEP); the served Terrarium has no transparency, so it must be some
+    # value, and shoaling it is the conservative choice. (In practice this is only the beyond-build
+    # fringe; true interior holes don't occur while GEBCO blankets the planet.)
     data[data == NODATA] = 0
     utils.save_terrarium_tile(data, out_webp)  # utils parses zoom from the {cz}-{x}-{y}.webp name
 
@@ -253,9 +258,15 @@ def _aggregation_mosaic_keys(aid):
 
 
 def _intersecting_keys(stem, agg_keys):
-    """The mosaic tile keys a render stem reads: every aggregation tile whose mercantile tile
-    overlaps the stem's anchor (an ancestor, a descendant, or the tile itself). Sorted, so the
-    terrain key is order-independent."""
+    """The mosaic tile keys a render stem reads INTO — every aggregation tile whose mercantile tile
+    overlaps OR EDGE/CORNER-TOUCHES the stem's anchor. The touch case is load-bearing for chart
+    safety: _read_window buffers the anchor by a halo (smooth's truncation radius) and blends those
+    haloed pixels into the served EDGE band, so the immediate 8-neighbour tiles genuinely shape the
+    output — they must enter the key or a neighbour-only re-merge leaves a stale seam depth. Hence
+    INCLUSIVE bounds (<=/>=): adjacent tiles share exact grid coordinates (the east neighbour's west
+    == the anchor's east), and the halo (65 px) is far under the 512 px minimum tile width, so it
+    never reaches past the immediate neighbours — the touch test is both necessary and sufficient.
+    Sorted, so the terrain key is order-independent."""
     z, x, y, _cz = (int(a) for a in stem.split("-"))
     anchor = mercantile.Tile(x=x, y=y, z=z)
     ab = mercantile.bounds(anchor)
@@ -263,8 +274,9 @@ def _intersecting_keys(stem, agg_keys):
     for astem, k in agg_keys.items():
         az, ax, ay, _acz = (int(a) for a in astem.split("-"))
         bb = mercantile.bounds(mercantile.Tile(x=ax, y=ay, z=az))
-        # lon/lat bbox overlap (tiles share a global grid, so overlap == ancestor/descendant/equal)
-        if bb.west < ab.east and bb.east > ab.west and bb.south < ab.north and bb.north > ab.south:
+        # lon/lat bbox overlap-or-touch (tiles share a global grid); >=/<= so an edge/corner
+        # neighbour the halo reads is included, not just a strictly-overlapping ancestor/descendant.
+        if bb.west <= ab.east and bb.east >= ab.west and bb.south <= ab.north and bb.north >= ab.south:
             keyset.append(k)
     return sorted(set(keyset))
 
@@ -465,6 +477,22 @@ def _check():
         # key sensitivity: a mosaic-tile-key change re-keys terrain; a smooth-config change too
         agg_keys2 = dict(agg_keys); agg_keys2[stem] = "deadbeefdead"
         assert terrain_key(stem, agg_keys2) != k, "a mosaic tile key change must move the terrain key"
+
+        # TWO-TILE fixture (the single-tile store structurally can't cover this): the anchor's
+        # 65 px halo reads its EDGE NEIGHBOUR's mosaic tile and blends it into the served seam band,
+        # so a neighbour-only re-merge MUST move the anchor's terrain key (else a stale seam depth —
+        # a chart-safety bug). anchor 8-75-96-14 + east neighbour 8-76-96-14 (shares the anchor's
+        # east edge) + a far tile 8-200-96-14 that neither overlaps nor touches.
+        anc, nbr, far = "8-75-96-14", "8-76-96-14", "8-200-96-14"
+        two = {anc: "1111aaaa1111", nbr: "2222bbbb2222"}
+        base2 = terrain_key(anc, two)
+        assert two[nbr] in _intersecting_keys(anc, two), "the edge neighbour must be an intersecting tile"
+        bumped = {**two, nbr: "3333cccc3333"}  # the neighbour re-merged (new mosaic key)
+        assert terrain_key(anc, bumped) != base2, \
+            "a neighbour-only mosaic re-key must move the anchor's terrain key (the halo reads it)"
+        assert terrain_key(anc, {**two, far: "4444dddd4444"}) == base2, \
+            "a non-touching far tile must NOT enter the anchor's terrain key"
+
         saved_sigma = smooth.DEM_SIGMA_DEEP
         smooth.DEM_SIGMA_DEEP = saved_sigma + 1
         try:
