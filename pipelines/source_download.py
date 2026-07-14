@@ -45,12 +45,16 @@ def fix_archive_ext(dest):
 
 def cached(dest):
     """The existing cache file for this dest, or None. Accounts for fix_archive_ext's
-    .tif->.zip rename: a prior run may have saved zip bytes under the .zip name, so a
-    dest ending .tif is also satisfied by its .zip sibling."""
+    rename of the ext_for "tif" fallback to .zip (an extensionless URL that served zip
+    bytes): only a .tif/.tiff dest is legitimately satisfied by a .zip sibling, so a
+    stray .zip never shadows a .nc/.asc/... at the same index if the URL list changes."""
     if os.path.exists(dest):
         return dest
-    zdest = dest.rsplit(".", 1)[0] + ".zip"
-    return zdest if os.path.exists(zdest) else None
+    if dest.rsplit(".", 1)[-1].lower() in ("tif", "tiff"):
+        zdest = dest.rsplit(".", 1)[0] + ".zip"
+        if os.path.exists(zdest):
+            return zdest
+    return None
 
 
 def main(force=False):
@@ -89,6 +93,8 @@ def _check():
     assert cached(zpath) == os.path.join(d, "s_0.zip")  # zpath was renamed to .zip above
     assert cached(tpath) == tpath                        # plain tif, present
     assert cached(os.path.join(d, "missing.tif")) is None
+    # a stray .zip sibling must NOT shadow a non-tif dest at the same index (s_0.zip exists)
+    assert cached(os.path.join(d, "s_0.nc")) is None
     print("source_download.py self-check ok")
 
 
