@@ -82,3 +82,38 @@ dwebp /tmp/t.webp -o /dev/null   # "Decoded … 512 x 512" = valid; the R2 tile 
 ### Healthy
 
 Near-zero `outcome: exception` over a week. The overzoom path is the usual offender; a burst of `Decoding error` with `exception` outcomes clustered in minutes is the [#67](https://github.com/openwatersio/seascape/pull/67) failure mode (isolate OOM under concurrent overzoom) — if it recurs, the `limiter(4)` cap in `worker/src/index.ts` is the knob to raise. A steady trickle on one fixed tile instead means that tile genuinely won't decode; fetch it (step 4) and, if `dwebp` also fails, rebuild it in the pipeline.
+
+## GitHub Actions
+
+Six workflows keep production fed. Two run on a schedule and are the ones that rot silently — a red scheduled run sends an email but nobody's watching Actions day to day, so check them here. Cadence: **Sources** weekly Mon 06:23 UTC (refresh/mirror data sources to R2), **GC** weekly Tue 04:17 UTC (prune old R2 releases). CI runs on every push; Build and Release are manual (`workflow_dispatch`); Deploy preview worker runs on push. `gh` reads the `openwatersio/seascape` repo — run these from a checkout, or add `-R openwatersio/seascape`.
+
+### 1. Any scheduled run red lately?
+
+```sh
+gh run list --workflow Sources -L 5
+gh run list --workflow GC -L 5
+```
+
+`completed / success` on the most recent of each is healthy. `failure` is the thing to open.
+
+### 2. Why did the weekly Sources run fail
+
+Sources fans out one matrix job per `sources/<id>/` with `fail-fast: false`, so one bad source shows as a red run while the rest refresh fine — and the build keeps covering the failed source from its last-good `bounds.csv`, so a single red Sources run is **not** a production outage, just a stale-by-one-week source. Find which source, then read only its failing step:
+
+```sh
+RUN=$(gh run list --workflow Sources -L 1 --json databaseId -q '.[0].databaseId')
+gh run view "$RUN"                       # which matrix job(s) are ✗
+gh run view "$RUN" --log-failed | tail -40   # the actual traceback
+```
+
+The common failure is an upstream data server (EA/Defra, NOAA, EMODnet) being flaky mid-fetch — a wall of `download … failed (404 …); retry` lines that the retry loop mostly rides out, plus one source that tips over. Re-running usually clears a transient one:
+
+```sh
+gh run rerun "$RUN" --failed
+```
+
+If the same source fails two weeks running, it's not transient — the upstream API, URL scheme, or (for `uk_surfzone`) the public subscription key has changed; regenerate its `file_list.txt` with the source's `harvest.py`.
+
+### Healthy
+
+Latest **Sources** and **GC** runs both `success`. A one-off red Sources run from a flaky upstream is expected noise — re-run its failed jobs. A source red for two consecutive weeks means the upstream drifted and its harvester needs attention; the build is unaffected until then.
