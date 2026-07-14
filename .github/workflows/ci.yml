@@ -83,6 +83,7 @@ jobs:
           node worker/src/overlay.test.mjs
           node worker/src/cache.test.mjs
           node worker/src/coverage.test.mjs
+          node worker/src/vector.test.mjs
       - name: Worker type-check (imports @openwaters/seascape across packages)
         working-directory: worker
         run: npx tsc --noEmit
