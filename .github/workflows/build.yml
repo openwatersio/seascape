@@ -239,28 +239,34 @@ jobs:
           mkdir -p "$STORE"
 
           # ── knobs, computed HERE, not in Python — the pipeline stays R2/host-agnostic.
-          #    AGG_PROCESSES = min(cores, RAM_GB/5). Per-worker memory budget: merged-DEM peak
-          #    ~4 GB (the dominant term; a max 32768px tile ≈ 4 GB float32, more with halo +
-          #    smooth) + GDAL_CACHEMAX 512 MB + 256 MB curl cache + ~32 MB VSI cache per open
-          #    dataset ≈ 5 GB — every cache below is PER PROCESS (workers share nothing), so
-          #    they scale with the worker count. ccx33 (8 cores / 32 GB) → 6 workers: ~5 GB of
-          #    caches + ~26 GB of DEM headroom, ~1 GB left for OS/docker. ccx63 (48 / 192) → 38.
-          #    BUNDLE_PROCESSES = min(cores, RAM_GB/8), more conservative — a bundle worker
-          #    reads whole input pmtiles into RAM and the planet base is one multi-GB unit,
-          #    unlike aggregate's bounded per-tile DEMs.
-          #    TERRAIN_PROCESSES = min(cores, RAM_GB/8), the same conservative budget — each
-          #    per-zoom render worker holds ONE mosaic window: a native macrotile is the same
-          #    ~4 GB float32 as an aggregate tile, and gdalwarp also spools the window to disk +
-          #    a GDAL cache, so it is at least as heavy as a bundle worker. ──
+          #    AGG_PROCESSES = min(cores, (RAM_GB − 40) / 9). Two things the old RAM/5 got wrong and
+          #    OOM-killed the first ccx63 planet build (38 workers, exit 137):
+          #      1. The pool runs HEAVIEST-FIRST (deepest child_z), so the first AGG_PROCESSES
+          #         workers are ALL hi-res coastal macrotiles simultaneously — a 32768px tile is
+          #         ~4 GB float32 at rest and PEAKS higher during the multi-source feather-merge
+          #         (S-102 alone is ~52 overlapping products) + halo + smooth. Budget ~9 GB, not 5.
+          #      2. Aggregate does not have the box to itself: the coverage tippecanoe is OVERLAPPED
+          #         (backgrounded) and the periodic push runs concurrently. Reserve ~40 GB for those
+          #         + OS/docker + slack, don't hand the whole box to workers.
+          #    ccx63 (48 / 192) → (192−40)/9 = 16 workers (~144 GB peak + 40 GB reserve). ccx33
+          #    (8 / 32) floors to 2. Deliberately conservative to GUARANTEE completion — retries cost
+          #    a whole run; tune UP once we measure real per-worker peak RSS. Aggregate is now
+          #    memory-bound below core count (each worker needs the multi-GB DEM), so ~16 of 48 cores
+          #    during aggregate is inherent, not waste — terrain/tippecanoe/bundle use the rest, and
+          #    more aggregate cores would need smaller per-tile memory (a pipeline change, not a knob).
+          #    BUNDLE/TERRAIN_PROCESSES = min(cores, RAM_GB/8): they run AFTER aggregate, alone (no
+          #    overlapped coverage), so the lighter budget holds; GDAL_CACHEMAX below is halved to
+          #    256 MB (sources are LOCAL now via selective hydrate, so the block cache matters far
+          #    less) which trims every worker's footprint. ──
           CORES=$(nproc)
           MEM_GB=$(( $(getconf _PHYS_PAGES) * $(getconf PAGE_SIZE) / 1073741824 ))
-          AGG=$(( MEM_GB / 5 )); [ "$AGG" -gt "$CORES" ] && AGG=$CORES; [ "$AGG" -lt 1 ] && AGG=1
+          AGG=$(( (MEM_GB - 40) / 9 )); [ "$AGG" -lt 2 ] && AGG=2; [ "$AGG" -gt "$CORES" ] && AGG=$CORES
           BND=$(( MEM_GB / 8 )); [ "$BND" -gt "$CORES" ] && BND=$CORES; [ "$BND" -lt 1 ] && BND=1
           TER=$(( MEM_GB / 8 )); [ "$TER" -gt "$CORES" ] && TER=$CORES; [ "$TER" -lt 1 ] && TER=1
           export AGG_PROCESSES=$AGG
           export BUNDLE_PROCESSES=$BND
           export TERRAIN_PROCESSES=$TER
-          export GDAL_CACHEMAX=512
+          export GDAL_CACHEMAX=256
           # The toolchain identity for the content-hash keys (pipelines/keys.py): the deps-keyed
           # image tag pins one GDAL/tippecanoe, so bumping the toolchain correctly invalidates
           # every key (dispatch a rebuild deliberately after a GDAL bump).
