@@ -36,6 +36,7 @@ terrain`.
   python terrain.py --check    self-check (renders a synthetic mosaic tile, asserts the pyramid)
 """
 
+import hashlib
 import math
 import os
 import shutil
@@ -341,14 +342,16 @@ def _render_stems(aid):
 def dirty_stems():
     """Render stems whose content-addressed pmtiles is absent under its current key (self-heal, or
     the mosaic tile(s) it reads / the smooth+encode config moved). FORCE_REBUILD makes every stem
-    stale. Heaviest-first (child_z desc) balances the pool."""
+    stale. Deterministic pseudo-random order (stable hash of the stem): under the memory budget,
+    heaviest-first back-loads the queue with un-fittable heavies that starve the pool; a shuffle
+    interleaves cheap and heavy so the budget keeps every core busy. Order can't affect output."""
     aid = _covering_id()
     agg_keys = _aggregation_mosaic_keys(aid)
     out = []
     for stem in _render_stems(aid):
         if not keys.fork_fresh(_artifact(stem), terrain_key(stem, agg_keys)):
             out.append(stem)
-    return sorted(out, key=lambda s: (-int(s.split("-")[3]), s))
+    return sorted(out, key=lambda s: hashlib.md5(s.encode()).hexdigest())
 
 
 def _run_one(stem_and_key):

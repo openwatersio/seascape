@@ -17,6 +17,7 @@ CLI:
                                         the stale tiles reference (see sources_manifest)
 """
 
+import hashlib
 import os
 import shutil
 import sys
@@ -195,15 +196,15 @@ def run(filepath):
 
 
 def covering_sorted():
-    """Every aggregation CSV in the current covering, heaviest-first. child_z is a strong cost
-    proxy (each level quadruples output tiles + contour features), so processing heaviest-first
-    keeps the process pool balanced (the longest tiles start first, no straggler tail)."""
+    """Every aggregation CSV in the current covering, in a deterministic pseudo-random order (stable
+    hash of the stem). Heaviest-first was the old order, but under the memory budget it back-loads the
+    queue with un-fittable weight-N heavies that starve the pool — only a handful fit the budget, the
+    rest block, so most cores idle. Shuffling interleaves cheap ocean tiles with the few heavy coastal
+    ones, so the budget keeps every core busy while bounding concurrent peaks. Order can't affect
+    output: tiles are independent and content-addressed."""
     aggregation_id = utils.get_aggregation_ids()[-1]
     csvs = glob(f"store/aggregation/{aggregation_id}/*-aggregation.csv")
-
-    def child_z(fp):
-        return int(fp.split("/")[-1].replace("-aggregation.csv", "").split("-")[3])
-    return sorted(csvs, key=lambda fp: (-child_z(fp), fp))
+    return sorted(csvs, key=lambda fp: hashlib.md5(fp.rsplit("/", 1)[-1].encode()).hexdigest())
 
 
 def dirty_filepaths():

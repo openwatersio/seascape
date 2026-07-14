@@ -162,9 +162,20 @@ def log_peak(stem):
 
 def pool_kwargs(budget_gb):
     """(manager, kwargs) for a Pool: `kwargs` carries initializer/initargs wiring the budget into
-    every worker. Spread `**kwargs` into Pool(...); keep `manager` alive until the pool closes."""
+    every worker. Spread `**kwargs` into Pool(...); keep `manager` alive until the pool closes.
+
+    maxtasksperchild recycles each worker after N tiles so its multi-GB peak is RETURNED to the OS.
+    glibc keeps freed arenas otherwise, so a long-lived worker's RSS ratchets up to its high-water and
+    stays there — the pool then OOMs even though the budget correctly bounds concurrent RESERVATIONS
+    (the reserved weight is released, but the memory isn't). A fresh worker per tile makes the actual
+    RSS match what the budget models. Respawn is ~free (fork) or a re-import (spawn), negligible vs a
+    minutes-long tile. POOL_MAXTASKSPERCHILD unset/1 = fresh per tile; 0 = never recycle (old)."""
     mgr, initargs = make_budget(budget_gb)
-    return mgr, {"initializer": init_worker, "initargs": initargs}
+    kwargs = {"initializer": init_worker, "initargs": initargs}
+    maxtasks = int(os.environ.get("POOL_MAXTASKSPERCHILD", "1")) or None
+    if maxtasks is not None:
+        kwargs["maxtasksperchild"] = maxtasks
+    return mgr, kwargs
 
 
 # ── self-check ───────────────────────────────────────────────────────────────────────────────────
