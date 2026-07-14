@@ -116,8 +116,8 @@ MapLibre's attribution control credits the sources automatically.
 Sources are merged by priority: resolution-derived (finer data wins where they overlap), except a datum-authoritative source (`priority` in metadata — e.g. S-102, already on a chart datum) wins the overlap even over a finer one. Each is built under [`sources/`](sources/):
 
 - **[NOAA S-102](sources/noaa_s102/)** — ~4–16 m, US navigable · NOAA Office of Coast Survey · public domain · already MLLW + per-node uncertainty
-- **[NOAA CUDEM 1/9″](sources/cudem/)** — ~3 m, US coast · NOAA NCEI · public domain
-- **[NOAA CUDEM 1/3″](sources/cudem_third/)** — ~10 m, US coast · NOAA NCEI · public domain
+- **[NOAA CUDEM 1/9″](sources/cudem/)** — ~3 m, US coast + territories (HI/PR/USVI/Guam/AmSam/CNMI) · NOAA NCEI · public domain
+- **[NOAA CUDEM 1/3″](sources/cudem_third/)** — ~10 m, US coast + territories · NOAA NCEI · public domain
 - **[Danmarks Dybdemodel (DDM)](sources/ddm/)** — 50 m, Danish waters · SDFI / Dataforsyningen
 - **[EMODnet Bathymetry 2024](sources/emodnet/)** — ~115 m, European waters · EMODnet Bathymetry Consortium · CC-BY 4.0
 - **[GEBCO 2026 Grid](sources/gebco/)** — 15″ (~450 m), global base · GEBCO Compilation Group / BODC · public domain

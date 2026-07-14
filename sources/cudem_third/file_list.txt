@@ -6,3 +6,18 @@
 # (header reads for newly-listed tiles only) + a mirror manifest; the bytes are copied
 # into the store's object mirror — no build-time NOAA reads.
 https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_third_Topobathy_2014_8580/urllist8580.txt
+
+# Territory topobathy (issue #32): Hawaii, Puerto Rico, USVI, Guam, American Samoa,
+# CNMI — same NCEI bucket family, same COG tiles, ~155 more tiles. Vertical datum is
+# local-MSL-family and varies per territory (verified in the tile headers): HI=MSL,
+# PR=PRVD02, USVI=VIVD09, and the Pacific offshore band (Guam/AmSam/CNMI) is labeled
+# NAVD88. NoData varies per tile (-9999 / -999999); gdalwarp reads each tile's nodata
+# + CRS at reproject, so they ingest as-is exactly like CONUS. When #16's low-water
+# offset lands each territory needs its own offset — that's why the header keeps the
+# per-territory datum on record.
+https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_third_Topobathy_Hawaii_9429/urllist9429.txt
+https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_third_Topobathy_PuertoRico_9524/urllist9524.txt
+https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_third_Topobathy_USVI_9528/urllist9528.txt
+https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_third_Topobathy_Guam_9463/urllist9463.txt
+https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_third_Topobathy_AmSam_9461/urllist9461.txt
+https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_third_Topobathy_CNMI_9561/urllist9561.txt
