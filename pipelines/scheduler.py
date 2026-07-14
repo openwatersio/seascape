@@ -139,25 +139,31 @@ def peak_rss_gb():
 _WORKER_PEAK = 0.0  # this worker PROCESS's last-seen ru_maxrss high-water (GB); module global per worker
 
 
-def log_peak(stem):
+def log_peak(stem, sources=None):
     """Log peak RSS for factor tuning. ru_maxrss is the worker PROCESS's MONOTONIC lifetime high-water,
     not this tile's peak — a Pool worker reuses across many tiles, so a light tile would otherwise
     inherit an earlier heavy tile's number. So log the PID and flag only a tile that DROVE a NEW
     high-water (that tile caused the peak). The max `drove … peak` across all workers is the heaviest
-    tile's real peak, correctly attributed — the number to tune the factor against. (Structured
-    logging is a separate task.)"""
+    tile's real peak, correctly attributed — the number to tune the factor against.
+
+    `sources` (the tile's overlapping source-file count, from the covering CSV) is the density signal
+    the geometry weight can't see: at one child_z the peak spans ~11× (a 1-source ocean tile vs a
+    ~50-source coastal one), so logging (sources, peak) pairs turns the density-aware weight from a
+    guess into a fit. Omitted (None) where the caller doesn't have the covering handy (terrain).
+    (Structured logging is a separate task.)"""
     global _WORKER_PEAK
     import os
     cz = int(stem.split("-")[3])
     w = weight(stem, _BUDGET_GB, _FACTOR) if _BUDGET_GB else weight(stem)
     rss = peak_rss_gb()
     pid = os.getpid()
+    src = f" src={sources}" if sources is not None else ""
     if rss > _WORKER_PEAK + 0.05:
-        print(f"tile {stem} z{cz} weight={w} drove worker[{pid}] peak {rss:.1f}GB "
+        print(f"tile {stem} z{cz} weight={w}{src} drove worker[{pid}] peak {rss:.1f}GB "
               f"(was {_WORKER_PEAK:.1f})", flush=True)
         _WORKER_PEAK = rss
     else:
-        print(f"tile {stem} z{cz} weight={w} worker[{pid}] peak {rss:.1f}GB", flush=True)
+        print(f"tile {stem} z{cz} weight={w}{src} worker[{pid}] peak {rss:.1f}GB", flush=True)
 
 
 def pool_kwargs(budget_gb):

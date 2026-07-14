@@ -191,7 +191,9 @@ def run(filepath):
                     keys.write_empty(e["art"], e["key"])  # legitimately empty -> mark it done
     if not os.environ.get("KEEP_TMP"):           # KEEP_TMP=1 preserves the merged DEM for re-running a fork
         shutil.rmtree(tmp_folder)
-    scheduler.log_peak(stem)                      # whole-run peak RSS (covers the forks) vs weight — factor-tuning data
+    with open(filepath) as f:                    # covering rows = overlapping source files: the density
+        n_src = sum(1 for _ in f) - 1            # signal behind the ~11× peak spread at one child_z
+    scheduler.log_peak(stem, sources=n_src)       # whole-run peak RSS (covers the forks) vs weight + density — tuning data
     print(f"{stem} end")
 
 
