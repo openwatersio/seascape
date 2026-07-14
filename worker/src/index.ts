@@ -28,11 +28,18 @@
 
 import { PMTiles, Source, RangeResponse } from "pmtiles";
 import { style as seascapeStyle } from "@openwaters/seascape";
-import { CachedSource, contentEtag, OVERZOOM_TAG_VERSION } from "./cache";
+import {
+  CachedSource,
+  contentEtag,
+  OVERZOOM_TAG_VERSION,
+  VECTOR_CLEAN_TAG_VERSION,
+  VECTOR_OVERZOOM_TAG_VERSION,
+} from "./cache";
 import { coverageTileJSON } from "./coverage";
 import { unpackTerrarium, packTerrariumInto, cubicBSpline } from "./terrarium";
 import { OverlayIndex, overlayFor, previewRoute } from "./overlay";
 import { limiter } from "./semaphore";
+import { decodeTile, synthesizeLayers, encodeTile, featureCount, serveMaxZoom } from "./vector";
 // jSquash on Workers: WASM must be imported as a module and passed to init()
 // (no fetch-based instantiation in the Workers runtime).
 import decodeWebp, { init as initWebpDecode } from "@jsquash/webp/decode";
@@ -73,6 +80,15 @@ interface Manifest {
   overlay: OverlayIndex; // {split_z, cells: {"z-x-y": max_zoom}}
   source_ids?: string[]; // every configured source (the viewer's provenance palette)
   attribution?: string; // combined HTML credit for every contributing dataset
+  // Authoritative serving maxzoom for the VECTOR archive, set from the covering's
+  // max child_z. Under variable depth the archive header records only the deepest
+  // baked LEAF, which can be shallower than the covering (a deep region whose
+  // content fits leafs early); advertising the header would push clients onto
+  // their own overzoom instead of the Worker's cleaned synthesis. Its PRESENCE is
+  // also the variable-depth signal: absent (today's dense archives) → the Worker
+  // serves baked tiles straight through with no synthesis (Part 1 stays inert);
+  // present → clean leaves + synthesize misses up to max_zoom.
+  vector?: { max_zoom: number };
 }
 
 const TILE = 512;
@@ -165,6 +181,11 @@ async function tile(
 // slow overzoom path queues instead of OOMing.
 // ponytail: fixed cap; raise it if bursts still starve throughput.
 const overzoomGate = limiter(4);
+
+// Vector synthesis (decode → clip/scale/repair → encode) is pure JS and far
+// lighter than the webp codecs, but still allocates decoded geometry + an encoder
+// buffer per tile; cap its concurrency for the same reason as the raster gate.
+const vectorGate = limiter(8);
 
 async function synthesize(
   parent: ArrayBuffer,
@@ -490,7 +511,10 @@ export default {
         name: "Open Waters Bathymetry",
         tiles: [`${tilesBase}/{z}/{x}/{y}.pbf`],
         minzoom: h.minZoom,
-        maxzoom: h.maxZoom,
+        // Manifest wins, archive header is the fallback: under variable depth the
+        // header maxzoom is only the deepest baked leaf, so advertise the
+        // covering's max child_z (the Worker synthesizes the levels in between).
+        maxzoom: serveMaxZoom(mf.vector?.max_zoom, h.maxZoom),
         bounds: [h.minLon, h.minLat, h.maxLon, h.maxLat],
         vector_layers: [
           {
@@ -554,7 +578,7 @@ export default {
         headers: { etag: tag, "cache-control": TILE_CACHE, ...CORS },
       });
     const sendTile = (
-      bytes: ArrayBuffer,
+      bytes: ArrayBuffer | Uint8Array,
       headers: Record<string, string>,
       tag: string,
       cache = true,
@@ -627,8 +651,70 @@ export default {
         : sendTile(await landFallbackBytes(), WEBP, await landFallbackEtag(), false);
 
     if (isVector) {
-      const t = await tile(renv, "vector.pmtiles", z, x, y);
-      return t ? sendTile(t, MVT, await contentEtag(t)) : noTile();
+      const mf = await manifest(renv);
+      const vmax = mf.vector?.max_zoom;
+      // Dense (pre-variable-depth) archive: no `vector.max_zoom` in the manifest.
+      // Serve baked tiles straight through — no synthesis, current behavior.
+      // Part 1 is inert until Part 2 publishes a sparse archive + this field.
+      if (vmax === undefined) {
+        const t = await tile(renv, "vector.pmtiles", z, x, y);
+        return t ? sendTile(t, MVT, await contentEtag(t)) : noTile();
+      }
+      if (z > vmax) return noTile();
+      const pmv = pm(renv, "vector.pmtiles");
+      // Archive header maxzoom is only the deepest baked leaf; the covering can go
+      // deeper (vmax), and even within header range a sparse pyramid has misses
+      // whose content lives at a shallower leaf. minZoom bounds the ancestor walk.
+      let hMin = 0;
+      try {
+        hMin = (await pmv.getHeader()).minZoom;
+      } catch {
+        /* pre-vector release tolerated as an empty archive below */
+      }
+      // Baked leaf served at its own zoom → clean/simplify pass (variable-depth
+      // leaves are written uncleaned). Validator derives from the baked bytes.
+      let baked: ArrayBuffer | undefined;
+      try {
+        baked = await tile(renv, "vector.pmtiles", z, x, y);
+      } catch (e) {
+        console.log(`vector leaf ${z}/${x}/${y} read failed: ${e}`);
+      }
+      if (baked) {
+        const tag = await contentEtag(baked, VECTOR_CLEAN_TAG_VERSION + "-");
+        if (inm === tag) return notModified(tag);
+        const raw = baked;
+        const bytes = await vectorGate(async () =>
+          encodeTile(synthesizeLayers([{ z, x, y, layers: decodeTile(raw) }], z, x, y)),
+        );
+        return sendTile(bytes, MVT, tag);
+      }
+      // Miss: synthesize the child from the deepest baked ancestor (the directory
+      // IS the availability index; each getZxy is a cached range read). One
+      // ancestor suffices for the child's whole buffered extent — b/2^Δz ⊆ b.
+      for (let sz = z - 1; sz >= hMin; sz--) {
+        const dz = z - sz;
+        let parent: ArrayBuffer | undefined;
+        try {
+          parent = await tile(renv, "vector.pmtiles", sz, x >> dz, y >> dz);
+        } catch (e) {
+          console.log(`vector ancestor z${sz} read failed at ${z}/${x}/${y}: ${e}`);
+          continue;
+        }
+        if (!parent) continue;
+        const tag = await contentEtag(parent, `${VECTOR_OVERZOOM_TAG_VERSION}-${dz}-`);
+        if (inm === tag) return notModified(tag);
+        const src = parent;
+        const sx = x >> dz,
+          sy = y >> dz;
+        const layers = await vectorGate(async () =>
+          synthesizeLayers([{ z: sz, x: sx, y: sy, layers: decodeTile(src) }], z, x, y),
+        );
+        // A present ancestor whose features all clip away from this child → nothing
+        // to draw here (open water past the data): 204, same contract as a miss.
+        if (featureCount(layers) === 0) return noTile();
+        return sendTile(encodeTile(layers), MVT, tag);
+      }
+      return noTile();
     }
 
     // Terrain always returns a valid 512px tile (sea-level/land on a miss)
