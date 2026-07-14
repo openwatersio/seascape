@@ -18,7 +18,7 @@ Running the build *on* the box rather than SSH-ing into an ephemeral box from a 
 | ------------- | ------- | ---------------------------------------------------------------------------------------- |
 | `bbox`        | empty   | `"W,S,E,N"` regional build; empty = full planet                                          |
 | `force`       | false   | Ignore the content-hash keys, rebuild every tile (escape hatch only — the keys already see code/config changes) |
-| `server_type` | `ccx33` | Hetzner box size — `ccx33` (8 vCPU / 32 GB, today's dedicated-vCPU cap); `ccx63` later    |
+| `server_type` | `ccx63` | Hetzner box size — `ccx63` (48 vCPU / 192 GB, dedicated-vCPU quota approved); `ccx33` for a cheap smoke |
 
 **Repository state**: `sources/<id>/` recipes + `metadata.json`, `pipelines/` code, the toolchain Docker image (deps-only, keyed on `Dockerfile`/`pyproject.toml`/`uv.lock`; code mounts at runtime). The box pulls this image from GHCR and runs everything through `docker run`, exactly like `ci.yml`.
 
@@ -65,7 +65,7 @@ The workflow is four jobs: `image` (ensure the deps-keyed toolchain image is in 
 
 There is **no prune step** — deletion of *store* artifacts is out-of-band (`gc.yml`, below); `delete-runner` only reclaims the box + its scratch volume.
 
-**No `timeout-minutes`.** A self-hosted job is **not** subject to the 6 h cap that GitHub-*hosted* runners impose — the ceiling is now the 72 h workflow limit, which is effectively non-binding, so a forced full planet rebuild runs to completion in one window regardless of size (no resume-on-re-dispatch needed). The incremental store still makes re-dispatches cheap (a re-dispatch hydrates the last completed build's manifest and rebuilds only what changed), but a build no longer *has* to fit a window. `ccx63` (dedicated-vCPU quota pending) just makes it faster.
+**No `timeout-minutes`.** A self-hosted job is **not** subject to the 6 h cap that GitHub-*hosted* runners impose — the ceiling is now the 72 h workflow limit, which is effectively non-binding, so a forced full planet rebuild runs to completion in one window regardless of size (no resume-on-re-dispatch needed). The incremental store still makes re-dispatches cheap (a re-dispatch hydrates the last completed build's manifest and rebuilds only what changed), but a build no longer *has* to fit a window. `ccx63` (48 vCPU / 192 GB) is the default now the dedicated-vCPU quota is approved; `ccx33` is a cheaper smoke.
 
 ## The incremental model
 

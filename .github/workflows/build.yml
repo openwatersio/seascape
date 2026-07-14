@@ -10,8 +10,9 @@ name: Build
 # Why self-hosted instead of the old SSH-into-an-ephemeral-box model: GitHub-HOSTED runners hard-cap
 # a job at 6 h, which the old `build` job orchestrated around (timeout-minutes: 350, resume-on-
 # re-dispatch). The build itself runs on the Hetzner box either way — but making that box a runner
-# lifts the cap: a self-hosted job may run up to 5 days (72 h workflow ceiling), effectively non-
-# binding, so a forced full planet rebuild now runs to completion in one window regardless of size.
+# lifts the 6 h job cap (self-hosted jobs have none); the only remaining ceiling is the 72 h
+# workflow-run limit that applies to everyone — far above any build — so a forced full planet
+# rebuild now runs to completion in one window regardless of size.
 # It also deletes the entire SSH surface — keygen/boot-wait/rsync/scp/`ssh … <<'REMOTE'`, the NAT
 # keepalive tuning, and the `build.env` + `%q` quoting: secrets now flow as native job `env:`,
 # which removes the sourced-file code-injection vector by construction (no file is ever `source`d).
@@ -136,7 +137,7 @@ jobs:
           # (~100 GiB peak) + the dirty-set source hydrate (the full coastal S-102+CUDEM subset is
           # ~100-200 GiB) → 400 GiB with headroom. Created UNATTACHED in the server's location; the
           # runner action attaches it at creation via the create-server volumes list. Left
-          # unformatted — the build job mkfs.ext4s it (as the old SSH model did).
+          # unformatted — the build job mkfs.ext4 it (as the old SSH model did).
           hcloud volume create --name "$NAME" --size 400 --location "$SERVER_LOCATION"
           id=$(hcloud volume describe "$NAME" -o json | jq -r '.id')
           [ -n "$id" ] && [ "$id" != "null" ] || { echo "failed to read new volume id" >&2; exit 1; }
@@ -550,15 +551,17 @@ jobs:
         if: always()
         env:
           HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
-          VOLUME_ID: ${{ needs.create-runner.outputs.volume_id }}
         run: |
           set -euo pipefail
           curl -fsSL https://github.com/hetznercloud/cli/releases/latest/download/hcloud-linux-amd64.tar.gz \
             | tar xz hcloud
           sudo mv hcloud /usr/local/bin/
-          # The volume (planet builds only) detaches when the server is deleted; then remove it,
-          # retrying in case detach lags the server delete.
-          if [ -n "${VOLUME_ID:-}" ]; then
+          # Delete the build volume by NAME, gated on its actual EXISTENCE — not on the exported
+          # volume_id, which is empty if create-runner made the volume but died before emitting the
+          # output, leaving a volume this step would otherwise skip (an avoidable leak). It detaches
+          # when the server is deleted; retry in case detach lags. A bbox build (no volume) and a
+          # create-runner failure before the volume both describe-miss and skip cleanly.
+          if hcloud volume describe "$NAME" >/dev/null 2>&1; then
             for _ in $(seq 1 12); do
               if hcloud volume delete "$NAME" 2>/dev/null; then break; else sleep 5; fi
             done
