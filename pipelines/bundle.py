@@ -57,7 +57,7 @@ def cell_of(z, x, y):
 def stem_groups(stem):
     """Group name(s) a pmtiles stem {z}-{x}-{y}-{child_z} contributes to: 'planet'
     for base zooms, else the overlay cell(s) its content tiles live under. Overlay
-    parents normally sit at z >= SPLIT_Z (exactly one cell — downsample extents
+    parents normally sit at z >= SPLIT_Z (exactly one cell — overview render extents
     stay at z >= child_z - num_overviews); a coarser parent spans its descendant
     cells, and create_archive keeps only each cell's own tiles."""
     z, x, y, child_z = (int(a) for a in stem.split("-"))
@@ -74,15 +74,16 @@ def archive_filename(name):
 
 
 def covering_stems(aggregation_id):
-    """{z}-{x}-{y}-{child_z} of every tile the current covering builds (aggregate AND
-    downsample). The only pmtiles that belong in a bundle. A source's footprint/maxzoom
-    shift re-tiles its area to new stems, but the R2 sync has no --delete and the
+    """{z}-{x}-{y}-{child_z} of every terrain tile the current covering builds (native +
+    per-zoom overview renders). The only pmtiles that belong in a bundle. A source's
+    footprint/maxzoom shift re-tiles its area to new stems, but the R2 sync has no --delete and the
     dirty-diff only adds work, so the superseded pmtiles lingers; bundling it draws a
-    stale tile over the live tiling. Filter every glob/listing through this."""
+    stale tile over the live tiling. Filter every glob/listing through this. The render stems are
+    the native aggregation stems plus the coalesced overview markers terrain.cover wrote."""
     return {
-        c.split("/")[-1].replace("-aggregation.csv", "").replace("-downsampling.csv", "")
+        c.split("/")[-1].replace("-aggregation.csv", "").replace("-terrain.csv", "")
         for c in glob(f"store/aggregation/{aggregation_id}/*-aggregation.csv")
-        + glob(f"store/aggregation/{aggregation_id}/*-downsampling.csv")
+        + glob(f"store/aggregation/{aggregation_id}/*-terrain.csv")
     }
 
 
@@ -180,11 +181,9 @@ def bundle_group(name, filepaths):
 
 def verify_complete(aggregation_id):
     """Every covering must have produced a pmtiles, or the pyramid has a silent hole.
-    create_tile (aggregate) and run_one (downsample) emit one pmtiles per covering, so a
-    covering with no pmtiles means a failed/interrupted run — the Worker overzooms
-    GEBCO into that hole, so it renders as missing high-zoom terrain. Fail rather than
-    publish it. (downsampling.execute catches gaps a *running* pass sees; this catches a
-    covering that produced nothing at all, which leaves nothing for execute to notice.)"""
+    terrain.run emits one pmtiles per render stem, so a covering stem with no pmtiles means a
+    failed/interrupted render — the Worker overzooms GEBCO into that hole, so it renders as missing
+    high-zoom terrain. Fail rather than publish it."""
     coverings = covering_stems(aggregation_id)
     have = {keys.stem_of(fp)
             for fp in glob("store/pmtiles/*.pmtiles") + glob("store/pmtiles/*/*.pmtiles")
@@ -193,7 +192,7 @@ def verify_complete(aggregation_id):
     if missing:
         raise SystemExit(
             f"pyramid incomplete: {len(missing)} of {len(coverings)} coverings have no pmtiles "
-            f"(a failed/interrupted aggregate or downsample run) — e.g. "
+            f"(a failed/interrupted terrain render) — e.g. "
             f"{', '.join(missing[:15])}{' …' if len(missing) > 15 else ''}")
 
 
@@ -255,7 +254,7 @@ def main():
     changed (it is per-sha).
 
     SPAWN, not fork: bundle imports rasterio (via utils), which inits GDAL at module load, and
-    GDAL is not fork-safe (see downsampling.execute)."""
+    GDAL is not fork-safe (see terrain.run)."""
     aggregation_id = utils.get_aggregation_ids()[-1]
     verify_complete(aggregation_id)
     groups = group_filepaths(aggregation_id)

@@ -17,6 +17,7 @@ fail=0
 # ── Synthetic bathymetry-shaped tree (the R2 layout gc.yml's rclone backend sees) ──
 tree="$root/bathymetry"
 mkdir -p "$tree/pmtiles/7-1-1" "$tree/contour" "$tree/depare" "$tree/soundings" \
+         "$tree/mosaic/tiles" "$tree/mosaic/index" \
          "$tree/store/manifests" "$tree/source/gebco" "$tree/landmask" \
          "$tree/aggregation/01OLDCOVERING0000000000000" "$tree/aggregation/01NEWCOVERING0000000000000"
 
@@ -38,6 +39,26 @@ del_objs=(
   contour/9-2-2-13-333333333333.fgb               # an orphan from a re-tiled covering
 )
 for f in "${keep_objs[@]}" "${del_objs[@]}"; do : > "$tree/$f"; done
+
+# MOSAIC (stage-2 product): the tile COGs + planet-z8 overview are content-addressed and named by
+# the manifests (kept via the union); the mosaic.gti pointer + the index it names are held by the
+# pointer set, and every SUPERSEDED tile/overview/index must be collected (the bug-4 fix).
+mosaic_keep=(
+  mosaic/tiles/8-1-1-14-aaaaaaaaaaaa.tif             # current mosaic tile COG (in the manifests)
+  mosaic/planet-z8-pppppppppppp.tif                  # current planet z8 overview (in the manifests)
+  mosaic/index/01CCCCCCCCCCCCCCCCCCCCCCCC.parquet    # the index the live mosaic.gti names
+  mosaic/mosaic.gti                                  # the mosaic pointer itself
+)
+mosaic_del=(
+  mosaic/tiles/8-1-1-14-999999999999.tif             # a superseded mosaic tile (old key)
+  mosaic/planet-z8-888888888888.tif                  # a superseded planet z8 (old key)
+  mosaic/index/01AAAAAAAAAAAAAAAAAAAAAAAA.parquet    # an old build's index (the pointer moved on)
+)
+for f in "${mosaic_keep[@]}" "${mosaic_del[@]}"; do : > "$tree/$f"; done
+# the live pointer names the current index (relative to the .gti dir); GDAL resolves it there.
+printf '<GDALTileIndexDataset><IndexDataset>index/01CCCCCCCCCCCCCCCCCCCCCCCC.parquet</IndexDataset><LocationField>location</LocationField></GDALTileIndexDataset>\n' \
+  > "$tree/mosaic/mosaic.gti"
+
 # Sources: the retired .recipe-hash is swept; bounds/catalog and the LIVE landmask hash are not.
 : > "$tree/source/gebco/.recipe-hash"
 : > "$tree/source/gebco/bounds.csv"
@@ -60,7 +81,8 @@ manifest "$tree" 01BBBBBBBBBBBBBBBBBBBBBBBB \
 manifest "$tree" 01CCCCCCCCCCCCCCCCCCCCCCCC \
   pmtiles/7-1-1/8-1-1-12-aaaaaaaaaaaa.pmtiles pmtiles/7-1-1/6-0-0-8-dddddddddddd.pmtiles \
   contour/8-1-1-12-eeeeeeeeeeee.fgb contour/8-1-1-12-ffffffffffff.empty \
-  depare/8-1-1-12-111111111111.fgb soundings/8-1-1-12-222222222222.geojson
+  depare/8-1-1-12-111111111111.fgb soundings/8-1-1-12-222222222222.geojson \
+  mosaic/tiles/8-1-1-14-aaaaaaaaaaaa.tif mosaic/planet-z8-pppppppppppp.tif
 printf '{"manifest":"manifests/01CCCCCCCCCCCCCCCCCCCCCCCC.json"}\n' > "$tree/store/manifest.json"
 
 # ── Happy path: run the real Collect, assert the exact delete/keep/purge sets ──
@@ -73,6 +95,9 @@ assert_out() { grep -qxF "$1" "$2" && { echo "FAIL: '$1' must NOT be in $2"; fai
 
 for f in "${del_objs[@]}";  do assert_in  "$f" "$out/gc-delete.txt"; done
 for f in "${keep_objs[@]}"; do assert_out "$f" "$out/gc-delete.txt"; done
+# mosaic: superseded tiles/overview/index collected; current tiles/overview/index + the pointer kept
+for f in "${mosaic_del[@]}";  do assert_in  "$f" "$out/gc-delete.txt"; done
+for f in "${mosaic_keep[@]}"; do assert_out "$f" "$out/gc-delete.txt"; done
 # the retired source .recipe-hash is swept; the LIVE landmask one and bounds/catalog are not
 assert_in  "source/gebco/.recipe-hash" "$out/gc-delete.txt"
 assert_out "landmask/.recipe-hash"     "$out/gc-delete.txt"   # not a swept prefix, never listed
@@ -82,9 +107,9 @@ assert_out "source/gebco/catalog.json" "$out/gc-delete.txt"
 assert_in "01OLDCOVERING0000000000000" "$out/gc-purge-dirs.txt"
 assert_in "01NEWCOVERING0000000000000" "$out/gc-purge-dirs.txt"
 [ "$(grep -c . "$out/gc-purge-dirs.txt")" -eq 2 ] || { echo "FAIL: expected 2 covering dirs to purge"; fail=1; }
-# exact count: 4 unreferenced content objects + 1 retired .recipe-hash
-[ "$(wc -l < "$out/gc-delete.txt")" -eq 5 ] \
-  || { echo "FAIL: delete set size $(wc -l < "$out/gc-delete.txt") != 5"; cat "$out/gc-delete.txt"; fail=1; }
+# exact count: 4 unreferenced content objects + 3 superseded mosaic objects + 1 retired .recipe-hash
+[ "$(wc -l < "$out/gc-delete.txt")" -eq 8 ] \
+  || { echo "FAIL: delete set size $(wc -l < "$out/gc-delete.txt") != 8"; cat "$out/gc-delete.txt"; fail=1; }
 # the full inventory printed before anything would delete
 grep -q "── inventory ──" "$out/log" || { echo "FAIL: no inventory in the collect log"; fail=1; }
 
@@ -118,9 +143,15 @@ for m in "$root/mut/store/manifests/"*.json; do echo '{"entries":[]}' > "$m"; do
 expect_refuse "empty referenced set" "$KEEP" "referenced set is empty"
 
 # e) zero-overlap sanity: the referenced names match NOTHING present (a path/listing mismatch) —
-#    the guard that keeps a bad listing from marking the whole store unreferenced
-mutate; rm -rf "$root/mut/pmtiles" "$root/mut/contour" "$root/mut/soundings" "$root/mut/depare"
+#    the guard that keeps a bad listing from marking the whole store unreferenced. Remove mosaic too,
+#    else its still-present referenced tiles/overview keep the overlap nonzero.
+mutate; rm -rf "$root/mut/pmtiles" "$root/mut/contour" "$root/mut/soundings" "$root/mut/depare" "$root/mut/mosaic"
 expect_refuse "zero-overlap sanity" "$KEEP" "path mismatch, refusing to GC"
+
+# g) a present-but-corrupt mosaic.gti (no <IndexDataset>) → refuse (an unparseable mosaic pointer
+#    would drop the current index from the referenced set and collect a live mosaic).
+mutate; printf '<GDALTileIndexDataset></GDALTileIndexDataset>\n' > "$root/mut/mosaic/mosaic.gti"
+expect_refuse "corrupt mosaic.gti" "$KEEP" "corrupt mosaic pointer"
 
 # f) ABSENT pointer is not a refusal: pre-immutable store → exit 0 with empty outputs
 mutate; rm "$root/mut/store/manifest.json"
@@ -142,4 +173,4 @@ done
 rm -rf "$tmpb"
 
 [ "$fail" -eq 0 ] || exit 1
-echo "gc-sim ok — ${#del_objs[@]} garbage + 1 recipe-hash flagged, ${#keep_objs[@]} referenced kept, 2 coverings purged, 5 guards refuse, absent-pointer no-op, batches bounded"
+echo "gc-sim ok — ${#del_objs[@]} content + ${#mosaic_del[@]} mosaic garbage + 1 recipe-hash flagged, ${#keep_objs[@]} content + ${#mosaic_keep[@]} mosaic referenced kept, 2 coverings purged, 6 guards refuse, absent-pointer no-op, batches bounded"

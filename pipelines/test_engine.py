@@ -172,6 +172,7 @@ def check_self_heal():
     import aggregation_run
     import config
     import keys
+    import mosaic
     import utils
     env_force = os.environ.pop("FORCE_REBUILD", None)  # this check is about the incremental path
     saved_land = os.environ.pop("LANDMASK", None)      # a dev mask's file hash would enter the keys
@@ -211,12 +212,18 @@ def check_self_heal():
                                           aggregation_run._KEYFN[fork](fp))
                 utils.create_folder(os.path.dirname(cpath))
                 open(cpath, "w").close()
+            # The stage-2 mosaic tile is a content-addressed product too — a fully-built store has
+            # it, so a fresh store means zero work only once it's present alongside the forks.
+            mpath = keys.content_path(mosaic.tile_artifact(t), mosaic.mosaic_key(fp))
+            utils.create_folder(os.path.dirname(mpath))
+            open(mpath, "w").close()
         assert aggregation_run.dirty_filepaths() == [], "fresh keys must mean zero work"
 
+        # Stage-2 self-heal: a tile whose MOSAIC COG is missing (a failed/interrupted aggregate) is
+        # stale even when the vector forks are present — mosaic.stale is part of dirty_filepaths.
         missing = set(tiles[1::2])
         for t in missing:
-            os.remove(keys.content_path(aggregation_run._artifact("terrain", t),
-                                        aggregation_run._KEYFN["terrain"](fp_by_tile[t])))
+            os.remove(keys.content_path(mosaic.tile_artifact(t), mosaic.mosaic_key(fp_by_tile[t])))
         dirty = {fp.split("/")[-1].replace("-aggregation.csv", "")
                  for fp in aggregation_run.dirty_filepaths()}
         assert dirty == missing, f"dirty != self-heal set (Δ {dirty ^ missing})"
@@ -250,84 +257,85 @@ def check_self_heal():
             os.environ["WATERMASK"] = saved_water
 
 
-def check_stale_overview():
-    """An overview must rebuild when a child it averages changed (its content name moved) or is
-    missing (about to self-heal), and the staleness must cascade up the pyramid — the invariants
-    the old mtime cascade enforced, now as a content-name cascade: an overview's key hashes its
-    children's keys (read off their content filenames) and rides in its own name, so a rebuilt
-    child yields a new overview name that isn't present -> stale, and dirty stems carry the cascade
-    up within the finest-first plan."""
-    import downsampling
+def check_terrain_staleness():
+    """The per-zoom terrain render's staleness (replacing the old downsample-pyramid cascade): a
+    render stem is stale when its content-addressed pmtiles is absent (self-heal), when the MOSAIC
+    tile it reads was re-keyed (a source-prop / precedence change moves mosaic.mosaic_key -> the
+    terrain key), and under FORCE. cover() plans the native + coalesced-overview stems, and the
+    terrain key hashes the intersecting mosaic tile keys, so a mosaic change re-renders exactly the
+    stems over it — no re-merge (the stage split's payoff)."""
+    import config
     import keys
+    import mosaic
+    import terrain
     import utils
     env_force = os.environ.pop("FORCE_REBUILD", None)  # the incremental path
+    saved_land = os.environ.pop("LANDMASK", None)
+    saved_water = os.environ.pop("WATERMASK", None)
     tmp = tempfile.mkdtemp()
-    cwd = os.getcwd()
+    cwd, saved_dir = os.getcwd(), config.SOURCES_DIR
     try:
         os.chdir(tmp)
-        aid = "01BBBBBBBBBBBBBBBBBBBBBBBB"
-        # An overview chain: z7 (4-4-5-7) averages a z8 base; z6 (3-2-2-6) averages the z7;
-        # z5 (2-1-1-5) averages the z6.
-        chain = {  # downsampling.csv stem -> child pmtiles it references
-            "4-4-5-7": "8-77-95-8.pmtiles",
-            "3-2-2-6": "4-4-5-7.pmtiles",
-            "2-1-1-5": "3-2-2-6.pmtiles",
-        }
+        config.SOURCES_DIR = "sources"
+        os.makedirs("sources/src")
+        with open("sources/src/metadata.json", "w") as f:
+            json.dump({"name": "src", "max_zoom": 9}, f)
+        aid = "01TERRAINTERRAINTERRAINST"
         os.makedirs(f"store/aggregation/{aid}")
-        open(f"store/aggregation/{aid}/8-77-95-8-aggregation.csv", "w").close()
-        for stem, child in chain.items():
-            with open(f"store/aggregation/{aid}/{stem}-downsampling.csv", "w") as f:
-                f.write(f"filename\n{child}\n")
+        # one z8 native tile (child_z 9) -> cover plans it + coalesced overview parents to z0
+        stem = "8-77-95-9"
+        with open(f"store/aggregation/{aid}/{stem}-aggregation.csv", "w") as f:
+            f.write("source,filename,maxzoom\nsrc,src_0.tif,9\n")
+        terrain.cover()
 
-        def touch(path):
-            utils.create_folder(os.path.dirname(path))
-            open(path, "w").close()
+        def dirty():
+            return set(terrain.dirty_stems())
 
-        def base_content(key):  # the aggregate child's content-addressed terrain pmtiles
-            return keys.content_path(downsampling._child_logical("8-77-95-8.pmtiles"), key)
+        def settle():
+            ak = terrain._aggregation_mosaic_keys(aid)
+            for s in terrain._render_stems(aid):
+                p = keys.content_path(terrain._artifact(s), terrain.terrain_key(s, ak))
+                utils.create_folder(os.path.dirname(p))
+                open(p, "w").close()
 
-        def settle_overview(stem):  # write the overview's content file at its current key
-            fp = f"store/aggregation/{aid}/{stem}-downsampling.csv"
-            touch(keys.content_path(downsampling._overview_artifact(fp), downsampling._overview_key(fp)))
+        assert dirty() == terrain._render_stems(aid), "before any render, every stem is stale"
+        settle()
+        assert dirty() == set(), "a fully-rendered covering must be fresh"
 
-        def dirty_stems():
-            return {fp.split("/")[-1].replace("-downsampling.csv", "")
-                    for fp in downsampling.dirty_filepaths()}
+        # 1) self-heal: a missing terrain pmtiles for the native stem -> exactly that stem stale.
+        ak = terrain._aggregation_mosaic_keys(aid)
+        os.remove(keys.content_path(terrain._artifact(stem), terrain.terrain_key(stem, ak)))
+        assert dirty() == {stem}, f"self-heal must stale only the missing stem: {dirty()}"
+        settle()
+        assert dirty() == set(), "re-rendering the missing stem returns to fresh"
 
-        K1, K2 = "aaaaaaaaaaaa", "bbbbbbbbbbbb"  # two content keys = a child rebuilt
-        # The aggregate child's terrain artifact (key K1), then each overview settled finest-first
-        # off its child's content name — exactly the state a completed run leaves behind.
-        touch(base_content(K1))
-        for stem in chain:  # 4-4-5-7, 3-2-2-6, 2-1-1-5 — finest first
-            settle_overview(stem)
-        assert dirty_stems() == set(), "a settled pyramid must be fully fresh"
+        # 2) a source-prop change moves the mosaic tile key -> every stem reading that tile stales
+        # (here: all of them — the covering is one mosaic tile). No aggregation CSV / cover change.
+        with open("sources/src/metadata.json", "w") as f:
+            json.dump({"name": "src", "max_zoom": 9, "priority": 5}, f)
+        config._catalog_cache.clear()
+        assert dirty() == terrain._render_stems(aid), \
+            "a mosaic re-key (source priority) must re-render every stem over it"
+        settle()
+        assert dirty() == set(), "re-rendering after the mosaic re-key returns to fresh"
 
-        # 1) the aggregate child was rebuilt (new terrain key K2) -> the whole chain above is stale.
-        os.remove(base_content(K1))
-        touch(base_content(K2))
-        assert dirty_stems() == {"4-4-5-7", "3-2-2-6", "2-1-1-5"}, f"child-key cascade wrong: {dirty_stems()}"
-        os.remove(base_content(K2))
-        touch(base_content(K1))
-        assert dirty_stems() == set(), "restoring the child key returns the pyramid to fresh"
-
-        # 2) a middle overview's pmtiles vanished -> itself (self-heal) + everything above, but
-        # NOT the fresh finer overview below it.
-        mid = f"store/aggregation/{aid}/3-2-2-6-downsampling.csv"
-        os.remove(keys.content_path(downsampling._overview_artifact(mid), downsampling._overview_key(mid)))
-        assert dirty_stems() == {"3-2-2-6", "2-1-1-5"}, f"missing-artifact cascade wrong: {dirty_stems()}"
-        assert "4-4-5-7" not in dirty_stems(), "the fresh finer overview must not rebuild"
-        settle_overview("3-2-2-6")
-
-        # 3) FORCE re-runs the whole pyramid regardless of key matches.
+        # 3) FORCE re-renders everything regardless of key matches.
         os.environ["FORCE_REBUILD"] = "1"
-        assert dirty_stems() == {"4-4-5-7", "3-2-2-6", "2-1-1-5"}, "FORCE must re-run every overview"
+        assert dirty() == terrain._render_stems(aid), "FORCE must re-render every stem"
         os.environ.pop("FORCE_REBUILD")
-        print("stale-overview ok — changed-child + missing-artifact both rebuild and cascade up; FORCE all")
+        print(f"terrain-staleness ok — {len(terrain._render_stems(aid))} stems: self-heal, mosaic "
+              "re-key, and FORCE all re-render; a plain rerun is a no-op")
     finally:
+        config.SOURCES_DIR = saved_dir
+        config._catalog_cache.clear()
         os.chdir(cwd)
         shutil.rmtree(tmp, ignore_errors=True)
         if env_force is not None:
             os.environ["FORCE_REBUILD"] = env_force
+        if saved_land is not None:
+            os.environ["LANDMASK"] = saved_land
+        if saved_water is not None:
+            os.environ["WATERMASK"] = saved_water
 
 
 def check_key_invalidation():
@@ -363,8 +371,8 @@ def check_key_invalidation():
         k1 = all_keys()
         assert k1["contour"] != k0["contour"] and k1["depare"] != k0["depare"], \
             "a CONTOUR_LEVELS change must move the contour + depare keys"
-        assert k1["terrain"] == k0["terrain"] and k1["soundings"] == k0["soundings"], \
-            "a CONTOUR_LEVELS change must NOT move the terrain/soundings keys"
+        assert k1["soundings"] == k0["soundings"], \
+            "a CONTOUR_LEVELS change must NOT move the soundings key"
         config.CONTOUR_LEVELS, config.DEPARE_LEVELS = saved_levels
 
         # listed-module byte change: touch soundings_run's bytes -> only the soundings key moves
@@ -375,7 +383,7 @@ def check_key_invalidation():
         finally:
             keys._module_bytes = orig
         assert k2["soundings"] != k0["soundings"], "a listed module's byte change must move its fork's key"
-        assert all(k2[f] == k0[f] for f in ("terrain", "contour", "depare")), \
+        assert all(k2[f] == k0[f] for f in ("contour", "depare")), \
             "a module byte change must not move forks that don't list it"
 
         # a local mask appearing enters every fork's key (all consume the masked merge)
@@ -397,7 +405,7 @@ def check_key_invalidation():
         finally:
             contour_run.MIN_RING_AREA_M2 = saved_ring
         assert k4["contour"] != k0["contour"], "a ring-drop knob change must move the contour key"
-        assert all(k4[f] == k0[f] for f in ("terrain", "soundings", "depare")), \
+        assert all(k4[f] == k0[f] for f in ("soundings", "depare")), \
             "a ring-drop knob change must not move the other forks"
 
         # band / mixed_crs are merge determinants (reproject reads them) -> every fork moves
@@ -1141,9 +1149,10 @@ def main():
         run(tmp, "source_bounds.py", "base")
         run(tmp, "source_bounds.py", "fine")
         run(tmp, "aggregation_covering.py")
-        run(tmp, "aggregation_run.py")
-        run(tmp, "downsampling.py", "cover")
-        run(tmp, "downsampling.py", "run")   # whole dirty pyramid on one machine
+        run(tmp, "aggregation_run.py")       # stage 2: mosaic tiles + vector forks
+        run(tmp, "mosaic.py", "index")       # the GTI the terrain render reads
+        run(tmp, "terrain.py", "cover")
+        run(tmp, "terrain.py", "run")        # stage 3: per-zoom render from the mosaic
         run(tmp, "bundle.py")
 
         n_tiles = len(glob(f"{tmp}/store/aggregation/*/*-aggregation.csv"))
@@ -1154,7 +1163,7 @@ def main():
         body_first = store_manifest_body(tmp)
         manifest = json.loads(body_first)
         entries = manifest["entries"]
-        assert {"terrain", "contour", "soundings", "depare", "overview"} <= {e["fork"] for e in entries}, \
+        assert {"mosaic", "terrain", "contour", "soundings", "depare"} <= {e["fork"] for e in entries}, \
             f"manifest missing a fork: {sorted({e['fork'] for e in entries})}"
         for e in entries:
             assert os.path.isfile(f"{tmp}/store/{e['name']}"), f"manifest names a missing file: {e['name']}"
@@ -1168,9 +1177,10 @@ def main():
         run(tmp, "aggregation_covering.py")
         out = run(tmp, "aggregation_run.py").stdout
         assert "nothing to do." in out, f"no-change rerun must aggregate nothing: {out!r}"
-        run(tmp, "downsampling.py", "cover")
-        out = run(tmp, "downsampling.py", "run").stdout
-        assert "parent(s)" not in out, f"no-change rerun must downsample nothing: {out!r}"
+        run(tmp, "mosaic.py", "index")
+        run(tmp, "terrain.py", "cover")
+        out = run(tmp, "terrain.py", "run").stdout
+        assert "nothing to render" in out, f"no-change rerun must render no terrain: {out!r}"
         out = run(tmp, "bundle.py").stdout
         assert "unchanged — skip" in out, f"no-change rerun must skip the bundle: {out!r}"
         # The manifest BODY is byte-stable across the no-op rerun even though the covering ULID
@@ -1204,12 +1214,14 @@ def main():
         assert set(contour_after) == set(contour_before), "the same tiles must still be present"
         assert all(contour_after[s] != contour_before[s] for s in contour_before), \
             "every tile's contour content name (key) must move on a contour-config change"
-        out = run(tmp, "downsampling.py", "run", env={"CONTOUR_LEVELS": levels}).stdout
-        assert "parent(s)" not in out, f"downsample must skip when terrain keys are unchanged: {out!r}"
+        run(tmp, "terrain.py", "cover", env={"CONTOUR_LEVELS": levels})
+        out = run(tmp, "terrain.py", "run", env={"CONTOUR_LEVELS": levels}).stdout
+        assert "nothing to render" in out, \
+            f"terrain must skip when the mosaic + smooth/encode config are unchanged: {out!r}"
         out = run(tmp, "bundle.py", env={"CONTOUR_LEVELS": levels}).stdout
         assert "unchanged — skip" in out, f"bundle must skip when terrain keys are unchanged: {out!r}"
-        print(f"contour-config change ok — {n_tiles} tiles re-merged, terrain keys stable, "
-              "downsample + bundle skipped")
+        print(f"contour-config change ok — {n_tiles} tiles re-merged, terrain render unchanged, "
+              "terrain + bundle skipped")
 
         import glob as _glob
 
@@ -1351,7 +1363,7 @@ if __name__ == "__main__":
     depare_run._check()
     check_priority()
     check_self_heal()
-    check_stale_overview()
+    check_terrain_staleness()
     check_key_invalidation()
     check_crash_leaves_stale()
     check_grid_split()

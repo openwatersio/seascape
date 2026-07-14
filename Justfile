@@ -1,7 +1,7 @@
 # Bathymetry tiling pipeline. Run recipes from the repo root; they execute in
-# pipelines/ (via `set working-directory`). Stages: source -> aggregation ->
-# downsampling -> bundle; then worker/ serves planet + grid-cell overlays.
-# See CONTRIBUTING.md.
+# pipelines/ (via `set working-directory`). Stages: source -> aggregation (mosaic +
+# vector forks) -> mosaic-index -> terrain (per-zoom render) -> bundle; then worker/
+# serves planet + grid-cell overlays. See CONTRIBUTING.md.
 
 set working-directory := 'pipelines'
 
@@ -35,7 +35,7 @@ sources:
         just ../sources/"$id"/
     done
 
-# Planet build: cover -> aggregate -> downsample -> bundle -> vector layers (BBOX="W,S,E,N"
+# Planet build: cover -> aggregate -> mosaic-index -> terrain -> bundle -> vector layers (BBOX="W,S,E,N"
 # for a region). Soundings + depare bundle BEFORE contours: the contours tile-join folds their
 # pmtiles into vector.pmtiles in the same single pass. Drying rides inside depare (a DEPARE band
 # with negative drval1) — aggregation_run generates its per-tile FGB, which depare consumes.
@@ -48,7 +48,9 @@ planet:
     just cover
     just coverage
     just aggregate
-    just combine
+    just mosaic-index
+    just terrain
+    just bundle
     just soundings
     just depare
     just contours
@@ -70,17 +72,21 @@ aggregate:
 sources-manifest:
     uv run python aggregation_run.py sources-manifest
 
-# Single-machine terrain finish: overview pyramid -> planet/overlay bundles + manifest.
-combine:
-    just downsample
-    just bundle
+# Assemble the stage-2 mosaic index from the tile COGs `aggregate` persisted: the GeoParquet
+# tile index (= manifest), the planet z8 overview COG, and the mosaic.gti pointer (written last).
+# Run after `aggregate`. A bbox build produces a window-scoped GTI (QGIS-inspectable) but writes
+# no planet-scoped pointer flip — that's a workflow concern (see mosaic._write_gti / 5b).
+mosaic-index:
+    uv run python mosaic.py index
 
-# Overview pyramid below each source's native maxzoom: plan the parent tiles, then
-# 2x2-average each stale overview (finest first, so each level feeds the next; an
-# overview's key hashes its children's keys, so child changes cascade up by construction).
-downsample:
-    uv run python downsampling.py cover
-    uv run python downsampling.py run
+# Stage 3 terrain: per-zoom Terrarium render from the MOSAIC (replaces the old 2x2-average
+# downsample pyramid). Plan the render stems (native aggregation tiles + coalesced overview
+# parents), then render each stale stem by reading the mosaic at that zoom's resolution ->
+# depth/zoom-gated smooth -> Terrarium encode. Needs the mosaic GTI, so run AFTER mosaic-index.
+# TERRAIN_PROCESSES caps concurrent stems (each holds a multi-GB window); unset = all cores.
+terrain:
+    uv run python terrain.py cover
+    uv run python terrain.py run
 
 # Concat the single-zoom pmtiles into planet.pmtiles + one overlay per populated
 # OVERLAY_SPLIT_Z grid cell + manifest.json (groups bundled in parallel).
@@ -233,6 +239,8 @@ test-engine:
     uv run python test_engine.py
     uv run python aggregation_reproject.py --check
     uv run python keys.py --check
+    uv run python mosaic.py --check
+    uv run python terrain.py --check
     uv run python store_manifest.py --check
 
 # Lint the GitHub Actions workflows.

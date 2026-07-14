@@ -239,13 +239,19 @@ jobs:
           #    caches + ~26 GB of DEM headroom, ~1 GB left for OS/docker. ccx63 (48 / 192) → 38.
           #    BUNDLE_PROCESSES = min(cores, RAM_GB/8), more conservative — a bundle worker
           #    reads whole input pmtiles into RAM and the planet base is one multi-GB unit,
-          #    unlike aggregate's bounded per-tile DEMs. ──
+          #    unlike aggregate's bounded per-tile DEMs.
+          #    TERRAIN_PROCESSES = min(cores, RAM_GB/8), the same conservative budget — each
+          #    per-zoom render worker holds ONE mosaic window: a native macrotile is the same
+          #    ~4 GB float32 as an aggregate tile, and gdalwarp also spools the window to disk +
+          #    a GDAL cache, so it is at least as heavy as a bundle worker. ──
           CORES=$(nproc)
           MEM_GB=$(( $(getconf _PHYS_PAGES) * $(getconf PAGE_SIZE) / 1073741824 ))
           AGG=$(( MEM_GB / 5 )); [ "$AGG" -gt "$CORES" ] && AGG=$CORES; [ "$AGG" -lt 1 ] && AGG=1
           BND=$(( MEM_GB / 8 )); [ "$BND" -gt "$CORES" ] && BND=$CORES; [ "$BND" -lt 1 ] && BND=1
+          TER=$(( MEM_GB / 8 )); [ "$TER" -gt "$CORES" ] && TER=$CORES; [ "$TER" -lt 1 ] && TER=1
           export AGG_PROCESSES=$AGG
           export BUNDLE_PROCESSES=$BND
+          export TERRAIN_PROCESSES=$TER
           export GDAL_CACHEMAX=512
           # The toolchain identity for the content-hash keys (pipelines/keys.py): the deps-keyed
           # image tag pins one GDAL/tippecanoe, so bumping the toolchain correctly invalidates
@@ -257,7 +263,7 @@ jobs:
           # docker run wrapper: repo code at /app, the store bind-mounted, BBOX/FORCE/TOOLCHAIN
           # forwarded (+ BUNDLE_PROCESSES — only bundle.py reads it; harmless elsewhere).
           dr() { docker run --rm -v /root/seascape:/app -v "$STORE:/app/pipelines/store" \
-            -e BBOX -e FORCE_REBUILD -e TOOLCHAIN -e BUNDLE_PROCESSES "$IMAGE:$IMAGE_TAG" just "$@"; }
+            -e BBOX -e FORCE_REBUILD -e TOOLCHAIN -e BUNDLE_PROCESSES -e TERRAIN_PROCESSES "$IMAGE:$IMAGE_TAG" just "$@"; }
 
           R2="R2:$DATA_BUCKET/bathymetry"
           # --retries 5: R2 occasionally returns a transient 500 InternalError; ride it out
@@ -405,7 +411,11 @@ jobs:
           # loop makes each re-dispatch monotonic. A file caught mid-write copies torn, but the
           # next pass overwrites it and the final post-stage push (under set -e) is authoritative
           # — acceptable residual. Loop failures never abort the build.
-          push_agg() { push pmtiles pmtiles; push contour contour; push soundings soundings; push depare depare; }
+          # Aggregate now produces the stage-2 MOSAIC tiles + the vector forks (NOT terrain pmtiles
+          # — those are stage 3's per-zoom render). Push only mosaic/tiles here (immutable, content-
+          # addressed, delta-sized); the mosaic index + the mosaic.gti pointer are pushed LATER,
+          # after mosaic-index builds them, with the pointer last.
+          push_agg() { push mosaic/tiles mosaic/tiles; push contour contour; push soundings soundings; push depare depare; }
           PUSH_LOOP=
           if [ -z "${BBOX:-}" ]; then
             ( while sleep 1200; do push_agg || true; done ) & PUSH_LOOP=$!
@@ -428,21 +438,35 @@ jobs:
           wait "$COV_PID" || cov_rc=$?
           [ "$cov_rc" -eq 0 ] || { echo "coverage stage failed (rc=$cov_rc)" >&2; exit "$cov_rc"; }
 
-          echo "── downsample ──"
-          dr downsample
+          # ── mosaic index (LOCAL, for the on-box terrain render) ── build the GTI + planet z8 +
+          #    index parquet from the mosaic tiles the aggregate persisted; terrain (stage 3) reads
+          #    the GTI, so this MUST run before it. NO MOSAIC_VSI_BASE here on purpose: the index
+          #    records LOCAL absolute tile paths so terrain reads the mosaic off local disk (the
+          #    plan's "build entirely against local disk"). The PUBLISHED index — with /vsicurl tile
+          #    URLs — is rebuilt at the mosaic-publish step below (after terrain), so a consumer
+          #    opening the published mosaic.gti resolves its tiles over the CDN, not a box-local path.
+          echo "── mosaic index (local) ──"
+          dr mosaic-index
+
+          # ── terrain (stage 3) ── the per-zoom Terrarium render from the mosaic (native + coalesced
+          #    overviews), replacing the old 2x2-average downsample pyramid. TERRAIN_PROCESSES caps
+          #    concurrent render windows (each multi-GB). Reads mosaic.gti by local path.
+          echo "── terrain (per-zoom render from the mosaic) ──"
+          dr terrain
           if [ -z "${BBOX:-}" ]; then
-            # Overviews. No covering publish: the retired covering diff was the only consumer of a
-            # previous covering — the content names carry all incremental state, and a re-dispatch
-            # hydrates the last manifest's artifacts and rebuilds only what never landed.
+            # The served terrain pmtiles. No covering publish: content names carry all incremental
+            # state, and a re-dispatch hydrates the last manifest's artifacts + re-renders only what
+            # never landed.
             push pmtiles pmtiles
 
-            # ── STORE PUBLISH: the content-addressed store is complete after downsample. Assemble
-            #    the manifest (a walk of the local store, in aggregate's key-affecting env so its
-            #    recomputed keys match the content names), push it, then flip the one-object pointer
-            #    LAST — one atomic PUT. A reader (the next hydrate, the GC) sees the whole old world
-            #    or the whole new one; a crash before the flip leaves the old pointer over a
-            #    complete old store, and this build's pushed-but-unreferenced objects are GC debris.
-            #    The bounds.csv-last / catalog-last pattern from sources.yml, generalized. ──
+            # ── STORE PUBLISH: the content-addressed store (mosaic tiles + vector forks + terrain
+            #    pmtiles) is complete after terrain. Assemble the manifest (a walk of the local
+            #    store, in aggregate's key-affecting env so its recomputed keys match the content
+            #    names — it now records mosaic + terrain + vector entries), push it, then flip the
+            #    one-object pointer LAST — one atomic PUT. A reader (the next hydrate, the GC) sees
+            #    the whole old world or the whole new one; a crash before the flip leaves the old
+            #    pointer over a complete old store, and this build's pushed-but-unreferenced objects
+            #    are GC debris. The bounds.csv-last / catalog-last pattern, generalized. ──
             echo "── store manifest + pointer ──"
             MANIFEST_ID=$(docker run --rm -v /root/seascape:/app -v "$STORE:/app/pipelines/store" \
               -e BBOX -e FORCE_REBUILD -e TOOLCHAIN "${AGG_ENV[@]}" "$IMAGE:$IMAGE_TAG" just store-manifest | tail -1)
@@ -453,6 +477,26 @@ jobs:
             printf '{"manifest":"manifests/%s.json","sha":"%s","entries":%s}\n' "$MANIFEST_ID" "$SHA" "$n" \
               | rclone rcat "$R2/store/manifest.json"
             echo "store published: manifest $MANIFEST_ID ($n artifacts), pointer flipped"
+
+            # ── MOSAIC PUBLISH ── the mosaic is a GDAL-openable published product (QA in QGIS,
+            #    preview-from-mosaic, any third party). Re-run mosaic-index with MOSAIC_VSI_BASE set
+            #    to the PUBLIC /vsicurl base for the mosaic TILES prefix, so the GeoParquet `location`
+            #    column records the real published tile URLs (the build-time index above used local
+            #    paths, which are invalid off-box). planet-z8 is content-addressed, so this reuses it
+            #    (no re-decimation, no /vsicurl read). The .gti's IndexDataset + planet-z8 <Overview>
+            #    refs are RELATIVE, so they resolve against the published mosaic/ dir automatically.
+            #    Push order = the pointer-last / bounds.csv-last discipline: everything the .gti
+            #    references (tiles + planet-z8 overview + index) BEFORE the mosaic.gti pointer.
+            echo "── mosaic publish (/vsicurl index) ──"
+            docker run --rm -v /root/seascape:/app -v "$STORE:/app/pipelines/store" \
+              -e BBOX -e FORCE_REBUILD -e TOOLCHAIN "${AGG_ENV[@]}" \
+              -e MOSAIC_VSI_BASE="/vsicurl/$PUBLIC_BASE/mosaic/tiles" \
+              "$IMAGE:$IMAGE_TAG" just mosaic-index
+            push mosaic/tiles mosaic/tiles                       # immutable tile COGs (dedup; push_agg already sent these)
+            push mosaic mosaic --include 'planet-z8-*.tif'       # the z8 overview COG (the .gti <Overview>)
+            push mosaic/index mosaic/index                       # the /vsicurl GeoParquet index
+            rclone copyto "$STORE/mosaic/mosaic.gti" "$R2/mosaic/mosaic.gti" $XFER   # the mosaic pointer, LAST
+            echo "mosaic published: tiles + planet-z8 + index pushed, mosaic.gti pointer flipped"
           fi
 
           echo "── bundle (terrain) ──"
