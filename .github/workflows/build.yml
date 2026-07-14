@@ -238,34 +238,54 @@ jobs:
           fi
           mkdir -p "$STORE"
 
+          # ── swap SAFETY NET (planet builds only; the LOCAL NVMe root disk, never the attached
+          #    volume or the store path). This is INSURANCE, not headroom: the memory-budget
+          #    scheduler (below) keeps the hot working set (~150 GB) in RAM, and the budget stays
+          #    sized to PHYSICAL RAM minus reserve, IGNORING this swap. Swap only catches a single
+          #    tile that peaks ABOVE its weight estimate — turning a rare exit-137 into a brief
+          #    slowdown instead of a dead build. It is NOT room to run more concurrency: swapping the
+          #    hot multi-GB merge arrays would thrash. vm.swappiness=10 keeps the working set in RAM
+          #    and only spills under real pressure. Torn down with the ephemeral box. ──
+          if [ -z "${BBOX:-}" ] && [ ! -e /swapfile ]; then
+            fallocate -l 64G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=65536
+            chmod 600 /swapfile
+            mkswap /swapfile
+            swapon /swapfile
+            sysctl -w vm.swappiness=10
+          fi
+
           # ── knobs, computed HERE, not in Python — the pipeline stays R2/host-agnostic.
-          #    AGG_PROCESSES = min(cores, (RAM_GB − 40) / 9). Two things the old RAM/5 got wrong and
-          #    OOM-killed the first ccx63 planet build (38 workers, exit 137):
-          #      1. The pool runs HEAVIEST-FIRST (deepest child_z), so the first AGG_PROCESSES
-          #         workers are ALL hi-res coastal macrotiles simultaneously — a 32768px tile is
-          #         ~4 GB float32 at rest and PEAKS higher during the multi-source feather-merge
-          #         (S-102 alone is ~52 overlapping products) + halo + smooth. Budget ~9 GB, not 5.
-          #      2. Aggregate does not have the box to itself: the coverage tippecanoe is OVERLAPPED
-          #         (backgrounded) and the periodic push runs concurrently. Reserve ~40 GB for those
-          #         + OS/docker + slack, don't hand the whole box to workers.
-          #    ccx63 (48 / 192) → (192−40)/9 = 16 workers (~144 GB peak + 40 GB reserve). ccx33
-          #    (8 / 32) floors to 2. Deliberately conservative to GUARANTEE completion — retries cost
-          #    a whole run; tune UP once we measure real per-worker peak RSS. Aggregate is now
-          #    memory-bound below core count (each worker needs the multi-GB DEM), so ~16 of 48 cores
-          #    during aggregate is inherent, not waste — terrain/tippecanoe/bundle use the rest, and
-          #    more aggregate cores would need smaller per-tile memory (a pipeline change, not a knob).
-          #    BUNDLE/TERRAIN_PROCESSES = min(cores, RAM_GB/8): they run AFTER aggregate, alone (no
-          #    overlapped coverage), so the lighter budget holds; GDAL_CACHEMAX below is halved to
-          #    256 MB (sources are LOCAL now via selective hydrate, so the block cache matters far
-          #    less) which trims every worker's footprint. ──
+          #    POOL SIZE vs MEMORY BUDGET, decoupled. The old "AGG_PROCESSES = a memory-divided
+          #    worker count" OOM-killed two ccx63 planet builds (exit 137): with the pool running
+          #    HEAVIEST-FIRST (deepest child_z), the first N workers are ALL hi-res coastal macrotiles
+          #    at once, and each PEAKS >12 GB during the multi-source feather-merge (a 32768px tile is
+          #    ~4 GB float32 at rest, ×~3 holding the merged array + reprojected sources + masks;
+          #    S-102 alone is ~52 overlapping products). No single worker count is right: safe-for-
+          #    the-peak wastes cores on cheap ocean tiles, core-count OOMs on the coast.
+          #      * AGG/TERRAIN_PROCESSES = CORES — the POOL SIZE (max workers), so cheap tiles (weight
+          #        1) fill every core. (Python: unset/0 would also default to cpu_count; set it
+          #        explicitly for the log line + clarity.)
+          #      * AGG/TERRAIN_MEM_BUDGET_GB = MEM_GB − RESERVE — a shared GB budget each worker draws
+          #        from (scheduler.reserve) across its tile's memory-peak section, sized to
+          #        weight(tile). This BOUNDS THE CONCURRENT HEAVY-TILE PEAK: the densest coastal
+          #        macrotiles can't all merge at once (the OOM), while cores stay full of light tiles.
+          #    RESERVE (~40) covers OS/docker + the OVERLAPPED coverage tippecanoe + the periodic push
+          #    that share the box during aggregate. The budget is sized to PHYSICAL RAM only — the
+          #    64 GB swap above is a safety net for a tile that peaks past its estimate, NOT budget
+          #    headroom (swapping the hot merge arrays would thrash). ccx63 (48/192): pool 48, budget
+          #    ~150 GB. ccx33 (8/32): reserve shrinks with RAM so a small box still gets a real budget.
+          #    GDAL_CACHEMAX=256 MB (sources are LOCAL now via selective hydrate, so the block cache
+          #    matters far less) trims every worker's footprint. ──
           CORES=$(nproc)
           MEM_GB=$(( $(getconf _PHYS_PAGES) * $(getconf PAGE_SIZE) / 1073741824 ))
-          AGG=$(( (MEM_GB - 40) / 9 )); [ "$AGG" -lt 2 ] && AGG=2; [ "$AGG" -gt "$CORES" ] && AGG=$CORES
+          RESERVE=$(( MEM_GB / 4 )); [ "$RESERVE" -gt 40 ] && RESERVE=40
+          BUDGET=$(( MEM_GB - RESERVE )); [ "$BUDGET" -lt 4 ] && BUDGET=4
           BND=$(( MEM_GB / 8 )); [ "$BND" -gt "$CORES" ] && BND=$CORES; [ "$BND" -lt 1 ] && BND=1
-          TER=$(( MEM_GB / 8 )); [ "$TER" -gt "$CORES" ] && TER=$CORES; [ "$TER" -lt 1 ] && TER=1
-          export AGG_PROCESSES=$AGG
+          export AGG_PROCESSES=$CORES
+          export TERRAIN_PROCESSES=$CORES
+          export AGG_MEM_BUDGET_GB=$BUDGET
+          export TERRAIN_MEM_BUDGET_GB=$BUDGET
           export BUNDLE_PROCESSES=$BND
-          export TERRAIN_PROCESSES=$TER
           export GDAL_CACHEMAX=256
           # The toolchain identity for the content-hash keys (pipelines/keys.py): the deps-keyed
           # image tag pins one GDAL/tippecanoe, so bumping the toolchain correctly invalidates
@@ -277,7 +297,9 @@ jobs:
           # docker run wrapper: repo code at /app, the store bind-mounted, BBOX/FORCE/TOOLCHAIN
           # forwarded (+ BUNDLE_PROCESSES — only bundle.py reads it; harmless elsewhere).
           dr() { docker run --rm -v "$GITHUB_WORKSPACE:/app" -v "$STORE:/app/pipelines/store" \
-            -e BBOX -e FORCE_REBUILD -e TOOLCHAIN -e BUNDLE_PROCESSES -e TERRAIN_PROCESSES "$IMAGE:$IMAGE_TAG" just "$@"; }
+            -e BBOX -e FORCE_REBUILD -e TOOLCHAIN -e BUNDLE_PROCESSES \
+            -e TERRAIN_PROCESSES -e TERRAIN_MEM_BUDGET_GB -e AGG_MEM_FACTOR \
+            -e GDAL_CACHEMAX "$IMAGE:$IMAGE_TAG" just "$@"; }
 
           R2="R2:$DATA_BUCKET/bathymetry"
           # --retries 5: R2 occasionally returns a transient 500 InternalError; ride it out
@@ -339,7 +361,7 @@ jobs:
           #    whose filename is already an absolute /vsi path passes through source_path
           #    untouched and still streams — acceptable fallback. bbox builds are
           #    self-contained (no volume) and keep streaming everything, as before. ──
-          AGG_ENV=(-e AGG_PROCESSES -e GDAL_CACHEMAX)
+          AGG_ENV=(-e AGG_PROCESSES -e AGG_MEM_BUDGET_GB -e AGG_MEM_FACTOR -e GDAL_CACHEMAX)
           if [ -n "${BBOX:-}" ]; then
             # Flagged coarse sources (GEBCO/EMODnet) clamp land + subtract inland water over
             # /vsicurl. WATERMASK only when it exists in R2 (landmask._present assumes any
