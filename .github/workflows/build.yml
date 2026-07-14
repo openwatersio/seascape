@@ -344,14 +344,8 @@ jobs:
             else
               echo "no store pointer in R2 — first immutable build, clean rebuild (nothing to hydrate)"
             fi
-            # Resume an interrupted run of THIS build. push_agg pushes content-addressed aggregate
-            # tiles to R2 every 20 min but never manifests them, so the manifest hydrate above misses
-            # them. Pull recently-pushed tiles (last 6h) so their content keys mark them fresh and
-            # aggregate SKIPS them — a crash/restart resumes ~20 min behind instead of from zero. Old
-            # builds' tiles are >6h old and stay unpulled (no wasted transfer; their keys wouldn't
-            # match a code/toolchain-changed rebuild anyway).
-            echo "── resume: recent in-progress aggregate output ──"
-            for p in mosaic/tiles contour soundings depare; do hydrate "$p" "$p" --max-age 6h; done
+            hydrate source source --include '*/bounds.csv' --include '*/catalog.json'
+            hydrate polygon polygon
           else
             hydrate source source --include '*/bounds.csv' --include '*/catalog.json'
             hydrate polygon polygon
