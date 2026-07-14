@@ -5,18 +5,25 @@
 # mixed_crs: normalize WITHOUT --crs to keep each file's embedded CRS; aggregation reprojects each
 # tile from its own frame. Raw values are orthometric NHN elevation; nodata -32768.
 #
-# SCOPE: only the tidal/estuary reaches are active in file_list.txt (16 tiles: Nordsee, Außenelbe
-# below Elbe-km 586, Jade, Unter-/Außenweser). Inland reaches are commented out (bed above MSL).
+# SCOPE: active reaches in file_list.txt — tidal estuaries (16 tiles: Nordsee, Außenelbe below
+# Elbe-km 586, Jade, Unter-/Außenweser), free-flowing Rhein (3), Main (6), upper Rhein (16). The
+# other inland reaches stay commented out (bed above MSL, pending low-water referencing).
 #
-# DATUM: build_reference.py builds the SKN (chart datum ~= LAT) surface in NHN — the BSH
-# SKN-Fläche grid for the outer estuaries, extended over the inner tidal Elbe from the GDWS
-# per-gauge SKN values — into store/source/dgm_w/reference/. source_datum then subtracts it
-# (bed - SKN = depth below chart datum) and --clamp-positive drops above-datum land/drying to
-# nodata, so the synced COG is low-water normalized. License: DEM GeoNutzV (attribute WSV),
-# reference BSH SKN-Fläche CC-BY 4.0 (attribute BSH). Not for navigation.
+# DATUM: build_reference.py builds a per-reach low-water surface in NHN — SKN (chart datum ~= LAT)
+# for the tidal estuaries, GlW for the free-flowing Rhein, per-pool Stauziel for the impounded Main
+# and upper Rhein — into store/source/dgm_w/reference/. source_datum subtracts it (bed - datum =
+# depth) and --clamp-positive drops above-datum land/drying to nodata, so the synced COG is
+# low-water normalized. Licenses: DEM GeoNutzV (attribute WSV), BSH SKN-Fläche CC-BY 4.0 (attribute
+# BSH). Not for navigation.
 [no-cd]
-default:
+default: download normalize
+
+[no-cd]
+download:
     uv run python source_download.py dgm_w
+
+[no-cd]
+normalize:
     uv run python source_unzip.py dgm_w
     uv run python ../sources/dgm_w/build_reference.py
     uv run python source_datum.py dgm_w --offset-surface reference/reference.vrt --clamp-positive
