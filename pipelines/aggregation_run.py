@@ -190,6 +190,7 @@ def run(filepath):
                     keys.write_empty(e["art"], e["key"])  # legitimately empty -> mark it done
     if not os.environ.get("KEEP_TMP"):           # KEEP_TMP=1 preserves the merged DEM for re-running a fork
         shutil.rmtree(tmp_folder)
+    scheduler.log_peak(stem)                      # whole-run peak RSS (covers the forks) vs weight — factor-tuning data
     print(f"{stem} end")
 
 

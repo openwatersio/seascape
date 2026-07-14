@@ -285,6 +285,14 @@ jobs:
           export TERRAIN_PROCESSES=$CORES
           export AGG_MEM_BUDGET_GB=$BUDGET
           export TERRAIN_MEM_BUDGET_GB=$BUDGET
+          # Conservative weight factor (scheduler.weight): 4, NOT 3. factor 3 → weight(z14)=13 → 11
+          # concurrent heavies, but the real per-tile peak is only known to be >12 GB (a LOWER bound;
+          # the vector forks — depare's shapely union + gdal_contour — are unmodelled), so 11×(>13)
+          # swap-thrashes. factor 4 → weight 18 → 8 concurrent heavies → 8×18 + 40 reserve = 184/192,
+          # in-RAM with ZERO swap even if the real peak is 18. An OOM under a marginal budget is worse
+          # than a clean exit-137 (it leaks the reservation AND can hang the pool). Tune DOWN with the
+          # per-tile peak_rss log (aggregate/terrain print "tile <stem> z<cz> weight=.. peak_rss=..").
+          export AGG_MEM_FACTOR=4
           export BUNDLE_PROCESSES=$BND
           export GDAL_CACHEMAX=256
           # The toolchain identity for the content-hash keys (pipelines/keys.py): the deps-keyed

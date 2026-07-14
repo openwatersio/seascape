@@ -182,6 +182,7 @@ def _render(stem, out_pmtiles):
     utils.create_archive(tmp, tmp_archive)
     keys.publish(tmp_archive, out_pmtiles)
     shutil.rmtree(tmp)
+    scheduler.log_peak(stem)  # whole-render peak RSS vs weight — factor-tuning data
 
 
 # ── the render covering: native aggregation stems + coalesced overview parents ──────────────────

@@ -42,8 +42,16 @@ from contextlib import contextmanager
 HALO_PX = 64
 
 # Peak-over-rest multiplier: a merge/render holds roughly the merged array + reprojected sources +
-# masks at once, ≈3× the resting float32 raster. Env-tunable (measure real RSS, then tune).
-DEFAULT_FACTOR = float(os.environ.get("AGG_MEM_FACTOR", "3"))
+# masks at once, plus the vector forks' own peaks (depare's shapely union + gdal_contour subprocess
+# can rival the merge). CONSERVATIVE default 4, pending measurement:
+#   factor 3 → weight(z14)=13 → floor(152/13)=11 concurrent heavies, but the real per-tile peak is
+#     only known to be >12 GB (a LOWER bound), so 11×(>13) swap-thrashes the hot merge arrays.
+#   factor 4 → weight(z14)=18 → floor(152/18)=8 concurrent heavies → 8×18 + 40 reserve = 184/192,
+#     fits in RAM with ZERO swap even if the real peak is 18 GB. Trades some heavy-tile concurrency
+#     (other cores still saturate on light tiles) for guaranteed-in-RAM completion — an OOM under a
+#     marginal budget is worse than a clean exit-137 (it leaks the reservation AND can hang the pool).
+# Tune DOWN once the per-tile peak_rss log (run()/_render()) gives real RSS data.
+DEFAULT_FACTOR = float(os.environ.get("AGG_MEM_FACTOR", "4"))
 
 
 def weight(stem, budget_gb=0, factor=DEFAULT_FACTOR):
@@ -117,6 +125,25 @@ def reserve(stem):
             _COND.notify_all()
 
 
+def peak_rss_gb():
+    """This worker process's peak resident set, in GB. ru_maxrss is KB on Linux (the build box) and
+    BYTES on macOS — normalise both. Captures the WHOLE run's peak, so it covers the vector forks'
+    own peaks (depare's shapely union + the gdal_contour subprocess) on top of the merge, not just
+    the modelled merge — the number the factor should ultimately be tuned against."""
+    import resource
+    import sys
+    ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return ru / 1e9 if sys.platform == "darwin" else ru / 1e6  # macOS: bytes→GB; Linux: KB→GB
+
+
+def log_peak(stem):
+    """Plain-print this worker's peak RSS alongside the tile stem, child_z, and computed weight — the
+    data that lets the factor be tuned DOWN after a run. Structured logging is a separate task."""
+    cz = int(stem.split("-")[3])
+    w = weight(stem, _BUDGET_GB, _FACTOR) if _BUDGET_GB else weight(stem)
+    print(f"tile {stem} z{cz} weight={w} peak_rss={peak_rss_gb():.1f}GB", flush=True)
+
+
 def pool_kwargs(budget_gb):
     """(manager, kwargs) for a Pool: `kwargs` carries initializer/initargs wiring the budget into
     every worker. Spread `**kwargs` into Pool(...); keep `manager` alive until the pool closes."""
@@ -161,25 +188,33 @@ def _check():
 
     # (b) a mixed-weight run through the real budget mechanism, low budget, short sleeps to force
     # overlap: the concurrently-admitted weight must NEVER exceed the budget, and every task must
-    # complete (no deadlock — including the clamped over-budget tiles that run alone).
+    # complete (no deadlock — including the clamped over-budget tiles that run alone). Run it under
+    # BOTH the default Pool AND an explicit SPAWN context: aggregate uses fork, terrain uses spawn,
+    # and the budget's Manager proxies must pickle into a spawn worker via the initializer — a future
+    # refactor that breaks that must fail here, not in the migration.
     factor = DEFAULT_FACTOR
-    mgr = mp.Manager()
-    held = mgr.Value("i", 0)
-    peak = mgr.Value("i", 0)
-    lock = mgr.Lock()
-    _mgr2, kwargs = pool_kwargs(budget)
     # a spread of cheap (cz=8 → 1), medium (cz=13 → ~4) and over-budget (cz=14 → clamp 8) tiles
     stems = ([f"{z}-{i}-0-8" for i in range(20)]
              + [f"{z}-{i}-0-13" for i in range(8)]
              + [f"{z}-{i}-0-14" for i in range(3)])
-    tasks = [(s, budget, factor, held, peak, lock) for s in stems]
-    with mp.Pool(4, **kwargs) as pool:
-        results = list(pool.imap_unordered(_sim_task, tasks, chunksize=1))
-    assert len(results) == len(tasks), f"all tasks must complete, got {len(results)}/{len(tasks)}"
-    assert peak.value <= budget, f"concurrent held weight {peak.value} exceeded budget {budget}"
-    assert peak.value >= budget - 1, f"expected the budget to fill (peak {peak.value}, budget {budget})"
-    mgr.shutdown()
-    _mgr2.shutdown()
+
+    def _run_sim(ctx, label):
+        mgr = ctx.Manager()
+        held = mgr.Value("i", 0)
+        peak = mgr.Value("i", 0)
+        lock = mgr.Lock()
+        _mgr2, kwargs = pool_kwargs(budget)
+        tasks = [(s, budget, factor, held, peak, lock) for s in stems]
+        with ctx.Pool(4, **kwargs) as pool:
+            results = list(pool.imap_unordered(_sim_task, tasks, chunksize=1))
+        assert len(results) == len(tasks), f"[{label}] all tasks must complete, got {len(results)}/{len(tasks)}"
+        assert peak.value <= budget, f"[{label}] concurrent held weight {peak.value} exceeded budget {budget}"
+        assert peak.value >= budget - 1, f"[{label}] expected the budget to fill (peak {peak.value})"
+        mgr.shutdown()
+        _mgr2.shutdown()
+
+    _run_sim(mp, "default-context")
+    _run_sim(mp.get_context("spawn"), "spawn-context")
     print("scheduler.py self-check ok")
 
 
