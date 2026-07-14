@@ -45,10 +45,12 @@ negative. That splits the waterways in two:
   bed is ~+130 m). As trusted data they keep their true elevation and render as **land, not
   water**. There is no single offset that fixes this — a river's water surface slopes downstream —
   so a per-reach low-water surface is subtracted instead (see below). Active so far: the
-  **free-flowing Rhein** below Iffezheim (km 336–865, 3 tiles, **GlW**), the **impounded Main**
-  (km 0–102, 6 tiles, **Stauziel**), and the **impounded upper Rhein** (Basel→Iffezheim, km 164–334,
-  16 tiles, **Stauziel**). The remaining inland tiles stay **commented out** in `file_list.txt`
-  pending their datum work.
+  **free-flowing Rhein** below Iffezheim (km 336–865, 3 tiles, **GlW**) and the impounded canalised
+  rivers on **Stauziel** — the **Main** (km 0–102, 6 tiles), the **upper Rhein** (Basel→Iffezheim,
+  km 164–334, 16 tiles), the **Mosel** (km 1.9–229.9, 1 tile), the **Saar** (km 0–94, 5 tiles), and
+  the **Lahn** (km 80–136, 3 tiles). The remaining inland tiles (upper Elbe, Oder, Weser, Ems, the
+  canals) stay **commented out** in `file_list.txt` — they publish no GlW/Stauziel, so they need an
+  MNW proxy or a state-sourced low-water datum first.
 
 Not for navigation: NHN/SKN depths are approximate and unreduced to chart standards. This source
 is visualization-only, consistent with Seascape's non-navigational disclaimer.
@@ -67,8 +69,8 @@ prep subtracts a **low-water reference surface** — the local low-water datum e
 the synced COG is depth below that datum, needing no special handling downstream. The datum differs
 by reach: **SKN** (Seekartennull ≈ LAT) for the tidal estuaries, **GlW** (gleichwertiger
 Wasserstand) for the free-flowing Rhein, and **Stauziel** (per-pool retention level) for the
-impounded Main and upper Rhein. This is the scalar lake `--offset` (Bodensee) generalized
-to a spatially-varying surface.
+impounded canalised rivers (Main, upper Rhein, Mosel, Saar, Lahn). This is the scalar lake
+`--offset` (Bodensee) generalized to a spatially-varying surface.
 
 Per pixel: `bed_depth = bed_NHN − datum_NHN(x, y)`. Result is bed elevation referenced to the local
 low water (negative = depth below datum, same convention as the MLLW/LAT sources); above-datum cells
@@ -78,7 +80,7 @@ Pipeline steps (after `source_unzip`, before `source_normalize`):
 
 1. `build_reference.py` (bespoke, lives in this source dir) builds the low-water surface into
    `store/source/dgm_w/reference/` (a subdir, so the pipeline's `*.tif` globs never treat it as a
-   data tile). Four reaches, each its own EPSG:4326 GeoTIFF, stitched into `reference.vrt` (a VRT so
+   data tile). Seven reaches, each its own EPSG:4326 GeoTIFF, stitched into `reference.vrt` (a VRT so
    each keeps its own extent/resolution and warp reads whichever overlaps a tile):
    - **Tidal — `skn_reference.tif`.** Outer estuaries + open Bight from the BSH **SKN-Fläche
      Nordsee 2026** ("Chart datum for the German Bight") grid of SKN in NHN, fetched at build time
@@ -91,8 +93,12 @@ Pipeline steps (after `source_unzip`, before `source_normalize`):
    - **Free-flowing Rhein — `glw_rhein.tif`.** Below the Iffezheim barrage (km 336) the Rhein runs
      free, so its datum is GlW. No packaged grid: the low-water longitudinal profile is assembled
      from the per-gauge GlW-in-NHN values in `rhein_glw.csv` (harvested from PEGELONLINE by
-     `harvest_gauges.py` — see below), interpolated along the gauge polyline the same way as the
-     inner Elbe. 17 gauges, Maxau (km 362) → Emmerich (km 852); GlW-in-NHN ~101 m tapering to ~9 m.
+     `harvest_gauges.py` — see below). 17 gauges, Maxau (km 362) → Emmerich (km 852); GlW-in-NHN
+     ~101 m tapering to ~9 m. The **corridor is the OSM river union** (`rhein_river.wkt`), not the
+     gauge polyline: 17 gauges over ~530 km make a chord that misses the wide outer channel at the
+     big meanders (Düsseldorf/Kaiserswerth), so the Rhine there fell outside the mask. GlW is still
+     the gauge ramp — each pixel projected onto the gauge line, interpolated by arc-length (GlW
+     drifts ~0.02 m/km, so the coarse chord is fine for the *value*; only the *fill* needed the river).
    - **Impounded Main — `zs_main.tif`.** The canalised Main (km 0–102 here) is a staircase of
      pools, each held at a fixed **Stauziel** by its barrage, so the datum is a **step function**,
      not a ramp: flat within a pool, jumping at each weir. Three data files, each addressing a
@@ -126,6 +132,20 @@ Pipeline steps (after `source_unzip`, before `source_normalize`):
        channel and off the low Restrhein running alongside it in the Grand Canal reach. (Confirmed on
        a km173–190 tile: the DGM-W only models the navigation corridor — one channel, ~14 % valid —
        so there is no second channel at a different level to mis-reference.)
+   - **Impounded Mosel / Saar / Lahn — `zs_mosel.tif` / `zs_saar.tif` / `zs_lahn.tif`** (`build_impounded`,
+     the general canalised-river builder). Each is a Stauziel staircase like the Main, but these
+     rivers meander in every direction, so the pool divider is **arc-length along a proper
+     centerline**, not latitude or a coarse chord: a pixel projected onto `<river>_centerline.wkt`
+     (a single LineString built by shortest-path through the OSM river graph — big meanders like the
+     Cochem loop followed faithfully) lands in a pool, and takes the retention level of the barrage
+     bounding it downstream. Flow direction is read off the falling levels, so river-km may run
+     either way (the Lahn's runs downstream, the Mosel/Saar's upstream). The **corridor** is the raw
+     OSM river union (`<river>_river.wkt`), filling the full channel width. Levels + km + coords in
+     `<river>_stau.csv` (Mosel: Wikipedia "Liste der Moselstaustufen"; Saar: Wikipedia + PEGELONLINE
+     headwater gauges; Lahn: the WSV/WSA-Koblenz "Steckbriefe" fact sheets), each **cross-checked**
+     against the reach's ZS_I gauges (`<river>_zs.csv`) — the assert caught a Cochem-loop
+     misprojection that forced the centerline approach. Levels: Mosel 65→140 m, Saar 130→187 m,
+     Lahn 66→106 m.
 2. `source_datum --offset-surface reference/reference.vrt --clamp-positive` reprojects the
    reference onto each tile (bilinear, cross-CRS), subtracts it, and drops above-datum cells.
 3. `source_normalize` (no `--crs`, keep per-tile CRS) → COG.

@@ -38,6 +38,9 @@ NHN_UNIT = "m. ü. NHN"   # gaugeZero unit that marks a gauge as referenced to G
 REACHES = {
     "rhein": ("RHEIN", "GlW", 336.0, 9e9, "rhein_glw.csv"),   # free-flowing below Iffezheim
     "main":  ("MAIN", "ZS_I", 0.0, 125.0, "main_zs.csv"),     # impounded; DEM reaches km ~102
+    "mosel": ("MOSEL", "ZS_I", 0.0, 245.0, "mosel_zs.csv"),   # impounded; cross-check Cochem/Trier
+    "saar":  ("SAAR", "ZS_I", 0.0, 95.0, "saar_zs.csv"),      # impounded; Fremersdorf/Sankt Arnual
+    "lahn":  ("LAHN", "ZS_I", 78.0, 140.0, "lahn_zs.csv"),    # impounded; Diez/Kalkofen (DEM km 80–136)
 }
 
 

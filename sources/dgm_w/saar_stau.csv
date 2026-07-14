@@ -1,0 +1,23 @@
+# Saar impounded-pool low-water datum: Stauziel (normal retention level) per barrage, in NHN. The
+# canalised Saar (Konz km 0, Mosel confluence → Güdingen km 93) is a staircase of pools; each
+# barrage holds the reach UPSTREAM of it at its Stauziel. build_reference.py (build_impounded)
+# assigns each channel pixel the retention level of the barrage bounding its pool downstream. Saar
+# river-km increases UPSTREAM (km 0 at the Mosel), so levels fall with km — build_impounded infers it.
+#
+# stauziel + km: triple-anchored — Wikipedia "Staustufe Serrig" Stauziel, each barrage's PEGELONLINE
+#   headwater (OP) gauge (gaugeZero + the uniform 2.00 m design pool), and the two ZS_I cross-checks
+#   in saar_zs.csv (Fremersdorf km48.5 → Mettlach pool 167.49; Sankt Arnual km90.9 → Saarbrücken
+#   185.23), all agreeing to ~2 cm. Güdingen (old 1863 weir, no ZS_I) is back-calculated ~187.3.
+# lat,lon: barrage UP-gauge positions (~100 m; Kanzem/Saarbrücken/Güdingen approx). The Konz row is
+#   not a Saar barrage — it anchors the km 0–5.2 stub below Kanzem, which is Mosel backwater ~130.3 m
+#   NHN, so those bed pixels reference the Mosel level rather than clamping up to Kanzem's pool.
+# Not for navigation.
+barrage,km,lat,lon,stauziel_nhn_m
+Konz,0.50,49.700,6.585,130.30
+Kanzem,5.20,49.607,6.577,142.00
+Serrig,18.30,49.5655,6.5899,156.50
+Mettlach,31.40,49.4920,6.5874,167.50
+Rehlingen,54.10,49.3763,6.6991,175.50
+Lisdorf,66.20,49.2987,6.7646,179.30
+Saarbruecken,81.40,49.247,6.940,185.20
+Guedingen,93.00,49.199,7.034,187.30
