@@ -241,6 +241,7 @@ test-engine:
     uv run python keys.py --check
     uv run python mosaic.py --check
     uv run python terrain.py --check
+    uv run python scheduler.py --check
     uv run python store_manifest.py --check
 
 # Lint the GitHub Actions workflows.
