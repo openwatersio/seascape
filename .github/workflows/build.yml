@@ -3,7 +3,7 @@ name: Build
 # Full planet build on ONE on-demand Hetzner box, run as a SELF-HOSTED GitHub Actions runner
 # (Cyclenerd/hcloud-github-runner): image → create-runner boots the box + registers it as a runner
 # → the `build` job runs NATIVELY on that box (no SSH, no rsync, no heredoc) → push each stage back
-# to R2 → delete-runner always-destroys the box (and the volume) and deregisters the runner. The
+# to R2 → delete-runner always-destroys the box and deregisters the runner. The
 # ubuntu-latest jobs only create/destroy infra; the compute is a pay-per-build box (~€2/hr, ~€10 for
 # a forced planet rebuild).
 #
@@ -60,7 +60,7 @@ env:
   SERVER_IMAGE: ubuntu-24.04
   SERVER_LOCATION: fsn1
   # Server hostname AND runner label (Cyclenerd/hcloud-github-runner registers the runner with
-  # --labels "<name>,hetzner"); the create-runner job also names the build volume this.
+  # --labels "<name>,hetzner").
   NAME: seascape-build-${{ github.run_id }}
   # Dispatch inputs reach every `run:` as env vars, never as raw ${{…}} interpolated into a
   # shell line — a bbox like `$(cmd)` would otherwise run under command substitution.
@@ -104,49 +104,17 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # Boot an on-demand Hetzner box and register it as a self-hosted runner for this repo. For a
-  # planet build we first create a 400 GB volume (this job holds HCLOUD_TOKEN) and hand its ID to
-  # the action, which attaches it at server-create time; the `build` job mkfs+mounts it. A bbox
-  # build is self-contained on the root disk (like seamap's AREA smoke), so it skips the volume.
-  # Volume LIFECYCLE: created here → attached by the action → mounted by build → destroyed by
-  # delete-runner (the action manages the server, never the volume). server_id is emitted by the
-  # action BEFORE its registration wait, so it is available to delete-runner even if registration
-  # times out — teardown still runs.
+  # Boot an on-demand Hetzner box and register it as a self-hosted runner for this repo. The store
+  # lives on the box's local NVMe root disk — no attached volume — so this job just boots + registers.
+  # server_id is emitted by the action BEFORE its registration wait, so it is available to
+  # delete-runner even if registration times out — teardown still runs.
   create-runner:
     runs-on: ubuntu-latest
     permissions: { contents: read }
     outputs:
       label: ${{ steps.runner.outputs.label }}
       server_id: ${{ steps.runner.outputs.server_id }}
-      volume_id: ${{ steps.volume.outputs.id }}
     steps:
-      - name: Install hcloud CLI
-        if: ${{ github.event.inputs.bbox == '' }}
-        run: |
-          # Pinned + sha256-verified: this job holds HCLOUD_TOKEN, so an unpinned `latest` from a
-          # compromised release or MITM would hand over infra control (same discipline as rclone).
-          curl -fsSL -o /tmp/hcloud.tgz https://github.com/hetznercloud/cli/releases/download/v1.66.0/hcloud-linux-amd64.tar.gz
-          echo "8b1a8598858232c491f58cbf65ce1bd0ec6f725114bb62ec967a20ab03e29a86  /tmp/hcloud.tgz" | sha256sum -c
-          tar xzf /tmp/hcloud.tgz -C /tmp hcloud
-          sudo mv /tmp/hcloud /usr/local/bin/
-
-      - name: Create build volume (planet only)
-        id: volume
-        if: ${{ github.event.inputs.bbox == '' }}
-        env:
-          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
-        run: |
-          # ~50 GiB hydrated tile/vector store + bundle outputs which ~2x during pmtiles finalize
-          # (~100 GiB peak) + the dirty-set source hydrate (the full coastal S-102+CUDEM subset is
-          # ~100-200 GiB) → 400 GiB with headroom. Created UNATTACHED in the server's location; the
-          # runner action attaches it at creation via the create-server volumes list. Left
-          # unformatted — the build job mkfs.ext4 it (as the old SSH model did).
-          hcloud volume create --name "$NAME" --size 400 --location "$SERVER_LOCATION"
-          id=$(hcloud volume describe "$NAME" -o json | jq -r '.id')
-          [ -n "$id" ] && [ "$id" != "null" ] || { echo "failed to read new volume id" >&2; exit 1; }
-          echo "id=$id" >> "$GITHUB_OUTPUT"
-          echo "created build volume $NAME (id $id)"
-
       - name: Create runner
         id: runner
         uses: Cyclenerd/hcloud-github-runner@v1.4.1
@@ -161,9 +129,12 @@ jobs:
           server_type: ${{ env.SERVER_TYPE }}
           location: ${{ env.SERVER_LOCATION }}
           image: ${{ env.SERVER_IMAGE }}
-          # Planet: the volume ID from above. bbox: no volume → 'null' (the action's sentinel for
-          # "attach none"; an empty string would fail its integer check).
-          volume: ${{ steps.volume.outputs.id || 'null' }}
+          # No attached volume: the store lives on the box's LOCAL NVMe root disk. ccx63 ships ~960 GB
+          # local NVMe — bigger AND faster than the old 400 GB network volume — so the build (~50 GiB
+          # store + ~240 GiB dirty-set sources + ~100 GiB bundle peak ≈ 400 GiB) fits with headroom on
+          # root. 'null' is the action's sentinel for "attach none" (an empty string fails its int check).
+          # The build job's df precheck fails loudly if a box ever has too small a root disk.
+          volume: 'null'
 
   # Runs NATIVELY on the Hetzner box (runs-on: the runner label the action minted). No SSH, no
   # rsync, no build.env — secrets are native job env, and the pipeline is the same `just` stages
@@ -207,10 +178,10 @@ jobs:
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
           # ── docker + the PINNED sha256-verified rclone (apt's 1.60.1 501s on R2's version-id
-          #    responses — same pin as sources.yml/release.yml). e2fsprogs: mkfs.ext4 for the
-          #    volume; jq: read the store pointer + manifest. The runner runs as root, so no sudo. ──
+          #    responses — same pin as sources.yml/release.yml). jq: read the store pointer +
+          #    manifest. The runner runs as root, so no sudo. ──
           apt-get update -qq
-          apt-get install -y -qq unzip e2fsprogs jq
+          apt-get install -y -qq unzip jq
           command -v docker >/dev/null || curl -fsSL https://get.docker.com | sh
           curl -fsSL -o /tmp/rclone.zip "https://downloads.rclone.org/v1.74.4/rclone-v1.74.4-linux-amd64.zip"
           echo "fe435e0c36228e7c2f116a8701f01127bb1f694005fc11d1f27186c8bca4115d  /tmp/rclone.zip" | sha256sum -c
@@ -225,21 +196,17 @@ jobs:
           set -euo pipefail
           cd "$GITHUB_WORKSPACE"
 
-          # ── store on the attached volume for a planet build, the workspace disk for a bbox ──
-          if [ -z "${BBOX:-}" ]; then
-            for _ in $(seq 1 12); do
-              # shellcheck disable=SC2012  # glob-match the fixed HC volume device name; ls is fine here
-              DEV=$(ls /dev/disk/by-id/scsi-0HC_Volume_* 2>/dev/null | head -1 || true)
-              # shellcheck disable=SC2015  # break-or-sleep, deliberately not if-then-else
-              [ -n "${DEV:-}" ] && break || sleep 5
-            done
-            [ -n "${DEV:-}" ] || { echo "build volume never attached" >&2; exit 1; }
-            mkfs.ext4 -qF "$DEV"; mkdir -p /mnt/store; mount "$DEV" /mnt/store
-            STORE=/mnt/store
-          else
-            STORE="$GITHUB_WORKSPACE/pipelines/store"
-          fi
+          # ── store on the box's LOCAL NVMe root disk (no attached volume) ── ccx63 has ~960 GB
+          #    local NVMe, faster than a network volume. A planet build needs ~400 GiB (store +
+          #    dirty-set sources + bundle peak); precheck the root filesystem has room and FAIL LOUD
+          #    if a box is ever too small, rather than running out mid-build. bbox is far smaller.
+          STORE="$GITHUB_WORKSPACE/pipelines/store"
           mkdir -p "$STORE"
+          if [ -z "${BBOX:-}" ]; then
+            avail_gb=$(df -BG --output=avail "$STORE" | tail -1 | tr -dc '0-9')
+            [ "${avail_gb:-0}" -ge 450 ] || { echo "root disk has only ${avail_gb:-?} GiB free at $STORE — a planet build needs ~450; use a box with a bigger local NVMe (ccx63 = ~960)" >&2; exit 1; }
+            echo "store on local NVMe: ${avail_gb} GiB free at $STORE"
+          fi
 
           # ── swap SAFETY NET (planet builds only; the LOCAL NVMe root disk, never the attached
           #    volume or the store path). This is INSURANCE, not headroom: the memory-budget
@@ -567,9 +534,9 @@ jobs:
 
   # Destroy the box + deregister the runner, ALWAYS — on build success, build failure, OR a
   # create-runner failure (server_id is emitted before the registration wait, so it is present even
-  # if the runner never registered). The action manages only the server + runner; this job also
-  # destroys the volume it did not create, and keeps the LOUD-DESTROY discipline: after teardown a
-  # still-present server or volume is a leaked billable resource and fails the step.
+  # if the runner never registered). No volume to destroy (store is on the box's local NVMe, gone
+  # with the box). LOUD-DESTROY discipline: a still-present server after teardown is a leaked
+  # billable resource and fails the step (also flags a stray volume, though none is created now).
   delete-runner:
     needs: [create-runner, build]
     if: always()
@@ -586,7 +553,7 @@ jobs:
           name: ${{ env.NAME }}
           server_id: ${{ needs.create-runner.outputs.server_id }}
 
-      - name: Destroy volume + verify no leak
+      - name: Verify no leaked resources
         if: always()
         env:
           HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
@@ -598,19 +565,10 @@ jobs:
           echo "8b1a8598858232c491f58cbf65ce1bd0ec6f725114bb62ec967a20ab03e29a86  /tmp/hcloud.tgz" | sha256sum -c
           tar xzf /tmp/hcloud.tgz -C /tmp hcloud
           sudo mv /tmp/hcloud /usr/local/bin/
-          # Delete the build volume by NAME, gated on its actual EXISTENCE — not on the exported
-          # volume_id, which is empty if create-runner made the volume but died before emitting the
-          # output, leaving a volume this step would otherwise skip (an avoidable leak). It detaches
-          # when the server is deleted; retry in case detach lags. A bbox build (no volume) and a
-          # create-runner failure before the volume both describe-miss and skip cleanly.
-          if hcloud volume describe "$NAME" >/dev/null 2>&1; then
-            for _ in $(seq 1 12); do
-              if hcloud volume delete "$NAME" 2>/dev/null; then break; else sleep 5; fi
-            done
-          fi
-          # LOUD-DESTROY: a still-present server or volume is billable — fail with a clear message
-          # so a leak shows as a red step, not invisible cost. Resources that never existed (a
-          # create-runner failure before the server, a bbox build without a volume) pass clean.
+          # LOUD-DESTROY: the action deletes the server; a still-present server after that is billable
+          # — fail with a clear message so a leak shows as a red step, not invisible cost. No volume is
+          # created now, but keep the volume check as cheap insurance against a stray one. Resources
+          # that never existed (a create-runner failure before the server) describe-miss and pass clean.
           fail=0
           if hcloud server describe "$NAME" >/dev/null 2>&1; then
             echo "::error::leaked billable resource: Hetzner server $NAME still exists — delete it manually"
