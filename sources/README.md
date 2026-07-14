@@ -16,8 +16,8 @@ Selection rule: **resolution sets the zoom cap, an openly-redistributable licens
 | [GEBCO 2026](gebco/)                                               | ~450 m      | ~z8       | global                              | MSL                     |
 | [EMODnet 2024](emodnet/)                                           | ~115 m      | z11       | European seas                       | LAT (confirm)           |
 | [DDM (Denmark)](ddm/)                                              | 50 m        | z12       | Danish EEZ                          | MSL (DKMSL2022)         |
-| [CUDEM 1/9](cudem/)                                                | ~3.4 m      | z13       | US coast                            | NAVD88                  |
-| [CUDEM 1/3](cudem_third/)                                          | ~10 m       | z12       | US coast (broader)                  | NAVD88                  |
+| [CUDEM 1/9](cudem/)                                                | ~3.4 m      | z13       | US coast + territories              | NAVD88 / local (terr.)  |
+| [CUDEM 1/3](cudem_third/)                                          | ~10 m       | z12       | US coast + territories (broader)    | NAVD88 / local (terr.)  |
 | [NOAA S-102](noaa_s102/)                                           | ~4–16 m     | z14       | US navigable                        | MLLW (+ uncertainty)    |
 | [Vaklodingen](vaklodingen/)                                        | 20 m        | z12       | Netherlands                         | NAP (~MSL)              |
 | INFOMAR ([10 m](infomar_10m/), [25 m](infomar_25m/))               | 10 m / 25 m | z13 / z11 | Ireland inshore + shelf             | **LAT**                 |
