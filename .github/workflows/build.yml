@@ -255,14 +255,15 @@ jobs:
           export TERRAIN_PROCESSES=$CORES
           export AGG_MEM_BUDGET_GB=$BUDGET
           export TERRAIN_MEM_BUDGET_GB=$BUDGET
-          # Conservative weight factor (scheduler.weight): 4, NOT 3. factor 3 → weight(z14)=13 → 11
-          # concurrent heavies, but the real per-tile peak is only known to be >12 GB (a LOWER bound;
-          # the vector forks — depare's shapely union + gdal_contour — are unmodelled), so 11×(>13)
-          # swap-thrashes. factor 4 → weight 18 → 8 concurrent heavies → 8×18 + 40 reserve = 184/192,
-          # in-RAM with ZERO swap even if the real peak is 18. An OOM under a marginal budget is worse
-          # than a clean exit-137 (it leaks the reservation AND can hang the pool). Tune DOWN with the
-          # per-tile peak_rss log (aggregate/terrain print "tile <stem> z<cz> weight=.. peak_rss=..").
-          export AGG_MEM_FACTOR=4
+          # Weight factor (scheduler.weight): 1. The old 4 was calibrated to a PHANTOM: pre-
+          # maxtasksperchild, long-lived pool workers never returned freed memory (glibc arenas), so
+          # ru_maxrss RATCHETED to ~15 GB across a dozen tiles and log_peak mis-attributed that to one
+          # tile. With maxtasksperchild=1 each tile gets a fresh worker (peak "(was 0.0)"), and the
+          # TRUE per-tile peak is ~0.2–2.8 GB — even a dense z14 (317k soundings) hit 2.8. factor 1 →
+          # weight(z14)=5 (ceil of the 4.3 GB output-array geometry, already ≥ the observed peak) →
+          # ~30 concurrent in the ~152 budget → the box's cores actually fill. 30×3 GB real = 90 GB,
+          # far under budget; the 64 GB swap net covers any tail tile beyond the sample.
+          export AGG_MEM_FACTOR=1
           export BUNDLE_PROCESSES=$BND
           export GDAL_CACHEMAX=256
           # The toolchain identity for the content-hash keys (pipelines/keys.py): the deps-keyed
@@ -322,8 +323,14 @@ jobs:
             else
               echo "no store pointer in R2 — first immutable build, clean rebuild (nothing to hydrate)"
             fi
-            hydrate source source --include '*/bounds.csv' --include '*/catalog.json'
-            hydrate polygon polygon
+            # Resume an interrupted run of THIS build. push_agg pushes content-addressed aggregate
+            # tiles to R2 every 20 min but never manifests them, so the manifest hydrate above misses
+            # them. Pull recently-pushed tiles (last 6h) so their content keys mark them fresh and
+            # aggregate SKIPS them — a crash/restart resumes ~20 min behind instead of from zero. Old
+            # builds' tiles are >6h old and stay unpulled (no wasted transfer; their keys wouldn't
+            # match a code/toolchain-changed rebuild anyway).
+            echo "── resume: recent in-progress aggregate output ──"
+            for p in mosaic/tiles contour soundings depare; do hydrate "$p" "$p" --max-age 6h; done
           else
             hydrate source source --include '*/bounds.csv' --include '*/catalog.json'
             hydrate polygon polygon
