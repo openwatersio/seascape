@@ -49,9 +49,12 @@ RHEIN_CSV = os.path.join(HERE, "rhein_glw.csv")
 MAIN_ZS_CSV = os.path.join(HERE, "main_zs.csv")
 MAIN_STAU_CSV = os.path.join(HERE, "main_stau.csv")
 MAIN_CENTERLINE_WKT = os.path.join(HERE, "main_centerline.wkt")
+RHEIN_STAU_CSV = os.path.join(HERE, "rhein_stau.csv")
+RHEIN_CENTERLINE_WKT = os.path.join(HERE, "rhein_centerline.wkt")
 
 CORRIDOR_DEG = 0.06   # ~6 km: only fill cells this close to the gauge line (keeps it to the river)
 MAIN_CORRIDOR = 0.015  # ~1.5 km: the Main is a narrow river — hug it (the estuary width isn't needed)
+RHEIN_UP_CORRIDOR = 0.02  # ~2 km: the upper Rhein channel/braids are wider than the Main
 EAST_MARGIN = 0.25    # extend the SKN canvas this far east of the most-upstream inner-Elbe gauge
 REACH_RES = 0.001     # ~110 m: a smooth ramp / flat pools resample cleanly onto 2 m tiles
 REACH_NODATA = -9999.0
@@ -255,10 +258,51 @@ def build_main(out_dir):
     return ref_path
 
 
+def build_rhein_upper(out_dir):
+    """Stauziel surface: the impounded upper Rhein (Basel→Iffezheim) as pool steps -> zs_rhein.tif.
+
+    Ten barrages from Kembs to Iffezheim hold a staircase of pools, each at its barrage's normal
+    retention level (rhein_stau.csv). Unlike the Main, no weir lines are needed: this reach flows
+    due north, so the barrage latitudes (strictly increasing downstream) are the pool dividers — a
+    pixel takes the retention level of the first barrage at or north of it. The corridor follows the
+    OSM navigation centerline (rhein_centerline.wkt: Grand Canal d'Alsace + canalised Rhine), which
+    keeps the fill on the impounded channel and off the low Restrhein running alongside it."""
+    barrages = []
+    with open(RHEIN_STAU_CSV, encoding="utf-8") as f:
+        for r in csv.DictReader(line for line in f if not line.lstrip().startswith("#")):
+            barrages.append((float(r["lat"]), float(r["stauziel_nhn_m"])))
+    barrages.sort()  # by latitude = upstream -> downstream
+    blat = np.array([b[0] for b in barrages])
+    blev = np.array([b[1] for b in barrages])
+    assert (np.diff(blat) > 0).all(), "barrage latitudes must strictly increase downstream"
+
+    def value_at(proj, plon, plat):  # first barrage at/north of the pixel -> its pool's Stauziel
+        return blev[np.clip(np.searchsorted(blat, plat, side="left"), 0, len(blat) - 1)]
+
+    center = shapely.from_wkt(open(RHEIN_CENTERLINE_WKT, encoding="utf-8").read())
+    w, s, e, n = center.bounds
+    west, north = w - RHEIN_UP_CORRIDOR - REACH_RES, n + RHEIN_UP_CORRIDOR + REACH_RES
+    width = int(np.ceil((e + RHEIN_UP_CORRIDOR - west) / REACH_RES))
+    height = int(np.ceil((north - (s - RHEIN_UP_CORRIDOR)) / REACH_RES))
+    out = np.full((height, width), REACH_NODATA, dtype="float32")
+    fill_corridor(out, REACH_NODATA, west, north, REACH_RES, -REACH_RES, center, value_at, RHEIN_UP_CORRIDOR)
+
+    ref_path = f"{out_dir}/zs_rhein.tif"
+    prof = dict(driver="GTiff", dtype="float32", count=1, width=width, height=height, crs="EPSG:4326",
+                nodata=REACH_NODATA, transform=rasterio.transform.from_origin(west, north, REACH_RES, REACH_RES),
+                compress="deflate", tiled=True, blockxsize=512, blockysize=512)
+    with rasterio.open(ref_path, "w", **prof) as dst:
+        dst.write(out, 1)
+    valid = out[out != REACH_NODATA]
+    print(f"wrote {ref_path}: {width}x{height}, Stauziel-in-NHN "
+          f"{valid.min():.2f}..{valid.max():.2f} m over {valid.size:,} cells ({len(barrages)} pools)")
+    return ref_path
+
+
 def main():
     out_dir = "store/source/dgm_w/reference"
     os.makedirs(out_dir, exist_ok=True)
-    parts = [build_tidal(out_dir), build_rhein(out_dir), build_main(out_dir)]
+    parts = [build_tidal(out_dir), build_rhein(out_dir), build_main(out_dir), build_rhein_upper(out_dir)]
     vrt = f"{out_dir}/reference.vrt"
     subprocess.run(["gdalbuildvrt", "-overwrite", vrt, *parts], check=True)
     print(f"wrote {vrt} ({len(parts)} reach(es))")

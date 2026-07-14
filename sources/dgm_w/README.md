@@ -44,9 +44,11 @@ negative. That splits the waterways in two:
   weir, Ems, Dortmund-Ems-Kanal, Ober-/Mittelweser) have beds tens of metres above MSL (the Saar
   bed is ~+130 m). As trusted data they keep their true elevation and render as **land, not
   water**. There is no single offset that fixes this — a river's water surface slopes downstream —
-  so a per-reach low-water surface is subtracted instead (see below). The **free-flowing Rhein**
-  below the Iffezheim barrage (km 336–865, 3 tiles) is now referenced to **GlW** and active; the
-  remaining inland tiles stay **commented out** in `file_list.txt` pending their datum work.
+  so a per-reach low-water surface is subtracted instead (see below). Active so far: the
+  **free-flowing Rhein** below Iffezheim (km 336–865, 3 tiles, **GlW**), the **impounded Main**
+  (km 0–102, 6 tiles, **Stauziel**), and the **impounded upper Rhein** (Basel→Iffezheim, km 164–334,
+  16 tiles, **Stauziel**). The remaining inland tiles stay **commented out** in `file_list.txt`
+  pending their datum work.
 
 Not for navigation: NHN/SKN depths are approximate and unreduced to chart standards. This source
 is visualization-only, consistent with Seascape's non-navigational disclaimer.
@@ -64,7 +66,8 @@ supersede the estuary tiles here if desired.
 prep subtracts a **low-water reference surface** — the local low-water datum expressed in NHN — so
 the synced COG is depth below that datum, needing no special handling downstream. The datum differs
 by reach: **SKN** (Seekartennull ≈ LAT) for the tidal estuaries, **GlW** (gleichwertiger
-Wasserstand) for the free-flowing Rhein. This is the scalar lake `--offset` (Bodensee) generalized
+Wasserstand) for the free-flowing Rhein, and **Stauziel** (per-pool retention level) for the
+impounded Main and upper Rhein. This is the scalar lake `--offset` (Bodensee) generalized
 to a spatially-varying surface.
 
 Per pixel: `bed_depth = bed_NHN − datum_NHN(x, y)`. Result is bed elevation referenced to the local
@@ -75,7 +78,7 @@ Pipeline steps (after `source_unzip`, before `source_normalize`):
 
 1. `build_reference.py` (bespoke, lives in this source dir) builds the low-water surface into
    `store/source/dgm_w/reference/` (a subdir, so the pipeline's `*.tif` globs never treat it as a
-   data tile). Three reaches, each its own EPSG:4326 GeoTIFF, stitched into `reference.vrt` (a VRT so
+   data tile). Four reaches, each its own EPSG:4326 GeoTIFF, stitched into `reference.vrt` (a VRT so
    each keeps its own extent/resolution and warp reads whichever overlaps a tile):
    - **Tidal — `skn_reference.tif`.** Outer estuaries + open Bight from the BSH **SKN-Fläche
      Nordsee 2026** ("Chart datum for the German Bight") grid of SKN in NHN, fetched at build time
@@ -106,6 +109,23 @@ Pipeline steps (after `source_unzip`, before `source_normalize`):
      - **Corridor — `main_centerline.wkt`** (the real OSM Main centerline): the reference is filled
        only within ~1.5 km of it, so the band hugs every meander instead of a coarse gauge chord the
        river escapes at bends. Stauziel 83.9 m (Kostheim pool) → 116.5 m (Wallstadt).
+   - **Impounded upper Rhein — `zs_rhein.tif`.** The Rhein above Iffezheim (km 164–334) is another
+     staircase — ten pools from Kembs to Iffezheim (Basel→Iffezheim, mostly French EDF barrages).
+     Same step-function idea as the Main, but the divider is simpler: this reach flows due **north**,
+     so pool boundaries fall cleanly on lines of **latitude** and no weir geometry is needed — a pixel
+     takes the retention level of the first barrage at or north of it (`np.searchsorted` on the
+     barrage latitudes). Two files:
+     - **Levels — `rhein_stau.csv`**: per-barrage normal retention level (Stauziel / cote de retenue),
+       244.26 m (Kembs pool) → 123.68 m (Iffezheim). PEGELONLINE publishes no ZS_I here (the barrages
+       are French; German gauges report MNW/MW only), so unlike the Main there is no gauge cross-check.
+       Values come from the French Wikipedia "Schéma détaillé du Grand canal d'Alsace" level profile,
+       anchored on Iffezheim's measured NHN Stauziel; the eight French values are NGF (Lallemand), so
+       ±0.3 m in NHN — fine for a non-navigational render. Barrage lat/lon are the OSM CEMT-VIb locks.
+     - **Corridor — `rhein_centerline.wkt`** (OSM navigation line: Grand Canal d'Alsace + canalised
+       Rhine, `boat=yes`): filled within ~2 km, which keeps the band on the impounded navigation
+       channel and off the low Restrhein running alongside it in the Grand Canal reach. (Confirmed on
+       a km173–190 tile: the DGM-W only models the navigation corridor — one channel, ~14 % valid —
+       so there is no second channel at a different level to mis-reference.)
 2. `source_datum --offset-surface reference/reference.vrt --clamp-positive` reprojects the
    reference onto each tile (bilinear, cross-CRS), subtracts it, and drops above-datum cells.
 3. `source_normalize` (no `--crs`, keep per-tile CRS) → COG.

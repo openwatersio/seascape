@@ -59,6 +59,27 @@ https://via.bund.de/wsv/inspire/download/el/2901_km60_78.zip
 https://via.bund.de/wsv/inspire/download/el/2901_km77_90.zip
 https://via.bund.de/wsv/inspire/download/el/2901_km90_102.zip
 
+# Rhein upper / impounded — 16 tile(s) (km 164–334, Basel→Iffezheim; per-pool Stauziel step surface)
+# Low-water datum = normal retention level per barrage from rhein_stau.csv; build_reference.py steps
+# the pool level at each barrage's latitude (the reach flows north, so latitude is the divider). The
+# free-flowing reach km 336–865 is active above (GlW).
+https://via.bund.de/wsv/inspire/download/el/3901_km164_174.zip
+https://via.bund.de/wsv/inspire/download/el/3902_km173_190.zip
+https://via.bund.de/wsv/inspire/download/el/3902_km190_205.zip
+https://via.bund.de/wsv/inspire/download/el/3902_km205_227.zip
+https://via.bund.de/wsv/inspire/download/el/3901_km226_235.zip
+https://via.bund.de/wsv/inspire/download/el/3903_km234_243.zip
+https://via.bund.de/wsv/inspire/download/el/3901_km242_249.zip
+https://via.bund.de/wsv/inspire/download/el/3904_km248_260.zip
+https://via.bund.de/wsv/inspire/download/el/3901_km259_268.zip
+https://via.bund.de/wsv/inspire/download/el/3905_km267_274.zip
+https://via.bund.de/wsv/inspire/download/el/3901_km273_284.zip
+https://via.bund.de/wsv/inspire/download/el/3906_km283_292.zip
+https://via.bund.de/wsv/inspire/download/el/3901_km291_308.zip
+https://via.bund.de/wsv/inspire/download/el/3907_km307_312.zip
+https://via.bund.de/wsv/inspire/download/el/3901_km311_326.zip
+https://via.bund.de/wsv/inspire/download/el/3901_km326_337.zip
+
 
 # ============================================================================================
 # INLAND — deferred: bed elevation far above MSL, needs GlW/Stauziel low-water referencing.
@@ -128,24 +149,6 @@ https://via.bund.de/wsv/inspire/download/el/2901_km90_102.zip
 # Ober-/Mittelweser — 1 tile(s) (inland, deferred)
 # https://via.bund.de/wsv/inspire/download/el/5201.zip
 
-# Rhein upper / impounded — 16 tile(s) (inland, deferred: km 164–337, Basel–Iffezheim barrages,
-# needs Stauziel per pool — not GlW. The free-flowing reach km 336–865 is active above.)
-# https://via.bund.de/wsv/inspire/download/el/3901_km164_174.zip
-# https://via.bund.de/wsv/inspire/download/el/3902_km173_190.zip
-# https://via.bund.de/wsv/inspire/download/el/3902_km190_205.zip
-# https://via.bund.de/wsv/inspire/download/el/3902_km205_227.zip
-# https://via.bund.de/wsv/inspire/download/el/3901_km226_235.zip
-# https://via.bund.de/wsv/inspire/download/el/3903_km234_243.zip
-# https://via.bund.de/wsv/inspire/download/el/3901_km242_249.zip
-# https://via.bund.de/wsv/inspire/download/el/3904_km248_260.zip
-# https://via.bund.de/wsv/inspire/download/el/3901_km259_268.zip
-# https://via.bund.de/wsv/inspire/download/el/3905_km267_274.zip
-# https://via.bund.de/wsv/inspire/download/el/3901_km273_284.zip
-# https://via.bund.de/wsv/inspire/download/el/3906_km283_292.zip
-# https://via.bund.de/wsv/inspire/download/el/3901_km291_308.zip
-# https://via.bund.de/wsv/inspire/download/el/3907_km307_312.zip
-# https://via.bund.de/wsv/inspire/download/el/3901_km311_326.zip
-# https://via.bund.de/wsv/inspire/download/el/3901_km326_337.zip
 
 # Saar — 5 tile(s) (inland, deferred)
 # https://via.bund.de/wsv/inspire/download/el/4201_km0_20.zip

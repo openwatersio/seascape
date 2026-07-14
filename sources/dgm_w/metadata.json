@@ -4,6 +4,6 @@
     "website": "https://via.bund.de/wsv/inspire/",
     "license": "GeoNutzV (attribution: © Wasserstraßen- und Schifffahrtsverwaltung des Bundes)",
     "max_zoom": 14,
-    "datum": "SKN / chart datum (~LAT). Raw DGM-W is orthometric NHN; the prep subtracts the SKN-in-NHN reference (BSH SKN-Fläche grid for the outer estuaries + an assembled GDWS per-gauge profile for the inner tidal Elbe) so the COG is depth below chart datum, with above-datum land/drying clamped to nodata. Scope: tidal/estuary reaches (Nordsee, Außenelbe below Elbe-km 586, Jade, Unter-/Außenweser). Inland reaches deferred (need GlW/Stauziel referencing). See README.",
+    "datum": "Local low water (chart datum ~LAT tidally, else the river low-water datum). Raw DGM-W is orthometric NHN; the prep subtracts a per-reach low-water reference in NHN so the COG is depth below that datum, with above-datum land/drying clamped to nodata. References: SKN for the tidal estuaries (BSH SKN-Fläche grid + assembled inner-Elbe gauge profile), GlW for the free-flowing Rhein, per-pool Stauziel for the impounded Main and upper Rhein. Active reaches: tidal (Nordsee, Außenelbe below Elbe-km 586, Jade, Unter-/Außenweser), free-flowing Rhein (km 336–865), Main (km 0–102), upper Rhein (km 164–334). Other inland reaches deferred. See README.",
     "mixed_crs": true
 }
