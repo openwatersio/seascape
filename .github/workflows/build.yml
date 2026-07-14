@@ -239,8 +239,8 @@ jobs:
           #        from (scheduler.reserve) across its tile's memory-peak section, sized to
           #        weight(tile). This BOUNDS THE CONCURRENT HEAVY-TILE PEAK: the densest coastal
           #        macrotiles can't all merge at once (the OOM), while cores stay full of light tiles.
-          #    RESERVE (~40) covers OS/docker + the OVERLAPPED coverage tippecanoe + the periodic push
-          #    that share the box during aggregate. The budget is sized to PHYSICAL RAM only — the
+          #    RESERVE (~40) covers OS/docker + the periodic push that share the box during aggregate
+          #    (coverage is sequential now — run #6's OOM was the two overlapping). The budget is sized to PHYSICAL RAM only — the
           #    64 GB swap above is a safety net for a tile that peaks past its estimate, NOT budget
           #    headroom (swapping the hot merge arrays would thrash). ccx63 (48/192): pool 48, budget
           #    ~150 GB. ccx33 (8/32): reserve shrinks with RAM so a small box still gets a real budget.
@@ -399,19 +399,7 @@ jobs:
           echo "── cover ──"
           dr cover                        # writes the covering (the tiling plan; keys drive dirtiness)
 
-          # ── coverage ∥ aggregate ── the plan's sanctioned DAG overlap: coverage reads only
-          # footprints + the covering and aggregate never reads coverage, but its single-
-          # threaded tippecanoe ran ~47 min BEFORE aggregate on the first real build, idling
-          # every other core. Backgrounded here, joined after aggregate. set -e cannot see a
-          # background job's failure, so the explicit wait below propagates its rc — and it
-          # sits BEFORE the manifest push, preserving manifest-last completeness (a build
-          # without coverage.pmtiles must not get a manifest). Output is prefixed so the two
-          # stages' interleaved logs stay readable; pipefail (set above, inherited by the
-          # subshell) makes the subshell's status the failing command's, never sed's.
-          echo "── coverage (backgrounded alongside aggregate) ──"
-          ( { dr coverage && push_build coverage.pmtiles; } 2>&1 | sed -u 's/^/[coverage] /' ) & COV_PID=$!
-
-          # ── selective source hydrate (planet only; overlaps the backgrounded coverage) ──
+          # ── selective source hydrate (planet only) ──
           # Pull exactly the source files the stale tiles reference, so aggregate reads them
           # from local disk: sources-manifest derives the (source, filename) union with the
           # same key-based dirty derivation the run itself uses (FORCE_REBUILD included).
@@ -458,18 +446,20 @@ jobs:
             -e BBOX -e FORCE_REBUILD -e TOOLCHAIN "${AGG_ENV[@]}" "$IMAGE:$IMAGE_TAG" just aggregate || agg_rc=$?
           # Kill the loop on BOTH exits (success or failure) before anything else runs.
           if [ -n "$PUSH_LOOP" ]; then kill "$PUSH_LOOP" 2>/dev/null || true; wait "$PUSH_LOOP" 2>/dev/null || true; fi
-          # First failure wins, as in the sequential version: on an aggregate failure, reap
-          # the in-flight coverage job and fail with aggregate's rc (destroy still runs).
-          if [ "$agg_rc" -ne 0 ]; then kill "$COV_PID" 2>/dev/null || true; exit "$agg_rc"; fi
+          if [ "$agg_rc" -ne 0 ]; then exit "$agg_rc"; fi
           if [ -z "${BBOX:-}" ]; then
             push_agg
           fi
 
-          # Join the backgrounded coverage: propagate a nonzero rc so a coverage failure fails
-          # the build exactly as the sequential version did — well before manifest.json.
-          cov_rc=0
-          wait "$COV_PID" || cov_rc=$?
-          [ "$cov_rc" -eq 0 ] || { echo "coverage stage failed (rc=$cov_rc)" >&2; exit "$cov_rc"; }
+          # ── coverage ── SEQUENTIAL, after aggregate: run #6 proved the two can't share the box —
+          # full-speed aggregate (~110 GB across 48 workers) + the planet tippecanoe (~130 GB,
+          # --no-tile-size-limit over every footprint) oversubscribed 184 GB RAM + 64 GB swap and the
+          # kernel OOM-killed both. The overlap only ever paid when the old weight factor throttled
+          # aggregate into leaving coverage headroom. Each stage now gets the whole box; under set -e
+          # a coverage failure still fails the build before manifest.json.
+          echo "── coverage ──"
+          dr coverage
+          push_build coverage.pmtiles
 
           # ── mosaic index (LOCAL, for the on-box terrain render) ── build the GTI + planet z8 +
           #    index parquet from the mosaic tiles the aggregate persisted; terrain (stage 3) reads
