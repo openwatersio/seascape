@@ -1,0 +1,164 @@
+# German Federal Waterway Bathymetry — WSV DGM-W (Digitales Geländemodell des Wasserlaufs), 2 m.
+# Source: WSV INSPIRE "Höhe" (Elevation) pre-defined Atom download service.
+#   Browse : https://via.bund.de/wsv/inspire/  ->  "INSPIRE Höhe – Höhenmodell Bundeswasserstraßen"
+#   Feed   : https://via.bund.de/wsv/inspire/resttpl/client?request=getTableData&serviceId=1c4c7ffc-cdd8-11eb-8fb7-005056a877b6
+#
+# Each URL is a .zip holding one GeoTIFF (terrain + riverbed, 2 m, Float32, nodata -32768).
+# Per-tile CRS varies (DHDN/Gauss-Krüger and UTM/ETRS89 zones) -> mixed_crs source.
+# Contour ("Höhenlinien") zips from the same feed are excluded; Seascape builds its own contours.
+# License: GeoNutzV — attribute "© Wasserstraßen- und Schifffahrtsverwaltung des Bundes (WSV)".
+#
+# SCOPE (see README.md): DGM-W values are orthometric NHN elevation, not depth. Only the tidal/
+# estuary reaches below are ACTIVE — near/below MSL, they render as depth. The inland reaches
+# further down are COMMENTED OUT: their beds sit tens of metres above MSL, so they render as land
+# until referenced to a low-water surface. See README.md "Datum normalization (planned)" for the
+# per-reach referencing follow-up (tidal: BSH SKN-Fläche; inland: WSV GlW/Stauziel profiles).
+# ============================================================================================
+# ACTIVE — tidal / estuary reaches (SKN chart-datum surface available; render as depth)
+
+
+# Elbe — 10 tile(s)
+https://via.bund.de/wsv/inspire/download/el/0701_km585_600.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km600_610.zip
+https://via.bund.de/wsv/inspire/download/el/0792_km607_620.zip
+https://via.bund.de/wsv/inspire/download/el/0794_km610_626.zip
+https://via.bund.de/wsv/inspire/download/el/0792_km620_639.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km639_650.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km650_670.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km670_690.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km690_710.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km710_728.zip
+
+# Jade — 1 tile(s)
+https://via.bund.de/wsv/inspire/download/el/7060_7061.zip
+
+# Nordsee — 4 tile(s)
+https://via.bund.de/wsv/inspire/download/el/7080_km67_80.zip
+https://via.bund.de/wsv/inspire/download/el/7080_km80_100.zip
+https://via.bund.de/wsv/inspire/download/el/7040_km727_740.zip
+https://via.bund.de/wsv/inspire/download/el/7040_km740_753.zip
+
+# Unter-/Außenweser — 1 tile(s)
+https://via.bund.de/wsv/inspire/download/el/5298_7050.zip
+
+# Rhein free-flowing — 3 tile(s) (below the Iffezheim barrage, km 336; GlW-referenced)
+# Low-water datum = GlW (gleichwertiger Wasserstand), assembled from PEGELONLINE gauges in
+# rhein_glw.csv (see build_reference.py / harvest_gauges.py). The upper impounded reach
+# (km 164–337, 3901/3902… below) still needs Stauziel and stays deferred.
+https://via.bund.de/wsv/inspire/download/el/3901_km332_560.zip
+https://via.bund.de/wsv/inspire/download/el/3901_km639_739.zip
+https://via.bund.de/wsv/inspire/download/el/3901_km739_865.zip
+
+# Main — 6 tile(s) (impounded, km 0–102; Stauziel step surface)
+# Low-water datum = per-pool Stauziel from main_stau.csv (barrage levels, Wikipedia) with a
+# main_zs.csv gauge cross-check; build_reference.py steps the pool level at each barrage.
+https://via.bund.de/wsv/inspire/download/el/2901_km0_20.zip
+https://via.bund.de/wsv/inspire/download/el/2901_km20_40.zip
+https://via.bund.de/wsv/inspire/download/el/2901_km40_60.zip
+https://via.bund.de/wsv/inspire/download/el/2901_km60_78.zip
+https://via.bund.de/wsv/inspire/download/el/2901_km77_90.zip
+https://via.bund.de/wsv/inspire/download/el/2901_km90_102.zip
+
+# Rhein upper / impounded — 16 tile(s) (km 164–334, Basel→Iffezheim; per-pool Stauziel step surface)
+# Low-water datum = normal retention level per barrage from rhein_stau.csv; build_reference.py steps
+# the pool level at each barrage's latitude (the reach flows north, so latitude is the divider). The
+# free-flowing reach km 336–865 is active above (GlW).
+https://via.bund.de/wsv/inspire/download/el/3901_km164_174.zip
+https://via.bund.de/wsv/inspire/download/el/3902_km173_190.zip
+https://via.bund.de/wsv/inspire/download/el/3902_km190_205.zip
+https://via.bund.de/wsv/inspire/download/el/3902_km205_227.zip
+https://via.bund.de/wsv/inspire/download/el/3901_km226_235.zip
+https://via.bund.de/wsv/inspire/download/el/3903_km234_243.zip
+https://via.bund.de/wsv/inspire/download/el/3901_km242_249.zip
+https://via.bund.de/wsv/inspire/download/el/3904_km248_260.zip
+https://via.bund.de/wsv/inspire/download/el/3901_km259_268.zip
+https://via.bund.de/wsv/inspire/download/el/3905_km267_274.zip
+https://via.bund.de/wsv/inspire/download/el/3901_km273_284.zip
+https://via.bund.de/wsv/inspire/download/el/3906_km283_292.zip
+https://via.bund.de/wsv/inspire/download/el/3901_km291_308.zip
+https://via.bund.de/wsv/inspire/download/el/3907_km307_312.zip
+https://via.bund.de/wsv/inspire/download/el/3901_km311_326.zip
+https://via.bund.de/wsv/inspire/download/el/3901_km326_337.zip
+
+# Mosel — 1 tile(s) (impounded, km 1.9–229.9; 12-pool Stauziel step, arc-length along the river)
+# Low-water datum = per-barrage retention level from mosel_stau.csv; build_impounded steps the pool
+# level at each barrage, cross-checked against PEGELONLINE ZS_I (mosel_zs.csv).
+https://via.bund.de/wsv/inspire/download/el/3201.zip
+
+# Saar — 5 tile(s) (impounded, km 0–94; 8-pool Stauziel step incl. the Mosel-backwater stub)
+# Low-water datum = per-barrage retention level from saar_stau.csv (cross-check saar_zs.csv).
+https://via.bund.de/wsv/inspire/download/el/4201_km0_20.zip
+https://via.bund.de/wsv/inspire/download/el/4201_km20_40.zip
+https://via.bund.de/wsv/inspire/download/el/4201_km40_60.zip
+https://via.bund.de/wsv/inspire/download/el/4201_km60_80.zip
+https://via.bund.de/wsv/inspire/download/el/4201_km80_94.zip
+
+# Lahn — 3 tile(s) (impounded, km 80–136; 11-weir Stauziel step, arc-length along the river)
+# Low-water datum = per-weir Stauziel from lahn_stau.csv (WSV Steckbriefe; cross-check lahn_zs.csv).
+https://via.bund.de/wsv/inspire/download/el/2401_km80_100.zip
+https://via.bund.de/wsv/inspire/download/el/2401_km100_120.zip
+https://via.bund.de/wsv/inspire/download/el/2401_km120_136.zip
+
+# Elbe upper / free-flowing — 25 tile(s) (km 0–586, Czech border → Geesthacht weir; MNW ramp)
+# The Elbe is un-canalised, so low water is a smooth downstream ramp (not stepped). build_freeflowing
+# interpolates the per-gauge MNW-in-NHN (elbe_mnw.csv) along the gauge line — an open proxy for the
+# WSV's un-published per-gauge GlW. Below km 586 (Geesthacht) is tidal and covered by the SKN reach.
+https://via.bund.de/wsv/inspire/download/el/0701_km0_20.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km20_40.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km40_60.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km60_80.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km80_100.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km100_120.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km120_140.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km140_160.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km160_180.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km180_200.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km200_230.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km230_260.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km260_290.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km290_320.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km320_350.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km350_380.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km380_410.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km410_440.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km440_460.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km460_480.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km480_500.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km500_520.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km520_540.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km540_560.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km560_590.zip
+
+
+# ============================================================================================
+# INLAND — deferred: bed elevation far above MSL, needs GlW/Stauziel low-water referencing.
+# Uncomment a waterway block once the inland datum step (README §Datum normalization) lands.
+# ============================================================================================
+
+# Dortmund-Ems-Kanal — 2 tile(s) (inland, deferred)
+# https://via.bund.de/wsv/inspire/download/el/0501_km202_214.zip
+# https://via.bund.de/wsv/inspire/download/el/0501_km214_226.zip
+
+# Ems — 4 tile(s) (inland, deferred)
+# https://via.bund.de/wsv/inspire/download/el/1191_km0_20.zip
+# https://via.bund.de/wsv/inspire/download/el/1191_km20_40.zip
+# https://via.bund.de/wsv/inspire/download/el/1191_km40_60.zip
+# https://via.bund.de/wsv/inspire/download/el/1191_km60_68.zip
+
+# Grenzoder — 8 tile(s) (inland, deferred)
+# https://via.bund.de/wsv/inspire/download/el/6201_km542_560.zip
+# https://via.bund.de/wsv/inspire/download/el/6201_km560_580.zip
+# https://via.bund.de/wsv/inspire/download/el/6201_km580_600.zip
+# https://via.bund.de/wsv/inspire/download/el/6201_km600_620.zip
+# https://via.bund.de/wsv/inspire/download/el/6201_km620_640.zip
+# https://via.bund.de/wsv/inspire/download/el/6201_km640_660.zip
+# https://via.bund.de/wsv/inspire/download/el/6201_km660_680.zip
+# https://via.bund.de/wsv/inspire/download/el/6201_km680_705.zip
+
+# Havel-Oder — 3 tile(s) (inland, deferred)
+# https://via.bund.de/wsv/inspire/download/el/5801_km80_100.zip
+# https://via.bund.de/wsv/inspire/download/el/5801_km100_120.zip
+# https://via.bund.de/wsv/inspire/download/el/5801_km120_136.zip
+
+# Ober-/Mittelweser — 1 tile(s) (inland, deferred)
+# https://via.bund.de/wsv/inspire/download/el/5201.zip

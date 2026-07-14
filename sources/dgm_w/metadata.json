@@ -1,0 +1,9 @@
+{
+    "name": "German Federal Waterway Bathymetry (WSV DGM-W, 2 m) — tidal reaches",
+    "producer": "Wasserstraßen- und Schifffahrtsverwaltung des Bundes (WSV) / Bundesanstalt für Gewässerkunde (BfG)",
+    "website": "https://via.bund.de/wsv/inspire/",
+    "license": "GeoNutzV (attribution: © Wasserstraßen- und Schifffahrtsverwaltung des Bundes)",
+    "max_zoom": 14,
+    "datum": "Local low water (chart datum ~LAT tidally, else the river low-water datum). Raw DGM-W is orthometric NHN; the prep subtracts a per-reach low-water reference in NHN so the COG is depth below that datum, with above-datum land/drying clamped to nodata. References: SKN for the tidal estuaries (BSH SKN-Fläche grid + assembled inner-Elbe gauge profile), a low-water ramp for the free-flowing reaches (GlW for the Rhein, MNW proxy for the upper Elbe), per-pool Stauziel for the impounded canalised rivers (Main, upper Rhein, Mosel, Saar, Lahn). Active reaches: tidal (Nordsee, Außenelbe below Elbe-km 586, Jade, Unter-/Außenweser), free-flowing Rhein (km 336–865) and upper Elbe (km 0–586), Main (km 0–102), upper Rhein (km 164–334), Mosel (km 1.9–229.9), Saar (km 0–94), Lahn (km 80–136). Remaining inland reaches (Oder, Weser, Ems, canals) deferred — no published GlW/Stauziel. See README.",
+    "mixed_crs": true
+}

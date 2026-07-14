@@ -1,0 +1,34 @@
+# German Federal Waterway Bathymetry — WSV DGM-W (Digitales Geländemodell des Wasserlaufs), 2 m.
+# Run from pipelines/:  just ../sources/dgm_w/
+# Zipped GeoTIFF tiles from the WSV INSPIRE "Höhe" Atom download service (file_list.txt), one .tif
+# per zip, terrain + riverbed merged. Per-tile CRS (DHDN/Gauss-Krüger and UTM/ETRS89 zones) ->
+# mixed_crs: normalize WITHOUT --crs to keep each file's embedded CRS; aggregation reprojects each
+# tile from its own frame. Raw values are orthometric NHN elevation; nodata -32768.
+#
+# SCOPE: active reaches in file_list.txt — tidal estuaries (16 tiles: Nordsee, Außenelbe below
+# Elbe-km 586, Jade, Unter-/Außenweser), the free-flowing Rhein (3) and upper Elbe (25), and the
+# impounded canalised rivers Main (6), upper Rhein (16), Mosel (1), Saar (5), Lahn (3). The other
+# inland reaches stay commented out (bed above MSL, pending low-water referencing).
+#
+# DATUM: build_reference.py builds a per-reach low-water surface in NHN — SKN (chart datum ~= LAT)
+# for the tidal estuaries, a GlW/MNW ramp for the free-flowing Rhein + Elbe, per-pool Stauziel for
+# the impounded canalised rivers — into store/source/dgm_w/reference/. source_datum subtracts it (bed - datum =
+# depth) and --clamp-positive drops above-datum land/drying to nodata, so the synced COG is
+# low-water normalized. Licenses: DEM GeoNutzV (attribute WSV), BSH SKN-Fläche CC-BY 4.0 (attribute
+# BSH). Not for navigation.
+[no-cd]
+default: download normalize
+
+[no-cd]
+download:
+    uv run python source_download.py dgm_w
+
+[no-cd]
+normalize:
+    uv run python source_unzip.py dgm_w
+    uv run python ../sources/dgm_w/build_reference.py
+    uv run python source_datum.py dgm_w --offset-surface reference/reference.vrt --clamp-positive
+    uv run python source_normalize.py dgm_w --nodata -32768
+    uv run python source_bounds.py dgm_w
+    uv run python source_polygonize.py dgm_w 8
+    uv run python source_create_tarball.py dgm_w
