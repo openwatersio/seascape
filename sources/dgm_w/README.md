@@ -29,6 +29,16 @@ The full feed is 93 DEM tiles across 15 waterways: Elbe (35), Rhein (19), Grenzo
 Nordsee (4), Ems (4), Main (4), Havel-Oder (3), Lahn (3), Dortmund-Ems-Kanal (2), Main-2 (2), and
 one each for Jade, Mosel, Ober-/Mittelweser, and Unter-/Außenweser.
 
+Two prep scripts refresh the checked-in reference inputs (neither runs in the build — the build reads
+the committed files):
+- `harvest_gauges.py` — per-gauge low-water datums (GlW / ZS_I / MNW) in NHN from PEGELONLINE →
+  `<reach>_{glw,zs,mnw}.csv`.
+- `build_geometry.py` — river corridors + centerlines from **Overture Maps** (`base/water`, the same
+  anonymous S3 parquet `landmask.py` reads) → `<river>_river.wkt` / `<river>_centerline.wkt`. Overture
+  over Overpass: name-filterable, bbox pushdown, no timeouts. Its `base/water` theme has no weirs or
+  CEMT navigation locks, so the Main's weir lines and the upper Rhein's lock coords stay as the
+  one-off OSM snapshots checked into their `*_stau.csv` (the build never re-extracts those).
+
 ## The datum problem, and why only tidal reaches are active
 
 DGM-W stores **orthometric NHN elevation** (DHHN2016, height above ~mean sea level), not depth.
@@ -45,12 +55,13 @@ negative. That splits the waterways in two:
   bed is ~+130 m). As trusted data they keep their true elevation and render as **land, not
   water**. There is no single offset that fixes this — a river's water surface slopes downstream —
   so a per-reach low-water surface is subtracted instead (see below). Active so far: the
-  **free-flowing Rhein** below Iffezheim (km 336–865, 3 tiles, **GlW**) and the impounded canalised
+  **free-flowing** reaches on a low-water ramp — the **Rhein** below Iffezheim (km 336–865, 3 tiles,
+  **GlW**) and the **upper Elbe** (km 0–586, 25 tiles, **MNW** proxy) — and the impounded canalised
   rivers on **Stauziel** — the **Main** (km 0–102, 6 tiles), the **upper Rhein** (Basel→Iffezheim,
   km 164–334, 16 tiles), the **Mosel** (km 1.9–229.9, 1 tile), the **Saar** (km 0–94, 5 tiles), and
-  the **Lahn** (km 80–136, 3 tiles). The remaining inland tiles (upper Elbe, Oder, Weser, Ems, the
-  canals) stay **commented out** in `file_list.txt` — they publish no GlW/Stauziel, so they need an
-  MNW proxy or a state-sourced low-water datum first.
+  the **Lahn** (km 80–136, 3 tiles). The remaining inland tiles (Oder, Weser, Ems, the canals) stay
+  **commented out** in `file_list.txt` — they publish no GlW/Stauziel, so they need an MNW proxy or a
+  state-sourced low-water datum first.
 
 Not for navigation: NHN/SKN depths are approximate and unreduced to chart standards. This source
 is visualization-only, consistent with Seascape's non-navigational disclaimer.
@@ -68,9 +79,9 @@ supersede the estuary tiles here if desired.
 prep subtracts a **low-water reference surface** — the local low-water datum expressed in NHN — so
 the synced COG is depth below that datum, needing no special handling downstream. The datum differs
 by reach: **SKN** (Seekartennull ≈ LAT) for the tidal estuaries, **GlW** (gleichwertiger
-Wasserstand) for the free-flowing Rhein, and **Stauziel** (per-pool retention level) for the
-impounded canalised rivers (Main, upper Rhein, Mosel, Saar, Lahn). This is the scalar lake
-`--offset` (Bodensee) generalized to a spatially-varying surface.
+Wasserstand, or **MNW** where GlW is un-published) for the free-flowing Rhein and upper Elbe, and
+**Stauziel** (per-pool retention level) for the impounded canalised rivers (Main, upper Rhein, Mosel,
+Saar, Lahn). This is the scalar lake `--offset` (Bodensee) generalized to a spatially-varying surface.
 
 Per pixel: `bed_depth = bed_NHN − datum_NHN(x, y)`. Result is bed elevation referenced to the local
 low water (negative = depth below datum, same convention as the MLLW/LAT sources); above-datum cells
@@ -80,7 +91,7 @@ Pipeline steps (after `source_unzip`, before `source_normalize`):
 
 1. `build_reference.py` (bespoke, lives in this source dir) builds the low-water surface into
    `store/source/dgm_w/reference/` (a subdir, so the pipeline's `*.tif` globs never treat it as a
-   data tile). Seven reaches, each its own EPSG:4326 GeoTIFF, stitched into `reference.vrt` (a VRT so
+   data tile). Eight reaches, each its own EPSG:4326 GeoTIFF, stitched into `reference.vrt` (a VRT so
    each keeps its own extent/resolution and warp reads whichever overlaps a tile):
    - **Tidal — `skn_reference.tif`.** Outer estuaries + open Bight from the BSH **SKN-Fläche
      Nordsee 2026** ("Chart datum for the German Bight") grid of SKN in NHN, fetched at build time
@@ -90,15 +101,17 @@ Pipeline steps (after `source_unzip`, before `source_normalize`):
      values in `tideelbe_skn.csv` (transcribed from the GDWS "Seekartennull an den Tidepegeln … ab
      2026" table; SKN ~−1.9 m NHN tapering to ~−1.2 m near Zollenspieker, clamped at the most-
      upstream gauge above the weir). Refresh the BSH grid edition and the CSV together.
-   - **Free-flowing Rhein — `glw_rhein.tif`.** Below the Iffezheim barrage (km 336) the Rhein runs
-     free, so its datum is GlW. No packaged grid: the low-water longitudinal profile is assembled
-     from the per-gauge GlW-in-NHN values in `rhein_glw.csv` (harvested from PEGELONLINE by
-     `harvest_gauges.py` — see below). 17 gauges, Maxau (km 362) → Emmerich (km 852); GlW-in-NHN
-     ~101 m tapering to ~9 m. The **corridor is the OSM river union** (`rhein_river.wkt`), not the
-     gauge polyline: 17 gauges over ~530 km make a chord that misses the wide outer channel at the
-     big meanders (Düsseldorf/Kaiserswerth), so the Rhine there fell outside the mask. GlW is still
-     the gauge ramp — each pixel projected onto the gauge line, interpolated by arc-length (GlW
-     drifts ~0.02 m/km, so the coarse chord is fine for the *value*; only the *fill* needed the river).
+   - **Free-flowing Rhein / upper Elbe — `ramp_rhein.tif` / `ramp_elbe.tif`** (`build_freeflowing`).
+     Un-impounded rivers have no pools, so low water is a smooth downstream **ramp**, not a step. The
+     Rhein below Iffezheim uses **GlW** (`rhein_glw.csv`); the un-canalised Elbe (Czech border →
+     Geesthacht km 586) has no openly-published per-gauge GlW, so it uses **MNW** (`elbe_mnw.csv`) — a
+     few cm–dm below GlW, the conservative direction, and reproducible from PEGELONLINE. Both harvested
+     by `harvest_gauges.py`; the datum is interpolated along the gauge line by arc-length (low water
+     drifts ~0.02 m/km, so the coarse gauge chord is fine for the *value*). The **corridor is the
+     river union** (`rhein_river.wkt` / `elbe_river.wkt`, from Overture — see `build_geometry.py`),
+     NOT the gauge chord: gauges ~30 km apart
+     make a chord that misses the wide outer channel at big meanders (the Rhein's Düsseldorf bends),
+     so the river there fell outside the mask — the fill needed the real river, only the value didn't.
    - **Impounded Main — `zs_main.tif`.** The canalised Main (km 0–102 here) is a staircase of
      pools, each held at a fixed **Stauziel** by its barrage, so the datum is a **step function**,
      not a ramp: flat within a pool, jumping at each weir. Three data files, each addressing a
@@ -136,11 +149,12 @@ Pipeline steps (after `source_unzip`, before `source_normalize`):
      the general canalised-river builder). Each is a Stauziel staircase like the Main, but these
      rivers meander in every direction, so the pool divider is **arc-length along a proper
      centerline**, not latitude or a coarse chord: a pixel projected onto `<river>_centerline.wkt`
-     (a single LineString built by shortest-path through the OSM river graph — big meanders like the
+     (a single LineString built by shortest-path through the river graph — big meanders like the
      Cochem loop followed faithfully) lands in a pool, and takes the retention level of the barrage
      bounding it downstream. Flow direction is read off the falling levels, so river-km may run
-     either way (the Lahn's runs downstream, the Mosel/Saar's upstream). The **corridor** is the raw
-     OSM river union (`<river>_river.wkt`), filling the full channel width. Levels + km + coords in
+     either way (the Lahn's runs downstream, the Mosel/Saar's upstream). The **corridor** is the
+     river union (`<river>_river.wkt`); both geometries come from Overture (`build_geometry.py`).
+     Levels + km + coords in
      `<river>_stau.csv` (Mosel: Wikipedia "Liste der Moselstaustufen"; Saar: Wikipedia + PEGELONLINE
      headwater gauges; Lahn: the WSV/WSA-Koblenz "Steckbriefe" fact sheets), each **cross-checked**
      against the reach's ZS_I gauges (`<river>_zs.csv`) — the assert caught a Cochem-loop

@@ -41,6 +41,11 @@ REACHES = {
     "mosel": ("MOSEL", "ZS_I", 0.0, 245.0, "mosel_zs.csv"),   # impounded; cross-check Cochem/Trier
     "saar":  ("SAAR", "ZS_I", 0.0, 95.0, "saar_zs.csv"),      # impounded; Fremersdorf/Sankt Arnual
     "lahn":  ("LAHN", "ZS_I", 78.0, 140.0, "lahn_zs.csv"),    # impounded; Diez/Kalkofen (DEM km 80–136)
+    # Free-flowing Elbe (Czech border → Geesthacht weir km 586): the WSV references it to GlW, but
+    # GlW is not published per-gauge on the open web (only in WSA/BfG maintenance docs). MNW (mittleres
+    # Niedrigwasser) is the openly-available low-water Hauptzahl and sits a few cm–dm below GlW — the
+    # conservative (shallower) direction — so it's a sound reproducible proxy for a non-nav depth render.
+    "elbe":  ("ELBE", "MNW", 0.0, 587.0, "elbe_mnw.csv"),
 }
 
 
@@ -114,7 +119,11 @@ def _check():
 
 def main():
     here = sys.path[0]
-    for name, (water, char, min_km, max_km, out) in REACHES.items():
+    want = sys.argv[1:] or list(REACHES)  # optional reach names to refresh just those
+    for name in want:
+        if name not in REACHES:
+            sys.exit(f"unknown reach {name!r}; known: {', '.join(REACHES)}")
+        water, char, min_km, max_km, out = REACHES[name]
         rows = harvest(water, char, min_km, max_km)
         if not rows:
             sys.exit(f"{name}: no {char} gauges found — the API may have moved; check the site.")

@@ -45,18 +45,15 @@ BSH_ZIP = "https://gdi.bsh.de/de/data/Chart-datum-for-the-German-Bight-2026.zip"
 BSH_MEMBER = "SKN-Flaeche_Nordsee_2026_NHN.tif"
 HERE = os.path.dirname(__file__)
 ELBE_CSV = os.path.join(HERE, "tideelbe_skn.csv")
-RHEIN_CSV = os.path.join(HERE, "rhein_glw.csv")
 MAIN_ZS_CSV = os.path.join(HERE, "main_zs.csv")
 MAIN_STAU_CSV = os.path.join(HERE, "main_stau.csv")
 MAIN_CENTERLINE_WKT = os.path.join(HERE, "main_centerline.wkt")
 RHEIN_STAU_CSV = os.path.join(HERE, "rhein_stau.csv")
 RHEIN_CENTERLINE_WKT = os.path.join(HERE, "rhein_centerline.wkt")
-RHEIN_RIVER_WKT = os.path.join(HERE, "rhein_river.wkt")  # OSM lower-Rhine union: the GlW fill corridor
 
 CORRIDOR_DEG = 0.06   # ~6 km: only fill cells this close to the gauge line (keeps it to the river)
 MAIN_CORRIDOR = 0.015  # ~1.5 km: the Main is a narrow river — hug it (the estuary width isn't needed)
 RHEIN_UP_CORRIDOR = 0.02  # ~2 km: the upper Rhein channel/braids are wider than the Main
-RHEIN_CORRIDOR = 0.025  # ~2.5 km: the free-flowing lower Rhine is wide and meanders (Düsseldorf bends)
 EAST_MARGIN = 0.25    # extend the SKN canvas this far east of the most-upstream inner-Elbe gauge
 REACH_RES = 0.001     # ~110 m: a smooth ramp / flat pools resample cleanly onto 2 m tiles
 REACH_NODATA = -9999.0
@@ -189,25 +186,28 @@ def _corridor_reach(spine_pts, value_at_factory, ref_path, label, corridor_deg=C
     return ref_path
 
 
-def build_rhein(out_dir):
-    """GlW surface: free-flowing lower Rhein, GlW interpolated along the gauges -> glw_rhein.tif.
+def build_freeflowing(out_dir, name, gauge_csv, river_wkt, corridor, label):
+    """Ramp surface for a free-flowing river: a low-water datum interpolated along the gauges and
+    filled over the OSM river corridor.
 
-    Corridor is the OSM river union (rhein_river.wkt), NOT the gauge polyline: the 17 gauges span
-    ~530 km, so a corridor around their chord misses the wide outer channel at the big meanders
-    (Düsseldorf/Kaiserswerth) and the Rhine there falls outside the mask. The GlW value is still the
-    gauge ramp — each pixel projected onto the gauge line, GlW linearly interpolated by arc-length
-    (GlW drifts ~0.02 m/km, so the coarse chord is fine for the *value*; only the fill needed fixing)."""
-    gauges = read_gauges(RHEIN_CSV, "datum_nhn_m")
+    The corridor is the river union (``river_wkt``), NOT the gauge polyline: gauges are ~30 km apart,
+    so a corridor around their chord misses the wide outer channel at the big meanders (the Rhein's
+    Düsseldorf/Kaiserswerth bends) and the river there falls outside the mask. The value is still the
+    gauge ramp — each pixel projected onto the gauge line, the datum linearly interpolated by
+    arc-length (low water drifts ~0.02 m/km, so the coarse chord is fine for the *value*; only the
+    fill needed the river). Used for both the Rhein (GlW) and the Elbe (MNW proxy for the un-published
+    GlW), the two un-impounded reaches."""
+    gauges = read_gauges(gauge_csv, "datum_nhn_m")
     gline, gdist = _spine(gauges)
     gval = np.array([g[2] for g in gauges])
 
-    def value_at(proj, plon, plat):  # interp GlW at each pixel's projection onto the gauge line
+    def value_at(proj, plon, plat):  # interp the datum at each pixel's projection onto the gauge line
         s = np.asarray(shapely.line_locate_point(gline, points(np.column_stack([plon, plat]))))
         return np.interp(s, gdist, gval)
 
-    river = shapely.from_wkt(open(RHEIN_RIVER_WKT, encoding="utf-8").read())
-    return _paint_corridor(river, value_at, RHEIN_CORRIDOR, f"{out_dir}/glw_rhein.tif",
-                           "GlW-in-NHN", f"{len(gauges)} gauges")
+    river = shapely.from_wkt(open(river_wkt, encoding="utf-8").read())
+    return _paint_corridor(river, value_at, corridor, f"{out_dir}/ramp_{name}.tif",
+                           label, f"{len(gauges)} gauges")
 
 
 def build_main(out_dir):
@@ -367,6 +367,14 @@ def build_impounded(out_dir, name, corridor_wkt, centerline_wkt, stau_csv, corri
                            f"{len(barr)} pools")
 
 
+# Free-flowing (un-impounded) reaches built by build_freeflowing: name, gauge CSV (low-water datum
+# in NHN), OSM-river corridor, corridor half-width (deg), log label. GlW for the Rhein; MNW for the
+# Elbe (open proxy for the un-published GlW — see harvest_gauges.py).
+FREEFLOWING = [
+    ("rhein", "rhein_glw.csv", "rhein_river.wkt", 0.025, "GlW-in-NHN"),
+    ("elbe",  "elbe_mnw.csv",  "elbe_river.wkt",  0.03,  "MNW-in-NHN"),
+]
+
 # Canalised Stauziel rivers built by build_impounded: name, OSM-river corridor, centerline (shortest
 # path for arc-length pools), barrage table, corridor half-width (deg), ZS_I cross-check CSV.
 IMPOUNDED = [
@@ -379,7 +387,9 @@ IMPOUNDED = [
 def main():
     out_dir = "store/source/dgm_w/reference"
     os.makedirs(out_dir, exist_ok=True)
-    parts = [build_tidal(out_dir), build_rhein(out_dir), build_main(out_dir), build_rhein_upper(out_dir)]
+    parts = [build_tidal(out_dir), build_main(out_dir), build_rhein_upper(out_dir)]
+    parts += [build_freeflowing(out_dir, name, os.path.join(HERE, gauge), os.path.join(HERE, riv), corr, label)
+              for name, gauge, riv, corr, label in FREEFLOWING]
     parts += [build_impounded(out_dir, name, os.path.join(HERE, riv), os.path.join(HERE, cl),
                               os.path.join(HERE, stau), corr, os.path.join(HERE, zs))
               for name, riv, cl, stau, corr, zs in IMPOUNDED]

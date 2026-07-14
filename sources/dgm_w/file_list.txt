@@ -99,6 +99,36 @@ https://via.bund.de/wsv/inspire/download/el/2401_km80_100.zip
 https://via.bund.de/wsv/inspire/download/el/2401_km100_120.zip
 https://via.bund.de/wsv/inspire/download/el/2401_km120_136.zip
 
+# Elbe upper / free-flowing — 25 tile(s) (km 0–586, Czech border → Geesthacht weir; MNW ramp)
+# The Elbe is un-canalised, so low water is a smooth downstream ramp (not stepped). build_freeflowing
+# interpolates the per-gauge MNW-in-NHN (elbe_mnw.csv) along the gauge line — an open proxy for the
+# WSV's un-published per-gauge GlW. Below km 586 (Geesthacht) is tidal and covered by the SKN reach.
+https://via.bund.de/wsv/inspire/download/el/0701_km0_20.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km20_40.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km40_60.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km60_80.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km80_100.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km100_120.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km120_140.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km140_160.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km160_180.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km180_200.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km200_230.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km230_260.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km260_290.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km290_320.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km320_350.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km350_380.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km380_410.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km410_440.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km440_460.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km460_480.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km480_500.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km500_520.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km520_540.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km540_560.zip
+https://via.bund.de/wsv/inspire/download/el/0701_km560_590.zip
+
 
 # ============================================================================================
 # INLAND — deferred: bed elevation far above MSL, needs GlW/Stauziel low-water referencing.
@@ -108,33 +138,6 @@ https://via.bund.de/wsv/inspire/download/el/2401_km120_136.zip
 # Dortmund-Ems-Kanal — 2 tile(s) (inland, deferred)
 # https://via.bund.de/wsv/inspire/download/el/0501_km202_214.zip
 # https://via.bund.de/wsv/inspire/download/el/0501_km214_226.zip
-
-# Elbe — 25 tile(s) (inland, deferred)
-# https://via.bund.de/wsv/inspire/download/el/0701_km0_20.zip
-# https://via.bund.de/wsv/inspire/download/el/0701_km20_40.zip
-# https://via.bund.de/wsv/inspire/download/el/0701_km40_60.zip
-# https://via.bund.de/wsv/inspire/download/el/0701_km60_80.zip
-# https://via.bund.de/wsv/inspire/download/el/0701_km80_100.zip
-# https://via.bund.de/wsv/inspire/download/el/0701_km100_120.zip
-# https://via.bund.de/wsv/inspire/download/el/0701_km120_140.zip
-# https://via.bund.de/wsv/inspire/download/el/0701_km140_160.zip
-# https://via.bund.de/wsv/inspire/download/el/0701_km160_180.zip
-# https://via.bund.de/wsv/inspire/download/el/0701_km180_200.zip
-# https://via.bund.de/wsv/inspire/download/el/0701_km200_230.zip
-# https://via.bund.de/wsv/inspire/download/el/0701_km230_260.zip
-# https://via.bund.de/wsv/inspire/download/el/0701_km260_290.zip
-# https://via.bund.de/wsv/inspire/download/el/0701_km290_320.zip
-# https://via.bund.de/wsv/inspire/download/el/0701_km320_350.zip
-# https://via.bund.de/wsv/inspire/download/el/0701_km350_380.zip
-# https://via.bund.de/wsv/inspire/download/el/0701_km380_410.zip
-# https://via.bund.de/wsv/inspire/download/el/0701_km410_440.zip
-# https://via.bund.de/wsv/inspire/download/el/0701_km440_460.zip
-# https://via.bund.de/wsv/inspire/download/el/0701_km460_480.zip
-# https://via.bund.de/wsv/inspire/download/el/0701_km480_500.zip
-# https://via.bund.de/wsv/inspire/download/el/0701_km500_520.zip
-# https://via.bund.de/wsv/inspire/download/el/0701_km520_540.zip
-# https://via.bund.de/wsv/inspire/download/el/0701_km540_560.zip
-# https://via.bund.de/wsv/inspire/download/el/0701_km560_590.zip
 
 # Ems — 4 tile(s) (inland, deferred)
 # https://via.bund.de/wsv/inspire/download/el/1191_km0_20.zip
