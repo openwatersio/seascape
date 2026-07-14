@@ -46,14 +46,19 @@ shared `source_catalog.py` tail generates the catalog item.
 
 ## Gotchas
 
-- **Vertical datum varies per territory.** Unlike CONUS (uniform NAVD88), each
-  nearshore product ships its own local datum — verified in the tile headers:
-  HI = MSL (EPSG:9705), PR = PRVD02, USVI = VIVD09, Guam = GUVD04, AmSam = ASVD02,
-  CNMI = NAVD88. The 1/3″ Pacific offshore band (Guam/AmSam/CNMI) is labeled NAVD88.
+- **Vertical datum varies per territory, and per tier.** Unlike CONUS (uniform
+  NAVD88), each territory ships its own local datum — verified in the tile headers.
+  The two tiers do **not** agree for the Pacific territories, so keep them separate:
+  - 1/9″ (nearshore): HI = MSL (EPSG:9705), PR = PRVD02, USVI = VIVD09,
+    Guam = GUVD04, AmSam = ASVD02, CNMI = NAVD88.
+  - 1/3″ (offshore band): HI = MSL, PR = PRVD02, USVI = VIVD09, and Guam / AmSam /
+    CNMI are labeled NAVD88.
+
   All are local-MSL-family, so ingesting **as-is** — no normalize, exactly like CONUS
   NAVD88 — is consistent with current behavior. When [#16](https://github.com/openwatersio/seascape/issues/16)'s
-  low-water offset lands, each territory needs its **own** offset (distinct datums);
-  the per-territory datum is recorded in the `file_list.txt` header for that reason.
+  low-water offset lands, each territory needs its **own** offset (distinct datums),
+  and it must read the datum from the correct tier; the per-territory datum is
+  recorded in each `file_list.txt` header for that reason.
 - **NoData varies per tile** (`-9999` and `-999999`, vs CONUS `-99999`). Not a
   problem: `gdalwarp` reads each tile's nodata + CRS at reproject and remaps to the
   pipeline's `-dstnodata -9999`, so no per-tile handling is needed.

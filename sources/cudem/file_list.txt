@@ -8,7 +8,7 @@
 https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_ninth_Topobathy_2014_8483/urllist8483.txt
 
 # Territory topobathy (issue #32): Hawaii, Puerto Rico, USVI, Guam, American Samoa,
-# CNMI — same NCEI bucket family, same COG tiles, ~250 more tiles. Each nearshore
+# CNMI — same NCEI bucket family, same COG tiles, 106 more tiles. Each nearshore
 # product carries its OWN local vertical datum, not NAVD88: HI=MSL, PR=PRVD02,
 # USVI=VIVD09, Guam=GUVD04, AmSam=ASVD02, CNMI=NAVD88 (all local-MSL-family, verified
 # in the tile headers). NoData varies per tile (-9999 / -999999); gdalwarp reads each
