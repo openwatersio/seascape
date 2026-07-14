@@ -280,7 +280,7 @@ jobs:
           #    EXIT trap reaps it however the step ends.
           ( set +eu; pt=0; pi=0; pk=0
             while :; do
-              set -- $(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8+$9, $5+$6; exit}' /proc/stat); tot=$1; idl=$2
+              read -r tot idl < <(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8+$9, $5+$6; exit}' /proc/stat)
               if [ "${pt}" -ne 0 ] && [ "$((tot-pt))" -gt 0 ]; then
                 cpu=$(awk "BEGIN{printf \"%.0f\", ${CORES}*(($tot-$pt)-($idl-$pi))/($tot-$pt)}")
               else cpu="?"; fi
