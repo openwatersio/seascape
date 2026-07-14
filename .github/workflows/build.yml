@@ -273,6 +273,27 @@ jobs:
           if [ "${FORCE:-}" = "true" ]; then export FORCE_REBUILD=1; else export FORCE_REBUILD=; fi
           echo "box: ${CORES} cores / ${MEM_GB} GB → AGG_PROCESSES=$AGG_PROCESSES, BUNDLE_PROCESSES=$BUNDLE_PROCESSES, BBOX='${BBOX:-}', FORCE='${FORCE:-}'"
 
+          # ── resource sampler ── one compact line every 30 s, interleaved into THIS log next to the
+          #    stage markers (no artifact, no sysstat; reads /proc on the host, so it covers the whole
+          #    docker build). mem carries a running high-water (pk) — the OOM headroom at a glance, the
+          #    number three OOM'd runs made us infer. set +eu so a transient read never kills it; the
+          #    EXIT trap reaps it however the step ends.
+          ( set +eu; pt=0; pi=0; pk=0
+            while :; do
+              set -- $(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8+$9, $5+$6; exit}' /proc/stat); tot=$1; idl=$2
+              if [ "${pt}" -ne 0 ] && [ "$((tot-pt))" -gt 0 ]; then
+                cpu=$(awk "BEGIN{printf \"%.0f\", ${CORES}*(($tot-$pt)-($idl-$pi))/($tot-$pt)}")
+              else cpu="?"; fi
+              pt=$tot; pi=$idl
+              used=$(awk '/MemTotal/{t=$2} /MemAvailable/{a=$2} END{printf "%.0f",(t-a)/1048576}' /proc/meminfo)
+              if [ "${used}" -gt "${pk}" ]; then pk=$used; fi
+              sw=$(awk '/SwapTotal/{t=$2} /SwapFree/{f=$2} END{printf "%.1f",(t-f)/1048576}' /proc/meminfo)
+              echo "[res] $(date -u +%H:%M:%S)  cpu=${cpu}/${CORES}  mem=${used}/${MEM_GB}g(pk${pk})  swap=${sw}g  load=$(cut -d' ' -f1 /proc/loadavg)"
+              sleep 30
+            done ) &
+          RES_PID=$!
+          trap 'kill "${RES_PID}" 2>/dev/null || true' EXIT
+
           # docker run wrapper: repo code at /app, the store bind-mounted, BBOX/FORCE/TOOLCHAIN
           # forwarded (+ BUNDLE_PROCESSES — only bundle.py reads it; harmless elsewhere).
           dr() { docker run --rm -v "$GITHUB_WORKSPACE:/app" -v "$STORE:/app/pipelines/store" \
