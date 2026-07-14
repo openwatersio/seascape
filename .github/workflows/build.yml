@@ -17,20 +17,21 @@ name: Build
 # keepalive tuning, and the `build.env` + `%q` quoting: secrets now flow as native job `env:`,
 # which removes the sourced-file code-injection vector by construction (no file is ever `source`d).
 #
-# The store lives in R2 under bathymetry/ as an IMMUTABLE, CONTENT-ADDRESSED store: every artifact
-# carries its content-hash key (pipelines/keys.py) IN its filename (<stem>-<key12>.<ext>), so a
-# stage skips artifacts whose name is present and a code/config change writes a NEW name — the old
-# one becomes unreferenced garbage the GC (gc.yml) collects. Nothing is ever mutated or deleted in
-# place. Each planet build assembles a STORE MANIFEST (the content name of every artifact it left)
-# and flips a one-object pointer (store/manifest.json) LAST — one atomic PUT — so the next build's
-# hydrate and the GC see the whole old world or the whole new one. Source registration/mirroring +
-# the land/water masks are sources.yml — a build never contacts an upstream; it reads every byte
-# (sources + masks) from R2 over /vsicurl.
-# Final bundles land in build/<sha>/; a release promotes that build (release.yml).
+# The STORE lives on a PERSISTENT Hetzner volume (env.STORE_VOLUME) attached to each build box: an
+# IMMUTABLE, CONTENT-ADDRESSED cache where every artifact carries its content-hash key
+# (pipelines/keys.py) IN its filename (<stem>-<key12>.<ext>), so a stage skips artifacts whose name
+# is present and a code/config change writes a NEW name. Because the volume outlives the box, every
+# run — completed OR interrupted — leaves durable progress the next run reuses with zero hydrate or
+# resume machinery; the volume is a CACHE (sources + code regenerate it), so losing it costs one
+# forced rebuild, never data. R2 keeps what it is right for: the stage-1 sources mirror (synced
+# down to the volume incrementally), and the published PRODUCTS — the mosaic (tiles + GTI,
+# pointer-last atomic publish) and the per-build bundles in build/<sha>/ (release.yml promotes
+# them). Source registration/mirroring + the land/water masks are sources.yml — a build never
+# contacts an upstream.
 #
 # Dispatch-only (a shared store shouldn't be mutated by routine pushes); any branch can trigger
-# one. A `bbox` builds a self-contained regional slice (no volume, no store push, no manifest/
-# pointer, never released). Deletion is out-of-band: gc.yml, sharing this concurrency group, is the
+# one. A `bbox` builds a self-contained regional slice (no volume — NVMe scratch store, never
+# released). Deletion is out-of-band: gc.yml, sharing this concurrency group, is the
 # only path. The light per-commit checks are ci.yml.
 
 on:
@@ -59,6 +60,13 @@ env:
   SERVER_TYPE: ${{ github.event.inputs.server_type }}
   SERVER_IMAGE: ubuntu-24.04
   SERVER_LOCATION: fsn1
+  # The PERSISTENT store volume (planet builds): the content-addressed store + hydrated sources
+  # survive between runs, so builds resume from whatever any prior run finished — completed or not.
+  # It is a CACHE, not a product: sources + code regenerate all of it, so losing it costs one forced
+  # rebuild, never data. Lives in SERVER_LOCATION (volumes attach same-location only). Sized for
+  # store (~100 GiB) + sources (~250 GiB) + bundle peak (~100 GiB); resizable live via console.
+  STORE_VOLUME: seascape-store
+  STORE_VOLUME_GB: "500"
   # Server hostname AND runner label (Cyclenerd/hcloud-github-runner registers the runner with
   # --labels "<name>,hetzner").
   NAME: seascape-build-${{ github.run_id }}
@@ -104,10 +112,10 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # Boot an on-demand Hetzner box and register it as a self-hosted runner for this repo. The store
-  # lives on the box's local NVMe root disk — no attached volume — so this job just boots + registers.
-  # server_id is emitted by the action BEFORE its registration wait, so it is available to
-  # delete-runner even if registration times out — teardown still runs.
+  # Boot an on-demand Hetzner box, register it as a self-hosted runner for this repo, and (planet
+  # builds) attach the persistent store volume. server_id is emitted by the action BEFORE its
+  # registration wait, so it is available to delete-runner even if registration times out —
+  # teardown still runs.
   create-runner:
     runs-on: ubuntu-latest
     permissions: { contents: read }
@@ -129,12 +137,38 @@ jobs:
           server_type: ${{ env.SERVER_TYPE }}
           location: ${{ env.SERVER_LOCATION }}
           image: ${{ env.SERVER_IMAGE }}
-          # No attached volume: the store lives on the box's LOCAL NVMe root disk. ccx63 ships ~960 GB
-          # local NVMe — bigger AND faster than the old 400 GB network volume — so the build (~50 GiB
-          # store + ~240 GiB dirty-set sources + ~100 GiB bundle peak ≈ 400 GiB) fits with headroom on
-          # root. 'null' is the action's sentinel for "attach none" (an empty string fails its int check).
-          # The build job's df precheck fails loudly if a box ever has too small a root disk.
+          # 'null' = the action attaches no volume of its own ('' fails its int check). The PERSISTENT
+          # store volume is attached by the step below instead — the action's volume support only
+          # creates+deletes per-run volumes, which is the opposite of a persistent cache.
           volume: 'null'
+
+      # ── attach the PERSISTENT store volume (planet builds only) ── the build cache (content-
+      # addressed store + hydrated sources) lives on a long-lived Hetzner volume, so a fresh box
+      # starts with the previous run's store already present: no manifest hydrate, no line-rate
+      # source re-download (~10 min/run), and an INTERRUPTED run's finished tiles are reused by the
+      # next run's content keys with zero resume machinery. Created once here (create-if-missing =
+      # self-bootstrapping); never deleted by any workflow. Attach fails loudly if the volume is
+      # still attached elsewhere (a leaked server) — the r2-store concurrency group means no two
+      # builds race for it. bbox smokes keep the NVMe scratch store and may run in any location;
+      # the volume pins planet builds to SERVER_LOCATION.
+      - name: Attach persistent store volume (planet only)
+        if: ${{ github.event.inputs.bbox == '' }}
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+          SERVER_ID: ${{ steps.runner.outputs.server_id }}
+        run: |
+          set -euo pipefail
+          # Pinned + sha256-verified hcloud (this job holds HCLOUD_TOKEN — same discipline as delete-runner).
+          curl -fsSL -o /tmp/hcloud.tgz https://github.com/hetznercloud/cli/releases/download/v1.66.0/hcloud-linux-amd64.tar.gz
+          echo "8b1a8598858232c491f58cbf65ce1bd0ec6f725114bb62ec967a20ab03e29a86  /tmp/hcloud.tgz" | sha256sum -c
+          tar xzf /tmp/hcloud.tgz -C /tmp hcloud
+          sudo mv /tmp/hcloud /usr/local/bin/
+          if ! hcloud volume describe "$STORE_VOLUME" >/dev/null 2>&1; then
+            echo "store volume $STORE_VOLUME does not exist — creating (${STORE_VOLUME_GB} GB, $SERVER_LOCATION; one-time bootstrap)"
+            hcloud volume create --name "$STORE_VOLUME" --size "$STORE_VOLUME_GB" --location "$SERVER_LOCATION"
+          fi
+          hcloud volume attach "$STORE_VOLUME" --server "$SERVER_ID"
+          echo "volume $STORE_VOLUME attached to server $SERVER_ID"
 
   # Runs NATIVELY on the Hetzner box (runs-on: the runner label the action minted). No SSH, no
   # rsync, no build.env — secrets are native job env, and the pipeline is the same `just` stages
@@ -178,10 +212,10 @@ jobs:
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
           # ── docker + the PINNED sha256-verified rclone (apt's 1.60.1 501s on R2's version-id
-          #    responses — same pin as sources.yml/release.yml). jq: read the store pointer +
-          #    manifest. The runner runs as root, so no sudo. ──
+          #    responses — same pin as sources.yml/release.yml). The runner runs as root, so no
+          #    sudo. ──
           apt-get update -qq
-          apt-get install -y -qq unzip jq
+          apt-get install -y -qq unzip
           command -v docker >/dev/null || curl -fsSL https://get.docker.com | sh
           curl -fsSL -o /tmp/rclone.zip "https://downloads.rclone.org/v1.74.4/rclone-v1.74.4-linux-amd64.zip"
           echo "fe435e0c36228e7c2f116a8701f01127bb1f694005fc11d1f27186c8bca4115d  /tmp/rclone.zip" | sha256sum -c
@@ -196,16 +230,38 @@ jobs:
           set -euo pipefail
           cd "$GITHUB_WORKSPACE"
 
-          # ── store on the box's LOCAL NVMe root disk (no attached volume) ── ccx63 has ~960 GB
-          #    local NVMe, faster than a network volume. A planet build needs ~400 GiB (store +
-          #    dirty-set sources + bundle peak); precheck the root filesystem has room and FAIL LOUD
-          #    if a box is ever too small, rather than running out mid-build. bbox is far smaller.
-          STORE="$GITHUB_WORKSPACE/pipelines/store"
-          mkdir -p "$STORE"
+          # ── store on the PERSISTENT volume (planet) / local NVMe (bbox) ── create-runner attached
+          #    the long-lived volume; mount it and point STORE there. The store survives the box, so
+          #    content keys skip everything ANY prior run finished — the hydrate/push-loop/resume
+          #    machinery this replaces is deleted below. First boot: blank volume → mkfs (one-time).
+          #    AGGREGATION SCRATCH stays on the box's local NVMe: store/aggregation holds only the
+          #    per-run covering plan + each tile's multi-GB reproject/merge tmp churn — regenerated
+          #    every run, never worth persisting, and its IO (TBs across a planet run) would saturate
+          #    a Ceph-backed volume (~300 MB/s) that shrugs at the durable artifacts' write rate.
+          #    dr() nested-binds it over the volume mount, so the pipeline sees one store path.
+          SCRATCH="$GITHUB_WORKSPACE/pipelines/store-scratch"
+          mkdir -p "$SCRATCH"
           if [ -z "${BBOX:-}" ]; then
+            dev=""
+            for _ in $(seq 1 30); do
+              for d in /dev/disk/by-id/scsi-0HC_Volume_*; do [ -e "$d" ] && dev="$d" && break; done
+              [ -n "$dev" ] && break
+              sleep 2
+            done
+            [ -n "$dev" ] || { echo "store volume device never appeared — was the attach step skipped or the volume attached elsewhere?" >&2; exit 1; }
+            blkid "$dev" >/dev/null 2>&1 || { echo "blank volume — one-time mkfs"; mkfs.ext4 -q -L seascape-store "$dev"; }
+            mkdir -p /mnt/seascape-store
+            mount -o noatime "$dev" /mnt/seascape-store
+            STORE="/mnt/seascape-store/store"
+            mkdir -p "$STORE"
             avail_gb=$(df -BG --output=avail "$STORE" | tail -1 | tr -dc '0-9')
-            [ "${avail_gb:-0}" -ge 450 ] || { echo "root disk has only ${avail_gb:-?} GiB free at $STORE — a planet build needs ~450; use a box with a bigger local NVMe (ccx63 = ~960)" >&2; exit 1; }
-            echo "store on local NVMe: ${avail_gb} GiB free at $STORE"
+            [ "${avail_gb:-0}" -ge 100 ] || { echo "store volume has only ${avail_gb:-?} GiB free — grow $STORE_VOLUME in the console (resizable live)" >&2; exit 1; }
+            scratch_gb=$(df -BG --output=avail "$SCRATCH" | tail -1 | tr -dc '0-9')
+            [ "${scratch_gb:-0}" -ge 300 ] || { echo "root NVMe has only ${scratch_gb:-?} GiB free for aggregation scratch — a planet build churns ~300; use a bigger box" >&2; exit 1; }
+            echo "store on volume $STORE_VOLUME: ${avail_gb} GiB free at $STORE; scratch on NVMe: ${scratch_gb} GiB free"
+          else
+            STORE="$GITHUB_WORKSPACE/pipelines/store"
+            mkdir -p "$STORE"
           fi
 
           # ── swap SAFETY NET (planet builds only; the LOCAL NVMe root disk, never the attached
@@ -239,8 +295,8 @@ jobs:
           #        from (scheduler.reserve) across its tile's memory-peak section, sized to
           #        weight(tile). This BOUNDS THE CONCURRENT HEAVY-TILE PEAK: the densest coastal
           #        macrotiles can't all merge at once (the OOM), while cores stay full of light tiles.
-          #    RESERVE (~40) covers OS/docker + the periodic push that share the box during aggregate
-          #    (coverage is sequential now — run #6's OOM was the two overlapping). The budget is sized to PHYSICAL RAM only — the
+          #    RESERVE (~40) covers OS/docker + page cache for the volume writes during aggregate
+          #    (coverage is sequential — run #6's OOM was the two overlapping; the push loop is gone). The budget is sized to PHYSICAL RAM only — the
           #    64 GB swap above is a safety net for a tile that peaks past its estimate, NOT budget
           #    headroom (swapping the hot merge arrays would thrash). ccx63 (48/192): pool 48, budget
           #    ~150 GB. ccx33 (8/32): reserve shrinks with RAM so a small box still gets a real budget.
@@ -301,7 +357,10 @@ jobs:
 
           # docker run wrapper: repo code at /app, the store bind-mounted, BBOX/FORCE/TOOLCHAIN
           # forwarded (+ BUNDLE_PROCESSES — only bundle.py reads it; harmless elsewhere).
+          # store/aggregation is NESTED-bound to NVMe scratch over the volume mount (see the store
+          # block above): the pipeline sees one store path, the volume never sees the tmp churn.
           dr() { docker run --rm -v "$GITHUB_WORKSPACE:/app" -v "$STORE:/app/pipelines/store" \
+            -v "$SCRATCH:/app/pipelines/store/aggregation" \
             -e BBOX -e FORCE_REBUILD -e TOOLCHAIN -e BUNDLE_PROCESSES \
             -e TERRAIN_PROCESSES -e TERRAIN_MEM_BUDGET_GB -e AGG_MEM_FACTOR \
             -e GDAL_CACHEMAX "$IMAGE:$IMAGE_TAG" just "$@"; }
@@ -321,40 +380,16 @@ jobs:
           push() { rclone copy "$STORE/$1" "$R2/$2" "${XFER[@]}" "${@:3}"; }
           push_build() { rclone copyto "$STORE/bundle/$1" "$R2/build/$SHA/$1" "${XFER[@]}"; }
 
-          # ── HYDRATE (planet only): MANIFEST-DRIVEN. Read the store pointer, fetch the manifest
-          #    it names, and rclone copy EXACTLY the artifacts it references (--files-from) — so
-          #    unreferenced garbage in the prefixes (superseded keys awaiting GC) costs no hydrate
-          #    bytes. Plus each source's bounds.csv + catalog.json (the tile keys read the item's
-          #    recipe hash + flags) + the footprint gpkgs. Source COGs + masks are hydrated
-          #    selectively AFTER cover (the dirty-set list doesn't exist yet — see the
-          #    sources-manifest block below). Bootstrap: no pointer yet = the FIRST immutable
-          #    build — hydrate nothing and clean-rebuild (the phase-4 rename makes every phase-3
-          #    artifact stale anyway, so a full re-key rebuild happens regardless; adopting the
-          #    old mutable names by renaming is not worth the fragility). Once this build's
-          #    manifest lands, the legacy names become GC debris. A bbox build rebuilds its window
-          #    from scratch and streams sources — bounds + catalog + footprints only, never a
-          #    planet-scoped pointer. ──
-          if [ -z "${BBOX:-}" ]; then
-            echo "── hydrate ──"
-            if rclone cat "$R2/store/manifest.json" > /tmp/pointer.json 2>/dev/null && [ -s /tmp/pointer.json ]; then
-              mref=$(jq -r '.manifest // empty' /tmp/pointer.json)
-              [ -n "$mref" ] || { echo "store pointer exists but names no manifest — corrupt pointer.json, refusing to guess" >&2; exit 1; }
-              rclone cat "$R2/store/$mref" > /tmp/manifest.json \
-                || { echo "pointer names $mref but it failed to fetch — pointer/manifest mismatch, refusing to hydrate" >&2; exit 1; }
-              jq -r '.entries[].name' /tmp/manifest.json > /tmp/hydrate-files.txt
-              n=$(wc -l < /tmp/hydrate-files.txt)
-              [ "$n" -gt 0 ] || { echo "store manifest $mref references 0 artifacts — refusing to hydrate an empty world" >&2; exit 1; }
-              echo "hydrating $n referenced store artifacts (manifest $mref)"
-              rclone copy "$R2" "$STORE" "${XFER[@]}" --files-from /tmp/hydrate-files.txt
-            else
-              echo "no store pointer in R2 — first immutable build, clean rebuild (nothing to hydrate)"
-            fi
-            hydrate source source --include '*/bounds.csv' --include '*/catalog.json'
-            hydrate polygon polygon
-          else
-            hydrate source source --include '*/bounds.csv' --include '*/catalog.json'
-            hydrate polygon polygon
-          fi
+          # ── NO STORE HYDRATE. The store IS the volume — whatever any prior run finished (completed
+          #    or interrupted) is already at $STORE, and the content-addressed names are
+          #    self-certifying (key in the filename; local writes are atomic), so freshness checks
+          #    skip it directly. The old manifest-driven R2 hydrate, its bootstrap branch, and the
+          #    resume problem are all deleted, not ported. What still syncs FROM R2 is stage-1 state
+          #    the volume doesn't own: bounds/catalog (source identity), footprints, masks, and the
+          #    dirty-set source files (below, after cover) — all incremental, mostly no-ops once the
+          #    volume is warm. A bbox build keeps the NVMe scratch store and streams sources. ──
+          hydrate source source --include '*/bounds.csv' --include '*/catalog.json'
+          hydrate polygon polygon
 
           # ── aggregate env. Planet builds read sources + masks from LOCAL disk (hydrated
           #    below, after cover names the dirty tiles): two real runs streaming per tile
@@ -432,29 +467,14 @@ jobs:
           fi
 
           echo "── aggregate ──"
-          # Periodic background pushes while aggregate runs, so a long stage makes durable net
-          # progress instead of holding every tile until its end. rclone copy is idempotent
-          # (finished tiles skip), so the loop is cheap. A file caught mid-write copies torn, but
-          # the next pass overwrites it and the final post-stage push (under set -e) is
-          # authoritative — acceptable residual. Loop failures never abort the build.
-          # Aggregate now produces the stage-2 MOSAIC tiles + the vector forks (NOT terrain pmtiles
-          # — those are stage 3's per-zoom render). Push only mosaic/tiles here (immutable, content-
-          # addressed, delta-sized); the mosaic index + the mosaic.gti pointer are pushed LATER,
-          # after mosaic-index builds them, with the pointer last.
-          push_agg() { push mosaic/tiles mosaic/tiles; push contour contour; push soundings soundings; push depare depare; }
-          PUSH_LOOP=
-          if [ -z "${BBOX:-}" ]; then
-            ( while sleep 1200; do push_agg || true; done ) & PUSH_LOOP=$!
-          fi
-          agg_rc=0
+          # Aggregate produces the stage-2 MOSAIC tiles + the vector forks (NOT terrain pmtiles —
+          # those are stage 3's per-zoom render) straight onto the persistent volume, so every
+          # finished tile is durable the moment it lands. The old 20-min push_agg loop (mid-build
+          # R2 durability, torn-copy caveats and all) is deleted — its entire job is now a property
+          # of the storage. R2 sees mosaic tiles only at the mosaic-publish step below.
           docker run --rm -v "$GITHUB_WORKSPACE:/app" -v "$STORE:/app/pipelines/store" \
-            -e BBOX -e FORCE_REBUILD -e TOOLCHAIN "${AGG_ENV[@]}" "$IMAGE:$IMAGE_TAG" just aggregate || agg_rc=$?
-          # Kill the loop on BOTH exits (success or failure) before anything else runs.
-          if [ -n "$PUSH_LOOP" ]; then kill "$PUSH_LOOP" 2>/dev/null || true; wait "$PUSH_LOOP" 2>/dev/null || true; fi
-          if [ "$agg_rc" -ne 0 ]; then exit "$agg_rc"; fi
-          if [ -z "${BBOX:-}" ]; then
-            push_agg
-          fi
+            -v "$SCRATCH:/app/pipelines/store/aggregation" \
+            -e BBOX -e FORCE_REBUILD -e TOOLCHAIN "${AGG_ENV[@]}" "$IMAGE:$IMAGE_TAG" just aggregate
 
           # ── coverage ── SEQUENTIAL, after aggregate: run #6 proved the two can't share the box —
           # full-speed aggregate (~110 GB across 48 workers) + the planet tippecanoe (~130 GB,
@@ -480,10 +500,12 @@ jobs:
           echo "── terrain (per-zoom render from the mosaic) ──"
           dr terrain
           if [ -z "${BBOX:-}" ]; then
-            # The served terrain pmtiles. No covering publish: content names carry all incremental
-            # state, and a re-dispatch hydrates the last manifest's artifacts + re-renders only what
-            # never landed.
-            push pmtiles pmtiles
+            # No terrain-pmtiles or store push: those prefixes were R2-store STATE for the deleted
+            # hydrate, and the store now persists on the volume. The store manifest + pointer flip
+            # are deleted with it — the manifest existed to name a consistent hydrate set; the only
+            # R2 publishes left are PRODUCTS: the mosaic (below, pointer-last) and build/<sha>/.
+            # (gc.yml re-rooting onto mosaic indexes + build manifests is a follow-up — do not run
+            # GC until that lands.)
 
             # ── MOSAIC PUBLISH ── the mosaic is a GDAL-openable published product (QGIS QA,
             #    preview-from-mosaic, third parties). Re-run mosaic-index with MOSAIC_VSI_BASE so the
@@ -493,32 +515,14 @@ jobs:
             #    + index) BEFORE flipping the mosaic.gti pointer — pointer-last atomic publish.
             echo "── mosaic publish (/vsicurl index) ──"
             docker run --rm -v "$GITHUB_WORKSPACE:/app" -v "$STORE:/app/pipelines/store" \
+              -v "$SCRATCH:/app/pipelines/store/aggregation" \
               -e TOOLCHAIN -e MOSAIC_VSI_BASE="/vsicurl/$PUBLIC_BASE/mosaic/tiles" \
               "$IMAGE:$IMAGE_TAG" just mosaic-index
-            push mosaic/tiles mosaic/tiles                 # immutable tile COGs (dedup; push_agg already sent these)
+            push mosaic/tiles mosaic/tiles                 # immutable tile COGs (delta-sized: unchanged keys skip)
             push mosaic mosaic --include 'planet-z8-*.tif' # the z8 overview COG (the .gti <Overview>)
             push mosaic/index mosaic/index                 # the /vsicurl GeoParquet index
             rclone copyto "$STORE/mosaic/mosaic.gti" "$R2/mosaic/mosaic.gti" "${XFER[@]}"  # pointer LAST
             echo "mosaic published: tiles + planet-z8 + index pushed, mosaic.gti pointer flipped"
-
-            # ── STORE PUBLISH: the content-addressed store (mosaic tiles + vector forks + terrain
-            #    pmtiles) is complete after terrain. Assemble the manifest (a walk of the local
-            #    store, in aggregate's key-affecting env so its recomputed keys match the content
-            #    names — it now records mosaic + terrain + vector entries), push it, then flip the
-            #    one-object pointer LAST — one atomic PUT. A reader (the next hydrate, the GC) sees
-            #    the whole old world or the whole new one; a crash before the flip leaves the old
-            #    pointer over a complete old store, and this build's pushed-but-unreferenced objects
-            #    are GC debris. The bounds.csv-last / catalog-last pattern, generalized. ──
-            echo "── store manifest + pointer ──"
-            MANIFEST_ID=$(docker run --rm -v "$GITHUB_WORKSPACE:/app" -v "$STORE:/app/pipelines/store" \
-              -e BBOX -e FORCE_REBUILD -e TOOLCHAIN "${AGG_ENV[@]}" "$IMAGE:$IMAGE_TAG" just store-manifest | tail -1)
-            [ -n "$MANIFEST_ID" ] || { echo "store-manifest produced no id" >&2; exit 1; }
-            rclone copy "$STORE/manifests" "$R2/store/manifests" "${XFER[@]}"
-            n=$(jq -r '.entries | length' "$STORE/manifests/$MANIFEST_ID.json")
-            [ "$n" -gt 0 ] || { echo "store manifest $MANIFEST_ID references 0 artifacts — refusing to flip the pointer" >&2; exit 1; }
-            printf '{"manifest":"manifests/%s.json","sha":"%s","entries":%s}\n' "$MANIFEST_ID" "$SHA" "$n" \
-              | rclone rcat "$R2/store/manifest.json"
-            echo "store published: manifest $MANIFEST_ID ($n artifacts), pointer flipped"
           fi
 
           echo "── bundle (terrain) ──"
@@ -551,9 +555,11 @@ jobs:
 
   # Destroy the box + deregister the runner, ALWAYS — on build success, build failure, OR a
   # create-runner failure (server_id is emitted before the registration wait, so it is present even
-  # if the runner never registered). No volume to destroy (store is on the box's local NVMe, gone
-  # with the box). LOUD-DESTROY discipline: a still-present server after teardown is a leaked
-  # billable resource and fails the step (also flags a stray volume, though none is created now).
+  # if the runner never registered). The PERSISTENT store volume ($STORE_VOLUME) is deliberately
+  # NEVER deleted; Hetzner auto-detaches it when the server is deleted, freeing it for the next
+  # build. LOUD-DESTROY discipline: a still-present server after teardown is a leaked billable
+  # resource and fails the step (a stray per-run volume named after the server is flagged too;
+  # $STORE_VOLUME never matches that name).
   delete-runner:
     needs: [create-runner, build]
     if: always()
