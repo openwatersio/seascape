@@ -136,12 +136,28 @@ def peak_rss_gb():
     return ru / 1e9 if sys.platform == "darwin" else ru / 1e6  # macOS: bytes→GB; Linux: KB→GB
 
 
+_WORKER_PEAK = 0.0  # this worker PROCESS's last-seen ru_maxrss high-water (GB); module global per worker
+
+
 def log_peak(stem):
-    """Plain-print this worker's peak RSS alongside the tile stem, child_z, and computed weight — the
-    data that lets the factor be tuned DOWN after a run. Structured logging is a separate task."""
+    """Log peak RSS for factor tuning. ru_maxrss is the worker PROCESS's MONOTONIC lifetime high-water,
+    not this tile's peak — a Pool worker reuses across many tiles, so a light tile would otherwise
+    inherit an earlier heavy tile's number. So log the PID and flag only a tile that DROVE a NEW
+    high-water (that tile caused the peak). The max `drove … peak` across all workers is the heaviest
+    tile's real peak, correctly attributed — the number to tune the factor against. (Structured
+    logging is a separate task.)"""
+    global _WORKER_PEAK
+    import os
     cz = int(stem.split("-")[3])
     w = weight(stem, _BUDGET_GB, _FACTOR) if _BUDGET_GB else weight(stem)
-    print(f"tile {stem} z{cz} weight={w} peak_rss={peak_rss_gb():.1f}GB", flush=True)
+    rss = peak_rss_gb()
+    pid = os.getpid()
+    if rss > _WORKER_PEAK + 0.05:
+        print(f"tile {stem} z{cz} weight={w} drove worker[{pid}] peak {rss:.1f}GB "
+              f"(was {_WORKER_PEAK:.1f})", flush=True)
+        _WORKER_PEAK = rss
+    else:
+        print(f"tile {stem} z{cz} weight={w} worker[{pid}] peak {rss:.1f}GB", flush=True)
 
 
 def pool_kwargs(budget_gb):

@@ -123,9 +123,12 @@ jobs:
       - name: Install hcloud CLI
         if: ${{ github.event.inputs.bbox == '' }}
         run: |
-          curl -fsSL https://github.com/hetznercloud/cli/releases/latest/download/hcloud-linux-amd64.tar.gz \
-            | tar xz hcloud
-          sudo mv hcloud /usr/local/bin/
+          # Pinned + sha256-verified: this job holds HCLOUD_TOKEN, so an unpinned `latest` from a
+          # compromised release or MITM would hand over infra control (same discipline as rclone).
+          curl -fsSL -o /tmp/hcloud.tgz https://github.com/hetznercloud/cli/releases/download/v1.66.0/hcloud-linux-amd64.tar.gz
+          echo "8b1a8598858232c491f58cbf65ce1bd0ec6f725114bb62ec967a20ab03e29a86  /tmp/hcloud.tgz" | sha256sum -c
+          tar xzf /tmp/hcloud.tgz -C /tmp hcloud
+          sudo mv /tmp/hcloud /usr/local/bin/
 
       - name: Create build volume (planet only)
         id: volume
@@ -589,9 +592,12 @@ jobs:
           HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
         run: |
           set -euo pipefail
-          curl -fsSL https://github.com/hetznercloud/cli/releases/latest/download/hcloud-linux-amd64.tar.gz \
-            | tar xz hcloud
-          sudo mv hcloud /usr/local/bin/
+          # Pinned + sha256-verified: this job holds HCLOUD_TOKEN, so an unpinned `latest` from a
+          # compromised release or MITM would hand over infra control (same discipline as rclone).
+          curl -fsSL -o /tmp/hcloud.tgz https://github.com/hetznercloud/cli/releases/download/v1.66.0/hcloud-linux-amd64.tar.gz
+          echo "8b1a8598858232c491f58cbf65ce1bd0ec6f725114bb62ec967a20ab03e29a86  /tmp/hcloud.tgz" | sha256sum -c
+          tar xzf /tmp/hcloud.tgz -C /tmp hcloud
+          sudo mv /tmp/hcloud /usr/local/bin/
           # Delete the build volume by NAME, gated on its actual EXISTENCE — not on the exported
           # volume_id, which is empty if create-runner made the volume but died before emitting the
           # output, leaving a volume this step would otherwise skip (an avoidable leak). It detaches
