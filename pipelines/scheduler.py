@@ -126,14 +126,16 @@ def reserve(stem):
 
 
 def peak_rss_gb():
-    """This worker process's peak resident set, in GB. ru_maxrss is KB on Linux (the build box) and
-    BYTES on macOS — normalise both. Captures the WHOLE run's peak, so it covers the vector forks'
-    own peaks (depare's shapely union + the gdal_contour subprocess) on top of the merge, not just
-    the modelled merge — the number the factor should ultimately be tuned against."""
+    """(self_gb, children_gb): this worker process's peak resident set AND its reaped subprocesses'
+    (gdal_contour — RUSAGE_SELF is blind to children, which hid multi-GB per tile from two runs'
+    factor tuning). ru_maxrss is KB on Linux (the build box) and BYTES on macOS — normalise both.
+    self covers the whole run incl. the in-process forks (depare's shapely union); self+children is
+    the conservative per-tile footprint the factor is tuned against (they can peak concurrently)."""
     import resource
     import sys
-    ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    return ru / 1e9 if sys.platform == "darwin" else ru / 1e6  # macOS: bytes→GB; Linux: KB→GB
+    div = 1e9 if sys.platform == "darwin" else 1e6  # macOS: bytes→GB; Linux: KB→GB
+    return (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / div,
+            resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / div)
 
 
 _WORKER_PEAK = 0.0  # this worker PROCESS's last-seen ru_maxrss high-water (GB); module global per worker
@@ -155,15 +157,16 @@ def log_peak(stem, sources=None):
     import os
     cz = int(stem.split("-")[3])
     w = weight(stem, _BUDGET_GB, _FACTOR) if _BUDGET_GB else weight(stem)
-    rss = peak_rss_gb()
+    rss, child = peak_rss_gb()
     pid = os.getpid()
     src = f" src={sources}" if sources is not None else ""
+    ch = f" child={child:.1f}GB" if child >= 0.05 else ""
     if rss > _WORKER_PEAK + 0.05:
-        print(f"tile {stem} z{cz} weight={w}{src} drove worker[{pid}] peak {rss:.1f}GB "
+        print(f"tile {stem} z{cz} weight={w}{src} drove worker[{pid}] peak {rss:.1f}GB{ch} "
               f"(was {_WORKER_PEAK:.1f})", flush=True)
         _WORKER_PEAK = rss
     else:
-        print(f"tile {stem} z{cz} weight={w}{src} worker[{pid}] peak {rss:.1f}GB", flush=True)
+        print(f"tile {stem} z{cz} weight={w}{src} worker[{pid}] peak {rss:.1f}GB{ch}", flush=True)
 
 
 def pool_kwargs(budget_gb):

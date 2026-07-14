@@ -255,15 +255,14 @@ jobs:
           export TERRAIN_PROCESSES=$CORES
           export AGG_MEM_BUDGET_GB=$BUDGET
           export TERRAIN_MEM_BUDGET_GB=$BUDGET
-          # Weight factor (scheduler.weight): 1. The old 4 was calibrated to a PHANTOM: pre-
-          # maxtasksperchild, long-lived pool workers never returned freed memory (glibc arenas), so
-          # ru_maxrss RATCHETED to ~15 GB across a dozen tiles and log_peak mis-attributed that to one
-          # tile. With maxtasksperchild=1 each tile gets a fresh worker (peak "(was 0.0)"), and the
-          # TRUE per-tile peak is ~0.2–2.8 GB — even a dense z14 (317k soundings) hit 2.8. factor 1 →
-          # weight(z14)=5 (ceil of the 4.3 GB output-array geometry, already ≥ the observed peak) →
-          # ~30 concurrent in the ~152 budget → the box's cores actually fill. 30×3 GB real = 90 GB,
-          # far under budget; the 64 GB swap net covers any tail tile beyond the sample.
-          export AGG_MEM_FACTOR=1
+          # Weight factor (scheduler.weight): 4. Run #7 settled this with fresh-worker (ratchet-proof)
+          # measurements: dense z14 tiles REALLY peak 12.4+ GB in a single worker — the factor-1
+          # experiment misread a light-tile log window as the whole distribution and OOM'd runs #6+#7
+          # in ~30 min (48 workers × real 12 GB heavies admitted at weight 5 → ~245 GB demand).
+          # factor 4 → weight(z14)=18 → ~8 concurrent heavies ≈ 110 GB, proven stable for hours by
+          # run #4; the SHUFFLE keeps the other pool slots busy on weight-1 light tiles between
+          # heavies, so this no longer costs the idle cores it did pre-shuffle.
+          export AGG_MEM_FACTOR=4
           export BUNDLE_PROCESSES=$BND
           export GDAL_CACHEMAX=256
           # The toolchain identity for the content-hash keys (pipelines/keys.py): the deps-keyed
@@ -289,6 +288,12 @@ jobs:
               if [ "${used}" -gt "${pk}" ]; then pk=$used; fi
               sw=$(awk '/SwapTotal/{t=$2} /SwapFree/{f=$2} END{printf "%.1f",(t-f)/1048576}' /proc/meminfo)
               echo "[res] $(date -u +%H:%M:%S)  cpu=${cpu}/${CORES}  mem=${used}/${MEM_GB}g(pk${pk})  swap=${sw}g  load=$(cut -d' ' -f1 /proc/loadavg)"
+              # Under pressure, NAME the memory: top processes by RSS, so an OOM post-mortem reads
+              # "which process" straight from the log instead of inferring it from totals (runs #6/#7
+              # burned two boxes on exactly that inference). Threshold ~80% of RAM; at most every 2nd tick.
+              if [ "${used}" -gt $(( MEM_GB * 8 / 10 )) ]; then
+                ps -eo rss,pid,comm --sort=-rss --no-headers | awk 'NR<=10{printf "[res]   %5.1fg %7s %s\n", $1/1048576, $2, $3}'
+              fi
               sleep 30
             done ) &
           RES_PID=$!
