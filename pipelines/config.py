@@ -128,7 +128,9 @@ def source_path(source, filename):
        registered straight off a public bucket) — use it verbatim.
     2. ``SOURCE_VSI_BASE`` is set (the CI aggregate job reading prepared COGs from
        the public data bucket) — resolve ``<base>/<source>/<filename>``, e.g.
-       ``/vsicurl/https://data.openwaters.io/bathymetry/source/gebco/gebco_0.tif``.
+       ``/vsicurl/https://data.openwaters.io/bathymetry/source/gebco/gebco_0.tif``,
+       but a locally-prepared copy on disk wins if it exists (a preview reads the
+       source you're iterating on from disk and streams the rest from R2).
     3. Otherwise (local dev) — ``store/source/<source>/<filename>`` on disk.
 
     So locally-prepared sources stream from R2 in CI yet read from disk locally,
@@ -137,10 +139,11 @@ def source_path(source, filename):
     """
     if filename.startswith("/vsi"):
         return filename
+    local = f"store/source/{source}/{filename}"
     base = os.environ.get("SOURCE_VSI_BASE")
     if base:
-        return f"{base}/{source}/{filename}"
-    return f"store/source/{source}/{filename}"
+        return local if os.path.isfile(local) else f"{base}/{source}/{filename}"
+    return local
 
 
 def file_list(source):

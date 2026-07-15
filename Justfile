@@ -149,23 +149,30 @@ preview bbox="-74.30,40.40,-73.75,40.80" local="":
         mkdir -p store/polygon
         for id in $(uv run python -c "import config; print('\n'.join(config.sources()))"); do
             mkdir -p "store/source/$id"
-            curl -fsS "$BOUNDS_BASE/$id/bounds.csv" -o "store/source/$id/bounds.csv" \
-                || { echo "skip $id (no bounds.csv in R2)"; rm -rf "store/source/$id"; }
+            # bounds.csv, catalog.json, and polygon all fetch from R2 only when absent locally
+            # — a local copy (from local prep, or edited to iterate) always wins, mirroring
+            # source_path preferring local COGs. Fetch to a temp and move on success so a 404
+            # never leaves a truncated file. A source with neither a bounds.csv nor local COGs
+            # is pruned.
+            [ -f "store/source/$id/bounds.csv" ] \
+                || { curl -fsS "$BOUNDS_BASE/$id/bounds.csv" -o "store/source/$id/bounds.csv.tmp" \
+                        && mv "store/source/$id/bounds.csv.tmp" "store/source/$id/bounds.csv" \
+                        || rm -f "store/source/$id/bounds.csv.tmp"; }
+            [ -f "store/source/$id/bounds.csv" ] || ls "store/source/$id"/*.tif >/dev/null 2>&1 \
+                || { echo "skip $id (no bounds.csv locally or in R2)"; rm -rf "store/source/$id"; continue; }
             # Catalog item (priority/offset/flags + recipe hash — the tile keys read it).
-            # Replace only on success; absent (a source registered before the catalog step
-            # existed) falls back to metadata.json. Note the fetched item SHADOWS local
-            # metadata.json knob edits (priority/max_zoom) — to iterate those against streamed
-            # sources, delete store/source/<id>/catalog.json so the metadata fallback applies.
-            if [ -d "store/source/$id" ]; then
-                curl -fsS "$BOUNDS_BASE/$id/catalog.json" -o "store/source/$id/catalog.json.tmp" \
-                    && mv "store/source/$id/catalog.json.tmp" "store/source/$id/catalog.json" \
-                    || rm -f "store/source/$id/catalog.json.tmp"
-            fi
+            # Absent (a source registered before the catalog step existed) falls back to
+            # metadata.json — so local metadata.json knob edits (priority/max_zoom) now take
+            # effect without deleting a fetched catalog.json.
+            [ -f "store/source/$id/catalog.json" ] \
+                || { curl -fsS "$BOUNDS_BASE/$id/catalog.json" -o "store/source/$id/catalog.json.tmp" \
+                        && mv "store/source/$id/catalog.json.tmp" "store/source/$id/catalog.json" \
+                        || rm -f "store/source/$id/catalog.json.tmp"; }
             # Provenance footprint for the coverage tileset (mirrored sources have none).
-            # Replace only on success — a 404 must not clobber a locally-prepared polygon.
-            curl -fsS "$POLY_BASE/$id.gpkg" -o "store/polygon/$id.gpkg.tmp" \
-                && mv "store/polygon/$id.gpkg.tmp" "store/polygon/$id.gpkg" \
-                || rm -f "store/polygon/$id.gpkg.tmp"
+            [ -f "store/polygon/$id.gpkg" ] \
+                || { curl -fsS "$POLY_BASE/$id.gpkg" -o "store/polygon/$id.gpkg.tmp" \
+                        && mv "store/polygon/$id.gpkg.tmp" "store/polygon/$id.gpkg" \
+                        || rm -f "store/polygon/$id.gpkg.tmp"; }
         done
         # Land mask for the coarse-source clamp: prefer a local copy if it's already there,
         # else stream it from R2 like the sources; if neither exists, it's built locally (below).
