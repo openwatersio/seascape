@@ -172,12 +172,15 @@ jobs:
 
   # Runs NATIVELY on the Hetzner box (runs-on: the runner label the action minted). No SSH, no
   # rsync, no build.env — secrets are native job env, and the pipeline is the same `just` stages
-  # the old SSH heredoc ran, in the same order, with the same pushes interleaved. No timeout-
-  # minutes: a self-hosted job isn't subject to the 6 h hosted cap; the ceiling is the 72 h
-  # workflow limit, effectively non-binding, so a forced full planet rebuild runs to completion.
+  # the old SSH heredoc ran, in the same order, with the same pushes interleaved.
+  # timeout-minutes is REQUIRED even on self-hosted: self-hosted escapes the 6 h HOSTED-runner
+  # platform cap, but the per-job DEFAULT timeout is 360 min on every runner type — omitting the
+  # key guillotined a healthy planet build at exactly 6 h (run 29371657768, 61% done). 48 h is a
+  # runaway backstop (box costs ~€2/hr), far above any real build.
   build:
     needs: [image, create-runner]
     runs-on: ${{ needs.create-runner.outputs.label }}
+    timeout-minutes: 2880
     permissions: { contents: read, packages: read }
     env:
       # Native job env — no build.env, no `%q`, nothing is ever `source`d, so the sourced-file
@@ -388,6 +391,21 @@ jobs:
           #    the volume doesn't own: bounds/catalog (source identity), footprints, masks, and the
           #    dirty-set source files (below, after cover) — all incremental, mostly no-ops once the
           #    volume is warm. A bbox build keeps the NVMe scratch store and streams sources. ──
+
+          # ── ONE-TIME SEED from R2 (first boot of a blank volume only, marker-gated) ── the old
+          #    push loop left thousands of finished tiles' artifacts in these prefixes (runs #6-#8
+          #    banked ~1900+ tiles that no run could ever see again); same code = same content keys,
+          #    so seeding them onto the volume makes the first volume build skip that work outright.
+          #    This is NOT run #5's per-run prefix-scan mistake: it runs ONCE ever (the marker),
+          #    transfers real data at line rate, and every later boot skips it entirely. It also
+          #    copies superseded-key garbage (~one GC generation's worth) — harmless cache bloat the
+          #    first forced rebuild orphans and a volume cleanup can drop.
+          if [ ! -e "$STORE/.seeded-from-r2" ]; then
+            echo "── one-time seed: prior runs' aggregate output from R2 ──"
+            for p in mosaic/tiles contour soundings depare; do hydrate "$p" "$p"; done
+            touch "$STORE/.seeded-from-r2"
+          fi
+
           hydrate source source --include '*/bounds.csv' --include '*/catalog.json'
           hydrate polygon polygon
 
