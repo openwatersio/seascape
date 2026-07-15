@@ -50,7 +50,11 @@ HALO_PX = 64
 #     fits in RAM with ZERO swap even if the real peak is 18 GB. Trades some heavy-tile concurrency
 #     (other cores still saturate on light tiles) for guaranteed-in-RAM completion — an OOM under a
 #     marginal budget is worse than a clean exit-137 (it leaks the reservation AND can hang the pool).
-# Tune DOWN once the per-tile peak_rss log (run()/_render()) gives real RSS data.
+# Tune DOWN once the per-tile peak_rss log (run()/_render()) gives real RSS data. Run 29371657768
+# measured z14 SERIAL-fork peaks of median 12.4 / max 14.4 GB against weight 18 — but the vector
+# forks now run concurrently (aggregation_run.run), which changes the peak shape, so that data no
+# longer prices this factor. Re-fit from the first parallel-fork run's log_peak lines (the env
+# knob AGG_MEM_FACTOR needs no code change).
 DEFAULT_FACTOR = float(os.environ.get("AGG_MEM_FACTOR", "4"))
 
 
@@ -104,17 +108,37 @@ def init_worker(cond, avail, budget_gb, factor):
     _COND, _AVAIL, _BUDGET_GB, _FACTOR = cond, avail, budget_gb, factor
 
 
+# The cheap lane: heavy tiles may never drain the budget below this floor, so weight-1/2 tiles
+# always have GB to acquire and the spare cores stay busy. Without it the planet run collapses:
+# 8 × weight-18 z14 tiles == the whole 144 GB budget, avail hits 0, and every other worker —
+# including 1 GB ocean tiles — blocks for hours (run 29371657768: 6 h at cpu 17/48, mem 95/184).
+# The floor shrinks to keep any single heavy admissible on an idle budget (deadlock-freedom:
+# effective floor ≤ budget − w always, so a lone waiter proceeds; clamped tiles still run alone).
+CHEAP_LANE_GB = 16
+CHEAP_MAX_W = 2  # weights ≤ this are "cheap": they ignore the floor and only need their own GB
+
+
+def lane_floor(w, budget_gb):
+    """GB a task of weight w must leave unclaimed. 0 for cheap tiles; for heavies, the cheap
+    lane — shrunk so the task itself stays admissible on an idle budget (never > budget − w)."""
+    if w <= CHEAP_MAX_W:
+        return 0
+    return max(0, min(CHEAP_LANE_GB, budget_gb - w))
+
+
 @contextmanager
 def reserve(stem):
     """Hold weight(stem) GB of the shared budget across the wrapped memory-peak section. Blocks
     until the budget can satisfy the FULL weight (atomic acquire — never a partial hold), then
-    releases in a try/finally so a normal exception frees it. No-op when no budget is configured."""
+    releases in a try/finally so a normal exception frees it. Heavy tiles additionally leave
+    CHEAP_LANE_GB unclaimed (the cheap lane above). No-op when no budget is configured."""
     if _COND is None or not _BUDGET_GB:
         yield
         return
     w = weight(stem, _BUDGET_GB, _FACTOR)
+    floor = lane_floor(w, _BUDGET_GB)
     with _COND:
-        while _AVAIL.value < w:
+        while _AVAIL.value < w + floor:
             _COND.wait()
         _AVAIL.value -= w
     try:
@@ -221,6 +245,15 @@ def _check():
         w = weight(f"{z}-0-0-{cz}", budget)
         assert 1 <= w <= budget, f"clamped weight must stay in [1, budget], got {w} for cz={cz}"
     assert weight(f"{z}-0-0-20", budget) == budget, "an over-budget tile must clamp to the budget"
+
+    # (a2) the cheap lane: heavies leave the floor, cheap tiles ignore it, and the floor never
+    # makes a task inadmissible on an idle budget (lane_floor ≤ budget − w).
+    assert lane_floor(1, 160) == 0 and lane_floor(2, 160) == 0, "cheap tiles must ignore the floor"
+    assert lane_floor(18, 160) == CHEAP_LANE_GB, "a z14 heavy must leave the full cheap lane"
+    assert lane_floor(150, 160) == 10, "the floor must shrink to keep a huge tile admissible"
+    assert lane_floor(160, 160) == 0, "a budget-sized (clamped) tile must still run alone"
+    for w_, b_ in ((1, 4), (3, 4), (18, 160), (5, 8)):
+        assert lane_floor(w_, b_) + w_ <= b_ or w_ <= CHEAP_MAX_W, f"floor+w must fit budget ({w_},{b_})"
 
     # (b) a mixed-weight run through the real budget mechanism, low budget, short sleeps to force
     # overlap: the concurrently-admitted weight must NEVER exceed the budget, and every task must

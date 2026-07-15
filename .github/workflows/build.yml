@@ -298,16 +298,19 @@ jobs:
           #        from (scheduler.reserve) across its tile's memory-peak section, sized to
           #        weight(tile). This BOUNDS THE CONCURRENT HEAVY-TILE PEAK: the densest coastal
           #        macrotiles can't all merge at once (the OOM), while cores stay full of light tiles.
-          #    RESERVE (~40) covers OS/docker + page cache for the volume writes during aggregate
-          #    (coverage is sequential — run #6's OOM was the two overlapping; the push loop is gone). The budget is sized to PHYSICAL RAM only — the
+          #    RESERVE (~24) covers OS/docker + page cache for the volume writes during aggregate
+          #    (coverage is sequential — run #6's OOM was the two overlapping; the push loop is gone).
+          #    24, down from 40: run #8 (29371657768) peaked the WHOLE box at 121/184 GB with zero
+          #    swap — the old 40 never came close to being needed, and each reclaimed GB is budget
+          #    for the heavy lane. The budget is sized to PHYSICAL RAM only — the
           #    64 GB swap above is a safety net for a tile that peaks past its estimate, NOT budget
           #    headroom (swapping the hot merge arrays would thrash). ccx63 (48/192): pool 48, budget
-          #    ~150 GB. ccx33 (8/32): reserve shrinks with RAM so a small box still gets a real budget.
+          #    ~160 GB. ccx33 (8/32): reserve shrinks with RAM so a small box still gets a real budget.
           #    GDAL_CACHEMAX=256 MB (sources are LOCAL now via selective hydrate, so the block cache
           #    matters far less) trims every worker's footprint. ──
           CORES=$(nproc)
           MEM_GB=$(( $(getconf _PHYS_PAGES) * $(getconf PAGE_SIZE) / 1073741824 ))
-          RESERVE=$(( MEM_GB / 4 )); [ "$RESERVE" -gt 40 ] && RESERVE=40
+          RESERVE=$(( MEM_GB / 4 )); [ "$RESERVE" -gt 24 ] && RESERVE=24
           BUDGET=$(( MEM_GB - RESERVE )); [ "$BUDGET" -lt 4 ] && BUDGET=4
           BND=$(( MEM_GB / 8 )); [ "$BND" -gt "$CORES" ] && BND=$CORES; [ "$BND" -lt 1 ] && BND=1
           export AGG_PROCESSES=$CORES
@@ -318,9 +321,13 @@ jobs:
           # measurements: dense z14 tiles REALLY peak 12.4+ GB in a single worker — the factor-1
           # experiment misread a light-tile log window as the whole distribution and OOM'd runs #6+#7
           # in ~30 min (48 workers × real 12 GB heavies admitted at weight 5 → ~245 GB demand).
-          # factor 4 → weight(z14)=18 → ~8 concurrent heavies ≈ 110 GB, proven stable for hours by
-          # run #4; the SHUFFLE keeps the other pool slots busy on weight-1 light tiles between
-          # heavies, so this no longer costs the idle cores it did pre-shuffle.
+          # factor 4 → weight(z14)=18 → ~8-9 concurrent heavies ≈ 110 GB, proven stable for hours
+          # by run #4. Light tiles stay admissible via scheduler's CHEAP LANE (heavies must leave
+          # 16 GB of budget unclaimed — run #8 showed 8×18 = the exact budget, starving even 1 GB
+          # tiles for 6 h at cpu 17/48), and the queue is HEAVIEST-FIRST again so the z14 backlog
+          # (the critical path) drains from t=0 with light tiles backfilling the other cores.
+          # Forks inside a tile now run concurrently — re-fit this factor from the first
+          # parallel-fork run's log_peak data (serial-run peaks no longer price it).
           export AGG_MEM_FACTOR=4
           export BUNDLE_PROCESSES=$BND
           export GDAL_CACHEMAX=256

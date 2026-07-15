@@ -21,6 +21,7 @@ import hashlib
 import os
 import shutil
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from glob import glob
 from multiprocessing import Pool
 
@@ -163,9 +164,11 @@ def run(filepath):
     mosaic_key = mosaic.mosaic_key(filepath)
     do_mosaic = not keys.fork_fresh(mosaic.tile_artifact(stem), mosaic_key)
     if not any(p["do"] for p in plan.values()) and not do_mosaic:
-        print(f"{stem} fresh — skip")
+        print(f"{stem} fresh — skip", flush=True)
         return
-    print(f"{stem} start")
+    # flush: a pool worker's stdout is block-buffered, so without it start/end reach the log
+    # together at process exit and per-tile timings are unrecoverable from a run's log.
+    print(f"{stem} start", flush=True)
     tmp_folder = filepath.replace("-aggregation.csv", "-tmp")
     # Reserve this tile's memory weight across the whole raster-heavy body: the feather-merge is the
     # RAM peak (holding the merged array + reprojected sources + masks — S-102 alone is ~52
@@ -181,32 +184,44 @@ def run(filepath):
             smooth.smooth_merged(tmp_folder)     # slope-selective blur, shared by every vector fork
         # Terrain is no longer produced here — terrain.py renders it per-zoom from the mosaic (stage
         # 3), keyed off the mosaic tile hashes. The vector forks still read the smoothed merge below.
-        for fork, mod in (("contour", contour_run), ("soundings", soundings_run), ("depare", depare_run)):
-            if plan[fork]["do"]:
-                e = plan[fork]
-                cpath = keys.content_path(e["art"], e["key"])
-                keys.supersede(e["art"])         # clear last build's key BEFORE generating (crash -> stale)
-                mod.generate(filepath, cpath)    # vector fork off the same merged DEM; writes cpath atomically, or nothing
-                if not os.path.isfile(cpath):
-                    keys.write_empty(e["art"], e["key"])  # legitimately empty -> mark it done
+        # The three forks are independent readers of the same on-disk smoothed DEM (distinct tmp +
+        # artifact files), so run them CONCURRENTLY: their heavy parts are subprocesses
+        # (gdal_contour) and GIL-releasing GEOS/rasterio calls, and a dense z14 tile spent most of
+        # its budget slot walking them serially — the forks' overlapped peak is covered by this
+        # tile's single reservation (the factor is re-fit against parallel-fork log_peak data).
+        def _fork(fork, mod):
+            e = plan[fork]
+            cpath = keys.content_path(e["art"], e["key"])
+            keys.supersede(e["art"])             # clear last build's key BEFORE generating (crash -> stale)
+            mod.generate(filepath, cpath)        # vector fork off the same merged DEM; writes cpath atomically, or nothing
+            if not os.path.isfile(cpath):
+                keys.write_empty(e["art"], e["key"])  # legitimately empty -> mark it done
+
+        forks = [(f, m) for f, m in (("contour", contour_run), ("soundings", soundings_run),
+                                     ("depare", depare_run)) if plan[f]["do"]]
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            for fut in [ex.submit(_fork, f, m) for f, m in forks]:
+                fut.result()                     # propagate the first fork failure
     if not os.environ.get("KEEP_TMP"):           # KEEP_TMP=1 preserves the merged DEM for re-running a fork
         shutil.rmtree(tmp_folder)
     with open(filepath) as f:                    # covering rows = overlapping source files: the density
         n_src = sum(1 for _ in f) - 1            # signal behind the ~11× peak spread at one child_z
     scheduler.log_peak(stem, sources=n_src)       # whole-run peak RSS (covers the forks) vs weight + density — tuning data
-    print(f"{stem} end")
+    print(f"{stem} end", flush=True)
 
 
 def covering_sorted():
-    """Every aggregation CSV in the current covering, in a deterministic pseudo-random order (stable
-    hash of the stem). Heaviest-first was the old order, but under the memory budget it back-loads the
-    queue with un-fittable weight-N heavies that starve the pool — only a handful fit the budget, the
-    rest block, so most cores idle. Shuffling interleaves cheap ocean tiles with the few heavy coastal
-    ones, so the budget keeps every core busy while bounding concurrent peaks. Order can't affect
+    """Every aggregation CSV in the current covering, HEAVIEST-FIRST (longest-job-first), md5
+    tiebreak for determinism. The heavy backlog is the phase's critical path (~125 z14 tiles ×
+    tens of minutes), so it must start at t=0 and drain continuously; scheduler.reserve's cheap
+    lane guarantees light tiles stay admissible alongside it, so heaviest-first no longer starves
+    the pool (the earlier md5 shuffle worked around exactly that, by spreading the heavies — and
+    thereby stretched the 8-heavies-at-a-time regime across the entire run). Order can't affect
     output: tiles are independent and content-addressed."""
     aggregation_id = utils.get_aggregation_ids()[-1]
     csvs = glob(f"store/aggregation/{aggregation_id}/*-aggregation.csv")
-    return sorted(csvs, key=lambda fp: hashlib.md5(fp.rsplit("/", 1)[-1].encode()).hexdigest())
+    return sorted(csvs, key=lambda fp: (-scheduler.weight(fp.rsplit("/", 1)[-1].replace("-aggregation.csv", "")),
+                                        hashlib.md5(fp.rsplit("/", 1)[-1].encode()).hexdigest()))
 
 
 def dirty_filepaths():
