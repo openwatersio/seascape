@@ -209,6 +209,17 @@ jobs:
           STORE=/mnt/seascape-store/store
           mkdir -p "$STORE"
           echo "STORE=$STORE" >> "$GITHUB_ENV"
+          # One-time seed of a BLANK volume from the R2 mirror (order-independent bootstrap:
+          # build.yml's fuller seed sets its own marker, which this respects — whichever workflow
+          # touches a blank volume first pays a line-rate R2 copy instead of a from-upstream
+          # re-prep of every source). Marker-gated: every later boot is a no-op.
+          if [ ! -e "$STORE/.seeded-sources-from-r2" ] && [ ! -e "$STORE/.seeded-from-r2" ]; then
+            echo "one-time seed: source mirror + masks + footprints from R2"
+            for p in source polygon landmask; do
+              rclone copy "r2:$DATA_BUCKET/bathymetry/$p" "$STORE/$p" --transfers 32 --checkers 64 --fast-list --retries 5 --stats 30s --stats-one-line
+            done
+            touch "$STORE/.seeded-sources-from-r2"
+          fi
       - uses: ./.github/actions/ghcr-login
       - name: Ensure land + water masks on the volume + R2
         env:
@@ -300,6 +311,17 @@ jobs:
           STORE=/mnt/seascape-store/store
           mkdir -p "$STORE"
           echo "STORE=$STORE" >> "$GITHUB_ENV"
+          # One-time seed of a BLANK volume from the R2 mirror (order-independent bootstrap:
+          # build.yml's fuller seed sets its own marker, which this respects — whichever workflow
+          # touches a blank volume first pays a line-rate R2 copy instead of a from-upstream
+          # re-prep of every source). Marker-gated: every later boot is a no-op.
+          if [ ! -e "$STORE/.seeded-sources-from-r2" ] && [ ! -e "$STORE/.seeded-from-r2" ]; then
+            echo "one-time seed: source mirror + masks + footprints from R2"
+            for p in source polygon landmask; do
+              rclone copy "r2:$DATA_BUCKET/bathymetry/$p" "$STORE/$p" --transfers 32 --checkers 64 --fast-list --retries 5 --stats 30s --stats-one-line
+            done
+            touch "$STORE/.seeded-sources-from-r2"
+          fi
       - uses: ./.github/actions/ghcr-login
       # Volatile sources re-register on EVERY run — their upstream drifts under an
       # unchanged recipe, and tracking that drift is this workflow's whole purpose.
