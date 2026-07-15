@@ -504,26 +504,35 @@ jobs:
             AGG_ENV+=(-e SOURCE_VSI_BASE=/local-source)
           fi
 
+          # ── coverage ∥ aggregate ── coverage tippecanoes the source FOOTPRINTS (off the volume) —
+          # measured at ~4 GB / 1 core on run 29431716434 (my earlier "~130 GB" was a bad subtraction
+          # off the phantom-aggregate estimate; the run #6 OOM was the factor-1 over-admission, not
+          # coverage). It shares nothing with aggregate — different inputs (footprints vs staged
+          # source COGs), different disks (volume vs NVMe) — so background it: its whole duration
+          # hides behind the multi-hour aggregate, and 4 GB sits inside the 24 GB reserve (+ swap).
+          # Backgrounded under set -e can't fail the build on its own, so the explicit wait below
+          # propagates its rc — and sits BEFORE any manifest, preserving completeness.
+          echo "── coverage (backgrounded alongside aggregate) ──"
+          ( { dr coverage && push_build coverage.pmtiles; } 2>&1 | sed -u 's/^/[coverage] /' ) & COV_PID=$!
+
           echo "── aggregate ──"
           # Aggregate produces the stage-2 MOSAIC tiles + the vector forks (NOT terrain pmtiles —
           # those are stage 3's per-zoom render) straight onto the persistent volume, so every
           # finished tile is durable the moment it lands. The old 20-min push_agg loop (mid-build
           # R2 durability, torn-copy caveats and all) is deleted — its entire job is now a property
           # of the storage. R2 sees mosaic tiles only at the mosaic-publish step below.
+          agg_rc=0
           docker run --rm -v "$GITHUB_WORKSPACE:/app" -v "$STORE:/app/pipelines/store" \
             -v "$SCRATCH:/app/pipelines/store/aggregation" \
             "${AGG_MOUNTS[@]}" -e BBOX -e FORCE_REBUILD -e TOOLCHAIN \
-            "${AGG_ENV[@]}" "$IMAGE:$IMAGE_TAG" just aggregate
+            "${AGG_ENV[@]}" "$IMAGE:$IMAGE_TAG" just aggregate || agg_rc=$?
+          # First failure wins: on an aggregate failure reap coverage and exit with aggregate's rc.
+          if [ "$agg_rc" -ne 0 ]; then kill "$COV_PID" 2>/dev/null || true; exit "$agg_rc"; fi
 
-          # ── coverage ── SEQUENTIAL, after aggregate: run #6 proved the two can't share the box —
-          # full-speed aggregate (~110 GB across 48 workers) + the planet tippecanoe (~130 GB,
-          # --no-tile-size-limit over every footprint) oversubscribed 184 GB RAM + 64 GB swap and the
-          # kernel OOM-killed both. The overlap only ever paid when the old weight factor throttled
-          # aggregate into leaving coverage headroom. Each stage now gets the whole box; under set -e
-          # a coverage failure still fails the build before manifest.json.
-          echo "── coverage ──"
-          dr coverage
-          push_build coverage.pmtiles
+          # Join coverage — propagate its rc so a coverage failure fails the build before manifest.json.
+          cov_rc=0
+          wait "$COV_PID" || cov_rc=$?
+          [ "$cov_rc" -eq 0 ] || { echo "coverage stage failed (rc=$cov_rc)" >&2; exit "$cov_rc"; }
 
           # ── mosaic index (LOCAL, for the on-box terrain render) ── build the GTI + planet z8 +
           #    index parquet from the mosaic tiles the aggregate persisted; terrain (stage 3) reads
