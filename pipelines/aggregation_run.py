@@ -17,6 +17,7 @@ CLI:
                                         the stale tiles reference (see sources_manifest)
 """
 
+import hashlib
 import os
 import shutil
 import sys
@@ -31,6 +32,7 @@ import depare_run
 import keys
 import landmask
 import mosaic
+import scheduler
 import smooth
 import soundings_run
 import utils
@@ -164,38 +166,47 @@ def run(filepath):
         print(f"{stem} fresh — skip")
         return
     print(f"{stem} start")
-    aggregation_reproject.reproject(filepath)
-    aggregation_merge.merge(filepath)
     tmp_folder = filepath.replace("-aggregation.csv", "-tmp")
-    if do_mosaic:
-        mosaic.produce(filepath, tmp_folder, mosaic_key)  # persist BEFORE smooth (unsmoothed truth)
-    if not SKIP_SMOOTH:
-        smooth.smooth_merged(tmp_folder)         # slope-selective blur, shared by every vector fork
-    # Terrain is no longer produced here — terrain.py renders it per-zoom from the mosaic (stage 3),
-    # keyed off the mosaic tile hashes. The vector forks still read the smoothed merge below.
-    for fork, mod in (("contour", contour_run), ("soundings", soundings_run), ("depare", depare_run)):
-        if plan[fork]["do"]:
-            e = plan[fork]
-            cpath = keys.content_path(e["art"], e["key"])
-            keys.supersede(e["art"])             # clear last build's key BEFORE generating (crash -> stale)
-            mod.generate(filepath, cpath)        # vector fork off the same merged DEM; writes cpath atomically, or nothing
-            if not os.path.isfile(cpath):
-                keys.write_empty(e["art"], e["key"])  # legitimately empty -> mark it done
+    # Reserve this tile's memory weight across the whole raster-heavy body: the feather-merge is the
+    # RAM peak (holding the merged array + reprojected sources + masks — S-102 alone is ~52
+    # overlapping products), and the vector forks below run off the SAME already-merged DEM (no extra
+    # raster), so the one reservation covers them too. Held across reproject→merge→smooth→forks in a
+    # try/finally (scheduler.reserve); the budget bounds how many dense coastal tiles peak at once.
+    with scheduler.reserve(stem):
+        aggregation_reproject.reproject(filepath)
+        aggregation_merge.merge(filepath)
+        if do_mosaic:
+            mosaic.produce(filepath, tmp_folder, mosaic_key)  # persist BEFORE smooth (unsmoothed truth)
+        if not SKIP_SMOOTH:
+            smooth.smooth_merged(tmp_folder)     # slope-selective blur, shared by every vector fork
+        # Terrain is no longer produced here — terrain.py renders it per-zoom from the mosaic (stage
+        # 3), keyed off the mosaic tile hashes. The vector forks still read the smoothed merge below.
+        for fork, mod in (("contour", contour_run), ("soundings", soundings_run), ("depare", depare_run)):
+            if plan[fork]["do"]:
+                e = plan[fork]
+                cpath = keys.content_path(e["art"], e["key"])
+                keys.supersede(e["art"])         # clear last build's key BEFORE generating (crash -> stale)
+                mod.generate(filepath, cpath)    # vector fork off the same merged DEM; writes cpath atomically, or nothing
+                if not os.path.isfile(cpath):
+                    keys.write_empty(e["art"], e["key"])  # legitimately empty -> mark it done
     if not os.environ.get("KEEP_TMP"):           # KEEP_TMP=1 preserves the merged DEM for re-running a fork
         shutil.rmtree(tmp_folder)
+    with open(filepath) as f:                    # covering rows = overlapping source files: the density
+        n_src = sum(1 for _ in f) - 1            # signal behind the ~11× peak spread at one child_z
+    scheduler.log_peak(stem, sources=n_src)       # whole-run peak RSS (covers the forks) vs weight + density — tuning data
     print(f"{stem} end")
 
 
 def covering_sorted():
-    """Every aggregation CSV in the current covering, heaviest-first. child_z is a strong cost
-    proxy (each level quadruples output tiles + contour features), so processing heaviest-first
-    keeps the process pool balanced (the longest tiles start first, no straggler tail)."""
+    """Every aggregation CSV in the current covering, in a deterministic pseudo-random order (stable
+    hash of the stem). Heaviest-first was the old order, but under the memory budget it back-loads the
+    queue with un-fittable weight-N heavies that starve the pool — only a handful fit the budget, the
+    rest block, so most cores idle. Shuffling interleaves cheap ocean tiles with the few heavy coastal
+    ones, so the budget keeps every core busy while bounding concurrent peaks. Order can't affect
+    output: tiles are independent and content-addressed."""
     aggregation_id = utils.get_aggregation_ids()[-1]
     csvs = glob(f"store/aggregation/{aggregation_id}/*-aggregation.csv")
-
-    def child_z(fp):
-        return int(fp.split("/")[-1].replace("-aggregation.csv", "").split("-")[3])
-    return sorted(csvs, key=lambda fp: (-child_z(fp), fp))
+    return sorted(csvs, key=lambda fp: hashlib.md5(fp.rsplit("/", 1)[-1].encode()).hexdigest())
 
 
 def dirty_filepaths():
@@ -242,12 +253,20 @@ def run_all(filepaths):
     landmask.require()  # fail fast + actionably if a flagged source needs the mask and it's
                         # missing, not per-tile deep in the pool with an opaque ogr2ogr error
     print(f"start aggregating {len(filepaths)} items...")
-    # Each tile holds a multi-GB merged DEM (a max 32768px tile ≈ 4 GB float32, more
-    # with the halo + smooth) so peak RAM ≈ workers × DEM. Cap workers via AGG_PROCESSES to
-    # stay under the machine's RAM (the build box sizes it from RAM); unset/0 = all cores.
+    # Pool size = cores (AGG_PROCESSES, unset/0 = all cores), so cheap ocean tiles use every core.
+    # Peak RAM is bounded SEPARATELY by a shared GB budget (AGG_MEM_BUDGET_GB): each worker reserves
+    # its tile's weight across the merge peak inside run() (scheduler.reserve), so the N densest
+    # coastal macrotiles can't all peak at once — the exit-137 a fixed workers×DEM pool hit. Budget
+    # unset/0 = no admission control (local / small runs): a plain core-bound pool.
     procs = int(os.environ.get("AGG_PROCESSES", "0")) or None
-    with Pool(procs) as pool:
-        pool.starmap(run, [(fp,) for fp in filepaths], chunksize=1)
+    budget = int(os.environ.get("AGG_MEM_BUDGET_GB", "0"))
+    mgr, pool_kwargs = scheduler.pool_kwargs(budget)
+    try:
+        with Pool(procs, **pool_kwargs) as pool:
+            pool.starmap(run, [(fp,) for fp in filepaths], chunksize=1)
+    finally:
+        if mgr is not None:
+            mgr.shutdown()
 
 
 def main(argv):

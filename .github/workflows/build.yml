@@ -1,9 +1,21 @@
 name: Build
 
-# Full planet build on ONE ephemeral Hetzner box (the seamap build-planet.yml pattern):
-#   image → boot box → hydrate the store from R2 → run the whole pipeline through `just`
-#   → push each stage back to R2 → always-destroy the box. The runner here only
-#   orchestrates; the compute is pay-per-build (~€2/hr, ~€10 for a forced planet rebuild).
+# Full planet build on ONE on-demand Hetzner box, run as a SELF-HOSTED GitHub Actions runner
+# (Cyclenerd/hcloud-github-runner): image → create-runner boots the box + registers it as a runner
+# → the `build` job runs NATIVELY on that box (no SSH, no rsync, no heredoc) → push each stage back
+# to R2 → delete-runner always-destroys the box and deregisters the runner. The
+# ubuntu-latest jobs only create/destroy infra; the compute is a pay-per-build box (~€2/hr, ~€10 for
+# a forced planet rebuild).
+#
+# Why self-hosted instead of the old SSH-into-an-ephemeral-box model: GitHub-HOSTED runners hard-cap
+# a job at 6 h, which the old `build` job orchestrated around (timeout-minutes: 350, resume-on-
+# re-dispatch). The build itself runs on the Hetzner box either way — but making that box a runner
+# lifts the 6 h job cap (self-hosted jobs have none); the only remaining ceiling is the 72 h
+# workflow-run limit that applies to everyone — far above any build — so a forced full planet
+# rebuild now runs to completion in one window regardless of size.
+# It also deletes the entire SSH surface — keygen/boot-wait/rsync/scp/`ssh … <<'REMOTE'`, the NAT
+# keepalive tuning, and the `build.env` + `%q` quoting: secrets now flow as native job `env:`,
+# which removes the sourced-file code-injection vector by construction (no file is ever `source`d).
 #
 # The store lives in R2 under bathymetry/ as an IMMUTABLE, CONTENT-ADDRESSED store: every artifact
 # carries its content-hash key (pipelines/keys.py) IN its filename (<stem>-<key12>.<ext>), so a
@@ -33,9 +45,9 @@ on:
         type: boolean
         default: false
       server_type:
-        description: "Hetzner type — ccx33 (8 vCPU/32 GB, the account's dedicated-vCPU cap today); ccx63 once the quota is raised"
+        description: "Hetzner type — ccx63 (48 vCPU/192 GB, dedicated-vCPU quota approved); ccx33 (8/32) for a cheaper smoke. Worker knobs (AGG/TERRAIN/BUNDLE_PROCESSES, GDAL_CACHEMAX) auto-size from the box's RAM."
         required: false
-        default: ccx33
+        default: ccx63
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
@@ -47,15 +59,11 @@ env:
   SERVER_TYPE: ${{ github.event.inputs.server_type }}
   SERVER_IMAGE: ubuntu-24.04
   SERVER_LOCATION: fsn1
-  # ServerAlive keepalives: the hosted runner's NAT drops idle TCP after ~4 min, and quiet
-  # pipeline stretches (tippecanoe, long warps) go silent for far longer — without keepalives
-  # the first silent stage kills the session ("Broken pipe", exit 255; seen on the first
-  # dispatch). 30s×20 also rides out ~10 min of transient network loss before giving up.
-  SSH_OPTS: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=20"
+  # Server hostname AND runner label (Cyclenerd/hcloud-github-runner registers the runner with
+  # --labels "<name>,hetzner").
   NAME: seascape-build-${{ github.run_id }}
   # Dispatch inputs reach every `run:` as env vars, never as raw ${{…}} interpolated into a
-  # shell line — a bbox like `$(cmd)` would otherwise run under command substitution in the
-  # build.env heredoc / the `[ -z … ]` test.
+  # shell line — a bbox like `$(cmd)` would otherwise run under command substitution.
   BBOX: ${{ github.event.inputs.bbox }}
   FORCE: ${{ github.event.inputs.force }}
 
@@ -96,21 +104,64 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # Boot an ephemeral box, hydrate → build → push, always-destroy. 350 min timeout — the max
-  # available: GitHub-HOSTED runners hard-cap jobs at 6 h, so it cannot be raised. Routine
-  # incrementals fit easily; a full forced planet rebuild on ccx33 may exceed it — the build
-  # resumes on re-dispatch by hydrating the LAST COMPLETED build's manifest (its artifacts skip as
-  # fresh) and rebuilding only what changed. A build interrupted before its pointer flips redoes
-  # its own new work (that new work isn't in any manifest yet), so resume granularity is "the last
-  # completed build" — fine for incrementals; ccx63 (quota pending) makes a forced full rebuild fit
-  # one window regardless.
-  build:
-    needs: image
+  # Boot an on-demand Hetzner box and register it as a self-hosted runner for this repo. The store
+  # lives on the box's local NVMe root disk — no attached volume — so this job just boots + registers.
+  # server_id is emitted by the action BEFORE its registration wait, so it is available to
+  # delete-runner even if registration times out — teardown still runs.
+  create-runner:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    permissions: { contents: read }
+    outputs:
+      label: ${{ steps.runner.outputs.label }}
+      server_id: ${{ steps.runner.outputs.server_id }}
+    steps:
+      - name: Create runner
+        id: runner
+        uses: Cyclenerd/hcloud-github-runner@v1.4.1
+        with:
+          mode: create
+          # Fine-grained PAT with repo Administration read/write — the action mints a runner
+          # registration token and registers/deregisters the runner. The job's GITHUB_TOKEN can't
+          # do this, hence a dedicated RUNNER_PAT secret.
+          github_token: ${{ secrets.RUNNER_PAT }}
+          hcloud_token: ${{ secrets.HCLOUD_TOKEN }}
+          name: ${{ env.NAME }}
+          server_type: ${{ env.SERVER_TYPE }}
+          location: ${{ env.SERVER_LOCATION }}
+          image: ${{ env.SERVER_IMAGE }}
+          # No attached volume: the store lives on the box's LOCAL NVMe root disk. ccx63 ships ~960 GB
+          # local NVMe — bigger AND faster than the old 400 GB network volume — so the build (~50 GiB
+          # store + ~240 GiB dirty-set sources + ~100 GiB bundle peak ≈ 400 GiB) fits with headroom on
+          # root. 'null' is the action's sentinel for "attach none" (an empty string fails its int check).
+          # The build job's df precheck fails loudly if a box ever has too small a root disk.
+          volume: 'null'
+
+  # Runs NATIVELY on the Hetzner box (runs-on: the runner label the action minted). No SSH, no
+  # rsync, no build.env — secrets are native job env, and the pipeline is the same `just` stages
+  # the old SSH heredoc ran, in the same order, with the same pushes interleaved. No timeout-
+  # minutes: a self-hosted job isn't subject to the 6 h hosted cap; the ceiling is the 72 h
+  # workflow limit, effectively non-binding, so a forced full planet rebuild runs to completion.
+  build:
+    needs: [image, create-runner]
+    runs-on: ${{ needs.create-runner.outputs.label }}
     permissions: { contents: read, packages: read }
     env:
-      HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+      # Native job env — no build.env, no `%q`, nothing is ever `source`d, so the sourced-file
+      # code-injection vector the old model quoted around is gone by construction. rclone reads the
+      # RCLONE_CONFIG_R2_* vars for the store sync; the AWS_* vars are the S3-API plumbing the
+      # pipeline expects for any /vsis3 read (source COGs are /vsicurl-public, so unused today, but
+      # they cost nothing to carry).
+      RCLONE_CONFIG_R2_TYPE: s3
+      RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+      RCLONE_CONFIG_R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      AWS_ENDPOINT_URL: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      SHA: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v6
 
@@ -119,140 +170,101 @@ jobs:
       - name: Toolchain image tag
         run: echo "IMAGE_TAG=deps-${{ hashFiles('Dockerfile', 'pipelines/pyproject.toml', 'pipelines/uv.lock') }}" >> "$GITHUB_ENV"
 
-      - name: Install hcloud CLI
-        run: |
-          curl -fsSL https://github.com/hetznercloud/cli/releases/latest/download/hcloud-linux-amd64.tar.gz \
-            | tar xz hcloud
-          sudo mv hcloud /usr/local/bin/
-
-      - name: Boot ephemeral server
-        run: |
-          ssh-keygen -t ed25519 -N "" -f id_build -q
-          hcloud ssh-key create --name "$NAME" --public-key-from-file id_build.pub
-          hcloud server create --name "$NAME" \
-            --type "$SERVER_TYPE" --image "$SERVER_IMAGE" --location "$SERVER_LOCATION" \
-            --ssh-key "$NAME"
-          IP=$(hcloud server ip "$NAME")
-          echo "IP=$IP" >> "$GITHUB_ENV"
-          # Planet builds work on an attached volume; the root disk is too small. Sizing:
-          # ~50 GiB hydrated tile/vector store + bundle outputs which ~2x during pmtiles
-          # finalize (~100 GiB peak) + the dirty-set source hydrate (the full coastal
-          # S-102+CUDEM subset is ~100-200 GiB) → 400 GiB with headroom. A bbox build is
-          # self-contained on the root disk (like seamap's AREA smoke), so skip the volume.
-          if [ -z "$BBOX" ]; then
-            hcloud volume create --name "$NAME" --size 400 --server "$NAME"
-          fi
-          for _ in $(seq 1 60); do
-            # shellcheck disable=SC2086  # SSH_OPTS is intentionally word-split into flags
-            ssh $SSH_OPTS -i id_build "root@$IP" true 2>/dev/null && exit 0
-            sleep 5
-          done
-          echo "server never became reachable" >&2; exit 1
-
-      - name: Build & publish
+      - name: Set up toolchain (Docker + pinned rclone, GHCR pull)
         env:
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          GHCR_TOKEN: ${{ github.token }}
           GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ github.token }}
         run: |
-          # Secrets + config to source on the box (kept off every command line). rclone reads
-          # the RCLONE_CONFIG_R2_* vars for the store sync; the AWS_* vars are the S3-API
-          # plumbing the pipeline expects for any /vsis3 read (source COGs are /vsicurl-public,
-          # so they aren't used today, but they cost nothing to carry).
-          #
-          # EVERY value is written via %q, never verbatim: build.env is `source`d as bash on
-          # the box, so anything written raw becomes code. The live vector is the dispatch
-          # inputs — a crafted bbox ('x"; curl …|bash; echo "') would execute with the R2 creds
-          # in the same file, and a "boolean" FORCE input is UI coercion only, not API-level
-          # validation — but quoting the secrets/config too makes the file safe by construction.
-          {
-            printf 'export RCLONE_CONFIG_R2_TYPE=%q\n'              s3
-            printf 'export RCLONE_CONFIG_R2_PROVIDER=%q\n'          Cloudflare
-            printf 'export RCLONE_CONFIG_R2_ENDPOINT=%q\n'          "$R2_ENDPOINT"
-            printf 'export RCLONE_CONFIG_R2_ACCESS_KEY_ID=%q\n'     "$R2_ACCESS_KEY_ID"
-            printf 'export RCLONE_CONFIG_R2_SECRET_ACCESS_KEY=%q\n' "$R2_SECRET_ACCESS_KEY"
-            printf 'export RCLONE_CONFIG_R2_NO_CHECK_BUCKET=%q\n'   true
-            printf 'export AWS_ACCESS_KEY_ID=%q\n'                  "$R2_ACCESS_KEY_ID"
-            printf 'export AWS_SECRET_ACCESS_KEY=%q\n'              "$R2_SECRET_ACCESS_KEY"
-            printf 'export AWS_DEFAULT_REGION=%q\n'                 auto
-            printf 'export AWS_ENDPOINT_URL=%q\n'                   "$R2_ENDPOINT"
-            printf 'export GHCR_TOKEN=%q\n'                         "$GHCR_TOKEN"
-            printf 'export GHCR_USER=%q\n'                          "$GHCR_USER"
-            printf 'export IMAGE=%q\n'                              "$IMAGE"
-            printf 'export IMAGE_TAG=%q\n'                          "$IMAGE_TAG"
-            printf 'export DATA_BUCKET=%q\n'                        "$DATA_BUCKET"
-            printf 'export PUBLIC_BASE=%q\n'                        "$PUBLIC_BASE"
-            printf 'export SHA=%q\n'                                "$GITHUB_SHA"
-            printf 'export BBOX=%q\n'                               "$BBOX"
-            printf 'export FORCE=%q\n'                              "$FORCE"
-          } > build.env
-
-          rsync -az --delete --exclude .git --exclude node_modules --exclude data --exclude pipelines/store \
-            -e "ssh $SSH_OPTS -i id_build" ./ "root@$IP:/root/seascape/"
-          # shellcheck disable=SC2086  # SSH_OPTS is intentionally word-split into flags
-          scp $SSH_OPTS -i id_build build.env "root@$IP:/root/seascape/build.env"
-
-          # The remote script is single-quoted (<<'REMOTE'): nothing here is interpolated by
-          # Actions or this shell — every value comes from build.env, sourced on the box.
-          # shellcheck disable=SC2086  # SSH_OPTS is intentionally word-split into flags
-          ssh $SSH_OPTS -i id_build "root@$IP" bash -se <<'REMOTE'
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
-          cd /root/seascape
-          set -a; source build.env; set +a
-
-          # ── toolchain: docker + the PINNED sha256-verified rclone (apt's 1.60.1 501s on R2's
-          #    version-id responses — same pin as sources.yml/release.yml) ──
+          # ── docker + the PINNED sha256-verified rclone (apt's 1.60.1 501s on R2's version-id
+          #    responses — same pin as sources.yml/release.yml). jq: read the store pointer +
+          #    manifest. The runner runs as root, so no sudo. ──
           apt-get update -qq
-          apt-get install -y -qq unzip e2fsprogs jq   # jq: read the store pointer + manifest
+          apt-get install -y -qq unzip jq
           command -v docker >/dev/null || curl -fsSL https://get.docker.com | sh
           curl -fsSL -o /tmp/rclone.zip "https://downloads.rclone.org/v1.74.4/rclone-v1.74.4-linux-amd64.zip"
           echo "fe435e0c36228e7c2f116a8701f01127bb1f694005fc11d1f27186c8bca4115d  /tmp/rclone.zip" | sha256sum -c
           unzip -q -j /tmp/rclone.zip '*/rclone' -d /tmp/rclone-bin
           install /tmp/rclone-bin/rclone /usr/local/bin/rclone
-
           # ── GHCR toolchain image (private; same github.token auth as ci.yml) ──
           echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
           docker pull "$IMAGE:$IMAGE_TAG"
 
-          # ── store on the attached volume for a planet build, the root disk for a bbox ──
-          if [ -z "${BBOX:-}" ]; then
-            for i in $(seq 1 12); do
-              DEV=$(ls /dev/disk/by-id/scsi-0HC_Volume_* 2>/dev/null | head -1 || true)
-              [ -n "${DEV:-}" ] && break || sleep 5
-            done
-            [ -n "${DEV:-}" ] || { echo "build volume never attached" >&2; exit 1; }
-            mkfs.ext4 -qF "$DEV"; mkdir -p /mnt/store; mount "$DEV" /mnt/store
-            STORE=/mnt/store
-          else
-            STORE=/root/seascape/pipelines/store
-          fi
+      - name: Build & publish
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+
+          # ── store on the box's LOCAL NVMe root disk (no attached volume) ── ccx63 has ~960 GB
+          #    local NVMe, faster than a network volume. A planet build needs ~400 GiB (store +
+          #    dirty-set sources + bundle peak); precheck the root filesystem has room and FAIL LOUD
+          #    if a box is ever too small, rather than running out mid-build. bbox is far smaller.
+          STORE="$GITHUB_WORKSPACE/pipelines/store"
           mkdir -p "$STORE"
+          if [ -z "${BBOX:-}" ]; then
+            avail_gb=$(df -BG --output=avail "$STORE" | tail -1 | tr -dc '0-9')
+            [ "${avail_gb:-0}" -ge 450 ] || { echo "root disk has only ${avail_gb:-?} GiB free at $STORE — a planet build needs ~450; use a box with a bigger local NVMe (ccx63 = ~960)" >&2; exit 1; }
+            echo "store on local NVMe: ${avail_gb} GiB free at $STORE"
+          fi
+
+          # ── swap SAFETY NET (planet builds only; the LOCAL NVMe root disk, never the attached
+          #    volume or the store path). This is INSURANCE, not headroom: the memory-budget
+          #    scheduler (below) keeps the hot working set (~150 GB) in RAM, and the budget stays
+          #    sized to PHYSICAL RAM minus reserve, IGNORING this swap. Swap only catches a single
+          #    tile that peaks ABOVE its weight estimate — turning a rare exit-137 into a brief
+          #    slowdown instead of a dead build. It is NOT room to run more concurrency: swapping the
+          #    hot multi-GB merge arrays would thrash. vm.swappiness=10 keeps the working set in RAM
+          #    and only spills under real pressure. Torn down with the ephemeral box. ──
+          if [ -z "${BBOX:-}" ] && [ ! -e /swapfile ]; then
+            fallocate -l 64G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=65536
+            chmod 600 /swapfile
+            mkswap /swapfile
+            swapon /swapfile
+            sysctl -w vm.swappiness=10
+          fi
 
           # ── knobs, computed HERE, not in Python — the pipeline stays R2/host-agnostic.
-          #    AGG_PROCESSES = min(cores, RAM_GB/5). Per-worker memory budget: merged-DEM peak
-          #    ~4 GB (the dominant term; a max 32768px tile ≈ 4 GB float32, more with halo +
-          #    smooth) + GDAL_CACHEMAX 512 MB + 256 MB curl cache + ~32 MB VSI cache per open
-          #    dataset ≈ 5 GB — every cache below is PER PROCESS (workers share nothing), so
-          #    they scale with the worker count. ccx33 (8 cores / 32 GB) → 6 workers: ~5 GB of
-          #    caches + ~26 GB of DEM headroom, ~1 GB left for OS/docker. ccx63 (48 / 192) → 38.
-          #    BUNDLE_PROCESSES = min(cores, RAM_GB/8), more conservative — a bundle worker
-          #    reads whole input pmtiles into RAM and the planet base is one multi-GB unit,
-          #    unlike aggregate's bounded per-tile DEMs.
-          #    TERRAIN_PROCESSES = min(cores, RAM_GB/8), the same conservative budget — each
-          #    per-zoom render worker holds ONE mosaic window: a native macrotile is the same
-          #    ~4 GB float32 as an aggregate tile, and gdalwarp also spools the window to disk +
-          #    a GDAL cache, so it is at least as heavy as a bundle worker. ──
+          #    POOL SIZE vs MEMORY BUDGET, decoupled. The old "AGG_PROCESSES = a memory-divided
+          #    worker count" OOM-killed two ccx63 planet builds (exit 137): with the pool running
+          #    HEAVIEST-FIRST (deepest child_z), the first N workers are ALL hi-res coastal macrotiles
+          #    at once, and each PEAKS >12 GB during the multi-source feather-merge (a 32768px tile is
+          #    ~4 GB float32 at rest, ×~3 holding the merged array + reprojected sources + masks;
+          #    S-102 alone is ~52 overlapping products). No single worker count is right: safe-for-
+          #    the-peak wastes cores on cheap ocean tiles, core-count OOMs on the coast.
+          #      * AGG/TERRAIN_PROCESSES = CORES — the POOL SIZE (max workers), so cheap tiles (weight
+          #        1) fill every core. (Python: unset/0 would also default to cpu_count; set it
+          #        explicitly for the log line + clarity.)
+          #      * AGG/TERRAIN_MEM_BUDGET_GB = MEM_GB − RESERVE — a shared GB budget each worker draws
+          #        from (scheduler.reserve) across its tile's memory-peak section, sized to
+          #        weight(tile). This BOUNDS THE CONCURRENT HEAVY-TILE PEAK: the densest coastal
+          #        macrotiles can't all merge at once (the OOM), while cores stay full of light tiles.
+          #    RESERVE (~40) covers OS/docker + the periodic push that share the box during aggregate
+          #    (coverage is sequential now — run #6's OOM was the two overlapping). The budget is sized to PHYSICAL RAM only — the
+          #    64 GB swap above is a safety net for a tile that peaks past its estimate, NOT budget
+          #    headroom (swapping the hot merge arrays would thrash). ccx63 (48/192): pool 48, budget
+          #    ~150 GB. ccx33 (8/32): reserve shrinks with RAM so a small box still gets a real budget.
+          #    GDAL_CACHEMAX=256 MB (sources are LOCAL now via selective hydrate, so the block cache
+          #    matters far less) trims every worker's footprint. ──
           CORES=$(nproc)
           MEM_GB=$(( $(getconf _PHYS_PAGES) * $(getconf PAGE_SIZE) / 1073741824 ))
-          AGG=$(( MEM_GB / 5 )); [ "$AGG" -gt "$CORES" ] && AGG=$CORES; [ "$AGG" -lt 1 ] && AGG=1
+          RESERVE=$(( MEM_GB / 4 )); [ "$RESERVE" -gt 40 ] && RESERVE=40
+          BUDGET=$(( MEM_GB - RESERVE )); [ "$BUDGET" -lt 4 ] && BUDGET=4
           BND=$(( MEM_GB / 8 )); [ "$BND" -gt "$CORES" ] && BND=$CORES; [ "$BND" -lt 1 ] && BND=1
-          TER=$(( MEM_GB / 8 )); [ "$TER" -gt "$CORES" ] && TER=$CORES; [ "$TER" -lt 1 ] && TER=1
-          export AGG_PROCESSES=$AGG
+          export AGG_PROCESSES=$CORES
+          export TERRAIN_PROCESSES=$CORES
+          export AGG_MEM_BUDGET_GB=$BUDGET
+          export TERRAIN_MEM_BUDGET_GB=$BUDGET
+          # Weight factor (scheduler.weight): 4. Run #7 settled this with fresh-worker (ratchet-proof)
+          # measurements: dense z14 tiles REALLY peak 12.4+ GB in a single worker — the factor-1
+          # experiment misread a light-tile log window as the whole distribution and OOM'd runs #6+#7
+          # in ~30 min (48 workers × real 12 GB heavies admitted at weight 5 → ~245 GB demand).
+          # factor 4 → weight(z14)=18 → ~8 concurrent heavies ≈ 110 GB, proven stable for hours by
+          # run #4; the SHUFFLE keeps the other pool slots busy on weight-1 light tiles between
+          # heavies, so this no longer costs the idle cores it did pre-shuffle.
+          export AGG_MEM_FACTOR=4
           export BUNDLE_PROCESSES=$BND
-          export TERRAIN_PROCESSES=$TER
-          export GDAL_CACHEMAX=512
+          export GDAL_CACHEMAX=256
           # The toolchain identity for the content-hash keys (pipelines/keys.py): the deps-keyed
           # image tag pins one GDAL/tippecanoe, so bumping the toolchain correctly invalidates
           # every key (dispatch a rebuild deliberately after a GDAL bump).
@@ -260,25 +272,54 @@ jobs:
           if [ "${FORCE:-}" = "true" ]; then export FORCE_REBUILD=1; else export FORCE_REBUILD=; fi
           echo "box: ${CORES} cores / ${MEM_GB} GB → AGG_PROCESSES=$AGG_PROCESSES, BUNDLE_PROCESSES=$BUNDLE_PROCESSES, BBOX='${BBOX:-}', FORCE='${FORCE:-}'"
 
+          # ── resource sampler ── one compact line every 30 s, interleaved into THIS log next to the
+          #    stage markers (no artifact, no sysstat; reads /proc on the host, so it covers the whole
+          #    docker build). mem carries a running high-water (pk) — the OOM headroom at a glance, the
+          #    number three OOM'd runs made us infer. set +eu so a transient read never kills it; the
+          #    EXIT trap reaps it however the step ends.
+          ( set +eu; pt=0; pi=0; pk=0
+            while :; do
+              read -r tot idl < <(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8+$9, $5+$6; exit}' /proc/stat)
+              if [ "${pt}" -ne 0 ] && [ "$((tot-pt))" -gt 0 ]; then
+                cpu=$(awk "BEGIN{printf \"%.0f\", ${CORES}*(($tot-$pt)-($idl-$pi))/($tot-$pt)}")
+              else cpu="?"; fi
+              pt=$tot; pi=$idl
+              used=$(awk '/MemTotal/{t=$2} /MemAvailable/{a=$2} END{printf "%.0f",(t-a)/1048576}' /proc/meminfo)
+              if [ "${used}" -gt "${pk}" ]; then pk=$used; fi
+              sw=$(awk '/SwapTotal/{t=$2} /SwapFree/{f=$2} END{printf "%.1f",(t-f)/1048576}' /proc/meminfo)
+              echo "[res] $(date -u +%H:%M:%S)  cpu=${cpu}/${CORES}  mem=${used}/${MEM_GB}g(pk${pk})  swap=${sw}g  load=$(cut -d' ' -f1 /proc/loadavg)"
+              # Under pressure, NAME the memory: top processes by RSS, so an OOM post-mortem reads
+              # "which process" straight from the log instead of inferring it from totals (runs #6/#7
+              # burned two boxes on exactly that inference). Threshold ~80% of RAM; at most every 2nd tick.
+              if [ "${used}" -gt $(( MEM_GB * 8 / 10 )) ]; then
+                ps -eo rss,pid,comm --sort=-rss --no-headers | awk 'NR<=10{printf "[res]   %5.1fg %7s %s\n", $1/1048576, $2, $3}'
+              fi
+              sleep 30
+            done ) &
+          RES_PID=$!
+          trap 'kill "${RES_PID}" 2>/dev/null || true' EXIT
+
           # docker run wrapper: repo code at /app, the store bind-mounted, BBOX/FORCE/TOOLCHAIN
           # forwarded (+ BUNDLE_PROCESSES — only bundle.py reads it; harmless elsewhere).
-          dr() { docker run --rm -v /root/seascape:/app -v "$STORE:/app/pipelines/store" \
-            -e BBOX -e FORCE_REBUILD -e TOOLCHAIN -e BUNDLE_PROCESSES -e TERRAIN_PROCESSES "$IMAGE:$IMAGE_TAG" just "$@"; }
+          dr() { docker run --rm -v "$GITHUB_WORKSPACE:/app" -v "$STORE:/app/pipelines/store" \
+            -e BBOX -e FORCE_REBUILD -e TOOLCHAIN -e BUNDLE_PROCESSES \
+            -e TERRAIN_PROCESSES -e TERRAIN_MEM_BUDGET_GB -e AGG_MEM_FACTOR \
+            -e GDAL_CACHEMAX "$IMAGE:$IMAGE_TAG" just "$@"; }
 
           R2="R2:$DATA_BUCKET/bathymetry"
           # --retries 5: R2 occasionally returns a transient 500 InternalError; ride it out
           # instead of failing the stage (same convention as sources.yml's mirror). Applied to
           # EVERY transfer, the single-file copyto publishes included — a flake on manifest.json
           # would break the completeness contract.
-          XFER="--transfers 32 --checkers 64 --fast-list --retries 5 --stats 30s --stats-one-line"
-          hydrate()    { rclone copy "$R2/$1" "$STORE/$2" $XFER "${@:3}"; }
+          XFER=(--transfers 32 --checkers 64 --fast-list --retries 5 --stats 30s --stats-one-line)
+          hydrate()    { rclone copy "$R2/$1" "$STORE/$2" "${XFER[@]}" "${@:3}"; }
           # Content-addressed store: an unchanged key is skipped and a push is delta-sized. ONE
           # pass, no ordering to get right — the per-tile artifacts self-mark (the key is IN the
           # name) and the pointer flip (not push order) is the atomicity mechanism, so a partial
           # push just strands unreferenced objects the GC collects. copy, NEVER sync --delete: a
           # re-key leaves last build's object as garbage, never clobbers a concurrent write.
-          push() { rclone copy "$STORE/$1" "$R2/$2" $XFER "${@:3}"; }
-          push_build() { rclone copyto "$STORE/bundle/$1" "$R2/build/$SHA/$1" $XFER; }
+          push() { rclone copy "$STORE/$1" "$R2/$2" "${XFER[@]}" "${@:3}"; }
+          push_build() { rclone copyto "$STORE/bundle/$1" "$R2/build/$SHA/$1" "${XFER[@]}"; }
 
           # ── HYDRATE (planet only): MANIFEST-DRIVEN. Read the store pointer, fetch the manifest
           #    it names, and rclone copy EXACTLY the artifacts it references (--files-from) — so
@@ -304,7 +345,7 @@ jobs:
               n=$(wc -l < /tmp/hydrate-files.txt)
               [ "$n" -gt 0 ] || { echo "store manifest $mref references 0 artifacts — refusing to hydrate an empty world" >&2; exit 1; }
               echo "hydrating $n referenced store artifacts (manifest $mref)"
-              rclone copy "$R2" "$STORE" $XFER --files-from /tmp/hydrate-files.txt
+              rclone copy "$R2" "$STORE" "${XFER[@]}" --files-from /tmp/hydrate-files.txt
             else
               echo "no store pointer in R2 — first immutable build, clean rebuild (nothing to hydrate)"
             fi
@@ -325,7 +366,7 @@ jobs:
           #    whose filename is already an absolute /vsi path passes through source_path
           #    untouched and still streams — acceptable fallback. bbox builds are
           #    self-contained (no volume) and keep streaming everything, as before. ──
-          AGG_ENV=(-e AGG_PROCESSES -e GDAL_CACHEMAX)
+          AGG_ENV=(-e AGG_PROCESSES -e AGG_MEM_BUDGET_GB -e AGG_MEM_FACTOR -e GDAL_CACHEMAX)
           if [ -n "${BBOX:-}" ]; then
             # Flagged coarse sources (GEBCO/EMODnet) clamp land + subtract inland water over
             # /vsicurl. WATERMASK only when it exists in R2 (landmask._present assumes any
@@ -358,24 +399,12 @@ jobs:
           # gdal invocation; deliberately not duplicated here).
           AGG_ENV+=(-e GDAL_HTTP_TIMEOUT=120 -e GDAL_HTTP_CONNECTTIMEOUT=30)
 
-          # ── BUILD, stage by stage, pushing after each so an orchestrator timeout loses at most
-          #    one stage. The stage order matches `just planet`; the box just interleaves pushes. ──
+          # ── BUILD, stage by stage, pushing after each so an interruption loses at most one
+          #    stage. The stage order matches `just planet`; the box just interleaves pushes. ──
           echo "── cover ──"
           dr cover                        # writes the covering (the tiling plan; keys drive dirtiness)
 
-          # ── coverage ∥ aggregate ── the plan's sanctioned DAG overlap: coverage reads only
-          # footprints + the covering and aggregate never reads coverage, but its single-
-          # threaded tippecanoe ran ~47 min BEFORE aggregate on the first real build, idling
-          # every other core. Backgrounded here, joined after aggregate. set -e cannot see a
-          # background job's failure, so the explicit wait below propagates its rc — and it
-          # sits BEFORE the manifest push, preserving manifest-last completeness (a build
-          # without coverage.pmtiles must not get a manifest). Output is prefixed so the two
-          # stages' interleaved logs stay readable; pipefail (set above, inherited by the
-          # subshell) makes the subshell's status the failing command's, never sed's.
-          echo "── coverage (backgrounded alongside aggregate) ──"
-          ( { dr coverage && push_build coverage.pmtiles; } 2>&1 | sed -u 's/^/[coverage] /' ) & COV_PID=$!
-
-          # ── selective source hydrate (planet only; overlaps the backgrounded coverage) ──
+          # ── selective source hydrate (planet only) ──
           # Pull exactly the source files the stale tiles reference, so aggregate reads them
           # from local disk: sources-manifest derives the (source, filename) union with the
           # same key-based dirty derivation the run itself uses (FORCE_REBUILD included).
@@ -399,18 +428,15 @@ jobs:
               echo "$legacy legacy absolute-path row(s) keep streaming via /vsicurl"
             fi
             echo "hydrating $(wc -l < /tmp/source-files.txt) of $(wc -l < "$STORE/source-manifest.txt") referenced source file(s)"
-            rclone copy "$R2/source" "$STORE/source" --files-from /tmp/source-files.txt $XFER
+            rclone copy "$R2/source" "$STORE/source" --files-from /tmp/source-files.txt "${XFER[@]}"
           fi
 
           echo "── aggregate ──"
-          # Periodic background pushes while aggregate runs. A forced planet rebuild can outlive
-          # the orchestrator window (GitHub-HOSTED runners hard-cap jobs at 6 h, so the timeout
-          # cannot be raised past ~360), and a stage that pushes only at its end makes zero net
-          # progress across re-dispatches: destroy kills the volume, and every retry restarts
-          # aggregate from tile 1. rclone copy is idempotent (finished tiles skip), so a 20-min
-          # loop makes each re-dispatch monotonic. A file caught mid-write copies torn, but the
-          # next pass overwrites it and the final post-stage push (under set -e) is authoritative
-          # — acceptable residual. Loop failures never abort the build.
+          # Periodic background pushes while aggregate runs, so a long stage makes durable net
+          # progress instead of holding every tile until its end. rclone copy is idempotent
+          # (finished tiles skip), so the loop is cheap. A file caught mid-write copies torn, but
+          # the next pass overwrites it and the final post-stage push (under set -e) is
+          # authoritative — acceptable residual. Loop failures never abort the build.
           # Aggregate now produces the stage-2 MOSAIC tiles + the vector forks (NOT terrain pmtiles
           # — those are stage 3's per-zoom render). Push only mosaic/tiles here (immutable, content-
           # addressed, delta-sized); the mosaic index + the mosaic.gti pointer are pushed LATER,
@@ -421,30 +447,30 @@ jobs:
             ( while sleep 1200; do push_agg || true; done ) & PUSH_LOOP=$!
           fi
           agg_rc=0
-          docker run --rm -v /root/seascape:/app -v "$STORE:/app/pipelines/store" \
+          docker run --rm -v "$GITHUB_WORKSPACE:/app" -v "$STORE:/app/pipelines/store" \
             -e BBOX -e FORCE_REBUILD -e TOOLCHAIN "${AGG_ENV[@]}" "$IMAGE:$IMAGE_TAG" just aggregate || agg_rc=$?
           # Kill the loop on BOTH exits (success or failure) before anything else runs.
           if [ -n "$PUSH_LOOP" ]; then kill "$PUSH_LOOP" 2>/dev/null || true; wait "$PUSH_LOOP" 2>/dev/null || true; fi
-          # First failure wins, as in the sequential version: on an aggregate failure, reap
-          # the in-flight coverage job and fail with aggregate's rc (destroy still runs).
-          if [ "$agg_rc" -ne 0 ]; then kill "$COV_PID" 2>/dev/null || true; exit "$agg_rc"; fi
+          if [ "$agg_rc" -ne 0 ]; then exit "$agg_rc"; fi
           if [ -z "${BBOX:-}" ]; then
             push_agg
           fi
 
-          # Join the backgrounded coverage: propagate a nonzero rc so a coverage failure fails
-          # the build exactly as the sequential version did — well before manifest.json.
-          cov_rc=0
-          wait "$COV_PID" || cov_rc=$?
-          [ "$cov_rc" -eq 0 ] || { echo "coverage stage failed (rc=$cov_rc)" >&2; exit "$cov_rc"; }
+          # ── coverage ── SEQUENTIAL, after aggregate: run #6 proved the two can't share the box —
+          # full-speed aggregate (~110 GB across 48 workers) + the planet tippecanoe (~130 GB,
+          # --no-tile-size-limit over every footprint) oversubscribed 184 GB RAM + 64 GB swap and the
+          # kernel OOM-killed both. The overlap only ever paid when the old weight factor throttled
+          # aggregate into leaving coverage headroom. Each stage now gets the whole box; under set -e
+          # a coverage failure still fails the build before manifest.json.
+          echo "── coverage ──"
+          dr coverage
+          push_build coverage.pmtiles
 
           # ── mosaic index (LOCAL, for the on-box terrain render) ── build the GTI + planet z8 +
           #    index parquet from the mosaic tiles the aggregate persisted; terrain (stage 3) reads
-          #    the GTI, so this MUST run before it. NO MOSAIC_VSI_BASE here on purpose: the index
-          #    records LOCAL absolute tile paths so terrain reads the mosaic off local disk (the
-          #    plan's "build entirely against local disk"). The PUBLISHED index — with /vsicurl tile
-          #    URLs — is rebuilt at the mosaic-publish step below (after terrain), so a consumer
-          #    opening the published mosaic.gti resolves its tiles over the CDN, not a box-local path.
+          #    the GTI, so this MUST run before it. NO MOSAIC_VSI_BASE here: the index records LOCAL
+          #    absolute tile paths so terrain reads the mosaic off local disk. The PUBLISHED index
+          #    (with /vsicurl tile URLs) is rebuilt at the mosaic-publish step below (after terrain).
           echo "── mosaic index (local) ──"
           dr mosaic-index
 
@@ -459,6 +485,22 @@ jobs:
             # never landed.
             push pmtiles pmtiles
 
+            # ── MOSAIC PUBLISH ── the mosaic is a GDAL-openable published product (QGIS QA,
+            #    preview-from-mosaic, third parties). Re-run mosaic-index with MOSAIC_VSI_BASE so the
+            #    GeoParquet `location` records the published /vsicurl tile URLs (the on-box index
+            #    above used local paths, invalid off-box). planet-z8 is content-addressed → reused,
+            #    no re-decimation. Push everything the .gti references (tiles + planet-z8 <Overview>
+            #    + index) BEFORE flipping the mosaic.gti pointer — pointer-last atomic publish.
+            echo "── mosaic publish (/vsicurl index) ──"
+            docker run --rm -v "$GITHUB_WORKSPACE:/app" -v "$STORE:/app/pipelines/store" \
+              -e TOOLCHAIN -e MOSAIC_VSI_BASE="/vsicurl/$PUBLIC_BASE/mosaic/tiles" \
+              "$IMAGE:$IMAGE_TAG" just mosaic-index
+            push mosaic/tiles mosaic/tiles                 # immutable tile COGs (dedup; push_agg already sent these)
+            push mosaic mosaic --include 'planet-z8-*.tif' # the z8 overview COG (the .gti <Overview>)
+            push mosaic/index mosaic/index                 # the /vsicurl GeoParquet index
+            rclone copyto "$STORE/mosaic/mosaic.gti" "$R2/mosaic/mosaic.gti" "${XFER[@]}"  # pointer LAST
+            echo "mosaic published: tiles + planet-z8 + index pushed, mosaic.gti pointer flipped"
+
             # ── STORE PUBLISH: the content-addressed store (mosaic tiles + vector forks + terrain
             #    pmtiles) is complete after terrain. Assemble the manifest (a walk of the local
             #    store, in aggregate's key-affecting env so its recomputed keys match the content
@@ -468,40 +510,20 @@ jobs:
             #    pointer over a complete old store, and this build's pushed-but-unreferenced objects
             #    are GC debris. The bounds.csv-last / catalog-last pattern, generalized. ──
             echo "── store manifest + pointer ──"
-            MANIFEST_ID=$(docker run --rm -v /root/seascape:/app -v "$STORE:/app/pipelines/store" \
+            MANIFEST_ID=$(docker run --rm -v "$GITHUB_WORKSPACE:/app" -v "$STORE:/app/pipelines/store" \
               -e BBOX -e FORCE_REBUILD -e TOOLCHAIN "${AGG_ENV[@]}" "$IMAGE:$IMAGE_TAG" just store-manifest | tail -1)
             [ -n "$MANIFEST_ID" ] || { echo "store-manifest produced no id" >&2; exit 1; }
-            rclone copy "$STORE/manifests" "$R2/store/manifests" $XFER
+            rclone copy "$STORE/manifests" "$R2/store/manifests" "${XFER[@]}"
             n=$(jq -r '.entries | length' "$STORE/manifests/$MANIFEST_ID.json")
             [ "$n" -gt 0 ] || { echo "store manifest $MANIFEST_ID references 0 artifacts — refusing to flip the pointer" >&2; exit 1; }
             printf '{"manifest":"manifests/%s.json","sha":"%s","entries":%s}\n' "$MANIFEST_ID" "$SHA" "$n" \
               | rclone rcat "$R2/store/manifest.json"
             echo "store published: manifest $MANIFEST_ID ($n artifacts), pointer flipped"
-
-            # ── MOSAIC PUBLISH ── the mosaic is a GDAL-openable published product (QA in QGIS,
-            #    preview-from-mosaic, any third party). Re-run mosaic-index with MOSAIC_VSI_BASE set
-            #    to the PUBLIC /vsicurl base for the mosaic TILES prefix, so the GeoParquet `location`
-            #    column records the real published tile URLs (the build-time index above used local
-            #    paths, which are invalid off-box). planet-z8 is content-addressed, so this reuses it
-            #    (no re-decimation, no /vsicurl read). The .gti's IndexDataset + planet-z8 <Overview>
-            #    refs are RELATIVE, so they resolve against the published mosaic/ dir automatically.
-            #    Push order = the pointer-last / bounds.csv-last discipline: everything the .gti
-            #    references (tiles + planet-z8 overview + index) BEFORE the mosaic.gti pointer.
-            echo "── mosaic publish (/vsicurl index) ──"
-            docker run --rm -v /root/seascape:/app -v "$STORE:/app/pipelines/store" \
-              -e BBOX -e FORCE_REBUILD -e TOOLCHAIN "${AGG_ENV[@]}" \
-              -e MOSAIC_VSI_BASE="/vsicurl/$PUBLIC_BASE/mosaic/tiles" \
-              "$IMAGE:$IMAGE_TAG" just mosaic-index
-            push mosaic/tiles mosaic/tiles                       # immutable tile COGs (dedup; push_agg already sent these)
-            push mosaic mosaic --include 'planet-z8-*.tif'       # the z8 overview COG (the .gti <Overview>)
-            push mosaic/index mosaic/index                       # the /vsicurl GeoParquet index
-            rclone copyto "$STORE/mosaic/mosaic.gti" "$R2/mosaic/mosaic.gti" $XFER   # the mosaic pointer, LAST
-            echo "mosaic published: tiles + planet-z8 + index pushed, mosaic.gti pointer flipped"
           fi
 
           echo "── bundle (terrain) ──"
           dr bundle
-          rclone copy "$STORE/bundle" "$R2/build/$SHA" $XFER --include 'planet.pmtiles' --include 'overlay-*.pmtiles'
+          rclone copy "$STORE/bundle" "$R2/build/$SHA" "${XFER[@]}" --include 'planet.pmtiles' --include 'overlay-*.pmtiles'
 
           echo "── vector layers ──"
           # Completeness is SELF-ENFORCED here, not step order: each bundler verifies every
@@ -526,29 +548,51 @@ jobs:
           #    already up. ──
           push_build manifest.json
           echo "── build complete → $R2/build/$SHA ──"
-          REMOTE
 
-      - name: Destroy server
+  # Destroy the box + deregister the runner, ALWAYS — on build success, build failure, OR a
+  # create-runner failure (server_id is emitted before the registration wait, so it is present even
+  # if the runner never registered). No volume to destroy (store is on the box's local NVMe, gone
+  # with the box). LOUD-DESTROY discipline: a still-present server after teardown is a leaked
+  # billable resource and fails the step (also flags a stray volume, though none is created now).
+  delete-runner:
+    needs: [create-runner, build]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions: { contents: read }
+    steps:
+      - name: Delete runner + server
+        if: ${{ needs.create-runner.outputs.server_id != '' }}
+        uses: Cyclenerd/hcloud-github-runner@v1.4.1
+        with:
+          mode: delete
+          github_token: ${{ secrets.RUNNER_PAT }}
+          hcloud_token: ${{ secrets.HCLOUD_TOKEN }}
+          name: ${{ env.NAME }}
+          server_id: ${{ needs.create-runner.outputs.server_id }}
+
+      - name: Verify no leaked resources
         if: always()
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
         run: |
-          # Best-effort delete all three, then FAIL if a billable resource (server, volume)
-          # still exists — a leaked box must show as a red step, not invisible cost. Resources
-          # that never existed (boot failed early, bbox build without a volume) pass clean.
-          hcloud server delete "$NAME" 2>/dev/null || true
-          # The volume (planet builds only) detaches when the server is deleted; then remove it.
-          if hcloud volume describe "$NAME" >/dev/null 2>&1; then
-            for _ in $(seq 1 12); do
-              if hcloud volume delete "$NAME" 2>/dev/null; then break; else sleep 5; fi
-            done
-          fi
-          hcloud ssh-key delete "$NAME" 2>/dev/null || true   # not billable; best-effort
+          set -euo pipefail
+          # Pinned + sha256-verified: this job holds HCLOUD_TOKEN, so an unpinned `latest` from a
+          # compromised release or MITM would hand over infra control (same discipline as rclone).
+          curl -fsSL -o /tmp/hcloud.tgz https://github.com/hetznercloud/cli/releases/download/v1.66.0/hcloud-linux-amd64.tar.gz
+          echo "8b1a8598858232c491f58cbf65ce1bd0ec6f725114bb62ec967a20ab03e29a86  /tmp/hcloud.tgz" | sha256sum -c
+          tar xzf /tmp/hcloud.tgz -C /tmp hcloud
+          sudo mv /tmp/hcloud /usr/local/bin/
+          # LOUD-DESTROY: the action deletes the server; a still-present server after that is billable
+          # — fail with a clear message so a leak shows as a red step, not invisible cost. No volume is
+          # created now, but keep the volume check as cheap insurance against a stray one. Resources
+          # that never existed (a create-runner failure before the server) describe-miss and pass clean.
           fail=0
           if hcloud server describe "$NAME" >/dev/null 2>&1; then
-            echo "::error::leaked Hetzner server $NAME — delete it manually (billing until then)"
+            echo "::error::leaked billable resource: Hetzner server $NAME still exists — delete it manually"
             fail=1
           fi
           if hcloud volume describe "$NAME" >/dev/null 2>&1; then
-            echo "::error::leaked Hetzner volume $NAME — delete it manually (billing until then)"
+            echo "::error::leaked billable resource: Hetzner volume $NAME still exists — delete it manually"
             fail=1
           fi
           exit "$fail"
