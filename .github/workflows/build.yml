@@ -483,8 +483,14 @@ jobs:
             grep -v -e '://' -e '/vsi' "$STORE/source-manifest.txt" > /tmp/source-files.txt || true
             legacy=$(grep -c -e '://' -e '/vsi' "$STORE/source-manifest.txt" || true)
             [ "${legacy:-0}" -eq 0 ] || echo "$legacy legacy absolute-path row(s) keep streaming"
-            LOCAL_SOURCE="$SCRATCH/source"
-            mkdir -p "$LOCAL_SOURCE"
+            # NOT under $SCRATCH — that dir is bind-mounted at store/aggregation, and
+            # utils.get_aggregation_ids() globs store/aggregation/* and takes the lexically-last as
+            # the current covering. A "source" subdir there sorts AFTER the ULID covering, so
+            # aggregate read an EMPTY covering and did "nothing to do" while 1245 tiles were dirty
+            # (run 29431716434). A sibling NVMe dir, mounted only at /local-source, stays invisible
+            # to that glob.
+            LOCAL_SOURCE="$GITHUB_WORKSPACE/pipelines/local-source"
+            rm -rf "$LOCAL_SOURCE"; mkdir -p "$LOCAL_SOURCE"
             source_bytes=$(rclone size "$STORE/source" --files-from /tmp/source-files.txt --json | jq -r .bytes)
             avail_bytes=$(df -B1 --output=avail "$SCRATCH" | tail -1 | tr -dc '0-9')
             reserve_bytes=$(( 300 * 1024 * 1024 * 1024 ))
