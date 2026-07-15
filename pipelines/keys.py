@@ -36,10 +36,12 @@ local GDAL version so a laptop's keys stay honest about GDAL skew. No bucket nam
   python keys.py --check   self-check
 """
 
+import errno
 import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from functools import lru_cache
@@ -214,12 +216,22 @@ def fork_fresh(artifact, key):
 
 
 def publish(tmp_path, final_path):
-    """Atomically move a fully-written temp file to its content-addressed name (``os.replace``
-    within one filesystem is atomic). The final name only ever appears complete — a crash mid-write
-    leaves the temp, which no freshness check looks at, and the fork reads stale next run. The
-    content-addressed analog of phase-3's sidecar-last rule."""
+    """Publish a fully-written temp file atomically, including across filesystems.
+
+    ``os.replace`` is the fast path. If scratch and the store are different mounts, copy to a temp
+    beside the final path first, then rename there. The final name therefore only appears complete;
+    a crash leaves a temp no freshness check considers.
+    """
     os.makedirs(os.path.dirname(final_path), exist_ok=True)
-    os.replace(tmp_path, final_path)
+    try:
+        os.replace(tmp_path, final_path)
+    except OSError as error:
+        if error.errno != errno.EXDEV:
+            raise
+        destination_tmp = final_path + ".tmp"
+        shutil.copyfile(tmp_path, destination_tmp)
+        os.replace(destination_tmp, final_path)
+        os.remove(tmp_path)
 
 
 def write_empty(artifact, key):
@@ -270,8 +282,8 @@ def _check():
     """Key stable across a no-op recompute; moves on a config-value change, an input change, and a
     LISTED module's byte change; ignores an UNLISTED module's byte change; the toolchain enters the
     key; the sidecar skip rule + the FORCE bypass."""
-    import shutil
     import tempfile
+    from unittest.mock import patch
 
     global PIPELINES_DIR
     saved_dir, saved_force = PIPELINES_DIR, os.environ.pop("FORCE_REBUILD", None)
@@ -353,6 +365,28 @@ def _check():
         assert os.path.isfile(cpath) and not os.path.isfile(tmp), "publish moves atomically"
         assert fork_fresh(logical, k), "content file present -> fresh"
         os.remove(cpath)
+
+        # NVMe scratch and the persistent store are separate mounts in production.
+        with open(tmp, "wb") as f:
+            f.write(b"cross-filesystem")
+        real_replace = os.replace
+        replace_calls = 0
+
+        def exdev_once(src, dst):
+            nonlocal replace_calls
+            replace_calls += 1
+            if replace_calls == 1:
+                raise OSError(errno.EXDEV, "cross-device link")
+            return real_replace(src, dst)
+
+        with patch.object(os, "replace", side_effect=exdev_once):
+            publish(tmp, cpath)
+        with open(cpath, "rb") as f:
+            assert f.read() == b"cross-filesystem"
+        assert not os.path.exists(tmp) and not os.path.exists(cpath + ".tmp"), \
+            "cross-filesystem publish must clean both temp files"
+        os.remove(cpath)
+
         write_empty(logical, k)
         assert os.path.isfile(empty_marker(logical, k)) and fork_fresh(logical, k), \
             "an empty marker alone marks the fork fresh (the legitimately-empty fork)"

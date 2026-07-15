@@ -218,7 +218,7 @@ jobs:
           #    responses — same pin as sources.yml/release.yml). The runner runs as root, so no
           #    sudo. ──
           apt-get update -qq
-          apt-get install -y -qq unzip
+          apt-get install -y -qq unzip jq
           command -v docker >/dev/null || curl -fsSL https://get.docker.com | sh
           curl -fsSL -o /tmp/rclone.zip "https://downloads.rclone.org/v1.74.4/rclone-v1.74.4-linux-amd64.zip"
           echo "fe435e0c36228e7c2f116a8701f01127bb1f694005fc11d1f27186c8bca4115d  /tmp/rclone.zip" | sha256sum -c
@@ -237,13 +237,13 @@ jobs:
           #    the long-lived volume; mount it and point STORE there. The store survives the box, so
           #    content keys skip everything ANY prior run finished — the hydrate/push-loop/resume
           #    machinery this replaces is deleted below. First boot: blank volume → mkfs (one-time).
-          #    AGGREGATION SCRATCH stays on the box's local NVMe: store/aggregation holds only the
-          #    per-run covering plan + each tile's multi-GB reproject/merge tmp churn — regenerated
-          #    every run, never worth persisting, and its IO (TBs across a planet run) would saturate
-          #    a Ceph-backed volume (~300 MB/s) that shrugs at the durable artifacts' write rate.
-          #    dr() nested-binds it over the volume mount, so the pipeline sees one store path.
+          #    DISPOSABLE SCRATCH stays on the box's local NVMe: aggregation holds the per-run
+          #    covering plan + multi-GB reproject/merge churn; terrain-tmp holds render windows,
+          #    smoothed TIFFs, WebPs, and pre-publish PMTiles. None is worth persisting, and its IO
+          #    would saturate Ceph. dr() nested-binds both over the volume's store mount.
           SCRATCH="$GITHUB_WORKSPACE/pipelines/store-scratch"
-          mkdir -p "$SCRATCH"
+          TERRAIN_SCRATCH="$GITHUB_WORKSPACE/pipelines/terrain-scratch"
+          mkdir -p "$SCRATCH" "$TERRAIN_SCRATCH"
           if [ -z "${BBOX:-}" ]; then
             dev=""
             for _ in $(seq 1 30); do
@@ -368,10 +368,11 @@ jobs:
 
           # docker run wrapper: repo code at /app, the store bind-mounted, BBOX/FORCE/TOOLCHAIN
           # forwarded (+ BUNDLE_PROCESSES — only bundle.py reads it; harmless elsewhere).
-          # store/aggregation is NESTED-bound to NVMe scratch over the volume mount (see the store
-          # block above): the pipeline sees one store path, the volume never sees the tmp churn.
+          # Disposable aggregation and terrain intermediates are nested-bound to local NVMe over
+          # the volume mount: the pipeline sees one store path, while Ceph avoids the tmp churn.
           dr() { docker run --rm -v "$GITHUB_WORKSPACE:/app" -v "$STORE:/app/pipelines/store" \
             -v "$SCRATCH:/app/pipelines/store/aggregation" \
+            -v "$TERRAIN_SCRATCH:/app/pipelines/store/terrain-tmp" \
             -e BBOX -e FORCE_REBUILD -e TOOLCHAIN -e BUNDLE_PROCESSES \
             -e TERRAIN_PROCESSES -e TERRAIN_MEM_BUDGET_GB -e AGG_MEM_FACTOR \
             -e GDAL_CACHEMAX "$IMAGE:$IMAGE_TAG" just "$@"; }
@@ -391,15 +392,16 @@ jobs:
           push() { rclone copy "$STORE/$1" "$R2/$2" "${XFER[@]}" "${@:3}"; }
           push_build() { rclone copyto "$STORE/bundle/$1" "$R2/build/$SHA/$1" "${XFER[@]}"; }
 
-          # ── NO STORE HYDRATE, NO SOURCE HYDRATE (planet). The store IS the volume — whatever any
+          # ── NO STORE HYDRATE, NO R2 SOURCE HYDRATE (planet). The store IS the volume — whatever any
           #    prior run finished (completed or interrupted) is already at $STORE, and the
           #    content-addressed names are self-certifying (key in the filename; local writes are
           #    atomic), so freshness checks skip it directly. Sources, masks, and footprints are
           #    ALSO on the volume — sources.yml runs on a box with this same volume attached and
-          #    writes them there — so a planet build reads NOTHING from R2/data.openwaters.io. The
-          #    old manifest hydrate, the selective dirty-set source hydrate, and the resume problem
-          #    are all deleted, not ported. A bbox build keeps the NVMe scratch store, hydrates
-          #    bounds/catalog/footprints from the R2 mirror, and streams source bytes. ──
+          #    writes them there — so a planet build reads NOTHING from R2/data.openwaters.io. Before
+          #    aggregate, the dirty tiles' deduplicated source set is copied once from the volume to
+          #    local NVMe; GDAL then reads NVMe instead of making 48 workers contend on Ceph. A bbox
+          #    build keeps the NVMe scratch store, hydrates bounds/catalog/footprints from the R2
+          #    mirror, and streams source bytes. ──
 
           # ── ONE-TIME SEED from R2 (first boot of a blank volume only, marker-gated) ── the old
           #    push loops left thousands of finished tiles' artifacts AND the full prepared-source
@@ -419,17 +421,18 @@ jobs:
             hydrate polygon polygon
           fi
 
-          # ── aggregate env. Planet builds read sources + masks from LOCAL disk (the volume,
-          #    populated by sources.yml + the one-time seed): two real runs streaming per tile
+          # ── aggregate env. Planet builds read masks from the volume and source COGs from
+          #    local NVMe (staged after cover from the volume's sources.yml-owned mirror): two real
+          #    runs streaming per tile
           #    banked ZERO tiles in 2.5-3.9 healthy hours — a coastal macrotile re-reads the
-          #    same S-102/CUDEM bytes over /vsicurl for every tile, >2.5 h each. With no
-          #    SOURCE_VSI_BASE / LANDMASK / WATERMASK set, config.source_path and the landmask
-          #    defaults resolve store/source/<id>/<file> and store/landmask/{land,water}.fgb —
-          #    the volume's local copies (the preview-local read path). A legacy bounds row
-          #    whose filename is already an absolute /vsi path passes through source_path
-          #    untouched and still streams — acceptable fallback. bbox builds are
+          #    same S-102/CUDEM bytes over /vsicurl for every tile, >2.5 h each. Planet aggregate
+          #    sets SOURCE_VSI_BASE=/local-source after staging; masks keep their default volume
+          #    paths at store/landmask/{land,water}.fgb. A legacy bounds row whose filename is
+          #    already an absolute /vsi path passes through source_path untouched and still streams
+          #    — acceptable fallback. bbox builds are
           #    self-contained (no volume) and keep streaming everything, as before. ──
           AGG_ENV=(-e AGG_PROCESSES -e AGG_MEM_BUDGET_GB -e AGG_MEM_FACTOR -e GDAL_CACHEMAX)
+          AGG_MOUNTS=()
           if [ -n "${BBOX:-}" ]; then
             # Flagged coarse sources (GEBCO/EMODnet) clamp land + subtract inland water over
             # /vsicurl. WATERMASK only when it exists in R2 (landmask._present assumes any
@@ -467,14 +470,32 @@ jobs:
           echo "── cover ──"
           dr cover                        # writes the covering (the tiling plan; keys drive dirtiness)
 
-          # ── sources are ALREADY LOCAL (planet) ── sources.yml writes every prepared source,
-          #    mask, and footprint straight onto this volume (the one-time seed above covers the
-          #    pre-volume backlog), so the old selective dirty-set hydrate (sources-manifest +
-          #    files-from pull) is deleted — there is nothing to pull. Fail fast if the masks are
-          #    missing (flagged coarse sources exist planet-wide; a mask-less run would clamp
-          #    nothing) rather than per-tile deep in the pool.
+          # ── stage dirty source COGs onto local NVMe (planet) ── the persistent volume is
+          #    the durable source cache, not the hot read path: 48 parallel GDAL workers otherwise
+          #    contend on its Ceph bandwidth and leave the expensive box idle. Reuse the pipeline's
+          #    exact dirty-tile derivation to copy each referenced source file ONCE to NVMe, then
+          #    point source_path there. Catalogs/bounds stay visible on the volume; SOURCE_VSI_BASE
+          #    changes only raster filenames. Absolute /vsi legacy rows keep streaming untouched.
           if [ -z "${BBOX:-}" ]; then
             [ -f "$STORE/landmask/land.fgb" ] || { echo "no land.fgb on the volume — run sources.yml (landmask job) first" >&2; exit 1; }
+            echo "── stage dirty-set sources to NVMe ──"
+            dr sources-manifest
+            grep -v -e '://' -e '/vsi' "$STORE/source-manifest.txt" > /tmp/source-files.txt || true
+            legacy=$(grep -c -e '://' -e '/vsi' "$STORE/source-manifest.txt" || true)
+            [ "${legacy:-0}" -eq 0 ] || echo "$legacy legacy absolute-path row(s) keep streaming"
+            LOCAL_SOURCE="$SCRATCH/source"
+            mkdir -p "$LOCAL_SOURCE"
+            source_bytes=$(rclone size "$STORE/source" --files-from /tmp/source-files.txt --json | jq -r .bytes)
+            avail_bytes=$(df -B1 --output=avail "$SCRATCH" | tail -1 | tr -dc '0-9')
+            reserve_bytes=$(( 300 * 1024 * 1024 * 1024 ))
+            [ "$avail_bytes" -ge $(( source_bytes + reserve_bytes )) ] || {
+              echo "NVMe needs $(( source_bytes / 1073741824 )) GiB for dirty sources plus 300 GiB aggregation scratch; only $(( avail_bytes / 1073741824 )) GiB free" >&2
+              exit 1
+            }
+            echo "staging $(wc -l < /tmp/source-files.txt) source file(s), $(( source_bytes / 1073741824 )) GiB, from volume to NVMe"
+            rclone copy "$STORE/source" "$LOCAL_SOURCE" --files-from /tmp/source-files.txt "${XFER[@]}"
+            AGG_MOUNTS=(-v "$LOCAL_SOURCE:/local-source:ro")
+            AGG_ENV+=(-e SOURCE_VSI_BASE=/local-source)
           fi
 
           echo "── aggregate ──"
@@ -485,7 +506,8 @@ jobs:
           # of the storage. R2 sees mosaic tiles only at the mosaic-publish step below.
           docker run --rm -v "$GITHUB_WORKSPACE:/app" -v "$STORE:/app/pipelines/store" \
             -v "$SCRATCH:/app/pipelines/store/aggregation" \
-            -e BBOX -e FORCE_REBUILD -e TOOLCHAIN "${AGG_ENV[@]}" "$IMAGE:$IMAGE_TAG" just aggregate
+            "${AGG_MOUNTS[@]}" -e BBOX -e FORCE_REBUILD -e TOOLCHAIN \
+            "${AGG_ENV[@]}" "$IMAGE:$IMAGE_TAG" just aggregate
 
           # ── coverage ── SEQUENTIAL, after aggregate: run #6 proved the two can't share the box —
           # full-speed aggregate (~110 GB across 48 workers) + the planet tippecanoe (~130 GB,
