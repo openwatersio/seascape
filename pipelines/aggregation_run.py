@@ -21,6 +21,7 @@ import hashlib
 import os
 import shutil
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from glob import glob
 from multiprocessing import Pool
@@ -273,9 +274,22 @@ def run_all(filepaths):
     # admission control (local / small runs): a plain core-bound pool.
     procs = int(os.environ.get("AGG_PROCESSES", "0")) or os.cpu_count()
     budget = int(os.environ.get("AGG_MEM_BUDGET_GB", "0"))
+    # Parent-side progress: a `k/N` line every ~30 s (and at the end), counted in THIS process via
+    # map_budgeted's on_done — immune to the worker stdout buffering that hides per-tile prints
+    # until process exit, and the one line that answers "how far along is aggregate?" in the log.
+    total, state = len(filepaths), {"done": 0, "last": time.monotonic()}
+
+    def _progress(_item):
+        state["done"] += 1
+        now = time.monotonic()
+        if now - state["last"] > 30 or state["done"] == total:
+            print(f"  aggregate {state['done']}/{total} tiles", flush=True)
+            state["last"] = now
+
     with Pool(procs, **scheduler.pool_kwargs()) as pool:
         scheduler.map_budgeted(pool, run, filepaths, budget, procs,
-                               stem_of=lambda fp: fp.rsplit("/", 1)[-1].replace("-aggregation.csv", ""))
+                               stem_of=lambda fp: fp.rsplit("/", 1)[-1].replace("-aggregation.csv", ""),
+                               on_done=_progress)
 
 
 def main(argv):

@@ -105,20 +105,21 @@ def map_budgeted(pool, fn, items, budget_gb, procs, stem_of=None, on_done=None):
     Heaviest admissible first: items are weighed and sorted here, so callers need no particular
     order. In-flight is capped at `procs` so reservations mirror what can actually run. On a task
     exception, dispatching stops, in-flight tasks drain, and the first error re-raises (pool.map
-    semantics). budget_gb 0 = no admission control (local / small runs): plain unordered dispatch.
+    semantics). budget_gb 0 = no admission control (local / small runs): every item is admissible,
+    through the SAME dispatch loop — one code path, and on_done keeps one contract.
     `stem_of(item)` extracts the `z-x-y-cz` stem weight() reads (default: item IS the stem).
-    `on_done(item)` (optional) fires in the parent per completion, serially — progress reporting."""
+    `on_done(item)` (optional) fires in the parent per successful completion with the ITEM (never
+    fn's return value), serialized on the pool's result-handler thread — progress reporting."""
     stem_of = stem_of or (lambda it: it)
-    if not budget_gb:
-        for it in pool.imap_unordered(fn, items, chunksize=1):
-            if on_done:
-                on_done(it)
-        return
     import threading
     # Weigh once (weight() warns on clamp — don't re-warn every scan), heaviest first; the sort
-    # key is the weight alone so items never need to be comparable.
-    pending = sorted([(weight(stem_of(it), budget_gb), it) for it in items],
-                     key=lambda p: -p[0])
+    # key is the weight alone so items never need to be comparable. Unbudgeted: weights are moot
+    # (everything is admissible) — skip them so weight() never warns, and keep the given order.
+    if budget_gb:
+        pending = sorted([(weight(stem_of(it), budget_gb), it) for it in items],
+                         key=lambda p: -p[0])
+    else:
+        pending = [(0, it) for it in items]
     cond = threading.Condition()
     state = {"avail": budget_gb, "inflight": 0, "err": None}
 
@@ -138,9 +139,10 @@ def map_budgeted(pool, fn, items, budget_gb, procs, stem_of=None, on_done=None):
             picked = None
             if state["inflight"] < procs:
                 # First fit in a heaviest-first list = heaviest admissible; light tiles pass a
-                # full-of-heavies budget via the cheap lane (lane_floor 0).
+                # full-of-heavies budget via the cheap lane (lane_floor 0). Unbudgeted: the first
+                # pending item always fits (w == 0).
                 for i, (w, it) in enumerate(pending):
-                    if state["avail"] - w >= lane_floor(w, budget_gb):
+                    if not budget_gb or state["avail"] - w >= lane_floor(w, budget_gb):
                         picked = i
                         break
             if picked is None:
@@ -236,6 +238,12 @@ def _sim_task(args):
     return stem
 
 
+def _noop(_item):
+    """Self-check worker for the unbudgeted path — returns None so a broken on_done contract
+    (passing fn's return instead of the item) fails loudly."""
+    return None
+
+
 def _check():
     import multiprocessing as mp
     import time
@@ -300,6 +308,15 @@ def _check():
 
     _run_sim(mp, "default-context")
     _run_sim(mp.get_context("spawn"), "spawn-context")
+
+    # (c) the UNBUDGETED path shares the dispatch loop and the on_done contract: every item
+    # completes, and on_done receives the ITEMS (never fn's return value — _noop returns None).
+    seen = []
+    with mp.Pool(4) as pool:
+        map_budgeted(pool, _noop, [f"{z}-{i}-0-8" for i in range(9)], 0, 4,
+                     on_done=seen.append)
+    assert sorted(seen) == sorted(f"{z}-{i}-0-8" for i in range(9)), (
+        f"unbudgeted on_done must receive every ITEM, got {seen}")
     print("scheduler.py self-check ok")
 
 
