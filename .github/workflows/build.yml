@@ -66,7 +66,7 @@ env:
   # rebuild, never data. Lives in SERVER_LOCATION (volumes attach same-location only). Sized for
   # store (~100 GiB) + sources (~250 GiB) + bundle peak (~100 GiB); resizable live via console.
   STORE_VOLUME: seascape-store
-  STORE_VOLUME_GB: "500"
+  STORE_VOLUME_GB: "750"
   # Server hostname AND runner label (Cyclenerd/hcloud-github-runner registers the runner with
   # --labels "<name>,hetzner").
   NAME: seascape-build-${{ github.run_id }}
@@ -383,39 +383,41 @@ jobs:
           push() { rclone copy "$STORE/$1" "$R2/$2" "${XFER[@]}" "${@:3}"; }
           push_build() { rclone copyto "$STORE/bundle/$1" "$R2/build/$SHA/$1" "${XFER[@]}"; }
 
-          # ── NO STORE HYDRATE. The store IS the volume — whatever any prior run finished (completed
-          #    or interrupted) is already at $STORE, and the content-addressed names are
-          #    self-certifying (key in the filename; local writes are atomic), so freshness checks
-          #    skip it directly. The old manifest-driven R2 hydrate, its bootstrap branch, and the
-          #    resume problem are all deleted, not ported. What still syncs FROM R2 is stage-1 state
-          #    the volume doesn't own: bounds/catalog (source identity), footprints, masks, and the
-          #    dirty-set source files (below, after cover) — all incremental, mostly no-ops once the
-          #    volume is warm. A bbox build keeps the NVMe scratch store and streams sources. ──
+          # ── NO STORE HYDRATE, NO SOURCE HYDRATE (planet). The store IS the volume — whatever any
+          #    prior run finished (completed or interrupted) is already at $STORE, and the
+          #    content-addressed names are self-certifying (key in the filename; local writes are
+          #    atomic), so freshness checks skip it directly. Sources, masks, and footprints are
+          #    ALSO on the volume — sources.yml runs on a box with this same volume attached and
+          #    writes them there — so a planet build reads NOTHING from R2/data.openwaters.io. The
+          #    old manifest hydrate, the selective dirty-set source hydrate, and the resume problem
+          #    are all deleted, not ported. A bbox build keeps the NVMe scratch store, hydrates
+          #    bounds/catalog/footprints from the R2 mirror, and streams source bytes. ──
 
           # ── ONE-TIME SEED from R2 (first boot of a blank volume only, marker-gated) ── the old
-          #    push loop left thousands of finished tiles' artifacts in these prefixes (runs #6-#8
-          #    banked ~1900+ tiles that no run could ever see again); same code = same content keys,
-          #    so seeding them onto the volume makes the first volume build skip that work outright.
-          #    This is NOT run #5's per-run prefix-scan mistake: it runs ONCE ever (the marker),
-          #    transfers real data at line rate, and every later boot skips it entirely. It also
-          #    copies superseded-key garbage (~one GC generation's worth) — harmless cache bloat the
-          #    first forced rebuild orphans and a volume cleanup can drop.
-          if [ ! -e "$STORE/.seeded-from-r2" ]; then
-            echo "── one-time seed: prior runs' aggregate output from R2 ──"
-            for p in mosaic/tiles contour soundings depare; do hydrate "$p" "$p"; done
+          #    push loops left thousands of finished tiles' artifacts AND the full prepared-source
+          #    mirror in R2 (runs #6-#8 banked ~1900+ tiles no run could see again); same code =
+          #    same content keys, so seeding the volume makes the first volume build skip that work
+          #    and spares sources.yml a from-upstream re-prep of every source. This is NOT run #5's
+          #    per-run prefix-scan mistake: it runs ONCE ever (the marker), transfers real data at
+          #    line rate, and every later boot skips it entirely. It also copies superseded-key
+          #    garbage (~one GC generation's worth) — harmless cache bloat a volume cleanup can drop.
+          if [ -z "${BBOX:-}" ] && [ ! -e "$STORE/.seeded-from-r2" ]; then
+            echo "── one-time seed: prior runs' aggregate output + the source mirror from R2 ──"
+            for p in mosaic/tiles contour soundings depare source polygon landmask; do hydrate "$p" "$p"; done
             touch "$STORE/.seeded-from-r2"
           fi
+          if [ -n "${BBOX:-}" ]; then
+            hydrate source source --include '*/bounds.csv' --include '*/catalog.json'
+            hydrate polygon polygon
+          fi
 
-          hydrate source source --include '*/bounds.csv' --include '*/catalog.json'
-          hydrate polygon polygon
-
-          # ── aggregate env. Planet builds read sources + masks from LOCAL disk (hydrated
-          #    below, after cover names the dirty tiles): two real runs streaming per tile
+          # ── aggregate env. Planet builds read sources + masks from LOCAL disk (the volume,
+          #    populated by sources.yml + the one-time seed): two real runs streaming per tile
           #    banked ZERO tiles in 2.5-3.9 healthy hours — a coastal macrotile re-reads the
           #    same S-102/CUDEM bytes over /vsicurl for every tile, >2.5 h each. With no
           #    SOURCE_VSI_BASE / LANDMASK / WATERMASK set, config.source_path and the landmask
           #    defaults resolve store/source/<id>/<file> and store/landmask/{land,water}.fgb —
-          #    the hydrated local copies (the preview-local read path). A legacy bounds row
+          #    the volume's local copies (the preview-local read path). A legacy bounds row
           #    whose filename is already an absolute /vsi path passes through source_path
           #    untouched and still streams — acceptable fallback. bbox builds are
           #    self-contained (no volume) and keep streaming everything, as before. ──
@@ -457,31 +459,14 @@ jobs:
           echo "── cover ──"
           dr cover                        # writes the covering (the tiling plan; keys drive dirtiness)
 
-          # ── selective source hydrate (planet only) ──
-          # Pull exactly the source files the stale tiles reference, so aggregate reads them
-          # from local disk: sources-manifest derives the (source, filename) union with the
-          # same key-based dirty derivation the run itself uses (FORCE_REBUILD included).
-          # The MASKS hydrate FIRST, before sources-manifest: local mask content hashes enter
-          # every fork key, so the manifest and aggregate must see identical mask state — a
-          # mask-less manifest run would compute different keys, call every tile stale, and
-          # hydrate the full planet source set. They land at the container's DEFAULT
-          # store/landmask paths, so aggregate needs no LANDMASK/WATERMASK env: land.fgb is
-          # required (flagged coarse sources exist planet-wide — fail here, not per-tile),
-          # water.fgb optional (absent → the clamp degrades to land-only, the old behavior).
-          # Legacy rows whose filename is an absolute /vsi path aren't R2 keys — filter them
-          # out of the files-from list; source_path streams them untouched (the AGG_ENV note).
+          # ── sources are ALREADY LOCAL (planet) ── sources.yml writes every prepared source,
+          #    mask, and footprint straight onto this volume (the one-time seed above covers the
+          #    pre-volume backlog), so the old selective dirty-set hydrate (sources-manifest +
+          #    files-from pull) is deleted — there is nothing to pull. Fail fast if the masks are
+          #    missing (flagged coarse sources exist planet-wide; a mask-less run would clamp
+          #    nothing) rather than per-tile deep in the pool.
           if [ -z "${BBOX:-}" ]; then
-            echo "── hydrate dirty-set sources ──"
-            hydrate landmask landmask --include 'land.fgb' --include 'water.fgb'
-            [ -f "$STORE/landmask/land.fgb" ] || { echo "no land.fgb in R2 — flagged coarse sources need the land mask" >&2; exit 1; }
-            dr sources-manifest
-            grep -v -e '://' -e '/vsi' "$STORE/source-manifest.txt" > /tmp/source-files.txt || true
-            legacy=$(grep -c -e '://' -e '/vsi' "$STORE/source-manifest.txt" || true)
-            if [ "${legacy:-0}" -gt 0 ]; then
-              echo "$legacy legacy absolute-path row(s) keep streaming via /vsicurl"
-            fi
-            echo "hydrating $(wc -l < /tmp/source-files.txt) of $(wc -l < "$STORE/source-manifest.txt") referenced source file(s)"
-            rclone copy "$R2/source" "$STORE/source" --files-from /tmp/source-files.txt "${XFER[@]}"
+            [ -f "$STORE/landmask/land.fgb" ] || { echo "no land.fgb on the volume — run sources.yml (landmask job) first" >&2; exit 1; }
           fi
 
           echo "── aggregate ──"
