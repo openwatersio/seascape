@@ -9,21 +9,26 @@ cheap ocean tiles, and core-count OOM-kills on the coast (the exit-137 the two c
 
 The fix decouples the two limits:
   * POOL SIZE = cores  — cheap tiles (weight 1) fill every core.
-  * A shared GB BUDGET — each task, inside its worker, reserves weight(tile) GB across its
-    memory-peak section (blocking until the budget frees) and releases after, so the concurrent
-    heavy-tile peak can never exceed the budget however many cores are busy.
+  * A shared GB BUDGET — enforced in the PARENT, at dispatch time (map_budgeted): a task enters
+    the pool only once its weight(tile) GB fits, and the weight is released when it completes, so
+    the concurrent heavy-tile peak can never exceed the budget however many cores are busy.
 
-weight(stem) is a deterministic estimate from the tile geometry (below); the budget is a
-cross-process counter (a multiprocessing.Manager Value + Condition) the parent creates and hands to
-every worker through the Pool initializer — works under both fork (aggregate) and spawn (terrain).
+Admission is parent-side because a Pool worker dequeues a task BEFORE the task can wait on
+anything: with worker-side reservations (the first design), every worker could end up holding a
+blocked heavy tile while cheap tiles sat undequeued behind them — the pool starved regardless of
+queue order (heaviest-first put 40 of 48 workers to sleep; the md5 shuffle merely spread the same
+collapse across the whole run, run 29371657768). Parent-side, a tile that doesn't fit waits in a
+list, never in a worker.
 
-Deadlock-freedom: a worker acquires its FULL weight atomically under the condition lock (decrement
-only when avail ≥ weight — never a partial hold-and-wait), and every weight is clamped ≤ budget, so
-when the budget is idle any single waiter can always proceed. No two tasks can each hold part and
-wait for the rest. Crash-safety: the reservation is released in a try/finally, so a normal exception
-frees it. A HARD kill (SIGKILL / OOM) can't run finally and would leak that weight for the run's
-lifetime — accepted, because correct budgeting is precisely what prevents OOM-kills; we don't build
-elaborate recovery for a case the budget exists to make impossible.
+weight(stem) is a deterministic estimate from the tile geometry (below). Dispatch policy: heaviest
+admissible tile first (the backlog of dense coastal tiles is the phase's critical path), light
+tiles backfill while heavies wait, and lane_floor keeps heavies from draining the budget below
+what a light tile needs. Deadlock-freedom is trivial: one thread admits, weights are clamped ≤
+budget and lane_floor ≤ budget − weight, so on an idle budget the heaviest pending tile always
+fits. Crash-safety: a task exception releases its weight via error_callback and re-raises after
+in-flight work drains. A HARD kill (SIGKILL / OOM) loses the task and its callback — the pool
+itself cannot complete then (Pool semantics, budget or not); accepted, because correct budgeting
+is precisely what prevents OOM-kills.
 
 Host-agnostic: the pool size and the budget come from env (the workflow computes them from the box's
 RAM); this module reads them but never mentions R2 / CI / any host.
@@ -31,7 +36,6 @@ RAM); this module reads them but never mentions R2 / CI / any host.
 
 import math
 import os
-from contextlib import contextmanager
 
 # ── weight: the estimated peak GB of a tile, from its geometry ───────────────────────────────────
 
@@ -75,45 +79,13 @@ def weight(stem, budget_gb=0, factor=DEFAULT_FACTOR):
     return w
 
 
-# ── the shared budget: a cross-process Value + Condition ─────────────────────────────────────────
-
-# Per-worker globals, set by init_worker (the Pool initializer). None when no budget is configured
-# (local / small runs) — then reserve() is a no-op and the pool is a plain core-bound pool.
-_COND = None
-_AVAIL = None       # Manager Value('i'): GB currently available
-_BUDGET_GB = 0
-_FACTOR = DEFAULT_FACTOR
-
-
-def make_budget(budget_gb):
-    """Create the shared budget in the PARENT. Returns (manager, initargs) — keep `manager` alive
-    for the Pool's lifetime (it owns the server process); pass `initargs` as the Pool initializer's
-    args. Returns (None, (None, None, 0, factor)) when budget_gb is 0 (no budget: reserve() no-ops).
-
-    A Manager (not raw multiprocessing primitives) so the proxies pickle cleanly into BOTH a fork
-    and a spawn Pool's workers; the per-tile acquire is rare (seconds-to-minutes tiles), so the
-    proxy round-trip is negligible next to a merge."""
-    factor = float(os.environ.get("AGG_MEM_FACTOR", str(DEFAULT_FACTOR)))
-    if not budget_gb:
-        return None, (None, None, 0, factor)
-    import multiprocessing as mp
-    mgr = mp.Manager()
-    cond = mgr.Condition()
-    avail = mgr.Value("i", budget_gb)
-    return mgr, (cond, avail, budget_gb, factor)
-
-
-def init_worker(cond, avail, budget_gb, factor):
-    global _COND, _AVAIL, _BUDGET_GB, _FACTOR
-    _COND, _AVAIL, _BUDGET_GB, _FACTOR = cond, avail, budget_gb, factor
-
-
 # The cheap lane: heavy tiles may never drain the budget below this floor, so weight-1/2 tiles
-# always have GB to acquire and the spare cores stay busy. Without it the planet run collapses:
-# 8 × weight-18 z14 tiles == the whole 144 GB budget, avail hits 0, and every other worker —
-# including 1 GB ocean tiles — blocks for hours (run 29371657768: 6 h at cpu 17/48, mem 95/184).
+# always have GB to draw on and the spare cores stay busy. Without it, heavies can consume the
+# budget to the last GB — 8 × weight-18 z14 tiles == the whole 144 GB budget — and light tiles
+# stall behind them (run 29371657768's 6 h at cpu 17/48 was this plus worker-side blocking).
 # The floor shrinks to keep any single heavy admissible on an idle budget (deadlock-freedom:
-# effective floor ≤ budget − w always, so a lone waiter proceeds; clamped tiles still run alone).
+# effective floor ≤ budget − w always, so the heaviest pending tile always fits eventually;
+# clamped tiles still run alone).
 CHEAP_LANE_GB = 16
 CHEAP_MAX_W = 2  # weights ≤ this are "cheap": they ignore the floor and only need their own GB
 
@@ -126,27 +98,64 @@ def lane_floor(w, budget_gb):
     return max(0, min(CHEAP_LANE_GB, budget_gb - w))
 
 
-@contextmanager
-def reserve(stem):
-    """Hold weight(stem) GB of the shared budget across the wrapped memory-peak section. Blocks
-    until the budget can satisfy the FULL weight (atomic acquire — never a partial hold), then
-    releases in a try/finally so a normal exception frees it. Heavy tiles additionally leave
-    CHEAP_LANE_GB unclaimed (the cheap lane above). No-op when no budget is configured."""
-    if _COND is None or not _BUDGET_GB:
-        yield
+def map_budgeted(pool, fn, items, budget_gb, procs, stem_of=None, on_done=None):
+    """Run fn(item) for every item across `pool`, admitting work in THIS process before dispatch
+    (see the module docstring for why worker-side blocking starves the pool).
+
+    Heaviest admissible first: items are weighed and sorted here, so callers need no particular
+    order. In-flight is capped at `procs` so reservations mirror what can actually run. On a task
+    exception, dispatching stops, in-flight tasks drain, and the first error re-raises (pool.map
+    semantics). budget_gb 0 = no admission control (local / small runs): plain unordered dispatch.
+    `stem_of(item)` extracts the `z-x-y-cz` stem weight() reads (default: item IS the stem).
+    `on_done(item)` (optional) fires in the parent per completion, serially — progress reporting."""
+    stem_of = stem_of or (lambda it: it)
+    if not budget_gb:
+        for it in pool.imap_unordered(fn, items, chunksize=1):
+            if on_done:
+                on_done(it)
         return
-    w = weight(stem, _BUDGET_GB, _FACTOR)
-    floor = lane_floor(w, _BUDGET_GB)
-    with _COND:
-        while _AVAIL.value < w + floor:
-            _COND.wait()
-        _AVAIL.value -= w
-    try:
-        yield
-    finally:
-        with _COND:
-            _AVAIL.value += w
-            _COND.notify_all()
+    import threading
+    # Weigh once (weight() warns on clamp — don't re-warn every scan), heaviest first; the sort
+    # key is the weight alone so items never need to be comparable.
+    pending = sorted([(weight(stem_of(it), budget_gb), it) for it in items],
+                     key=lambda p: -p[0])
+    cond = threading.Condition()
+    state = {"avail": budget_gb, "inflight": 0, "err": None}
+
+    def _release(w, item, err=None):
+        # Runs in the pool's single result-handler thread — on_done calls are serialized.
+        with cond:
+            state["avail"] += w
+            state["inflight"] -= 1
+            if err is not None and state["err"] is None:
+                state["err"] = err
+            cond.notify_all()
+        if err is None and on_done:
+            on_done(item)
+
+    with cond:
+        while pending and state["err"] is None:
+            picked = None
+            if state["inflight"] < procs:
+                # First fit in a heaviest-first list = heaviest admissible; light tiles pass a
+                # full-of-heavies budget via the cheap lane (lane_floor 0).
+                for i, (w, it) in enumerate(pending):
+                    if state["avail"] - w >= lane_floor(w, budget_gb):
+                        picked = i
+                        break
+            if picked is None:
+                cond.wait()
+                continue
+            w, it = pending.pop(picked)
+            state["avail"] -= w
+            state["inflight"] += 1
+            pool.apply_async(fn, (it,),
+                             callback=lambda _r, w=w, it=it: _release(w, it),
+                             error_callback=lambda e, w=w, it=it: _release(w, it, e))
+        while state["inflight"]:
+            cond.wait()
+    if state["err"] is not None:
+        raise state["err"]
 
 
 def peak_rss_gb():
@@ -180,7 +189,7 @@ def log_peak(stem, sources=None):
     global _WORKER_PEAK
     import os
     cz = int(stem.split("-")[3])
-    w = weight(stem, _BUDGET_GB, _FACTOR) if _BUDGET_GB else weight(stem)
+    w = weight(stem)  # unclamped estimate — display only; admission happens in the parent
     rss, child = peak_rss_gb()
     pid = os.getpid()
     src = f" src={sources}" if sources is not None else ""
@@ -193,9 +202,8 @@ def log_peak(stem, sources=None):
         print(f"tile {stem} z{cz} weight={w}{src} worker[{pid}] peak {rss:.1f}GB{ch}", flush=True)
 
 
-def pool_kwargs(budget_gb):
-    """(manager, kwargs) for a Pool: `kwargs` carries initializer/initargs wiring the budget into
-    every worker. Spread `**kwargs` into Pool(...); keep `manager` alive until the pool closes.
+def pool_kwargs():
+    """kwargs for a Pool (spread `**pool_kwargs()` into Pool(...)).
 
     maxtasksperchild recycles each worker after N tiles so its multi-GB peak is RETURNED to the OS.
     glibc keeps freed arenas otherwise, so a long-lived worker's RSS ratchets up to its high-water and
@@ -203,36 +211,34 @@ def pool_kwargs(budget_gb):
     (the reserved weight is released, but the memory isn't). A fresh worker per tile makes the actual
     RSS match what the budget models. Respawn is ~free (fork) or a re-import (spawn), negligible vs a
     minutes-long tile. POOL_MAXTASKSPERCHILD unset/1 = fresh per tile; 0 = never recycle (old)."""
-    mgr, initargs = make_budget(budget_gb)
-    kwargs = {"initializer": init_worker, "initargs": initargs}
     maxtasks = int(os.environ.get("POOL_MAXTASKSPERCHILD", "1")) or None
-    if maxtasks is not None:
-        kwargs["maxtasksperchild"] = maxtasks
-    return mgr, kwargs
+    return {"maxtasksperchild": maxtasks} if maxtasks is not None else {}
 
 
 # ── self-check ───────────────────────────────────────────────────────────────────────────────────
 
 def _sim_task(args):
-    """A synthetic task: reserve the budget for a tile, then (independently of the mechanism) bump a
-    shared held-GB counter and record the peak, sleep to force overlap, and release. If the budget
-    mechanism is correct the peak held over ALL workers never exceeds the budget."""
+    """A synthetic task: bump a shared held-GB counter by this tile's weight, record the peak,
+    sleep (heavies longer, so light tasks can only finish early if admission lets them through),
+    release, and log (weight, completion time). The ADMISSION happens in the parent
+    (map_budgeted) — this task just proves what actually ran concurrently."""
     import time
-    stem, budget, factor, held, peak, lock = args
-    w = weight(stem, budget, factor)
-    with reserve(stem):
-        with lock:
-            held.value += w
-            if held.value > peak.value:
-                peak.value = held.value
-        time.sleep(0.02)
-        with lock:
-            held.value -= w
-    return w
+    stem, budget, held, peak, lock, log, t0 = args
+    w = weight(stem, budget)
+    with lock:
+        held.value += w
+        if held.value > peak.value:
+            peak.value = held.value
+    time.sleep(0.3 if w > CHEAP_MAX_W else 0.03)
+    with lock:
+        held.value -= w
+    log.append((w, time.monotonic() - t0))
+    return stem
 
 
 def _check():
     import multiprocessing as mp
+    import time
 
     # (a) weight is monotonic in child_z and clamped ≤ budget.
     z = 8
@@ -255,32 +261,42 @@ def _check():
     for w_, b_ in ((1, 4), (3, 4), (18, 160), (5, 8)):
         assert lane_floor(w_, b_) + w_ <= b_ or w_ <= CHEAP_MAX_W, f"floor+w must fit budget ({w_},{b_})"
 
-    # (b) a mixed-weight run through the real budget mechanism, low budget, short sleeps to force
-    # overlap: the concurrently-admitted weight must NEVER exceed the budget, and every task must
-    # complete (no deadlock — including the clamped over-budget tiles that run alone). Run it under
-    # BOTH the default Pool AND an explicit SPAWN context: aggregate uses fork, terrain uses spawn,
-    # and the budget's Manager proxies must pickle into a spawn worker via the initializer — a future
-    # refactor that breaks that must fail here, not in the migration.
-    factor = DEFAULT_FACTOR
-    # a spread of cheap (cz=8 → 1), medium (cz=13 → ~4) and over-budget (cz=14 → clamp 8) tiles
-    stems = ([f"{z}-{i}-0-8" for i in range(20)]
-             + [f"{z}-{i}-0-13" for i in range(8)]
-             + [f"{z}-{i}-0-14" for i in range(3)])
+    # (b) the ADVERSARIAL mix through the real mechanism (map_budgeted on a real Pool), heavies
+    # listed FIRST — the exact shape that starved the worker-side design (workers dequeued blocked
+    # heavies before any cheap task; run 29371657768). Asserts, per context (fork = aggregate,
+    # spawn = terrain):
+    #   * every task completes (no deadlock, clamped tiles included)
+    #   * the concurrently-held weight never exceeds the budget
+    #   * the budget actually fills (heavy + backfilled cheap)
+    #   * ANTI-STARVATION: heavies serialize on this tiny budget (~8 × 0.3 s back-to-back), so if
+    #     admission is fair ALL cheap tasks finish while heavies are still draining — assert the
+    #     slowest cheap task beats the MEDIAN heavy completion (~4 × 0.3 s ≈ 10× margin; the
+    #     worker-side design fails this by construction: cheap tasks couldn't start until the
+    #     heavies ahead of them in the queue had run).
+    stems = ([f"{z}-{i}-0-13" for i in range(6)]        # heavy: w=5, one at a time under floor 3
+             + [f"{z}-{i}-0-14" for i in range(2)]      # over-budget: clamp 8, runs alone
+             + [f"{z}-{i}-0-8" for i in range(20)])     # cheap: w=1, must flow around the heavies
 
     def _run_sim(ctx, label):
         mgr = ctx.Manager()
         held = mgr.Value("i", 0)
         peak = mgr.Value("i", 0)
         lock = mgr.Lock()
-        _mgr2, kwargs = pool_kwargs(budget)
-        tasks = [(s, budget, factor, held, peak, lock) for s in stems]
-        with ctx.Pool(4, **kwargs) as pool:
-            results = list(pool.imap_unordered(_sim_task, tasks, chunksize=1))
-        assert len(results) == len(tasks), f"[{label}] all tasks must complete, got {len(results)}/{len(tasks)}"
+        log = mgr.list()
+        t0 = time.monotonic()
+        tasks = [(s, budget, held, peak, lock, log, t0) for s in stems]
+        with ctx.Pool(4, **pool_kwargs()) as pool:
+            map_budgeted(pool, _sim_task, tasks, budget, 4, stem_of=lambda t: t[0])
+        entries = list(log)
+        assert len(entries) == len(tasks), f"[{label}] all tasks must complete, got {len(entries)}/{len(tasks)}"
         assert peak.value <= budget, f"[{label}] concurrent held weight {peak.value} exceeded budget {budget}"
         assert peak.value >= budget - 1, f"[{label}] expected the budget to fill (peak {peak.value})"
+        cheap_done = [t for w, t in entries if w <= CHEAP_MAX_W]
+        heavy_done = sorted(t for w, t in entries if w > CHEAP_MAX_W)
+        assert max(cheap_done) < heavy_done[len(heavy_done) // 2], (
+            f"[{label}] cheap tasks starved behind heavies: slowest cheap {max(cheap_done):.2f}s vs "
+            f"median heavy {heavy_done[len(heavy_done) // 2]:.2f}s")
         mgr.shutdown()
-        _mgr2.shutdown()
 
     _run_sim(mp, "default-context")
     _run_sim(mp.get_context("spawn"), "spawn-context")

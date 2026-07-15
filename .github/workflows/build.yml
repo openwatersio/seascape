@@ -294,10 +294,11 @@ jobs:
           #      * AGG/TERRAIN_PROCESSES = CORES — the POOL SIZE (max workers), so cheap tiles (weight
           #        1) fill every core. (Python: unset/0 would also default to cpu_count; set it
           #        explicitly for the log line + clarity.)
-          #      * AGG/TERRAIN_MEM_BUDGET_GB = MEM_GB − RESERVE — a shared GB budget each worker draws
-          #        from (scheduler.reserve) across its tile's memory-peak section, sized to
-          #        weight(tile). This BOUNDS THE CONCURRENT HEAVY-TILE PEAK: the densest coastal
-          #        macrotiles can't all merge at once (the OOM), while cores stay full of light tiles.
+          #      * AGG/TERRAIN_MEM_BUDGET_GB = MEM_GB − RESERVE — a shared GB budget enforced in the
+          #        POOL PARENT (scheduler.map_budgeted): a tile enters the pool only once its
+          #        weight(tile) fits, released on completion. This BOUNDS THE CONCURRENT HEAVY-TILE
+          #        PEAK (the densest coastal macrotiles can't all merge at once — the OOM) without a
+          #        blocked tile ever occupying a worker, so cores stay full of light tiles.
           #    RESERVE (~24) covers OS/docker + page cache for the volume writes during aggregate
           #    (coverage is sequential — run #6's OOM was the two overlapping; the push loop is gone).
           #    24, down from 40: run #8 (29371657768) peaked the WHOLE box at 121/184 GB with zero
@@ -322,10 +323,10 @@ jobs:
           # experiment misread a light-tile log window as the whole distribution and OOM'd runs #6+#7
           # in ~30 min (48 workers × real 12 GB heavies admitted at weight 5 → ~245 GB demand).
           # factor 4 → weight(z14)=18 → ~8-9 concurrent heavies ≈ 110 GB, proven stable for hours
-          # by run #4. Light tiles stay admissible via scheduler's CHEAP LANE (heavies must leave
-          # 16 GB of budget unclaimed — run #8 showed 8×18 = the exact budget, starving even 1 GB
-          # tiles for 6 h at cpu 17/48), and the queue is HEAVIEST-FIRST again so the z14 backlog
-          # (the critical path) drains from t=0 with light tiles backfilling the other cores.
+          # by run #4. Dispatch is heaviest-admissible-first in the pool parent (map_budgeted), so
+          # the z14 backlog (the critical path) drains from t=0; light tiles stay dispatchable via
+          # the CHEAP LANE (heavies must leave 16 GB of budget unclaimed — run #8 showed 8×18 = the
+          # exact budget, starving even 1 GB tiles for 6 h at cpu 17/48).
           # Forks inside a tile now run concurrently — re-fit this factor from the first
           # parallel-fork run's log_peak data (serial-run peaks no longer price it).
           export AGG_MEM_FACTOR=4
