@@ -632,6 +632,31 @@ jobs:
           push_build manifest.json
           echo "── build complete → $R2/build/$SHA ──"
 
+  # Capture provider-side CPU, disk, and network series while the ephemeral server still exists.
+  # The guest-level [res] sampler remains the source for memory, swap, load, and process RSS.
+  # Collection is best-effort: teardown waits for this job, but runs regardless of its result.
+  collect-metrics:
+    needs: [create-runner, build]
+    if: ${{ always() && needs.create-runner.outputs.server_id != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fetch Hetzner host metrics
+        continue-on-error: true
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+          SERVER_ID: ${{ needs.create-runner.outputs.server_id }}
+        run: .github/scripts/collect-hcloud-metrics "$SERVER_ID"
+
+      - name: Upload Hetzner host metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hcloud-metrics-${{ github.run_id }}-${{ needs.create-runner.outputs.server_id }}
+          path: hcloud-metrics/
+          if-no-files-found: ignore
+          retention-days: 90
+
   # Destroy the box + deregister the runner, ALWAYS — on build success, build failure, OR a
   # create-runner failure (server_id is emitted before the registration wait, so it is present even
   # if the runner never registered). The PERSISTENT store volume ($STORE_VOLUME) is deliberately
@@ -640,7 +665,7 @@ jobs:
   # resource and fails the step (a stray per-run volume named after the server is flagged too;
   # $STORE_VOLUME never matches that name).
   delete-runner:
-    needs: [create-runner, build]
+    needs: [create-runner, build, collect-metrics]
     if: always()
     runs-on: ubuntu-latest
     permissions: { contents: read }
