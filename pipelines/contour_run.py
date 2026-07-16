@@ -114,20 +114,18 @@ def _drop_small_rings(geom, min_area):
     return kept[0] if len(kept) == 1 else MultiLineString(kept)
 
 
-def smooth_and_enrich(sources, out_fgb, tol):
-    """Concatenate the metre + feet contour sets (each `(fgb, sys)`), tag `sys`, Chaikin-smooth
-    (in 3857, nav-band skip so smoothing never understates a shoal), drop deep micro-loop stipple,
-    and add depth_abs_m / depth_ft / depth_fm. Feet features sit on whole-fathom depths so their
-    depth_ft/depth_fm round clean; the viewer labels metre features in metres, feet features in
-    feet or fathoms."""
+def smooth_and_enrich(raw_fgb, out_fgb, tol):
+    """Tag each reassembled contour with every system whose ladder includes its depth (a level in
+    both the metre and fathom ladders yields one feature per system), Chaikin-smooth (in 3857,
+    nav-band skip so smoothing never understates a shoal), drop deep micro-loop stipple, and add
+    depth_abs_m / depth_ft / depth_fm. Feet features sit on whole-fathom depths so their
+    depth_ft/depth_fm round clean; the viewer labels metre features in metres, feet in feet/fathoms."""
     import geopandas as gpd
     import pandas as pd
-    parts = []
-    for fgb, sys in sources:
-        g = gpd.read_file(fgb)
-        g["sys"] = sys
-        parts.append(g)
-    gdf = gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), crs=parts[0].crs)
+    g = gpd.read_file(raw_fgb)
+    m = g[g["depth_m"].isin(config.CONTOUR_LEVELS)].assign(sys="m")
+    ft = g[g["depth_m"].isin(config.CONTOUR_LEVELS_FT)].assign(sys="ft")
+    gdf = gpd.GeoDataFrame(pd.concat([m, ft], ignore_index=True), crs=g.crs)
     gdf["depth_abs_m"] = (-gdf["depth_m"]).round().astype(int)
     gdf["depth_ft"] = (-gdf["depth_m"] / 0.3048).round().astype(int)
     gdf["depth_fm"] = (-gdf["depth_m"] / 1.8288).round().astype(int)
@@ -139,6 +137,79 @@ def smooth_and_enrich(sources, out_fgb, tol):
                                      for g in gdf.loc[deep, "geometry"]]
         gdf = gdf[gdf.geometry.notna() & ~gdf.geometry.is_empty]
     gdf.to_file(out_fgb, driver="FlatGeobuf")
+
+
+# gdal_contour holds ALL of its input raster's line geometry in RAM, so one dense 32768 px coastal
+# tile peaks ~12-14 GB in a single subprocess — the aggregate's whole memory peak, why a few heavy
+# tiles exhaust RAM while cores idle. merge and smooth already window for this; contour was the one
+# heavy stage still run whole. _contour_blocks windows it (see its docstring).
+CONTOUR_BLOCK = int(os.environ.get("CONTOUR_BLOCK", "8192"))  # core block side (px)
+CONTOUR_HALO = 2                                              # read overlap (px); contour marching is cell-local, so 1 neighbour row suffices to draw the seam segment
+CONTOUR_SNAP = 1e-3                                           # reassembly snap grid (m, 3857); << pixel, >> float noise
+
+
+def _reassemble(fragments, out):
+    """Rejoin the block fragments a seam split back into whole contour lines, writing `out`. Per
+    depth level: snap fragment coordinates to a fine grid (a seam's two blocks compute its crossing
+    to the last ULP, and the halo can duplicate a corner bridge, so "the same" endpoint differs by
+    ~1e-9), union to flatten and dedupe, then line_merge to stitch each seam-split line whole.
+    Genuinely separate contours at a level don't touch, so they stay separate. Runs BEFORE
+    smooth_and_enrich so Chaikin smooths each whole line as one piece — smoothing the raw fragments
+    would kink the geometry at every block seam (the regression this exists to prevent)."""
+    import geopandas as gpd
+    import pandas as pd
+    from shapely import get_parts, line_merge, set_precision, union_all
+    gdf = pd.concat([gpd.read_file(f) for f in fragments], ignore_index=True)
+    rows = []
+    for depth, grp in gdf.groupby("depth_m"):
+        merged = line_merge(union_all(set_precision(grp.geometry.values, CONTOUR_SNAP)))
+        rows.extend({"depth_m": depth, "geometry": g} for g in get_parts(merged))
+    gpd.GeoDataFrame(rows, crs=gdf.crs).to_file(out, driver="FlatGeobuf")
+
+
+def _contour_blocks(dem, levels, tmp, tag):
+    """Contour `dem` into ONE FGB, bounding gdal_contour's RAM by running it per core block. Returns
+    the FGB path, or None if the DEM yields no contours. A DEM within one block contours directly
+    (byte-identical to the old single call). A larger tile contours per CONTOUR_BLOCK core block
+    (halo-padded reads so a seam segment still draws, each clipped back to its core so halo
+    duplicates drop), then _reassemble stitches the seam-split fragments back into whole lines before
+    the caller smooths them."""
+    import rasterio
+    from rasterio.windows import Window
+    from rasterio.windows import bounds as window_bounds
+    with rasterio.open(dem) as ds:
+        width, height, transform = ds.width, ds.height, ds.transform
+    if width <= CONTOUR_BLOCK and height <= CONTOUR_BLOCK:
+        raw = f"{tmp}/contour-raw-{tag}.fgb"
+        _run(f"gdal_contour -q -fl {levels} -a depth_m -f FlatGeobuf {dem} {raw}", f"gdal_contour {tag}")
+        return raw if feature_count(raw) > 0 else None
+    fragments = []
+    n = 0
+    for oy in range(0, height, CONTOUR_BLOCK):
+        for ox in range(0, width, CONTOUR_BLOCK):
+            cw, ch = min(CONTOUR_BLOCK, width - ox), min(CONTOUR_BLOCK, height - oy)
+            rx0, ry0 = max(0, ox - CONTOUR_HALO), max(0, oy - CONTOUR_HALO)
+            rx1, ry1 = min(width, ox + cw + CONTOUR_HALO), min(height, oy + ch + CONTOUR_HALO)
+            vrt = f"{tmp}/cblk-{tag}-{n}.vrt"
+            rawb = f"{tmp}/cblk-{tag}-{n}-raw.fgb"
+            clipped = f"{tmp}/cblk-{tag}-{n}.fgb"
+            # -of VRT -srcwin is a metadata-only window (no data copy), keeping the DEM geotransform
+            _run(f"gdal_translate -q -of VRT -srcwin {rx0} {ry0} {rx1 - rx0} {ry1 - ry0} {dem} {vrt}",
+                 f"gdal_translate contour block {tag}")
+            _run(f"gdal_contour -q -fl {levels} -a depth_m -f FlatGeobuf {vrt} {rawb}",
+                 f"gdal_contour {tag}")
+            left, bottom, right, top = window_bounds(Window(ox, oy, cw, ch), transform)
+            _run(f"ogr2ogr -f FlatGeobuf -overwrite -nlt PROMOTE_TO_MULTI "
+                 f"-clipsrc {left} {bottom} {right} {top} {clipped} {rawb}",
+                 f"ogr2ogr contour block clip {tag}")
+            if feature_count(clipped) > 0:
+                fragments.append(clipped)
+            n += 1
+    if not fragments:
+        return None
+    out = f"{tmp}/contour-raw-{tag}.fgb"
+    _reassemble(fragments, out)
+    return out
 
 
 def generate(filepath, out):
@@ -155,24 +226,17 @@ def generate(filepath, out):
         print(f"contour: no merged DEM for {filename}")
         return
 
-    levels = " ".join(str(l) for l in config.CONTOUR_LEVELS)
-    raw = f"{tmp}/contour-raw.fgb"
-    _run(f"gdal_contour -q -fl {levels} -a depth_m -f FlatGeobuf {dem} {raw}", "gdal_contour m")
-    sources = [(raw, "m")]
-
-    # A second set at the fathom curves for feet/fathom charts (same DEM, tagged sys=ft).
-    levels_ft = " ".join(str(l) for l in config.CONTOUR_LEVELS_FT)
-    raw_ft = f"{tmp}/contour-raw-ft.fgb"
-    _run(f"gdal_contour -q -fl {levels_ft} -a depth_m -f FlatGeobuf {dem} {raw_ft}", "gdal_contour ft")
-    if feature_count(raw_ft) > 0:
-        sources.append((raw_ft, "ft"))
-
-    if sum(feature_count(f) for f, _ in sources) == 0:
+    # Contour the metre + fathom ladders in ONE pass over the union of levels — halving the
+    # per-block contour/clip/reassemble work vs a pass each. smooth_and_enrich splits each line
+    # back to its system(s) by depth membership.
+    levels = " ".join(str(l) for l in sorted(set(config.CONTOUR_LEVELS) | set(config.CONTOUR_LEVELS_FT)))
+    raw = _contour_blocks(dem, levels, tmp, "all")
+    if not raw:
         print(f"contour: no ocean features for {filename}")
         return
 
     smoothed = f"{tmp}/contour-smooth.fgb"
-    smooth_and_enrich(sources, smoothed, tol=get_resolution(child_z))
+    smooth_and_enrich(raw, smoothed, tol=get_resolution(child_z))
 
     b = mercantile.xy_bounds(tile)  # unbuffered, tile-aligned (EPSG:3857)
     clipped = f"{tmp}/contour-clip.fgb"
@@ -515,7 +579,43 @@ def _check():
     assert "depth_abs_m" not in PER_ZOOM_FILTER
     # every tier level must exist in the generated contour set (else it filters to nothing)
     assert all(d in config.CONTOUR_LEVELS for _, depths in CONTOUR_TIERS for d in depths)
-    print("contour_run ring-drop + orphan-filter self-check ok")
+
+    # windowed gdal_contour must reconstruct the whole-raster line set with no seam gaps. A line
+    # only SPLITS at a block core (total length preserved); a dropped seam segment would shorten
+    # it. Contour a diagonal ramp whole and in small blocks (diagonals cross both seam axes), and
+    # compare total line length.
+    import tempfile
+    import geopandas as gpd
+    import rasterio
+    from rasterio.transform import from_origin
+    global CONTOUR_BLOCK
+    with tempfile.TemporaryDirectory() as d:
+        n = 256
+        yy, xx = np.mgrid[0:n, 0:n]
+        ramp = ((xx + yy) / (2 * (n - 1)) * 200 - 100).astype("float32")  # anti-diagonal contours
+        dem = f"{d}/dem.tif"
+        with rasterio.open(dem, "w", driver="GTiff", height=n, width=n, count=1, dtype="float32",
+                           crs="EPSG:3857", transform=from_origin(0, n, 1, 1)) as ds:
+            ds.write(ramp, 1)
+        lv = "-50 0 50"
+        whole = f"{d}/whole.fgb"
+        _run(f"gdal_contour -q -fl {lv} -a depth_m -f FlatGeobuf {dem} {whole}", "check whole")
+        saved, CONTOUR_BLOCK = CONTOUR_BLOCK, 64   # 4x4 blocks over the 256px DEM
+        try:
+            win = _contour_blocks(dem, lv, d, "chk")   # windowed + reassembled
+        finally:
+            CONTOUR_BLOCK = saved
+        wg = gpd.read_file(win)
+        len_whole = float(gpd.read_file(whole).geometry.length.sum())
+        assert abs(float(wg.geometry.length.sum()) - len_whole) / len_whole < 0.02, \
+            "windowed contour lost length (seam gap?)"
+        # reconnection: fragments MUST rejoin into whole lines before smoothing, else a seam-crossing
+        # line Chaikin-smooths as pieces (a kink per block seam). The whole-raster contour is one
+        # line per component; the reassembled windowed set must carry the SAME count, not extra
+        # fragments — length alone can't see this, since splitting preserves length.
+        assert len(wg) == feature_count(whole), \
+            f"fragments not reconnected: whole={feature_count(whole)} lines, windowed={len(wg)}"
+    print("contour_run ring-drop + orphan-filter + windowed-contour self-check ok")
 
 
 if __name__ == "__main__":

@@ -250,6 +250,7 @@ test-engine:
     uv run python terrain.py --check
     uv run python scheduler.py --check
     uv run python store_manifest.py --check
+    uv run python contour_run.py check
 
 # Lint the GitHub Actions workflows.
 test-workflows:
