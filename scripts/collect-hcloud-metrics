@@ -13,8 +13,11 @@ curl -fsS --connect-timeout 10 --max-time 60 -H "$auth" \
 
 start=$(jq -er .server.created "$out/server.json")
 end=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-start_epoch=$(date -d "$start" +%s)
-end_epoch=$(date -d "$end" +%s)
+to_epoch() {
+  date -u -d "$1" +%s 2>/dev/null || date -j -u -f %Y-%m-%dT%H:%M:%SZ "$1" +%s
+}
+start_epoch=$(to_epoch "$start")
+end_epoch=$(to_epoch "$end")
 step=$(( (end_epoch - start_epoch + 1399) / 1400 ))
 [ "$step" -ge 60 ] || step=60
 
@@ -24,7 +27,7 @@ curl -fsSG --connect-timeout 10 --max-time 120 -H "$auth" \
   --data-urlencode "end=$end" \
   --data-urlencode "step=$step" \
   "$api/servers/$server_id/metrics" -o "$out/metrics.json"
-jq -e '.metrics.values | length > 0' "$out/metrics.json" >/dev/null
+jq -e '.metrics.time_series | length > 0' "$out/metrics.json" >/dev/null
 
 jq -n --arg server_id "$server_id" --arg start "$start" --arg end "$end" \
   --argjson step "$step" \
