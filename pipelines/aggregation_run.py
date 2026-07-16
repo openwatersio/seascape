@@ -18,6 +18,7 @@ CLI:
 """
 
 import hashlib
+import json
 import os
 import shutil
 import sys
@@ -270,6 +271,68 @@ def sources_manifest():
     print(f"source manifest: {len(files)} file(s) across {len(dirty)} dirty tile(s)")
 
 
+def explain_keys():
+    """Print the expected keys and their unhashed determinants for one ubiquitous tile.
+
+    Prefer a GEBCO-only tile so a change diagnoses the global base path, not a regional source.
+    Stored sibling names expose the previous final keys even when none matches today's key. This
+    command is diagnostic-only and this module is intentionally absent from every product key.
+    """
+    csvs = covering_sorted()
+    if not csvs:
+        raise SystemExit("key diagnostics: no covering")
+
+    def sources(fp):
+        with open(fp) as f:
+            return sorted({line.split(",", 1)[0] for line in f.readlines()[1:] if line.strip()})
+
+    filepath = next((fp for fp in csvs if sources(fp) == ["gebco"]), csvs[0])
+    stem = filepath.rsplit("/", 1)[-1].replace("-aggregation.csv", "")
+    source_ids = sources(filepath)
+    merge_inputs, merge_cfg = _merge_inputs_config(filepath)
+    mosaic_inputs, mosaic_cfg = mosaic._inputs_config(filepath)
+
+    products = {}
+    for name, key, art in (
+        ("mosaic", mosaic.mosaic_key(filepath), mosaic.tile_artifact(stem)),
+        ("contour", contour_key(filepath), _artifact("contour", stem)),
+        ("soundings", soundings_key(filepath), _artifact("soundings", stem)),
+        ("depare", depare_key(filepath), _artifact("depare", stem)),
+    ):
+        expected = keys.content_path(art, key)
+        base, ext = os.path.splitext(art)
+        products[name] = {
+            "expected_key": key,
+            "expected_exists": os.path.isfile(expected) or os.path.isfile(keys.empty_marker(art, key)),
+            "stored_siblings": sorted(glob(f"{base}-*{ext}") + glob(f"{base}-*.empty")),
+        }
+
+    modules = sorted(set(MERGE_MODULES + ["contour_run", "soundings_run", "depare_run", "mosaic"]))
+    with open(filepath, "rb") as f:
+        covering_sha = hashlib.sha256(f.read()).hexdigest()
+    report = {
+        "stem": stem,
+        "covering": filepath,
+        "covering_sha256": covering_sha,
+        "toolchain": keys.toolchain(),
+        "products": products,
+        "module_sha256": {name: hashlib.sha256(keys._module_bytes(name)).hexdigest()
+                          for name in modules},
+        "mask_hashes": {path: keys.file_hash(path) for path in (landmask.path(), landmask.water_path())},
+        "sources": {sid: {"recipe_hash": config.source_recipe_hash(sid),
+                           "properties": {k: config.source_property(sid, k) for k in
+                                          ("priority", "max_zoom", "land_clamp", "offset",
+                                           "negate", "band", "mixed_crs")}}
+                    for sid in source_ids},
+        "resolved_config": {"merge": merge_cfg, "mosaic": mosaic_cfg},
+        "input_sha256": {
+            "merge": [hashlib.sha256(str(v).encode()).hexdigest() for v in merge_inputs],
+            "mosaic": [hashlib.sha256(str(v).encode()).hexdigest() for v in mosaic_inputs],
+        },
+    }
+    print("key diagnostics:\n" + json.dumps(report, indent=2, sort_keys=True), flush=True)
+
+
 def run_all(filepaths):
     if not filepaths:
         print("nothing to do.")
@@ -309,8 +372,10 @@ def main(argv):
         run_all(dirty_filepaths())
     elif argv == ["sources-manifest"]:
         sources_manifest()
+    elif argv == ["explain-keys"]:
+        explain_keys()
     else:
-        sys.exit("usage: aggregation_run.py [sources-manifest]")
+        sys.exit("usage: aggregation_run.py [sources-manifest|explain-keys]")
 
 
 if __name__ == "__main__":

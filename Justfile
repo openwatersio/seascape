@@ -72,6 +72,10 @@ aggregate:
 sources-manifest:
     uv run python aggregation_run.py sources-manifest
 
+# Explain one GEBCO-only tile's expected/stored keys and every unhashed determinant.
+key-diagnostics:
+    uv run python aggregation_run.py explain-keys
+
 # Assemble the stage-2 mosaic index from the tile COGs `aggregate` persisted: the GeoParquet
 # tile index (= manifest), the planet z8 overview COG, and the mosaic.gti pointer (written last).
 # Run after `aggregate`. A bbox build produces a window-scoped GTI (QGIS-inspectable) but writes

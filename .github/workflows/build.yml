@@ -478,6 +478,7 @@ jobs:
           #    stage. The stage order matches `just planet`; the box just interleaves pushes. ──
           echo "── cover ──"
           dr cover                        # writes the covering (the tiling plan; keys drive dirtiness)
+          dr key-diagnostics              # expected/stored keys + determinants for resume failures
 
           # ── stage dirty source COGs onto local NVMe (planet) ── the persistent volume is
           #    the durable source cache, not the hot read path: 48 parallel GDAL workers otherwise
