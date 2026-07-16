@@ -17,7 +17,7 @@ jobs:
         env:
           HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
           SERVER_ID: ${{ inputs.server_id }}
-        run: .github/scripts/collect-hcloud-metrics "$SERVER_ID"
+        run: scripts/collect-hcloud-metrics "$SERVER_ID"
       - uses: actions/upload-artifact@v4
         with:
           name: hcloud-metrics-${{ github.run_id }}-${{ inputs.server_id }}
