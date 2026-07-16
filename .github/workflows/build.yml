@@ -255,6 +255,9 @@ jobs:
             blkid "$dev" >/dev/null 2>&1 || { echo "blank volume — one-time mkfs"; mkfs.ext4 -q -L seascape-store "$dev"; }
             mkdir -p /mnt/seascape-store
             mount -o noatime "$dev" /mnt/seascape-store
+            # Hetzner enlarges the block device but not its ext4 filesystem. Online resize is
+            # idempotent: it grows after a console resize and is a no-op on later builds.
+            resize2fs "$dev"
             STORE="/mnt/seascape-store/store"
             mkdir -p "$STORE"
             avail_gb=$(df -BG --output=avail "$STORE" | tail -1 | tr -dc '0-9')
