@@ -330,6 +330,11 @@ jobs:
           # Forks inside a tile now run concurrently — re-fit this factor from the first
           # parallel-fork run's log_peak data (serial-run peaks no longer price it).
           export AGG_MEM_FACTOR=4
+          # Temporary completion mode: run 29437160867 exposed unbounded DEPARE/GEOS work in a
+          # small pathological tail. Keep the raster, contours, and soundings product shippable;
+          # the workflow removes any stale DEPARE bundle before the final vector join.
+          # Remove this one export to restore DEPARE after its geometry path is bounded.
+          export SKIP_DEPARE=1
           export BUNDLE_PROCESSES=$BND
           export GDAL_CACHEMAX=256
           # The toolchain identity for the content-hash keys (pipelines/keys.py): the deps-keyed
@@ -374,7 +379,7 @@ jobs:
             -v "$SCRATCH:/app/pipelines/store/aggregation" \
             -v "$TERRAIN_SCRATCH:/app/pipelines/store/terrain-tmp" \
             -e BBOX -e FORCE_REBUILD -e TOOLCHAIN -e BUNDLE_PROCESSES \
-            -e TERRAIN_PROCESSES -e TERRAIN_MEM_BUDGET_GB -e AGG_MEM_FACTOR \
+            -e TERRAIN_PROCESSES -e TERRAIN_MEM_BUDGET_GB -e AGG_MEM_FACTOR -e SKIP_DEPARE \
             -e GDAL_CACHEMAX "$IMAGE:$IMAGE_TAG" just "$@"; }
 
           R2="R2:$DATA_BUCKET/bathymetry"
@@ -431,7 +436,8 @@ jobs:
           #    already an absolute /vsi path passes through source_path untouched and still streams
           #    — acceptable fallback. bbox builds are
           #    self-contained (no volume) and keep streaming everything, as before. ──
-          AGG_ENV=(-e AGG_PROCESSES -e AGG_MEM_BUDGET_GB -e AGG_MEM_FACTOR -e GDAL_CACHEMAX)
+          AGG_ENV=(-e AGG_PROCESSES -e AGG_MEM_BUDGET_GB -e AGG_MEM_FACTOR -e GDAL_CACHEMAX
+                   -e SKIP_DEPARE)
           AGG_MOUNTS=()
           if [ -n "${BBOX:-}" ]; then
             # Flagged coarse sources (GEBCO/EMODnet) clamp land + subtract inland water over
@@ -582,8 +588,17 @@ jobs:
           # covering tile left an artifact or .empty marker (contour_run.verify_vector_complete)
           # before bundling — the same invariant the store manifest hard-failed on above, so
           # reordering these steps past the manifest can't silently bundle a holed layer.
-          dr soundings                    # soundings + depare bundle BEFORE contours: the single
-          dr depare                       # tile-join folds them into vector.pmtiles
+          dr soundings                    # bundled before contours' single tile-join
+          if [ -z "${SKIP_DEPARE:-}" ]; then
+            dr depare
+          else
+            echo "DEPARE disabled for this build"
+            # Derived bundles only: per-tile DEPARE artifacts stay cached for later diagnosis.
+            # Removing vector.pmtiles forces contour_run to rejoin contours + soundings without
+            # accidentally reusing a previously keyed vector archive that already contains DEPARE.
+            rm -f "$STORE/bundle/depare.pmtiles" "$STORE/bundle/depare.pmtiles.key" \
+                  "$STORE/bundle/vector.pmtiles" "$STORE/bundle/vector.pmtiles.key"
+          fi
           dr contours
           push_build vector.pmtiles
 

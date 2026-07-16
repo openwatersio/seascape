@@ -170,17 +170,25 @@ def run(filepath):
     # flush: a pool worker's stdout is block-buffered, so without it start/end reach the log
     # together at process exit and per-tile timings are unrecoverable from a run's log.
     print(f"{stem} start", flush=True)
+    started = time.monotonic()
+
+    def timed(label, fn):
+        t = time.monotonic()
+        result = fn()
+        print(f"{stem} {label} {time.monotonic() - t:.1f}s", flush=True)
+        return result
+
     tmp_folder = filepath.replace("-aggregation.csv", "-tmp")
     # This tile's memory weight was reserved in the PARENT before dispatch (scheduler.map_budgeted
     # in run_all) and is released when this task completes — the whole body runs under it. The
     # feather-merge is the RAM peak (the merged array + reprojected sources + masks — S-102 alone
     # is ~52 overlapping products); the vector forks below run off the SAME already-merged DEM.
-    aggregation_reproject.reproject(filepath)
-    aggregation_merge.merge(filepath)
+    timed("reproject", lambda: aggregation_reproject.reproject(filepath))
+    timed("merge", lambda: aggregation_merge.merge(filepath))
     if do_mosaic:
-        mosaic.produce(filepath, tmp_folder, mosaic_key)  # persist BEFORE smooth (unsmoothed truth)
+        timed("mosaic", lambda: mosaic.produce(filepath, tmp_folder, mosaic_key))
     if not SKIP_SMOOTH:
-        smooth.smooth_merged(tmp_folder)         # slope-selective blur, shared by every vector fork
+        timed("smooth", lambda: smooth.smooth_merged(tmp_folder))
     # Terrain is no longer produced here — terrain.py renders it per-zoom from the mosaic (stage
     # 3), keyed off the mosaic tile hashes. The vector forks still read the smoothed merge below.
     # The three forks are independent readers of the same on-disk smoothed DEM (distinct tmp +
@@ -189,12 +197,15 @@ def run(filepath):
     # its budget slot walking them serially — the forks' overlapped peak is covered by this
     # tile's single reservation (the factor is re-fit against parallel-fork log_peak data).
     def _fork(fork, mod):
+        t = time.monotonic()
+        print(f"{stem} fork={fork} begin", flush=True)
         e = plan[fork]
         cpath = keys.content_path(e["art"], e["key"])
         keys.supersede(e["art"])                 # clear last build's key BEFORE generating (crash -> stale)
         mod.generate(filepath, cpath)            # vector fork off the same merged DEM; writes cpath atomically, or nothing
         if not os.path.isfile(cpath):
             keys.write_empty(e["art"], e["key"])  # legitimately empty -> mark it done
+        print(f"{stem} fork={fork} {time.monotonic() - t:.1f}s", flush=True)
 
     forks = [(f, m) for f, m in (("contour", contour_run), ("soundings", soundings_run),
                                  ("depare", depare_run)) if plan[f]["do"]]
@@ -206,6 +217,7 @@ def run(filepath):
     with open(filepath) as f:                    # covering rows = overlapping source files: the density
         n_src = sum(1 for _ in f) - 1            # signal behind the ~11× peak spread at one child_z
     scheduler.log_peak(stem, sources=n_src)       # whole-run peak RSS (covers the forks) vs weight + density — tuning data
+    print(f"{stem} total {time.monotonic() - started:.1f}s", flush=True)
     print(f"{stem} end", flush=True)
 
 
