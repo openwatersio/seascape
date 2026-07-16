@@ -385,6 +385,17 @@ jobs:
             -e TERRAIN_PROCESSES -e TERRAIN_MEM_BUDGET_GB -e AGG_MEM_FACTOR -e SKIP_DEPARE \
             -e GDAL_CACHEMAX "$IMAGE:$IMAGE_TAG" just "$@"; }
 
+          # The planet-z8 COG is larger than classic TIFF's 4 GiB ceiling. Inject BIGTIFF only for
+          # mosaic-index rather than editing mosaic.py: that module's bytes are part of every
+          # persisted mosaic tile key, so changing it during recovery would dirty the whole planet.
+          dr_mosaic_index() { docker run --rm -v "$GITHUB_WORKSPACE:/app" \
+            -v "$STORE:/app/pipelines/store" \
+            -v "$SCRATCH:/app/pipelines/store/aggregation" \
+            -v "$GITHUB_WORKSPACE/.github/scripts/gdalwarp-bigtiff:/usr/local/bin/gdalwarp:ro" \
+            -v "$TERRAIN_SCRATCH:/app/pipelines/store/terrain-tmp" \
+            -e BBOX -e FORCE_REBUILD -e TOOLCHAIN -e GDAL_CACHEMAX \
+            "$IMAGE:$IMAGE_TAG" just mosaic-index; }
+
           R2="R2:$DATA_BUCKET/bathymetry"
           # --retries 5: R2 occasionally returns a transient 500 InternalError; ride it out
           # instead of failing the stage (same convention as sources.yml's mirror). Applied to
@@ -550,7 +561,7 @@ jobs:
           #    absolute tile paths so terrain reads the mosaic off local disk. The PUBLISHED index
           #    (with /vsicurl tile URLs) is rebuilt at the mosaic-publish step below (after terrain).
           echo "── mosaic index (local) ──"
-          dr mosaic-index
+          dr_mosaic_index
 
           # ── terrain (stage 3) ── the per-zoom Terrarium render from the mosaic (native + coalesced
           #    overviews), replacing the old 2x2-average downsample pyramid. TERRAIN_PROCESSES caps
@@ -574,6 +585,7 @@ jobs:
             echo "── mosaic publish (/vsicurl index) ──"
             docker run --rm -v "$GITHUB_WORKSPACE:/app" -v "$STORE:/app/pipelines/store" \
               -v "$SCRATCH:/app/pipelines/store/aggregation" \
+              -v "$GITHUB_WORKSPACE/.github/scripts/gdalwarp-bigtiff:/usr/local/bin/gdalwarp:ro" \
               -e TOOLCHAIN -e MOSAIC_VSI_BASE="/vsicurl/$PUBLIC_BASE/mosaic/tiles" \
               "$IMAGE:$IMAGE_TAG" just mosaic-index
             push mosaic/tiles mosaic/tiles                 # immutable tile COGs (delta-sized: unchanged keys skip)
