@@ -231,12 +231,16 @@ def bundle():
     for stale in (out, keys.sidecar(out)):
         if os.path.isfile(stale):
             os.remove(stale)
+    tmp_out = utils.vector_scratch("soundings.pmtiles")
+    if os.path.exists(tmp_out):
+        os.remove(tmp_out)
     with utils.log_group(f"soundings tippecanoe ({len(gj)} inputs, z0-{maxz})"):
-        subprocess.run(
-            ["tippecanoe", "-o", out, "-f", "-l", "soundings",
+        utils.run_monitored(
+            ["tippecanoe", "-o", tmp_out, "-f", "-l", "soundings",
              "-n", "Bathymetric soundings", "-A", utils.ATTRIBUTION, "-Z", "0", "-z", str(maxz),
              "-P", "-q", "-r1", "-y", "depth_m", "-y", "depth_ft", "-y", "depth_fm",
-             *gj], check=True)
+             *gj], "soundings tippecanoe", tmp_out)
+    keys.publish(tmp_out, out)
     keys.write_key(out, skey)
     print(f"soundings bundle: {out} (z0-{maxz}, {len(gj)} tiles)")
 

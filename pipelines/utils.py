@@ -13,6 +13,9 @@ import gzip
 import math
 import os
 import hashlib
+import shutil
+import tempfile
+import time
 
 import numpy as np
 
@@ -67,6 +70,95 @@ def log_group(title):
     finally:
         if actions:
             print("::endgroup::", flush=True)
+
+
+def _process_tree(root):
+    """Root + descendants from Linux /proc; just the root on other platforms."""
+    if not os.path.isdir("/proc"):
+        return {root}
+    parents = {}
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            fields = open(f"/proc/{name}/stat").read().rsplit(")", 1)[1].split()
+            parents[int(name)] = int(fields[1])
+        except (FileNotFoundError, PermissionError, ValueError, IndexError):
+            pass
+    tree = {root}
+    while True:
+        children = {pid for pid, parent in parents.items() if parent in tree}
+        if children <= tree:
+            return tree
+        tree |= children
+
+
+def _process_metrics(root):
+    ticks = rss = read = written = deleted = 0
+    for pid in _process_tree(root):
+        try:
+            fields = open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()
+            ticks += int(fields[11]) + int(fields[12])
+            status = open(f"/proc/{pid}/status").read().splitlines()
+            rss += next((int(line.split()[1]) for line in status if line.startswith("VmRSS:")), 0)
+            io = dict(line.split(": ", 1) for line in open(f"/proc/{pid}/io").read().splitlines())
+            read += int(io.get("read_bytes", 0))
+            written += int(io.get("write_bytes", 0))
+            for fd in os.listdir(f"/proc/{pid}/fd"):
+                path = f"/proc/{pid}/fd/{fd}"
+                try:
+                    if os.readlink(path).endswith(" (deleted)"):
+                        deleted += os.stat(path).st_size
+                except (FileNotFoundError, PermissionError, OSError):
+                    pass
+        except (FileNotFoundError, PermissionError, ValueError, StopIteration):
+            pass
+    return ticks, rss * 1024, read, written, deleted
+
+
+def _annotation(kind, title, message):
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        print(f"::{kind} title={title}::{message}", flush=True)
+    else:
+        print(f"[{title}] {message}", flush=True)
+
+
+def run_monitored(command, title, output=None):
+    """Run a long command with one-minute Actions/local resource heartbeats."""
+    interval = int(os.environ.get("BUILD_HEARTBEAT_SECONDS", "60"))
+    started = last_time = time.monotonic()
+    process = subprocess.Popen(command)
+    last = _process_metrics(process.pid)
+    while True:
+        try:
+            rc = process.wait(timeout=interval)
+            break
+        except subprocess.TimeoutExpired:
+            now = time.monotonic()
+            current = _process_metrics(process.pid)
+            elapsed = now - last_time
+            cores = (current[0] - last[0]) / os.sysconf("SC_CLK_TCK") / elapsed if os.path.isdir("/proc") else 0
+            out_size = os.path.getsize(output) if output and os.path.exists(output) else 0
+            out_dir = os.path.dirname(os.path.abspath(output)) if output else os.getcwd()
+            free = shutil.disk_usage(out_dir).free
+            tmp_free = shutil.disk_usage(tempfile.gettempdir()).free
+            msg = (f"elapsed={int(now-started)}s cpu={cores:.1f} cores rss={current[1]/2**30:.1f}GiB "
+                   f"io_read={(current[2]-last[2])/elapsed/2**20:.1f}MiB/s "
+                   f"io_write={(current[3]-last[3])/elapsed/2**20:.1f}MiB/s "
+                   f"output={out_size/2**30:.1f}GiB deleted_tmp={current[4]/2**30:.1f}GiB "
+                   f"free={free/2**30:.0f}GiB tmp_free={tmp_free/2**30:.0f}GiB")
+            _annotation("warning" if min(free, tmp_free) < 20 * 2**30 else "notice", title, msg)
+            last, last_time = current, now
+    if rc:
+        raise subprocess.CalledProcessError(rc, command)
+    size = os.path.getsize(output) if output and os.path.exists(output) else 0
+    _annotation("notice", title, f"complete elapsed={int(time.monotonic()-started)}s output={size/2**30:.1f}GiB")
+
+
+def vector_scratch(name):
+    root = os.environ.get("VECTOR_SCRATCH", tempfile.gettempdir())
+    os.makedirs(root, exist_ok=True)
+    return os.path.join(root, f"seascape-{os.getpid()}-{name}")
 
 
 def run_command(command, silent=True, env=None):

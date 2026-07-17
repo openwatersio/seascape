@@ -230,7 +230,7 @@ PER_ZOOM_FILTER = _per_zoom_filter()
 
 def _tippecanoe(fgbs, minz, maxz, out):
     with utils.log_group(f"contour tippecanoe ({len(fgbs)} inputs, z{minz}-{maxz})"):
-        subprocess.run(
+        utils.run_monitored(
             ["tippecanoe", "-o", out, "-f", "-l", "contours",
              "-n", "Bathymetric contours", "-A", utils.ATTRIBUTION,
              "-Z", str(minz), "-z", str(maxz), "-P", "-q", "--drop-densest-as-needed",
@@ -241,7 +241,7 @@ def _tippecanoe(fgbs, minz, maxz, out):
              # FlatGeobuf Integer64 attributes otherwise land in the MVT as strings.
              "-T", "depth_abs_m:int", "-T", "depth_ft:int", "-T", "depth_fm:int",
              "-j", PER_ZOOM_FILTER, *fgbs],
-            check=True)
+            "contour tippecanoe", out)
 
 
 def _global_maxz(fgbs):
@@ -361,7 +361,7 @@ def coverage_bundle():
     print(f"coverage bundle: {out} (z0-{COVERAGE_MAX_ZOOM})")
 
 
-def _finalize_contours(archives):
+def _finalize_contours(archives, out):
     """tile-join the contour lines pmtiles + the soundings/depare pmtiles (bundled first)
     into store/bundle/vector.pmtiles. ONE join: tile-join rewrites every tile of the whole
     archive, so folding each sparse layer in afterwards re-paid the planet-wide join
@@ -373,8 +373,9 @@ def _finalize_contours(archives):
                           "store/bundle/depare.pmtiles"]
               if os.path.isfile(p)]
     with utils.log_group(f"vector tile-join ({len(archives) + len(layers)} archives)"):
-        subprocess.run(["tile-join", "-o", "store/bundle/vector.pmtiles", "-f", "-pk",
-                        *archives, *layers], check=True)
+        utils.run_monitored(["tile-join", "-o", out, "-f", "-pk",
+                             *archives, *layers], "vector tile-join",
+                            out)
 
 
 def _current_stems():
@@ -479,10 +480,15 @@ def bundle():
     for stale in (vec, keys.sidecar(vec)):
         if os.path.isfile(stale):
             os.remove(stale)
-    lines = "store/contour/contours-lines.pmtiles"
+    lines = utils.vector_scratch("contours-lines.pmtiles")
+    vector_tmp = utils.vector_scratch("vector.pmtiles")
+    for path in (lines, vector_tmp):
+        if os.path.exists(path):
+            os.remove(path)
     _tippecanoe(fgbs, 0, maxz, lines)
-    _finalize_contours([lines])
+    _finalize_contours([lines], vector_tmp)
     os.remove(lines)
+    keys.publish(vector_tmp, vec)
     keys.write_key(vec, vkey)
     print(f"contour bundle: {vec} (z0-{maxz}, {len(fgbs)} FGBs)")
 
