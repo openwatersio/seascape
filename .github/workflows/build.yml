@@ -651,6 +651,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - uses: actions/checkout@v6
+
       - name: Fetch Hetzner host metrics
         continue-on-error: true
         env:
@@ -664,7 +666,7 @@ jobs:
         with:
           name: hcloud-metrics-${{ github.run_id }}-${{ needs.create-runner.outputs.server_id }}
           path: hcloud-metrics/
-          if-no-files-found: ignore
+          if-no-files-found: warn
           retention-days: 90
 
   # Destroy the box + deregister the runner, ALWAYS — on build success, build failure, OR a

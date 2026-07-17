@@ -138,11 +138,17 @@ def map_budgeted(pool, fn, items, budget_gb, procs, stem_of=None, on_done=None):
         while pending and state["err"] is None:
             picked = None
             if state["inflight"] < procs:
+                # Reserve the cheap lane only while cheap work is actually waiting. Once the
+                # cheap queue is drained, continuing to reserve 16 GB serializes an all-heavy
+                # tail for no beneficiary (four weight-5 regional tiles ran one-at-a-time on a
+                # 23 GB budget in run 29578999167).
+                cheap_pending = any(pw <= CHEAP_MAX_W for pw, _ in pending)
                 # First fit in a heaviest-first list = heaviest admissible; light tiles pass a
                 # full-of-heavies budget via the cheap lane (lane_floor 0). Unbudgeted: the first
                 # pending item always fits (w == 0).
                 for i, (w, it) in enumerate(pending):
-                    if not budget_gb or state["avail"] - w >= lane_floor(w, budget_gb):
+                    floor = lane_floor(w, budget_gb) if cheap_pending else 0
+                    if not budget_gb or state["avail"] - w >= floor:
                         picked = i
                         break
             if picked is None:
@@ -308,6 +314,18 @@ def _check():
 
     _run_sim(mp, "default-context")
     _run_sim(mp.get_context("spawn"), "spawn-context")
+
+    # Heavy-only work must use the budget once there is no cheap task waiting for the reserved
+    # lane. Four z13 weight-5 tiles fit concurrently in a 23 GB small-box budget.
+    heavy_only = [f"{z}-{i}-0-13" for i in range(4)]
+    mgr = mp.Manager()
+    held, peak, lock, log = mgr.Value("i", 0), mgr.Value("i", 0), mgr.Lock(), mgr.list()
+    t0 = time.monotonic()
+    tasks = [(s, 23, held, peak, lock, log, t0) for s in heavy_only]
+    with mp.Pool(4, **pool_kwargs()) as pool:
+        map_budgeted(pool, _sim_task, tasks, 23, 4, stem_of=lambda t: t[0])
+    assert peak.value == 20, f"heavy-only tail should fill 20/23 GB, got {peak.value}"
+    mgr.shutdown()
 
     # (c) the UNBUDGETED path shares the dispatch loop and the on_done contract: every item
     # completes, and on_done receives the ITEMS (never fn's return value — _noop returns None).
