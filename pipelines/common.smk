@@ -50,8 +50,16 @@ def recipe_files(wc):
 def source_priority(wc, input=None, attempt=None):
     """Heavier sources first — the scheduler knows nothing about duration, so a big
     source scheduled last runs alone at the end (longest-first shortens the makespan).
-    file_list length is the parse-pure weight proxy (uk_surfzone 1301 … gebco 1); it
-    under-weights single-huge-archive sources — refine with raw sizes if the tail ever
-    matters. Set on prep only: priorities propagate upstream through the DAG, so the
+    Weight = real raw bytes (MB) once the source has ever been fetched (a stat is
+    parse-pure, and actual size beats any proxy); a never-fetched source falls back to
+    file_list length + max_zoom + chart priority — finer/prioritized sources plausibly
+    carry more data, which catches the one-huge-file cases (infomar) that count alone
+    misses. Set on prep only: priorities propagate upstream through the DAG, so the
     source's fetch jobs inherit it."""
-    return len(pipeline_config.file_list(wc.source))
+    from glob import glob
+    raws = glob(f"store/source/{wc.source}/raw/*")
+    if raws:
+        return int(sum(os.path.getsize(r) for r in raws) / 1e6)
+    meta = pipeline_config.load_metadata(wc.source)
+    return (len(pipeline_config.file_list(wc.source))
+            + 10 * (meta.get("max_zoom") or 0) + 100 * meta.get("priority", 0))
