@@ -81,13 +81,15 @@ def main():
                          f"{tmp}/store/polygon/{sid}.gpkg",
                          f"{tmp}/store/tar/{sid}.tar"):
             assert os.path.exists(artifact), artifact
-        # The catalog folds in the recorded transform (negate + −1 m offset), the assigned CRS,
-        # and the file count — the datum offset was invisible downstream before it was recorded.
+        # The catalog folds in the recorded offset, the assigned CRS, and the file count — but
+        # negate must publish False: source_datum baked the flip into the COGs, and aggregation
+        # consumes seascape:negate as "negate at reproject" (republishing the applied flag
+        # double-negated african_great_lakes/ddm back to positive depth).
         with open(f"{tmp}/store/source/{sid}/catalog.json") as jf:
             item = json.load(jf)
         p = item["properties"]
         assert item["id"] == sid and item["bbox"], item
-        assert p["seascape:negate"] is True and p["seascape:datum_offset_m"] == -1.0, p
+        assert p["seascape:negate"] is False and p["seascape:datum_offset_m"] == -1.0, p
         assert p["proj:epsg"] == 4326 and p["seascape:file_count"] == 1, p
         print("source stage e2e ok")
     finally:
