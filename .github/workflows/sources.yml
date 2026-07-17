@@ -164,23 +164,6 @@ jobs:
           mkdir -p "$STATE/store"
           echo "STATE=$STATE" >> "$GITHUB_ENV"
       - uses: ./.github/actions/ghcr-login
-      # One-time migration from the retired shadow lane: salvage its fetched raw/ trees into
-      # the shared store (tens of GB that would otherwise refetch), then delete the shadow
-      # tree — its other contents are either identical to the shared store or derivable.
-      # Idempotent: a no-op once snakemake-store is gone.
-      - name: Fold the retired shadow store into the shared store
-        run: |
-          set -euo pipefail
-          if [ -d "$STATE/snakemake-store" ]; then
-            for raw in "$STATE"/snakemake-store/store/source/*/raw; do
-              [ -d "$raw" ] || continue
-              id=$(basename "$(dirname "$raw")")
-              mkdir -p "$STATE/store/source/$id"
-              [ -d "$STATE/store/source/$id/raw" ] || mv "$raw" "$STATE/store/source/$id/raw"
-            done
-            rm -rf "$STATE/snakemake-store"
-            echo "shadow store folded in and removed"
-          fi
       # A SIGKILLed previous run (box reaped, OOM) leaves .snakemake locks + incomplete
       # markers ON THE VOLUME, wedging every later run at startup. Unlock is safe here:
       # the r2-store concurrency group guarantees no other lane run holds the store.
