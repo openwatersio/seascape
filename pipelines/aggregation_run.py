@@ -3,7 +3,7 @@
 Vendored from mapterhorn (BSD-3). Picks the latest aggregation id and, for every tile in the
 covering, produces the stage-2 MOSAIC tile (mosaic.produce — the persisted unsmoothed truth) and
 computes a content-hash key per VECTOR FORK — contours / soundings / depare — from the merged DEM's
-determinants plus each fork's own modules and config. Each fork's key rides IN its artifact filename
+determinants plus each fork's explicit cache version and config. Each key rides IN its artifact filename
 (``store/contour/<stem>-<key>.fgb``, keys.content_path), so a tile re-runs iff ANY fork's (or the
 mosaic's) content-named file (or its empty marker) is absent; within the run, forks already present
 are skipped. The merge (reproject + merge + smooth) is shared, so it re-runs whenever the mosaic or
@@ -29,6 +29,7 @@ from multiprocessing import Pool
 
 import aggregation_merge
 import aggregation_reproject
+import cache_versions
 import config
 import contour_run
 import depare_run
@@ -46,17 +47,10 @@ SKIP_SOUNDINGS = os.environ.get("SKIP_SOUNDINGS", "")
 SKIP_DEPARE = os.environ.get("SKIP_DEPARE", "")
 SKIP_SMOOTH = os.environ.get("SKIP_SMOOTH", "")
 
-# Code dependencies as a static per-fork module list (coarse per-module hashing; over-invalidation
-# on a comment edit is accepted, under-invalidation is not). config.py is deliberately NOT listed:
-# it mixes pure config constants (CONTOUR_LEVELS) with path plumbing, and a fork's config VALUES
-# enter its key resolved (below), so a CONTOUR_LEVELS edit moves only the contour/depare keys, not
-# terrain's. landmask stands in for the land+water masks: the masks' recipe-hash marker IS
-# hashFiles(landmask.py) (sources.yml gates their mirror on it), so hashing the module is hashing
-# the mask identity.
-MERGE_MODULES = ["aggregation_reproject", "aggregation_merge", "smooth", "landmask", "utils"]
-CONTOUR_MODULES = MERGE_MODULES + ["contour_run"]
-SOUNDINGS_MODULES = MERGE_MODULES + ["soundings_run"]
-DEPARE_MODULES = MERGE_MODULES + ["depare_run"]
+MERGE_VERSIONS = [cache_versions.MERGE, cache_versions.LANDMASK, cache_versions.SMOOTH]
+CONTOUR_VERSIONS = MERGE_VERSIONS + [cache_versions.CONTOUR]
+SOUNDINGS_VERSIONS = MERGE_VERSIONS + [cache_versions.SOUNDINGS]
+DEPARE_VERSIONS = MERGE_VERSIONS + [cache_versions.DEPARE]
 
 # The terrain raster is no longer a fork here: it's stage 3's per-zoom render from the persisted
 # mosaic (terrain.py), keyed off the mosaic tile hashes, not the transient merge. The aggregate is
@@ -71,7 +65,7 @@ def _merge_inputs_config(filepath):
     it), each intersecting source's recipe hash + every resolved build prop the reproject/merge
     reads (priority/maxzoom/offset/land_clamp/negate/band/mixed_crs), the smoothing + resample
     knobs, and any LOCAL mask file's content (a /vsicurl mask carries its identity via the
-    landmask module hash instead)."""
+    explicit landmask cache version instead)."""
     with open(filepath) as f:
         covering_row = f.read()
     sources = sorted({line.split(",")[0] for line in covering_row.splitlines()[1:] if line.strip()})
@@ -106,14 +100,14 @@ def contour_key(filepath):
            "nav_smooth_max": contour_run.NAV_SMOOTH_MAX_M,
            "deep_cutoff_m": contour_run.DEEP_CUTOFF_M,
            "min_ring_area_m2": contour_run.MIN_RING_AREA_M2}
-    return keys.stage_key(inputs, CONTOUR_MODULES, cfg)
+    return keys.stage_key(inputs, CONTOUR_VERSIONS, cfg)
 
 
 def soundings_key(filepath):
     inputs, cfg = _merge_inputs_config(filepath)
     cfg = {**cfg, "fork": "soundings", "sound_cell_px": soundings_run.SOUND_CELL_PX,
            "sound_min_depth_m": soundings_run.SOUND_MIN_DEPTH_M}
-    return keys.stage_key(inputs, SOUNDINGS_MODULES, cfg)
+    return keys.stage_key(inputs, SOUNDINGS_VERSIONS, cfg)
 
 
 def depare_key(filepath):
@@ -121,7 +115,7 @@ def depare_key(filepath):
     cfg = {**cfg, "fork": "depare", "depare_levels": config.DEPARE_LEVELS,
            "depare_levels_ft": config.DEPARE_LEVELS_FT, "drying_cap": config.DRYING_CAP,
            "sliver_min_px": depare_run.SLIVER_MIN_PX}
-    return keys.stage_key(inputs, DEPARE_MODULES, cfg)
+    return keys.stage_key(inputs, DEPARE_VERSIONS, cfg)
 
 
 _KEYFN = {"contour": contour_key, "soundings": soundings_key, "depare": depare_key}
@@ -307,7 +301,6 @@ def explain_keys():
             "stored_siblings": sorted(glob(f"{base}-*{ext}") + glob(f"{base}-*.empty")),
         }
 
-    modules = sorted(set(MERGE_MODULES + ["contour_run", "soundings_run", "depare_run", "mosaic"]))
     with open(filepath, "rb") as f:
         covering_sha = hashlib.sha256(f.read()).hexdigest()
     report = {
@@ -316,8 +309,7 @@ def explain_keys():
         "covering_sha256": covering_sha,
         "toolchain": keys.toolchain(),
         "products": products,
-        "module_sha256": {name: hashlib.sha256(keys._module_bytes(name)).hexdigest()
-                          for name in modules},
+        "cache_versions": cache_versions.all_versions(),
         "mask_hashes": {path: keys.file_hash(path) for path in (landmask.path(), landmask.water_path())},
         "sources": {sid: {"recipe_hash": config.source_recipe_hash(sid),
                            "properties": {k: config.source_property(sid, k) for k in

@@ -51,6 +51,7 @@ import numpy as np
 import rasterio
 
 import aggregation_reproject
+import cache_versions
 import encode
 import keys
 import mosaic
@@ -61,10 +62,10 @@ import utils
 NODATA = -9999
 
 # Code the served terrain render depends on: the smoothing (the ONE f(depth,zoom)), the encode
-# (bias-shallow quantization), the mosaic reader (whose module bytes + resolution math shape the
-# window), and this renderer. A change to any re-keys the render — but NOT the mosaic (the stage
-# split: a smoothing/quantization change re-renders from a fully cached mosaic, no re-merge).
-TERRAIN_MODULES = ["smooth", "encode", "aggregation_reproject", "mosaic", "utils", "terrain"]
+# Explicit contracts for the index/GTI semantics and terrain renderer. Output-affecting changes
+# bump these versions; the mosaic tile keys enter separately as terrain inputs.
+TERRAIN_VERSIONS = [cache_versions.MOSAIC_INDEX, cache_versions.MOSAIC_GTI,
+                    cache_versions.SMOOTH, cache_versions.ENCODE, cache_versions.TERRAIN]
 
 
 # ── the mosaic GTI, read through the system gdal by absolute path ──────────────────────────────
@@ -320,7 +321,7 @@ def _config():
 
 
 def terrain_key(stem, agg_keys):
-    return keys.stage_key(_intersecting_keys(stem, agg_keys), TERRAIN_MODULES,
+    return keys.stage_key(_intersecting_keys(stem, agg_keys), TERRAIN_VERSIONS,
                           {**_config(), "product": "terrain"})
 
 

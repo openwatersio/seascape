@@ -28,6 +28,7 @@ from glob import glob
 import mercantile
 
 import config
+import cache_versions
 import keys
 import utils
 from aggregation_reproject import get_resolution
@@ -424,9 +425,6 @@ def verify_vector_complete(layer, paths):
 # layers' modules (the tippecanoe filter + flags live in them) + the env-tunable simplifications.
 # A per-tile fork whose key changed (a contour-levels edit) moves this key; an unchanged set skips
 # the whole tippecanoe + planet-wide tile-join.
-VECTOR_MODULES = ["contour_run", "soundings_run", "depare_run", "utils"]
-
-
 def _vector_key(maxz):
     stems = _current_stems()
     inputs = []
@@ -445,7 +443,7 @@ def _vector_key(maxz):
     cfg = {"maxz": maxz,
            "contour_simplification": os.environ.get("CONTOUR_SIMPLIFICATION", "8"),
            "depare_simplification": os.environ.get("DEPARE_SIMPLIFICATION", "8")}
-    return keys.stage_key(inputs, VECTOR_MODULES, cfg)
+    return keys.stage_key(inputs, [cache_versions.VECTOR_BUNDLE], cfg)
 
 
 def bundle():

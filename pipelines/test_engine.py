@@ -319,12 +319,26 @@ def check_terrain_staleness():
         settle()
         assert dirty() == set(), "re-rendering after the mosaic re-key returns to fresh"
 
-        # 3) FORCE re-renders everything regardless of key matches.
+        # 3) a GTI/terrain contract bump re-renders terrain without moving the mosaic tile key.
+        fp = f"store/aggregation/{aid}/{stem}-aggregation.csv"
+        mosaic_before = mosaic.mosaic_key(fp)
+        original_versions = terrain.TERRAIN_VERSIONS
+        terrain.TERRAIN_VERSIONS = original_versions[:-1] + ["terrain-v999"]
+        try:
+            assert dirty() == terrain._render_stems(aid), \
+                "a terrain contract bump must re-render every terrain stem"
+            assert mosaic.mosaic_key(fp) == mosaic_before, \
+                "a terrain/GTI contract bump must not re-key mosaic COGs"
+        finally:
+            terrain.TERRAIN_VERSIONS = original_versions
+        assert dirty() == set(), "restoring the terrain contract restores the cached names"
+
+        # 4) FORCE re-renders everything regardless of key matches.
         os.environ["FORCE_REBUILD"] = "1"
         assert dirty() == terrain._render_stems(aid), "FORCE must re-render every stem"
         os.environ.pop("FORCE_REBUILD")
         print(f"terrain-staleness ok — {len(terrain._render_stems(aid))} stems: self-heal, mosaic "
-              "re-key, and FORCE all re-render; a plain rerun is a no-op")
+              "input, explicit terrain version, and FORCE invalidate the intended scope")
     finally:
         config.SOURCES_DIR = saved_dir
         config._catalog_cache.clear()
@@ -340,9 +354,8 @@ def check_terrain_staleness():
 
 def check_key_invalidation():
     """The per-fork key wiring: a config-VALUE change (CONTOUR_LEVELS, the ring-drop knobs) moves
-    exactly the contour(+depare) keys; a listed module's byte change moves exactly the forks that
-    list it (keys.py's own --check covers the hashing primitive — this asserts each fork declares
-    the right determinants); a merge-level source prop (band/mixed_crs — reproject reads them) and
+    exactly the contour(+depare) keys; an explicit fork-version bump moves exactly that fork; a
+    merge-level source prop (band/mixed_crs — reproject reads it) and
     a mask presence change move every fork (all read the merged DEM they shape)."""
     import aggregation_run
     import config
@@ -375,16 +388,16 @@ def check_key_invalidation():
             "a CONTOUR_LEVELS change must NOT move the soundings key"
         config.CONTOUR_LEVELS, config.DEPARE_LEVELS = saved_levels
 
-        # listed-module byte change: touch soundings_run's bytes -> only the soundings key moves
-        orig = keys._module_bytes
-        keys._module_bytes = lambda name: (orig(name) + b"\n# x") if name == "soundings_run" else orig(name)
+        # explicit contract bump: only the named artifact family moves
+        original_versions = aggregation_run.SOUNDINGS_VERSIONS
+        aggregation_run.SOUNDINGS_VERSIONS = original_versions[:-1] + ["soundings-v999"]
         try:
             k2 = all_keys()
         finally:
-            keys._module_bytes = orig
-        assert k2["soundings"] != k0["soundings"], "a listed module's byte change must move its fork's key"
+            aggregation_run.SOUNDINGS_VERSIONS = original_versions
+        assert k2["soundings"] != k0["soundings"], "a version bump must move its fork's key"
         assert all(k2[f] == k0[f] for f in ("contour", "depare")), \
-            "a module byte change must not move forks that don't list it"
+            "a fork version bump must not move unrelated forks"
 
         # a local mask appearing enters every fork's key (all consume the masked merge)
         os.makedirs("store/landmask")
@@ -419,7 +432,7 @@ def check_key_invalidation():
         k6 = all_keys()
         assert all(k6[f] != k0[f] and k6[f] != k5[f] for f in aggregation_run.FORKS), \
             "a mixed_crs change must move every fork's key"
-        print("key-invalidation ok — config values, listed modules, source props, and masks "
+        print("key-invalidation ok — config values, explicit versions, source props, and masks "
               "move exactly their forks")
     finally:
         config.SOURCES_DIR = saved_dir

@@ -32,6 +32,7 @@ from glob import glob
 import mercantile
 
 import contour_run
+import cache_versions
 import keys
 import utils
 
@@ -219,7 +220,7 @@ def bundle():
     # layer's own regional max would truncate it out of deeper joined tiles.
     maxz = contour_run.bundle_maxz(max(int(keys.stem_of(g).split("-")[3]) for g in gj))
     skey = keys.stage_key([os.path.basename(g) for g in gj],  # the key rides in each member's name
-                          ["soundings_run", "contour_run", "utils"], {"maxz": maxz})
+                          [cache_versions.SOUNDINGS_BUNDLE], {"maxz": maxz})
     if keys.is_fresh(out, skey):
         print("soundings bundle: inputs unchanged — skip")
         return
