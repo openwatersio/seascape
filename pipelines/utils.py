@@ -6,6 +6,7 @@ Vendored from mapterhorn (BSD-3, (c) 2025 mapterhorn; see LICENSE.mapterhorn).
 """
 
 import subprocess
+from contextlib import contextmanager
 from pathlib import Path
 from glob import glob
 import gzip
@@ -54,6 +55,18 @@ num_overviews = int(os.environ.get("NUM_OVERVIEWS", "4"))
 ATTRIBUTION = '<a href="https://openwaters.io/charts/seascape#license">© Open Water Software, LLC</a> '
 
 X_MIN_3857, _, X_MAX_3857, __ = transform_bounds('EPSG:4326', 'EPSG:3857', -180, 0, 180, 0)
+
+
+@contextmanager
+def log_group(title):
+    """Collapsible in Actions; the same stage remains readable locally."""
+    actions = os.environ.get("GITHUB_ACTIONS") == "true"
+    print(f"::group::{title}" if actions else f"── {title} ──", flush=True)
+    try:
+        yield
+    finally:
+        if actions:
+            print("::endgroup::", flush=True)
 
 
 def run_command(command, silent=True, env=None):

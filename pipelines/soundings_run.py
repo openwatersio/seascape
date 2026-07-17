@@ -231,11 +231,12 @@ def bundle():
     for stale in (out, keys.sidecar(out)):
         if os.path.isfile(stale):
             os.remove(stale)
-    subprocess.run(
-        ["tippecanoe", "-o", out, "-f", "-l", "soundings",
-         "-n", "Bathymetric soundings", "-A", utils.ATTRIBUTION, "-Z", "0", "-z", str(maxz),
-         "-P", "-q", "-r1", "-y", "depth_m", "-y", "depth_ft", "-y", "depth_fm",
-         *gj], check=True)
+    with utils.log_group(f"soundings tippecanoe ({len(gj)} inputs, z0-{maxz})"):
+        subprocess.run(
+            ["tippecanoe", "-o", out, "-f", "-l", "soundings",
+             "-n", "Bathymetric soundings", "-A", utils.ATTRIBUTION, "-Z", "0", "-z", str(maxz),
+             "-P", "-q", "-r1", "-y", "depth_m", "-y", "depth_ft", "-y", "depth_fm",
+             *gj], check=True)
     keys.write_key(out, skey)
     print(f"soundings bundle: {out} (z0-{maxz}, {len(gj)} tiles)")
 

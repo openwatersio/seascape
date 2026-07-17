@@ -229,18 +229,19 @@ PER_ZOOM_FILTER = _per_zoom_filter()
 
 
 def _tippecanoe(fgbs, minz, maxz, out):
-    subprocess.run(
-        ["tippecanoe", "-o", out, "-f", "-l", "contours",
-         "-n", "Bathymetric contours", "-A", utils.ATTRIBUTION,
-         "-Z", str(minz), "-z", str(maxz), "-P", "-q", "--drop-densest-as-needed",
-         # Aggressive low-zoom vertex thinning (tolerance scales with zoom distance from
-         # maxz, so maxz detail is untouched). Env-tunable to dial on a re-bundle.
-         "--simplification", os.environ.get("CONTOUR_SIMPLIFICATION", "8"),
-         "-y", "depth_m", "-y", "depth_abs_m", "-y", "sys", "-y", "depth_ft", "-y", "depth_fm",
-         # FlatGeobuf Integer64 attributes otherwise land in the MVT as strings.
-         "-T", "depth_abs_m:int", "-T", "depth_ft:int", "-T", "depth_fm:int",
-         "-j", PER_ZOOM_FILTER, *fgbs],
-        check=True)
+    with utils.log_group(f"contour tippecanoe ({len(fgbs)} inputs, z{minz}-{maxz})"):
+        subprocess.run(
+            ["tippecanoe", "-o", out, "-f", "-l", "contours",
+             "-n", "Bathymetric contours", "-A", utils.ATTRIBUTION,
+             "-Z", str(minz), "-z", str(maxz), "-P", "-q", "--drop-densest-as-needed",
+             # Aggressive low-zoom vertex thinning (tolerance scales with zoom distance from
+             # maxz, so maxz detail is untouched). Env-tunable to dial on a re-bundle.
+             "--simplification", os.environ.get("CONTOUR_SIMPLIFICATION", "8"),
+             "-y", "depth_m", "-y", "depth_abs_m", "-y", "sys", "-y", "depth_ft", "-y", "depth_fm",
+             # FlatGeobuf Integer64 attributes otherwise land in the MVT as strings.
+             "-T", "depth_abs_m:int", "-T", "depth_ft:int", "-T", "depth_fm:int",
+             "-j", PER_ZOOM_FILTER, *fgbs],
+            check=True)
 
 
 def _global_maxz(fgbs):
@@ -371,8 +372,9 @@ def _finalize_contours(archives):
     layers = [p for p in ["store/bundle/soundings.pmtiles",
                           "store/bundle/depare.pmtiles"]
               if os.path.isfile(p)]
-    subprocess.run(["tile-join", "-o", "store/bundle/vector.pmtiles", "-f", "-pk",
-                    *archives, *layers], check=True)
+    with utils.log_group(f"vector tile-join ({len(archives) + len(layers)} archives)"):
+        subprocess.run(["tile-join", "-o", "store/bundle/vector.pmtiles", "-f", "-pk",
+                        *archives, *layers], check=True)
 
 
 def _current_stems():
