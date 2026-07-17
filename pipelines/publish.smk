@@ -7,16 +7,11 @@
 # credentials; a dry run is pure — the destination and ordering are decided here at parse,
 # the network happens in the shell.
 #
-# Destination: r2:$DATA_BUCKET/<data_prefix>/… . data_prefix defaults to the shadow namespace
-# bathymetry-next; the production prefix bathymetry is refused unless allow_production=true, so
-# a stray publish can never overwrite the live mosaic's source mirror.
+# Destination: r2:$DATA_BUCKET/<data_prefix>/…, defaulting to the production prefix — the
+# lanes share one store and one mirror (the source contract is identical); data_prefix
+# remains a config knob only for ad-hoc experiments against a scratch prefix.
 
-DATA_PREFIX = config.get("data_prefix", "bathymetry-next")
-if DATA_PREFIX == "bathymetry" and not config.get("allow_production", False):
-    raise WorkflowError(
-        "refusing to publish to the production prefix 'bathymetry' — the shadow lane "
-        "publishes below 'bathymetry-next'. Pass --config allow_production=true to override.")
-
+DATA_PREFIX = config.get("data_prefix", "bathymetry")
 DEST = f"r2:$DATA_BUCKET/{DATA_PREFIX}"  # $DATA_BUCKET stays a shell env var (no braces)
 
 # Fail fast in every publish shell when the box isn't set up for R2 — rclone missing, or the
@@ -31,7 +26,8 @@ PUBLISH_GUARD = (
 def publish_inputs(wc):
     """publish_source's inputs: bounds.csv + catalog.json always, plus the polygon for a
     prepped source (its footprint publishes alongside) or the objects-mirror stamp for a
-    volatile source (its upstream objects must reach R2 before the pointer lands)."""
+    volatile source (every object a bounds.csv row references must be verified-present in
+    the mirror before the pointer lands)."""
     ins = {"bounds": f"store/source/{wc.source}/bounds.csv",
            "catalog": f"store/source/{wc.source}/catalog.json"}
     if wc.source in MIRRORED:
@@ -41,9 +37,10 @@ def publish_inputs(wc):
     return ins
 
 
-# Volatile only: copy the enumerated upstream objects into store objects/ (anonymous S3),
-# then push those objects to R2. mirror.txt is the full key list, so a partial prior mirror
-# self-heals; neither leg ever deletes.
+# Volatile only: top up the store's objects/ from upstream (newly-listed keys; existing
+# ones skip by size+mtime), then push the same objects to R2. With the single shared store
+# both copies already exist from the legacy lane, so steady-state this moves only the
+# week's churn. Neither leg ever deletes.
 rule mirror_objects:
     input:
         mirror="store/source/{source}/mirror.txt",
@@ -52,7 +49,7 @@ rule mirror_objects:
         touch("store/meta/publish/{source}.objects")
     wildcard_constraints:
         source=pat(MIRRORED)
-    priority: 5000  # CUDEM's object mirror moves ~190 GB — the run's longest data leg
+    priority: 5000  # CUDEM's object mirror moves ~190 GB — the longest data leg when it runs
     shell:
         PUBLISH_GUARD +
         'printf "[upstream]\\ntype = s3\\nprovider = AWS\\nregion = us-east-1\\n" > /tmp/upstream-{wildcards.source}.conf; '
@@ -81,9 +78,9 @@ rule publish_source:
         PUBLISH_GUARD +
         'src="store/source/{wildcards.source}"; dest="{DEST}/source/{wildcards.source}"; '
         'if [ "{params.volatile}" = "true" ]; then '
-        '  rclone copy "$src" "$dest" --exclude "bounds.csv" --exclude "catalog.json" --exclude "objects/**" --retries 5; '
+        '  rclone copy "$src" "$dest" --exclude "bounds.csv" --exclude "catalog.json" --exclude "objects/**" --exclude "raw/**" --retries 5; '
         'else '
-        '  rclone sync "$src" "$dest" --exclude "bounds.csv" --exclude "catalog.json" --retries 5; '
+        '  rclone sync "$src" "$dest" --exclude "bounds.csv" --exclude "catalog.json" --exclude "raw/**" --retries 5; '
         '  if [ -f "store/polygon/{wildcards.source}.gpkg" ]; then '
         '    rclone copyto "store/polygon/{wildcards.source}.gpkg" "{DEST}/polygon/{wildcards.source}.gpkg" --retries 5; '
         '  fi; '

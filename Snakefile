@@ -9,7 +9,7 @@
 #   uv run snakemake catalogs -j4            # every catalog + masks + the covering
 #   uv run snakemake cover -j1               # store/aggregation/covering.txt only
 #   uv run snakemake check --config source=<id>   # validate one source's contract
-#   uv run snakemake publish [--config source=<id> data_prefix=bathymetry-next]
+#   uv run snakemake publish [--config source=<id>]   # → r2 bathymetry/ (the one mirror)
 #   ./docker.sh snakemake sources -j4        # same, inside the toolchain container
 #
 # Pipeline-code changes do NOT invalidate per-source outputs — matching the legacy
