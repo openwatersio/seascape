@@ -268,7 +268,11 @@ jobs:
             avail_gb=$(df -BG --output=avail "$STORE" | tail -1 | tr -dc '0-9')
             [ "${avail_gb:-0}" -ge 100 ] || { echo "store volume has only ${avail_gb:-?} GiB free — grow $STORE_VOLUME in the console (resizable live)" >&2; exit 1; }
             scratch_gb=$(df -BG --output=avail "$SCRATCH" | tail -1 | tr -dc '0-9')
-            [ "${scratch_gb:-0}" -ge 300 ] || { echo "root NVMe has only ${scratch_gb:-?} GiB free for aggregation scratch — a planet build churns ~300; use a bigger box" >&2; exit 1; }
+            if [ "${VECTOR_SAMPLE:-0}" -gt 0 ]; then
+              [ "${scratch_gb:-0}" -ge 100 ] || { echo "root NVMe has only ${scratch_gb:-?} GiB free for the vector benchmark; use a bigger box" >&2; exit 1; }
+            else
+              [ "${scratch_gb:-0}" -ge 300 ] || { echo "root NVMe has only ${scratch_gb:-?} GiB free for aggregation scratch — a planet build churns ~300; use a bigger box" >&2; exit 1; }
+            fi
             echo "store on volume $STORE_VOLUME: ${avail_gb} GiB free at $STORE; scratch on NVMe: ${scratch_gb} GiB free"
           else
             STORE="$GITHUB_WORKSPACE/pipelines/store"
