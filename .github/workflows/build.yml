@@ -140,7 +140,7 @@ jobs:
           # 'null' = the action attaches no volume of its own ('' fails its int check). The PERSISTENT
           # store volume is attached by the step below instead — the action's volume support only
           # creates+deletes per-run volumes, which is the opposite of a persistent cache.
-          volume: 'null'
+          volume: "null"
 
       # ── attach the PERSISTENT store volume (planet builds only) ── the build cache (content-
       # addressed store + hydrated sources) lives on a long-lived Hetzner volume, so a fresh box
@@ -324,7 +324,7 @@ jobs:
           # Weight factor (scheduler.weight): 4. Run #7 settled this with fresh-worker (ratchet-proof)
           # measurements: dense z14 tiles REALLY peak 12.4+ GB in a single worker — the factor-1
           # experiment misread a light-tile log window as the whole distribution and OOM'd runs #6+#7
-          # in ~30 min (48 workers × real 12 GB heavies admitted at weight 5 → ~245 GB demand).
+          # in ~30 min (~28 heavies admitted — budget 144 / weight 5 — × real ~12 GB ≈ 340 GB demand).
           # factor 4 → weight(z14)=18 → ~8-9 concurrent heavies ≈ 110 GB, proven stable for hours
           # by run #4. Dispatch is heaviest-admissible-first in the pool parent (map_budgeted), so
           # the z14 backlog (the critical path) drains from t=0; light tiles stay dispatchable via
@@ -401,7 +401,8 @@ jobs:
           # instead of failing the stage (same convention as sources.yml's mirror). Applied to
           # EVERY transfer, the single-file copyto publishes included — a flake on manifest.json
           # would break the completeness contract.
-          XFER=(--transfers 32 --checkers 64 --fast-list --retries 5 --stats 30s --stats-one-line)
+          XFER=(--transfers 32 --checkers 64 --fast-list --retries 5 --stats 30s --stats-one-line
+                --stats-log-level NOTICE)
           hydrate()    { rclone copy "$R2/$1" "$STORE/$2" "${XFER[@]}" "${@:3}"; }
           # Content-addressed store: an unchanged key is skipped and a push is delta-sized. ONE
           # pass, no ordering to get right — the per-tile artifacts self-mark (the key is IN the
@@ -525,16 +526,17 @@ jobs:
             AGG_ENV+=(-e SOURCE_VSI_BASE=/local-source)
           fi
 
-          # ── coverage ∥ aggregate ── coverage tippecanoes the source FOOTPRINTS (off the volume) —
-          # measured at ~4 GB / 1 core on run 29431716434 (my earlier "~130 GB" was a bad subtraction
-          # off the phantom-aggregate estimate; the run #6 OOM was the factor-1 over-admission, not
-          # coverage). It shares nothing with aggregate — different inputs (footprints vs staged
-          # source COGs), different disks (volume vs NVMe) — so background it: its whole duration
-          # hides behind the multi-hour aggregate, and 4 GB sits inside the 24 GB reserve (+ swap).
-          # Backgrounded under set -e can't fail the build on its own, so the explicit wait below
-          # propagates its rc — and sits BEFORE any manifest, preserving completeness.
-          echo "── coverage (backgrounded alongside aggregate) ──"
-          ( { dr coverage && push_build coverage.pmtiles; } 2>&1 | sed -u 's/^/[coverage] /' ) & COV_PID=$!
+          # Coverage belongs to sources.yml: its only inputs are source registrations + footprints.
+          # Planet builds consume the completed volume artifact. Regional builds have no volume and
+          # retain bbox-scoped coverage for faithful local/CI previews.
+          if [ -n "${BBOX:-}" ]; then
+            echo "── regional coverage ──"
+            dr coverage
+          else
+            test -s "$STORE/bundle/coverage.pmtiles" || {
+              echo "coverage.pmtiles is missing — run sources.yml first" >&2; exit 1; }
+          fi
+          push_build coverage.pmtiles
 
           echo "── aggregate ──"
           # Aggregate produces the stage-2 MOSAIC tiles + the vector forks (NOT terrain pmtiles —
@@ -547,13 +549,7 @@ jobs:
             -v "$SCRATCH:/app/pipelines/store/aggregation" \
             "${AGG_MOUNTS[@]}" -e BBOX -e FORCE_REBUILD -e TOOLCHAIN \
             "${AGG_ENV[@]}" "$IMAGE:$IMAGE_TAG" just aggregate || agg_rc=$?
-          # First failure wins: on an aggregate failure reap coverage and exit with aggregate's rc.
-          if [ "$agg_rc" -ne 0 ]; then kill "$COV_PID" 2>/dev/null || true; exit "$agg_rc"; fi
-
-          # Join coverage — propagate its rc so a coverage failure fails the build before manifest.json.
-          cov_rc=0
-          wait "$COV_PID" || cov_rc=$?
-          [ "$cov_rc" -eq 0 ] || { echo "coverage stage failed (rc=$cov_rc)" >&2; exit "$cov_rc"; }
+          [ "$agg_rc" -eq 0 ] || exit "$agg_rc"
 
           # ── mosaic index (LOCAL, for the on-box terrain render) ── build the GTI + planet z8 +
           #    index parquet from the mosaic tiles the aggregate persisted; terrain (stage 3) reads

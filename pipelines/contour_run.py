@@ -27,8 +27,9 @@ from glob import glob
 
 import mercantile
 
-import config
+import aggregation_covering
 import cache_versions
+import config
 import keys
 import utils
 from aggregation_reproject import get_resolution
@@ -287,20 +288,8 @@ COVERAGE_MAX_ZOOM = int(os.environ.get("COVERAGE_MAX_ZOOM", "8"))
 
 
 def _source_maxzooms():
-    """{source: native maxzoom} from the newest covering's aggregation CSVs — the pipeline's
-    authoritative per-source zoom (resolution-derived, capped/floored). Empty when no covering
-    is local (a CI contour job). Note: metadata.json's max_zoom is only an optional *cap*, so
-    most regional sources don't carry it — read the real zoom from the covering instead."""
-    ids = utils.get_aggregation_ids()
-    if not ids:
-        return {}
-    mz = {}
-    for csv in glob(f"store/aggregation/{ids[-1]}/*-aggregation.csv"):
-        with open(csv) as f:
-            for line in f.readlines()[1:]:
-                s, _fn, z = line.strip().split(",")
-                mz[s] = max(mz.get(s, 0), int(z))
-    return mz
+    """{source: resolved native/capped maxzoom}, independent of a planet covering."""
+    return aggregation_covering.source_maxzooms()
 
 
 def _coverage_geojson():
