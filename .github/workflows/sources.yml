@@ -200,10 +200,36 @@ jobs:
             uv run snakemake catalogs publish --keep-going --rerun-incomplete \
               --resources mem_gb=28 -R mirror_source "${extra[@]}"
 
+  # Capture provider-side CPU, disk, and network series while the ephemeral server still
+  # exists — same pattern as build.yml. Best-effort: teardown waits for this job, but runs
+  # regardless of its result.
+  collect-metrics:
+    needs: [create-runner, sources]
+    if: ${{ always() && needs.create-runner.outputs.server_id != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Fetch Hetzner host metrics
+        continue-on-error: true
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+          SERVER_ID: ${{ needs.create-runner.outputs.server_id }}
+        run: scripts/collect-hcloud-metrics "$SERVER_ID"
+
+      - name: Upload Hetzner host metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hcloud-metrics-${{ github.run_id }}-${{ needs.create-runner.outputs.server_id }}
+          path: hcloud-metrics/
+          if-no-files-found: ignore
+          retention-days: 90
+
   # Destroy the box + deregister the runner, ALWAYS. The persistent store volume is never
   # deleted; Hetzner auto-detaches it. Same LOUD-DESTROY discipline as sources.yml.
   delete-runner:
-    needs: [create-runner, sources]
+    needs: [create-runner, sources, collect-metrics]
     if: always()
     runs-on: ubuntu-latest
     permissions: { contents: read }
