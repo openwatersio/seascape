@@ -49,6 +49,10 @@ on:
         description: "Hetzner type — ccx63 (48 vCPU/192 GB, dedicated-vCPU quota approved); ccx33 (8/32) for a cheaper smoke. Worker knobs (AGG/TERRAIN/BUNDLE_PROCESSES, GDAL_CACHEMAX) auto-size from the box's RAM."
         required: false
         default: ccx63
+      vector_sample:
+        description: "Benchmark only: sample this many persisted planet vector tiles (0 = normal build)"
+        type: number
+        default: 0
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
@@ -74,6 +78,7 @@ env:
   # shell line — a bbox like `$(cmd)` would otherwise run under command substitution.
   BBOX: ${{ github.event.inputs.bbox }}
   FORCE: ${{ github.event.inputs.force }}
+  VECTOR_SAMPLE: ${{ github.event.inputs.vector_sample || '0' }}
 
 # One store-mutating workflow at a time, globally (not per-ref): the store is shared, so a build
 # must never interleave with another build, a sources.yml refresh (whose prepared-source syncs use
@@ -268,6 +273,20 @@ jobs:
           else
             STORE="$GITHUB_WORKSPACE/pipelines/store"
             mkdir -p "$STORE"
+          fi
+
+          # Vector-only benchmark: attach the planet cache, sample persisted per-tile artifacts,
+          # and exercise the production bundlers on NVMe without replaying aggregation/terrain.
+          if [ "${VECTOR_SAMPLE:-0}" -gt 0 ]; then
+            [ -z "${BBOX:-}" ] || { echo "vector_sample requires an empty bbox" >&2; exit 1; }
+            BENCH_STORE="$GITHUB_WORKSPACE/pipelines/vector-benchmark-store"
+            rm -rf "$BENCH_STORE"
+            scripts/prepare-vector-benchmark "$STORE" "$BENCH_STORE" "$VECTOR_SAMPLE"
+            docker run --rm -v "$GITHUB_WORKSPACE:/app" -v "$STORE:/planet-store:ro" \
+              -v "$BENCH_STORE:/app/pipelines/store" -e FORCE_REBUILD=1 -e TOOLCHAIN \
+              -e VECTOR_SCRATCH=/app/pipelines/store/vector-tmp "$IMAGE:$IMAGE_TAG" \
+              bash -lc 'just soundings && just contours'
+            exit 0
           fi
 
           # ── swap SAFETY NET (planet builds only; the LOCAL NVMe root disk, never the attached
@@ -724,7 +743,7 @@ jobs:
   # build is a window slice and never claims planet validity, so it never releases.
   release:
     needs: build
-    if: ${{ github.ref == 'refs/heads/main' && github.event.inputs.bbox == '' && needs.build.result == 'success' }}
+    if: ${{ github.ref == 'refs/heads/main' && github.event.inputs.bbox == '' && github.event.inputs.vector_sample == '0' && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
     permissions: { actions: write }
     steps:
