@@ -8,10 +8,23 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # Build deps for tippecanoe (GDAL CLI comes with the base image).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl git \
+    ca-certificates curl git unzip \
     build-essential libsqlite3-dev zlib1g-dev \
     shellcheck \
   && rm -rf /var/lib/apt/lists/*
+
+# rclone — the publish rules shell it from inside this container (the R2 pushes that the
+# legacy workflows ran on the host). Pinned + sha256-verified per arch, same 1.74.4 pin as
+# the workflows' host installs (survived R2's version-id breakage; do not float).
+ARG TARGETARCH=amd64
+RUN case "$TARGETARCH" in \
+      arm64) sha=97685285c9ad6a0cf17d5844115d2a67245af6444db672187074bd9c358de419 ;; \
+      *)     sha=fe435e0c36228e7c2f116a8701f01127bb1f694005fc11d1f27186c8bca4115d ;; \
+    esac \
+  && curl -fsSL -o /tmp/rclone.zip "https://downloads.rclone.org/v1.74.4/rclone-v1.74.4-linux-${TARGETARCH:-amd64}.zip" \
+  && echo "$sha  /tmp/rclone.zip" | sha256sum -c \
+  && unzip -q -j /tmp/rclone.zip '*/rclone' -d /usr/local/bin \
+  && rm /tmp/rclone.zip
 
 # Every source is read over /vsicurl (R2/NOAA), so a transient HTTP/curl blip — an R2
 # 500 InternalError, a "Recv failure: Connection reset by peer" — must not kill an

@@ -63,32 +63,22 @@ rule fetch_asset:
         "{PY}/source_fetch.py {wildcards.source} {wildcards.index}"
 
 
-# Stage → datum → normalize, one job per source. Staging is content-keyed, so archive
-# member names aren't knowable at parse; the raw assets + metadata carry the provenance
-# (module changes are force-only — see the header).
+# Stage → datum → normalize → bounds, one job per source. Staging is content-keyed, so
+# the staged tif names aren't knowable at parse — bounds.csv (one row per staged file) is
+# the job's declared artifact, and bounds could never rerun without a re-prep anyway.
+# The raw assets + metadata carry the provenance (module changes are force-only — header).
 rule prep_source:
     input:
         raw_assets,
         metadata=str(SOURCES_DIR / "{source}/metadata.json"),
     output:
-        touch("store/source/{source}/.prepared")
+        "store/source/{source}/bounds.csv"
     wildcard_constraints:
         source=pat(PREPPED)
     resources:
         mem_gb=8  # asc-mosaic / archive-extract jobs hold whole rasters in flight
     shell:
-        "{PY}/source_prep.py {wildcards.source}"
-
-
-rule bounds:
-    input:
-        "store/source/{source}/.prepared",
-    output:
-        "store/source/{source}/bounds.csv"
-    wildcard_constraints:
-        source=pat(PREPPED)
-    shell:
-        "{PY}/source_bounds.py {wildcards.source}"
+        "{PY}/source_prep.py {wildcards.source} && {PY}/source_bounds.py {wildcards.source}"
 
 
 # Volatile mirrored collections register objects/<key> rows off the public bucket.
@@ -122,11 +112,12 @@ rule polygon:
         "{PY}/source_polygonize.py {wildcards.source} {threads}"
 
 
-# The machine-facing contract item, last in every source's chain. --hash-recipe:
-# this lane computes the recipe hash itself (staleness here is engine provenance;
-# the hash feeds the legacy build's tile keys until cutover B). recipe_files declares
-# everything the hash covers, so a Justfile/harvest.py/file_list edit restamps it.
-# bounds.csv transitively guarantees .prepared for prepped sources.
+# The machine-facing contract item, last in every source's chain — the definitive
+# "this source is prepared and current" signal, exactly as in the legacy lane.
+# --hash-recipe: this lane computes the recipe hash itself (staleness here is engine
+# provenance; the hash feeds the legacy build's tile keys until cutover B). recipe_files
+# declares everything the hash covers, so a Justfile/harvest.py/file_list edit restamps
+# the catalog without re-prepping the source.
 rule catalog_item:
     input:
         "store/source/{source}/bounds.csv",

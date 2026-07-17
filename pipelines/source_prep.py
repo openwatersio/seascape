@@ -40,6 +40,7 @@ Run from pipelines/:  uv run python source_prep.py <source-id>
 
 import fnmatch
 import gzip
+import lzma
 import os
 import shutil
 import sys
@@ -263,6 +264,17 @@ def _clear_stale(root):
     shutil.rmtree(f"{root}/_7z_extract", ignore_errors=True)
 
 
+class CorruptRaw(Exception):
+    """A staged file whose bytes are unreadable — an upstream 200-with-error-page."""
+
+
+# Errors that mean "this raw's BYTES are bad" (truncated archive, an upstream error page
+# saved as a raster) — never a code bug, so deleting the raw and refetching is the remedy.
+# Deliberately narrow: our own hard errors (collisions, zero glob matches) sys.exit past it.
+_CORRUPT = (zipfile.BadZipFile, gzip.BadGzipFile, tarfile.TarError, EOFError,
+            lzma.LZMAError, CorruptRaw)
+
+
 def stage(source):
     root = f"store/source/{source}"
     urls = config.file_list(source)
@@ -271,30 +283,53 @@ def stage(source):
     _clear_stale(root)
     asc_dir = f"{root}/asc"
     seen = set()  # staged basenames — collisions across raws/archives hard-error
+    corrupt = []
     for index in indices:
         raw = f"{root}/raw/{index}"
         origin = f"{source}[{index}]"
         with open(raw, "rb") as f:
             kind = _kind(f.read(512))
-        if kind == "zip":
-            note = _stage_zip(raw, root, asc_dir, seen, origin, members_glob)
-        elif kind == "7z":
-            note = _stage_7z(raw, root, seen, origin, members_glob)
-        elif kind == "gzip":
-            note = _stage_gzip(raw, root, source, index, seen, members_glob)
-        elif kind == "netcdf":
-            note = _stage_netcdf(raw, root, urls[index], seen, origin)
-        else:
-            base = f"{source}_{index}.{ext_for(urls[index])}"
-            _claim(seen, base, origin)
-            dest = f"{root}/{base}"
-            if os.path.exists(dest):
-                os.remove(dest)
-            os.link(raw, dest)
-            note = f"-> {base}"
+        try:
+            if kind == "zip":
+                note = _stage_zip(raw, root, asc_dir, seen, origin, members_glob)
+            elif kind == "7z":
+                note = _stage_7z(raw, root, seen, origin, members_glob)
+            elif kind == "gzip":
+                note = _stage_gzip(raw, root, source, index, seen, members_glob)
+            elif kind == "netcdf":
+                note = _stage_netcdf(raw, root, urls[index], seen, origin)
+            else:
+                base = f"{source}_{index}.{ext_for(urls[index])}"
+                _claim(seen, base, origin)
+                dest = f"{root}/{base}"
+                if os.path.exists(dest):
+                    os.remove(dest)
+                os.link(raw, dest)
+                _check_raster(dest)  # an upstream error page saved as .tif dies here
+                note = f"-> {base}"
+        except _CORRUPT as e:
+            print(f"{origin}: corrupt raw ({e}) — deleted, a rerun refetches it")
+            os.remove(raw)
+            corrupt.append(index)
+            continue
         print(f"{origin}: {note}")
+    if corrupt:
+        sys.exit(f"{source}: deleted {len(corrupt)} corrupt raw asset(s) {corrupt} — "
+                 "rerun to refetch them")
     if os.path.isdir(asc_dir):
         _mosaic_asc(root, source, asc_dir)
+
+
+def _check_raster(path):
+    """Header-open the staged file; unreadable bytes (a server's 200-with-error-page)
+    surface here as a corrupt raw instead of a normalize crash naming only the staged tif."""
+    import rasterio
+    try:
+        with rasterio.open(path):
+            pass
+    except rasterio.errors.RasterioIOError as e:
+        os.remove(path)
+        raise CorruptRaw(f"not a readable raster: {e}") from e
 
 
 def prep(source):
@@ -515,6 +550,39 @@ def _check():
         stage(eid)
         with rasterio.open(f"store/source/{eid}/{eid}.tif") as src:
             assert src.shape == (2, 2) and src.read(1)[0, 0] == 1.0, src.read(1)
+
+        # Corrupt raws self-heal: a truncated zip (PK magic intact) and a server error
+        # page routed as a raster are both deleted with a refetch message; a rerun with a
+        # good raw then succeeds — the exact truncated-download / 200-with-garbage cases.
+        cid = "_prep_corrupt"
+        os.makedirs(f"sources/{cid}")
+        os.makedirs(f"store/source/{cid}/raw")
+        with open(f"sources/{cid}/file_list.txt", "w") as f:
+            f.write("https://x/a.zip\nhttps://x/b.tif\n")
+        with open(f"sources/{cid}/metadata.json", "w") as f:
+            json.dump({"name": "Corrupt"}, f)
+        good_zip = io.BytesIO()
+        with zipfile.ZipFile(good_zip, "w") as z:
+            z.writestr("a.tif", tif_bytes(1.0))
+        with open(f"store/source/{cid}/raw/0", "wb") as f:
+            f.write(good_zip.getvalue()[: len(good_zip.getvalue()) // 2])  # truncated, PK intact
+        with open(f"store/source/{cid}/raw/1", "wb") as f:
+            f.write(b"<html>503 Service Unavailable</html>")  # kind=other → staged as tif
+        try:
+            stage(cid)
+            assert False, "expected corrupt raws to exit"
+        except SystemExit as e:
+            assert "corrupt raw asset(s) [0, 1]" in str(e), e
+        assert not os.path.exists(f"store/source/{cid}/raw/0"), "corrupt zip raw must be deleted"
+        assert not os.path.exists(f"store/source/{cid}/raw/1"), "garbage raster raw must be deleted"
+        assert not os.path.exists(f"store/source/{cid}/{cid}_1.tif"), "bad staged tif must be removed"
+        with open(f"store/source/{cid}/raw/0", "wb") as f:
+            f.write(good_zip.getvalue())
+        with open(f"store/source/{cid}/raw/1", "wb") as f:
+            f.write(tif_bytes(2.0))
+        stage(cid)  # refetched good bytes stage cleanly
+        assert os.path.isfile(f"store/source/{cid}/a.tif")
+        assert os.path.isfile(f"store/source/{cid}/{cid}_1.tif")
 
         # Format registry: a zip of ESRI ASCII .asc tiles mosaics to <id>.tif (needs GDAL CLI).
         if shutil.which("gdalbuildvrt") and shutil.which("gdal_translate"):
