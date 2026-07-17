@@ -58,6 +58,10 @@ from source_remote import _prev_bounds, bounds_3857, to_vsicurl, wrap_antimeridi
 # trips the guard and the previous registration keeps serving.
 SHRINK_TOLERANCE = 0.05
 
+# More listed-but-unreadable products than this aborts the registration like the shrink
+# guard — the carry-forward tolerance must not quietly absorb a half-broken edition.
+BROKEN_TOLERANCE = 5
+
 # S-102 filenames end in a fixed-width 6-character issue field before ``.h5``
 # (``102US005JAXEF262297.h5`` -> cell ``102US005JAXEF``, issue ``262297``). Verified
 # against the full ed3.0.0 population (4,315 products, 17 distinct issue codes): the
@@ -257,9 +261,17 @@ def register(source, keys, header):
 
     Guards run BEFORE any header read or write: removed keys print loudly, and a
     shrink beyond SHRINK_TOLERANCE aborts with the previous registration intact
-    (MIRROR_ALLOW_SHRINK=1 overrides). Only after every new header read succeeds do
-    mirror.txt and bounds.csv get written — a half-read registration publishes
-    nothing."""
+    (MIRROR_ALLOW_SHRINK=1 overrides).
+
+    A listed key whose header read fails PERSISTENTLY (h5_header's retries exhausted —
+    e.g. NOAA's 0-byte 102US005WI1DT262297.h5 replacing a deleted good issue) must not
+    freeze the other ~4.3k products: when the previous registration has a row for the
+    same cell, that row is carried forward — its object lives in our never-delete
+    mirror even when the upstream deleted it — and a broken brand-new cell is dropped.
+    Both print loudly; more than BROKEN_TOLERANCE such keys aborts like the shrink
+    guard (a half-broken edition must not be quietly absorbed cell by cell). Broken
+    and carried keys stay OUT of mirror.txt — the object copier must never chase an
+    upstream-deleted or empty object."""
     keys = sorted(set(keys))
     prev = _prev_bounds(source)
     removed = sorted({_upstream_key(f) for f in prev} - set(keys))
@@ -276,6 +288,7 @@ def register(source, keys, header):
                      f"over the previous registration (MIRROR_ALLOW_SHRINK=1 to override)")
 
     rows, todo = [], []
+    healthy = set(keys)  # keys whose objects the copier may chase; broken ones leave
     for key in keys:
         rel = f"objects/{key}"
         if rel in prev:
@@ -289,28 +302,57 @@ def register(source, keys, header):
 
         def read_one(item):
             i, key = item
-            row = (f"objects/{key}", *header(key))
+            try:
+                row = (f"objects/{key}", *header(key))
+            except RuntimeError as e:
+                return i, key, e  # persistent read failure — triaged below, not fatal here
             nonlocal done
             with lock:
                 done += 1
                 if done % 100 == 0:
                     print(f"  {done}/{len(todo)} headers")
-            return i, row
+            return i, row, None
 
         # Header reads are network-bound (one ranged GET each, or a gdalinfo subprocess
         # for .h5) — the box CPU sits idle through this sweep, so the pool runs wide.
         # noaa_s102 alone is ~4.3k headers; at 16 workers that measured ~2 h, so a fresh
         # registration dominates the run. MIRROR_HEADER_WORKERS tunes it down if an
-        # upstream throttles. pool.map re-raises the first failure — one bad header
-        # still fails the whole registration.
+        # upstream throttles.
         workers = int(os.environ.get("MIRROR_HEADER_WORKERS", "48"))
+        broken = []
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            for i, row in pool.map(read_one, todo):
-                rows[i] = row
+            for i, row_or_key, err in pool.map(read_one, todo):
+                if err is None:
+                    rows[i] = row_or_key
+                else:
+                    broken.append((i, row_or_key, err))
+
+        if len(broken) > BROKEN_TOLERANCE:
+            sys.exit(f"{source}: {len(broken)} listed products are unreadable "
+                     f"(> {BROKEN_TOLERANCE}) — upstream looks half-broken; refusing to "
+                     "publish over the previous registration")
+        # One row per previous CELL: a broken new issue keeps serving the superseded one
+        # from our mirror (upstream deletes the old object when re-issuing, but the
+        # never-delete mirror still holds it).
+        prev_by_cell = {cell_key(_upstream_key(rel)): row for rel, row in prev.items()}
+        drop = set()
+        for i, key, err in sorted(broken):
+            # the cell concept is S-102's fixed-width issue naming; other keys just drop
+            carried = prev_by_cell.get(cell_key(key)) if key.lower().endswith(".h5") else None
+            healthy.discard(key)
+            if carried:
+                print(f"BROKEN upstream product: {key} ({err}) — carrying forward "
+                      f"{carried[0]} from the mirror")
+                rows[i] = carried
+            else:
+                print(f"BROKEN upstream product: {key} ({err}) — new cell, no previous "
+                      "issue to carry; dropping it")
+                drop.add(i)
+        rows = [r for i, r in enumerate(rows) if i not in drop]
 
     os.makedirs(f"store/source/{source}", exist_ok=True)
     with open(f"store/source/{source}/mirror.txt", "w") as f:
-        f.writelines(key + "\n" for key in keys)
+        f.writelines(key + "\n" for key in sorted(healthy))
     write_bounds(source, rows)
     print(f"{source}: {len(rows) - len(todo)} carried forward, {len(todo)} newly read, "
           f"{len(removed)} removed")
@@ -419,6 +461,43 @@ def _check():
     with open(f"store/source/{src}/bounds.csv") as f:
         assert len(f.read().splitlines()) == 2
     shutil.rmtree(f"store/source/{src}")
+
+    # Broken-product triage: a persistently-unreadable NEW issue carries the previous
+    # cell's row forward (the mirror still holds its object) and stays out of mirror.txt;
+    # a broken brand-new cell is dropped; more than BROKEN_TOLERANCE aborts.
+    src2 = "_mirror_broken"
+    shutil.rmtree(f"store/source/{src2}", ignore_errors=True)
+    os.makedirs(f"store/source/{src2}", exist_ok=True)
+    with open(f"store/source/{src2}/bounds.csv", "w") as f:
+        f.write("filename,left,bottom,right,top,width,height\n"
+                "objects/p/102US005AAAAA111111.h5,1.0,2.0,3.0,4.0,10,20\n")
+
+    def broken_header(key):
+        if "BROKEN" in key or "NEWCEL" in key:
+            raise RuntimeError(f"gdalinfo failed on {key}")
+        return (0.0, 0.0, 1.0, 1.0, 5, 5)
+
+    register(src2, ["p/102US005AAAAABROKEN.h5",    # re-issue of AAAAA, unreadable → carry
+                    "p/102US005NEWCLNEWCEL.h5",    # broken new cell → dropped
+                    "p/102US005CCCCC222222.h5"],   # healthy new
+             broken_header)
+    with open(f"store/source/{src2}/bounds.csv") as f:
+        out2 = f.read()
+    assert "objects/p/102US005AAAAA111111.h5,1.0,2.0,3.0,4.0,10,20" in out2, \
+        "broken re-issue must carry the previous cell's row"
+    assert "BROKEN" not in out2 and "NEWCEL" not in out2, out2
+    assert "objects/p/102US005CCCCC222222.h5" in out2, "healthy keys must register"
+    with open(f"store/source/{src2}/mirror.txt") as f:
+        m = f.read().splitlines()
+    assert m == ["p/102US005CCCCC222222.h5"], f"mirror.txt must hold only healthy keys: {m}"
+    # ceiling: more broken keys than BROKEN_TOLERANCE refuses the whole registration
+    many = [f"p/102US005X{i:04d}BROKEN.h5" for i in range(BROKEN_TOLERANCE + 1)]
+    try:
+        register(src2, many, broken_header)
+        assert False, "expected the broken-product ceiling to exit"
+    except SystemExit as e:
+        assert "unreadable" in str(e), e
+    shutil.rmtree(f"store/source/{src2}")
 
     # a header-read failure raises (offline: gdalinfo on a path that cannot exist
     # exits nonzero instantly — the same subprocess path a segfaulting driver hits)
