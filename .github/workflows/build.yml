@@ -473,11 +473,13 @@ jobs:
           # legacy absolute-path rows): 5 MB range reads (S-102's HDF5 driver is the chattiest
           # reader — big chunks amortize its many small requests), a real per-process curl
           # cache and small per-open-dataset VSI cache (both budgeted in the RAM math above),
-          # HTTP/2 multiplexing (R2 speaks it), and a 512 KB first read at open instead of
-          # 16 KB (many opens per tile). Inert for local reads, so set unconditionally.
+          # HTTP/1.1 for reliable Cloudflare range reads, and a 512 KB first read at open instead
+          # of 16 KB (many opens per tile). Run 29576789428 repeatedly got a zero-byte TIFF tile
+          # near the end of the same CUDEM read under forced HTTP/2 multiplexing; the exact range
+          # succeeds over HTTP/1.1. Inert for local reads, so set unconditionally.
           AGG_ENV+=(-e CPL_VSIL_CURL_CHUNK_SIZE=5242880
                     -e CPL_VSIL_CURL_CACHE_SIZE=268435456
-                    -e GDAL_HTTP_MULTIPLEX=YES -e GDAL_HTTP_VERSION=2
+                    -e GDAL_HTTP_MULTIPLEX=NO -e GDAL_HTTP_VERSION=1.1
                     -e VSI_CACHE=TRUE -e VSI_CACHE_SIZE=33554432
                     -e GDAL_INGESTED_BYTES_AT_OPEN=524288)
           # A dead multiplexed connection must error-and-retry, never hang: the tuned run's
