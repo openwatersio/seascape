@@ -1,6 +1,6 @@
 """Download ONE file_list.txt entry to store/source/<id>/raw/<index>.
 
-The per-asset half of source_download.py for the Snakemake lane: one URL, one
+One URL, one
 job, one retry unit. The raw name is the bare list index — extensionless on
 purpose, so the output path is known before the bytes are (a URL that lies
 about its extension can't rename the artifact; source_stage.py sniffs content).

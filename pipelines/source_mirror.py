@@ -47,7 +47,6 @@ import requests
 from rasterio.warp import transform_bounds
 
 import config
-from source_download_filelist import filelist_urls
 from source_remote import _prev_bounds, bounds_3857, to_vsicurl, wrap_antimeridian, write_bounds
 
 # Refuse to publish when the registration shrinks by more than this fraction of the
@@ -73,6 +72,12 @@ ISSUE_FIELD_LEN = 6
 # pretty-printed variant without admitting anything between the two fields.
 _CONTENTS_RE = re.compile(r"<Key>([^<]+)</Key>\s*<LastModified>([^<]+)</LastModified>")
 _TOKEN_RE = re.compile(r"<NextContinuationToken>\s*([^<\s]+)\s*</NextContinuationToken>")
+
+
+def filelist_urls(text):
+    """File URLs in a downloaded manifest: non-blank, non-comment lines."""
+    return [l.strip() for l in text.splitlines()
+            if l.strip() and not l.lstrip().startswith("#")]
 
 
 def _next_token(xml):

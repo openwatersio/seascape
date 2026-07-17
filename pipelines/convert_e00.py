@@ -14,7 +14,7 @@ GRD interchange section is parsed directly. The format is simple and self-descri
 Called from staging (source_prep) once a raw asset sniffs as an .e00 export. No CRS is
 assigned here — source_normalize assigns the horizontal CRS from metadata.json — so this
 stays a pure format converter, not a source-specific script. Absorbed verbatim from the
-GRD parser in source_download_tahoe.py (the legacy downloader stays for the Justfile chain
+GRD parser from the retired legacy downloader (this module is now the only copy
 until cutover A; the duplication is bounded and noted in the migration plan).
 """
 

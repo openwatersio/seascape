@@ -25,8 +25,8 @@ trust URL extensions), and stage() routes each raw by sniffing its magic bytes:
              a bare GeoTIFF → keep)
   netCDF   → gdal_translate to a GeoTIFF, per-file CRS preserved (assign EPSG:4326 only
              when the file embeds none), named after the URL stem (NOAA estuaries)
-  anything else → hardlink to <id>_<index>.<ext> under the extension source_download
-             would have chosen, so staged names match the legacy chain
+  anything else → hardlink to <id>_<index>.<ext> with the URL-derived extension
+             (ext_for), keeping the store's historical file naming
 
 Staged basenames are tracked across every raw: two members (from any archives or nested
 paths) sharing a basename is a hard error, never a silent overwrite. The in-place
@@ -52,8 +52,18 @@ import config
 import utils
 from convert_e00 import e00_to_tif
 from source_datum import transform_file, write_sidecar
-from source_download import ext_for
 from source_normalize import normalize_file
+
+# Only trust a URL's trailing extension when it names a real data/archive format;
+# otherwise (e.g. a weblink ending in ...html?...) stage as .tif — GDAL reads by
+# content, not by name.
+DATA_EXTS = {"tif", "tiff", "zip", "nc", "asc", "xyz", "img", "gz", "7z", "grd"}
+
+
+def ext_for(url):
+    last = url.split("?")[0].split("#")[0].rsplit("/", 1)[-1]
+    ext = last.rsplit(".", 1)[-1].lower() if "." in last else ""
+    return ext if ext in DATA_EXTS else "tif"
 
 
 def _kind(head):

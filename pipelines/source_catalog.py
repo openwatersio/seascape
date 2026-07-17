@@ -110,28 +110,18 @@ def _datum(source):
 
     ``negate`` is the one field with a machine consumer — aggregation_reproject flips band 1
     when it's true — so it must mean "negate at aggregation", which only a mirrored/streamed
-    source (no sidecar; negates nothing at prep) ever needs. A sidecar means source_datum
-    already baked the transform into the prepared COGs, so negate is False regardless of what
-    was applied — publishing the applied flag here made aggregation flip prepared depths back
-    to positive (the african_great_lakes/ddm double-negation). ``offset_m``/``clamp_positive``
-    stay the applied-at-prep record (provenance + tile keying; nothing re-applies them).
-    Enforces the invariant that a recipe running source_datum must leave a sidecar behind."""
+    source (no sidecar; negates nothing at prep) ever needs. A sidecar means the transform is
+    already baked into the prepared COGs, so negate is False regardless of what was applied —
+    publishing the applied flag here made aggregation flip prepared depths back to positive
+    (the african_great_lakes/ddm double-negation). ``offset_m``/``clamp_positive`` stay the
+    applied-at-prep record (provenance + tile keying; nothing re-applies them). Every prepped
+    source has a sidecar (source_prep writes one even for a no-op transform); no sidecar
+    means a mirrored source, whose negate comes from metadata."""
     sidecar = f"store/source/{source}/datum.json"
     if os.path.isfile(sidecar):
         with open(sidecar) as f:
             d = json.load(f)
         return False, float(d.get("offset_m", 0.0)), bool(d.get("clamp_positive", False))
-    justfile = f"{config.SOURCES_DIR}/{source}/Justfile"
-    if os.path.isfile(justfile):
-        with open(justfile) as f:
-            # Recipe lines only — header comments legitimately mention source_datum
-            # (noaa_s102's explains why mirrored sources skip it) without running it.
-            runs_datum = any("source_datum" in line for line in f
-                             if not line.lstrip().startswith("#"))
-        if runs_datum:
-            raise SystemExit(
-                f"{source}: recipe runs source_datum but store/source/{source}/datum.json is "
-                "missing — the transform wasn't recorded; failing registration, not aggregation")
     meta = config.load_metadata(source)
     return bool(meta.get("negate", False)), 0.0, False
 
@@ -196,18 +186,14 @@ def main():
 
 def _check():
     """Offline synthetic self-check: an item assembles from a synthetic source, the recorded
-    datum offset round-trips, an antimeridian-wrapped bounds row is represented (west > east),
-    a comment-only source_datum mention doesn't trip the sidecar invariant (the real noaa_s102
-    Justfile is the regression case), and the two hard-error paths (missing metadata.json, a
-    recipe that ran source_datum with no sidecar) both fail registration."""
+    datum offset round-trips (sidecar → negate publishes False), a sidecar-less source takes
+    negate from metadata (the mirrored model), an antimeridian-wrapped bounds row is
+    represented (west > east), and missing metadata.json fails registration."""
     import shutil
     import tempfile
 
     d = tempfile.mkdtemp()
     cwd, saved_sources_dir = os.getcwd(), config.SOURCES_DIR
-    # The real repo sources dir, resolved before the chdir — the noaa_s102 case below reads
-    # its actual Justfile (offline file read; its header comment mentions source_datum).
-    real_sources = os.path.abspath(saved_sources_dir)
     try:
         os.chdir(d)
         config.SOURCES_DIR = "sources"
@@ -270,31 +256,11 @@ def _check():
         assert abs(w2 - 175.0) < 0.01 and abs(e2 - -150.0) < 0.01, (w2, e2)
         assert s2 < n2, (s2, n2)
 
-        # A Justfile whose COMMENT mentions source_datum but never invokes it must not trip
-        # the sidecar invariant (sid2 has no sidecar and no datum need)…
-        with open(f"sources/{sid2}/Justfile", "w") as f:
-            f.write("# mirrored sources skip source_datum — see the module docstring\n"
-                    "default:\n    uv run python source_mirror.py x\n")
-        assert build_item(sid2)["properties"]["seascape:negate"] is False
-        # …and the real noaa_s102 recipe (header comment mentions it, never runs it) is the
-        # live regression: _datum must fall through to metadata (negate=true, no offset).
-        assert os.path.isfile(f"{real_sources}/noaa_s102/Justfile"), \
-            f"run --check from pipelines/ ({real_sources}/noaa_s102/Justfile not found)"
-        config.SOURCES_DIR = real_sources
-        try:
-            assert _datum("noaa_s102") == (True, 0.0, False)
-        finally:
-            config.SOURCES_DIR = "sources"
-
-        # missing datum sidecar for a recipe that runs source_datum → hard error
-        with open(f"sources/{sid}/Justfile", "w") as f:
-            f.write("default:\n    uv run python source_datum.py x --negate\n")
-        os.remove(f"store/source/{sid}/datum.json")
-        try:
-            build_item(sid)
-            assert False, "expected a missing datum sidecar to fail"
-        except SystemExit as ex:
-            assert "datum.json is missing" in str(ex), ex
+        # No sidecar = the mirrored model: negate comes from metadata (a prepped source
+        # always has a sidecar — source_prep writes one even for a no-op transform).
+        with open(f"sources/{sid2}/metadata.json", "w") as f:
+            json.dump({"name": "Wrap Source", "negate": True, "volatile": True}, f)
+        assert build_item(sid2)["properties"]["seascape:negate"] is True
 
         # missing metadata.json → hard error
         shutil.rmtree(f"sources/{sid}")
