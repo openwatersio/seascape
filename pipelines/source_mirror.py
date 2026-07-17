@@ -289,10 +289,14 @@ def register(source, keys, header):
                     print(f"  {done}/{len(todo)} headers")
             return i, row
 
-        # Header reads are network-bound (one ranged GET each); a small pool turns
-        # the cutover-sized sweep from hours into minutes. pool.map re-raises the
-        # first failure — one bad header still fails the whole registration.
-        with ThreadPoolExecutor(max_workers=16) as pool:
+        # Header reads are network-bound (one ranged GET each, or a gdalinfo subprocess
+        # for .h5) — the box CPU sits idle through this sweep, so the pool runs wide.
+        # noaa_s102 alone is ~4.3k headers; at 16 workers that measured ~2 h, so a fresh
+        # registration dominates the run. MIRROR_HEADER_WORKERS tunes it down if an
+        # upstream throttles. pool.map re-raises the first failure — one bad header
+        # still fails the whole registration.
+        workers = int(os.environ.get("MIRROR_HEADER_WORKERS", "48"))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
             for i, row in pool.map(read_one, todo):
                 rows[i] = row
 

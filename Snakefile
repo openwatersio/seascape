@@ -59,6 +59,8 @@ rule fetch_asset:
     wildcard_constraints:
         source=pat(PREPPED), index=r"\d+"
     retries: 2
+    benchmark:
+        "store/bench/fetch/{source}-{index}.tsv"
     shell:
         "{PY}/source_fetch.py {wildcards.source} {wildcards.index}"
 
@@ -78,6 +80,8 @@ rule prep_source:
     priority: source_priority
     resources:
         mem_gb=8  # asc-mosaic / archive-extract jobs hold whole rasters in flight
+    benchmark:
+        "store/bench/prep/{source}.tsv"
     shell:
         "{PY}/source_prep.py {wildcards.source} && {PY}/source_bounds.py {wildcards.source}"
 
@@ -94,10 +98,12 @@ rule mirror_source:
         bucket="store/source/{source}/mirror-bucket.txt",
     wildcard_constraints:
         source=pat(MIRRORED)
-    priority: 5000  # thousands of serial header reads — the longest single jobs; start first
+    priority: 5000  # thousands of network header reads — a long single job; start early
     retries: 2
     resources:
         mem_gb=2  # header reads + list bookkeeping, no raster in memory
+    benchmark:
+        "store/bench/mirror/{source}.tsv"
     shell:
         "{PY}/source_mirror.py {wildcards.source}"
 
@@ -138,12 +144,22 @@ rule catalog_item:
 # recipe-hash gating exactly (the pinned snapshot URL + Overture release live in the
 # module, so the data can't drift under an unchanged recipe). Flagged coarse sources
 # clamp against land.fgb and keep depths inside water.fgb during aggregation.
+# priority 10000 — above every prep/mirror: these are the longest single-threaded jobs
+# (watermask ~60 min), code-only inputs so ready at t=0, and rebuild only on a landmask.py
+# change. Starting them first overlaps their runtime with the fetch/prep/mirror work
+# instead of tailing the run; without it the byte-weighted prep priority front-loads big
+# fetches ahead of them and pushes their finish past everything else.
 rule landmask:
     input:
         code=code("landmask.py"),
     output:
         "store/landmask/land.fgb"
+    priority: 10000
     retries: 2
+    resources:
+        mem_gb=4
+    benchmark:
+        "store/bench/landmask.tsv"
     shell:
         "{PY}/landmask.py prep"
 
@@ -153,7 +169,12 @@ rule watermask:
         code=code("landmask.py"),
     output:
         "store/landmask/water.fgb"
+    priority: 10000
     retries: 2
+    resources:
+        mem_gb=8  # the planet Overture-water reproject; refine from the benchmark
+    benchmark:
+        "store/bench/watermask.tsv"
     shell:
         "{PY}/landmask.py prep-water"
 
