@@ -45,3 +45,13 @@ def recipe_files(wc):
     file_list.txt, metadata.json) restamps the catalog's seascape:recipe_hash."""
     root = SOURCES_DIR / wc.source
     return sorted(str(p) for p in root.rglob("*") if p.is_file())
+
+
+def source_priority(wc, input=None, attempt=None):
+    """Heavier sources first — the scheduler knows nothing about duration, so a big
+    source scheduled last runs alone at the end (longest-first shortens the makespan).
+    file_list length is the parse-pure weight proxy (uk_surfzone 1301 … gebco 1); it
+    under-weights single-huge-archive sources — refine with raw sizes if the tail ever
+    matters. Set on prep only: priorities propagate upstream through the DAG, so the
+    source's fetch jobs inherit it."""
+    return len(pipeline_config.file_list(wc.source))

@@ -52,6 +52,7 @@ rule mirror_objects:
         touch("store/meta/publish/{source}.objects")
     wildcard_constraints:
         source=pat(MIRRORED)
+    priority: 5000  # CUDEM's object mirror moves ~190 GB — the run's longest data leg
     shell:
         PUBLISH_GUARD +
         'printf "[upstream]\\ntype = s3\\nprovider = AWS\\nregion = us-east-1\\n" > /tmp/upstream-{wildcards.source}.conf; '

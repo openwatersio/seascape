@@ -75,6 +75,7 @@ rule prep_source:
         "store/source/{source}/bounds.csv"
     wildcard_constraints:
         source=pat(PREPPED)
+    priority: source_priority
     resources:
         mem_gb=8  # asc-mosaic / archive-extract jobs hold whole rasters in flight
     shell:
@@ -93,6 +94,7 @@ rule mirror_source:
         bucket="store/source/{source}/mirror-bucket.txt",
     wildcard_constraints:
         source=pat(MIRRORED)
+    priority: 5000  # thousands of serial header reads — the longest single jobs; start first
     retries: 2
     resources:
         mem_gb=2  # header reads + list bookkeeping, no raster in memory
