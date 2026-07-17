@@ -47,6 +47,7 @@ import requests
 from rasterio.warp import transform_bounds
 
 import config
+import utils
 from source_remote import _prev_bounds, bounds_3857, to_vsicurl, wrap_antimeridian, write_bounds
 
 # Refuse to publish when the registration shrinks by more than this fraction of the
@@ -116,7 +117,8 @@ def list_prefix(bucket, prefix):
         params = {"list-type": "2", "prefix": prefix}
         if token:
             params["continuation-token"] = token
-        r = requests.get(host, params=params, timeout=60)
+        r = requests.get(host, params=params, timeout=60,
+                         headers={"User-Agent": utils.USER_AGENT})
         r.raise_for_status()
         items += _CONTENTS_RE.findall(r.text)
         token = _next_token(r.text)
@@ -167,7 +169,8 @@ def enumerate_keys(source):
             pairs += [(bucket, k) for k in dedupe_cells(products)]
         else:
             print(f"{source}: reading urllist {entry}")
-            r = requests.get(entry, timeout=60)
+            r = requests.get(entry, timeout=60,
+                             headers={"User-Agent": utils.USER_AGENT})
             r.raise_for_status()
             # A urllist also names sidecars (tile-index .shp/.shx/.dbf, .vrt, .xml,
             # .pdf, itself); keep only raster tiles.

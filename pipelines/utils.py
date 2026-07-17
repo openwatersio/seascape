@@ -199,6 +199,12 @@ def write_if_changed(path, content):
     return True
 
 
+# Identifying User-Agent for every upstream request (requests here, GDAL /vsicurl via
+# GDAL_HTTP_USERAGENT in the Dockerfile): gives data providers something to allowlist
+# instead of the default python-requests fingerprint their WAFs throttle.
+USER_AGENT = "seascape/1.0 (+https://openwaters.io/charts/seascape)"
+
+
 def http_download(url, dest, chunk=1 << 20, retries=5):
     '''Stream a URL to dest with requests (handles query-string URLs; no shell).
     Retries with backoff on transient network errors — the public data servers
@@ -207,7 +213,8 @@ def http_download(url, dest, chunk=1 << 20, retries=5):
     import requests
     for attempt in range(retries):
         try:
-            with requests.get(url, stream=True, timeout=120) as r:
+            with requests.get(url, stream=True, timeout=120,
+                              headers={'User-Agent': USER_AGENT}) as r:
                 r.raise_for_status()
                 written = 0
                 with open(dest, 'wb') as f:
