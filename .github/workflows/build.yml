@@ -411,6 +411,8 @@ jobs:
           # re-key leaves last build's object as garbage, never clobbers a concurrent write.
           push() { rclone copy "$STORE/$1" "$R2/$2" "${XFER[@]}" "${@:3}"; }
           push_build() { rclone copyto "$STORE/bundle/$1" "$R2/build/$SHA/$1" "${XFER[@]}"; }
+          group() { echo "::group::$*"; }
+          end_group() { echo "::endgroup::"; }
 
           # ── NO STORE HYDRATE, NO R2 SOURCE HYDRATE (planet). The store IS the volume — whatever any
           #    prior run finished (completed or interrupted) is already at $STORE, and the
@@ -432,9 +434,10 @@ jobs:
           #    line rate, and every later boot skips it entirely. It also copies superseded-key
           #    garbage (~one GC generation's worth) — harmless cache bloat a volume cleanup can drop.
           if [ -z "${BBOX:-}" ] && [ ! -e "$STORE/.seeded-from-r2" ]; then
-            echo "── one-time seed: prior runs' aggregate output + the source mirror from R2 ──"
+            group "one-time seed: prior aggregate output + source mirror"
             for p in mosaic/tiles contour soundings depare source polygon landmask; do hydrate "$p" "$p"; done
             touch "$STORE/.seeded-from-r2"
+            end_group
           fi
           if [ -n "${BBOX:-}" ]; then
             hydrate source source --include '*/bounds.csv' --include '*/catalog.json'
@@ -488,9 +491,10 @@ jobs:
 
           # ── BUILD, stage by stage, pushing after each so an interruption loses at most one
           #    stage. The stage order matches `just planet`; the box just interleaves pushes. ──
-          echo "── cover ──"
+          group "cover"
           dr cover                        # writes the covering (the tiling plan; keys drive dirtiness)
           dr key-diagnostics              # expected/stored keys + determinants for resume failures
+          end_group
 
           # ── stage dirty source COGs onto local NVMe (planet) ── the persistent volume is
           #    the durable source cache, not the hot read path: 48 parallel GDAL workers otherwise
@@ -500,7 +504,7 @@ jobs:
           #    changes only raster filenames. Absolute /vsi legacy rows keep streaming untouched.
           if [ -z "${BBOX:-}" ]; then
             [ -f "$STORE/landmask/land.fgb" ] || { echo "no land.fgb on the volume — run sources.yml (landmask job) first" >&2; exit 1; }
-            echo "── stage dirty-set sources to NVMe ──"
+            group "stage dirty-set sources to NVMe"
             dr sources-manifest
             grep -v -e '://' -e '/vsi' "$STORE/source-manifest.txt" > /tmp/source-files.txt || true
             legacy=$(grep -c -e '://' -e '/vsi' "$STORE/source-manifest.txt" || true)
@@ -524,21 +528,23 @@ jobs:
             rclone copy "$STORE/source" "$LOCAL_SOURCE" --files-from /tmp/source-files.txt "${XFER[@]}"
             AGG_MOUNTS=(-v "$LOCAL_SOURCE:/local-source:ro")
             AGG_ENV+=(-e SOURCE_VSI_BASE=/local-source)
+            end_group
           fi
 
           # Coverage belongs to sources.yml: its only inputs are source registrations + footprints.
           # Planet builds consume the completed volume artifact. Regional builds have no volume and
           # retain bbox-scoped coverage for faithful local/CI previews.
           if [ -n "${BBOX:-}" ]; then
-            echo "── regional coverage ──"
+            group "regional coverage"
             dr coverage
+            end_group
           else
             test -s "$STORE/bundle/coverage.pmtiles" || {
               echo "coverage.pmtiles is missing — run sources.yml first" >&2; exit 1; }
           fi
           push_build coverage.pmtiles
 
-          echo "── aggregate ──"
+          group "aggregate"
           # Aggregate produces the stage-2 MOSAIC tiles + the vector forks (NOT terrain pmtiles —
           # those are stage 3's per-zoom render) straight onto the persistent volume, so every
           # finished tile is durable the moment it lands. The old 20-min push_agg loop (mid-build
@@ -550,20 +556,23 @@ jobs:
             "${AGG_MOUNTS[@]}" -e BBOX -e FORCE_REBUILD -e TOOLCHAIN \
             "${AGG_ENV[@]}" "$IMAGE:$IMAGE_TAG" just aggregate || agg_rc=$?
           [ "$agg_rc" -eq 0 ] || exit "$agg_rc"
+          end_group
 
           # ── mosaic index (LOCAL, for the on-box terrain render) ── build the GTI + planet z8 +
           #    index parquet from the mosaic tiles the aggregate persisted; terrain (stage 3) reads
           #    the GTI, so this MUST run before it. NO MOSAIC_VSI_BASE here: the index records LOCAL
           #    absolute tile paths so terrain reads the mosaic off local disk. The PUBLISHED index
           #    (with /vsicurl tile URLs) is rebuilt at the mosaic-publish step below (after terrain).
-          echo "── mosaic index (local) ──"
+          group "mosaic index (local)"
           dr_mosaic_index
+          end_group
 
           # ── terrain (stage 3) ── the per-zoom Terrarium render from the mosaic (native + coalesced
           #    overviews), replacing the old 2x2-average downsample pyramid. TERRAIN_PROCESSES caps
           #    concurrent render windows (each multi-GB). Reads mosaic.gti by local path.
-          echo "── terrain (per-zoom render from the mosaic) ──"
+          group "terrain (per-zoom render from the mosaic)"
           dr terrain
+          end_group
           if [ -z "${BBOX:-}" ]; then
             # No terrain-pmtiles or store push: those prefixes were R2-store STATE for the deleted
             # hydrate, and the store now persists on the volume. The store manifest + pointer flip
@@ -578,7 +587,7 @@ jobs:
             #    above used local paths, invalid off-box). planet-z8 is content-addressed → reused,
             #    no re-decimation. Push everything the .gti references (tiles + planet-z8 <Overview>
             #    + index) BEFORE flipping the mosaic.gti pointer — pointer-last atomic publish.
-            echo "── mosaic publish (/vsicurl index) ──"
+            group "mosaic publish (/vsicurl index)"
             docker run --rm -v "$GITHUB_WORKSPACE:/app" -v "$STORE:/app/pipelines/store" \
               -v "$SCRATCH:/app/pipelines/store/aggregation" \
               -v "$GITHUB_WORKSPACE/.github/scripts/gdalwarp-bigtiff:/usr/local/bin/gdalwarp:ro" \
@@ -589,13 +598,15 @@ jobs:
             push mosaic/index mosaic/index                 # the /vsicurl GeoParquet index
             rclone copyto "$STORE/mosaic/mosaic.gti" "$R2/mosaic/mosaic.gti" "${XFER[@]}"  # pointer LAST
             echo "mosaic published: tiles + planet-z8 + index pushed, mosaic.gti pointer flipped"
+            end_group
           fi
 
-          echo "── bundle (terrain) ──"
+          group "bundle (terrain)"
           dr bundle
           rclone copy "$STORE/bundle" "$R2/build/$SHA" "${XFER[@]}" --include 'planet.pmtiles' --include 'overlay-*.pmtiles'
+          end_group
 
-          echo "── vector layers ──"
+          group "vector layers"
           # Completeness is SELF-ENFORCED here, not step order: each bundler verifies every
           # covering tile left an artifact or .empty marker (contour_run.verify_vector_complete)
           # before bundling — the same invariant the store manifest hard-failed on above, so
@@ -613,6 +624,7 @@ jobs:
           fi
           dr contours
           push_build vector.pmtiles
+          end_group
 
           # ── No prune here. Deletion is OUT-OF-BAND: gc.yml (weekly + dispatch, sharing the
           #    r2-store concurrency group so it never runs during a build) is the ONLY deletion
@@ -626,7 +638,7 @@ jobs:
           #    without one). Everything it references (planet + overlays + vector + coverage) is
           #    already up. ──
           push_build manifest.json
-          echo "── build complete → $R2/build/$SHA ──"
+          echo "::notice::build complete → $R2/build/$SHA"
 
   # Capture provider-side CPU, disk, and network series while the ephemeral server still exists.
   # The guest-level [res] sampler remains the source for memory, swap, load, and process RSS.
