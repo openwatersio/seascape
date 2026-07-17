@@ -48,10 +48,10 @@ env:
   SERVER_LOCATION: fsn1
   STORE_VOLUME: seascape-store
   STORE_VOLUME_GB: "750"
-  NAME: seascape-sources-smk-${{ github.run_id }}
+  NAME: seascape-sources-${{ github.run_id }}
 
-# Shares the r2-store concurrency group with sources.yml + build.yml: the shadow store lives
-# on the same volume, so it queues behind the legacy lanes instead of racing for the attach.
+# Shares the r2-store concurrency group with build.yml: one store on one volume, so a
+# sources run and a build queue behind each other instead of racing for the attach.
 concurrency:
   group: r2-store
   cancel-in-progress: false
@@ -103,7 +103,7 @@ jobs:
           server_type: ${{ env.SERVER_TYPE }}
           location: ${{ env.SERVER_LOCATION }}
           image: ${{ env.SERVER_IMAGE }}
-          volume: 'null'
+          volume: "null"
       - name: Attach persistent store volume
         env:
           HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
@@ -131,23 +131,17 @@ jobs:
     permissions: { contents: read, packages: read }
     steps:
       - uses: actions/checkout@v6
-      # Idempotent box setup — docker + pinned rclone + the store volume mount. ONE store:
-      # the Snakemake lane reads and writes the same /mnt/seascape-store/store the legacy
+      # Idempotent box setup — docker + the store volume mount (rclone lives in the
+      # toolchain image; every publish/mirror shell runs in-container). ONE store: the
+      # Snakemake lane reads and writes the same /mnt/seascape-store/store the legacy
       # lane populated (the source contract is identical, verified byte-for-byte), and
       # .snakemake/ provenance lives beside it at the volume root. STATE is the volume root
       # (the dir that CONTAINS store/), mounted whole so both land on persistent disk.
-      - name: Set up box (docker + rclone + store volume)
+      - name: Set up box (docker + store volume)
         run: |
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
-          command -v unzip >/dev/null || { apt-get update -qq; apt-get install -y -qq unzip; }
           command -v docker >/dev/null || curl -fsSL https://get.docker.com | sh
-          if ! command -v rclone >/dev/null; then
-            curl -fsSL -o /tmp/rclone.zip "https://downloads.rclone.org/v1.74.4/rclone-v1.74.4-linux-amd64.zip"
-            echo "fe435e0c36228e7c2f116a8701f01127bb1f694005fc11d1f27186c8bca4115d  /tmp/rclone.zip" | sha256sum -c
-            unzip -q -j /tmp/rclone.zip '*/rclone' -d /tmp/rclone-bin
-            install /tmp/rclone-bin/rclone /usr/local/bin/rclone
-          fi
           if ! mountpoint -q /mnt/seascape-store; then
             dev=""
             for _ in $(seq 1 30); do
@@ -192,6 +186,11 @@ jobs:
           if [ "$INPUT_FORCE" = "true" ]; then extra+=(-F); fi
           # catalogs + publish: catalogs pulls the masks, covering, and coverage tileset in
           # addition to every source. --rerun-incomplete resumes cleanly after a hard kill.
+          # --cores 16 (> the 8 vCPUs): the fetch phase is network-bound at 2-4 cores and
+          # ~35% NIC, so cores is the width knob for cheap IO jobs while the mem budget
+          # stays the honest limiter for heavy ones (fetch ≤14 via 28/2, prep ≤3 via 28/8 —
+          # CPU-bound normalizes can't oversubscribe). Box-only: laptops run with no
+          # --resources budget, so the profile's cores:all remains their safety cap.
           # --resources mem_gb=28: ccx33 has 32 GB; 4 GB reserved for OS + Snakemake + rclone.
           # Per-job reservations are scheduler accounting only — kernel cgroup caps per job
           # are a stage-2 (mosaic) item, not wired here.
@@ -202,7 +201,7 @@ jobs:
             -v "$PWD:/app" -v "$STATE:/app/state" \
             "$IMAGE:$IMAGE_TAG" \
             uv run snakemake catalogs publish --keep-going --rerun-incomplete \
-              --resources mem_gb=28 -R mirror_source "${extra[@]}"
+              --cores 16 --resources mem_gb=28 -R mirror_source "${extra[@]}"
 
   # Capture provider-side CPU, disk, and network series while the ephemeral server still
   # exists — same pattern as build.yml. Best-effort: teardown waits for this job, but runs

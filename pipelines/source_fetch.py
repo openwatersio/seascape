@@ -3,7 +3,8 @@
 One URL, one
 job, one retry unit. The raw name is the bare list index — extensionless on
 purpose, so the output path is known before the bytes are (a URL that lies
-about its extension can't rename the artifact; source_stage.py sniffs content).
+about its extension can't rename the artifact; source_prep's stage() sniffs
+the content).
 Writes via a dot-prefixed temp name + rename (removed on failure) so an
 interrupted download never leaves a truncated file at the declared path — and,
 because raw/* globs skip dotfiles, never leaves anything staging could misread.

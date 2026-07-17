@@ -216,8 +216,9 @@ def http_download(url, dest, chunk=1 << 20, retries=5):
                 # A server can truncate mid-body and still look like success (a cut zip
                 # keeps its PK magic). Verify against Content-Length when it describes
                 # the bytes on the wire (identity encoding only) and retry a short read.
-                expected = r.headers.get('Content-Length')
-                if expected and r.headers.get('Content-Encoding', 'identity') == 'identity' \
+                # A malformed header skips the check rather than escaping the retry loop.
+                expected = r.headers.get('Content-Length', '')
+                if expected.isdigit() and r.headers.get('Content-Encoding', 'identity') == 'identity' \
                         and written != int(expected):
                     raise requests.exceptions.RequestException(
                         f"truncated body: {written} of {expected} bytes")

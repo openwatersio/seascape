@@ -16,6 +16,7 @@ DEST = f"r2:$DATA_BUCKET/{DATA_PREFIX}"  # $DATA_BUCKET stays a shell env var (n
 
 # Fail fast in every publish shell when the box isn't set up for R2 — rclone missing, or the
 # ambient RCLONE_CONFIG_R2_* env / DATA_BUCKET unset. Never trips a dry run (shells don't run).
+# The doubled braces are Snakemake shell-string format-escaping: {{ }} reaches bash as { }.
 PUBLISH_GUARD = (
     'command -v rclone >/dev/null || {{ echo "rclone not found — publish runs on the box only" >&2; exit 1; }}; '
     ': "${{DATA_BUCKET:?DATA_BUCKET unset — publish runs on the box only}}"; '
