@@ -3,5 +3,6 @@
     "producer": "Rijkswaterstaat",
     "website": "https://downloads.rijkswaterstaatdata.nl/",
     "license": "CC0 1.0",
-    "datum": "NAP (Amsterdam Ordnance Datum, ~MSL)"
+    "datum": "NAP (Amsterdam Ordnance Datum, ~MSL)",
+    "crs": "EPSG:28992"
 }

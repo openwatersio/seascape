@@ -205,7 +205,7 @@ jobs:
       # The toolchain image tag (mirrors ghcr-login; hashed here, after checkout, so the
       # workspace exists). The box pulls this exact tag and runs the pipeline through it.
       - name: Toolchain image tag
-        run: echo "IMAGE_TAG=deps-${{ hashFiles('Dockerfile', 'pipelines/pyproject.toml', 'pipelines/uv.lock') }}" >> "$GITHUB_ENV"
+        run: echo "IMAGE_TAG=deps-${{ hashFiles('Dockerfile', 'pyproject.toml', 'uv.lock') }}" >> "$GITHUB_ENV"
 
       - name: Set up toolchain (Docker + pinned rclone, GHCR pull)
         env:

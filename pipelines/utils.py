@@ -184,6 +184,21 @@ def create_folder(path):
     Path(path).mkdir(parents=True, exist_ok=True)
 
 
+def write_if_changed(path, content):
+    """Write path only when its content differs — mtimes don't churn on a no-op rewrite,
+    so engine provenance sees an unchanged artifact as unchanged (a code-mtime re-prep
+    with identical output stops cascading downstream). Temp + rename so a crash never
+    leaves a half-written file at the declared path."""
+    if os.path.isfile(path):
+        with open(path) as f:
+            if f.read() == content:
+                return False
+    with open(path + ".tmp", "w") as f:
+        f.write(content)
+    os.replace(path + ".tmp", path)
+    return True
+
+
 def http_download(url, dest, chunk=1 << 20, retries=5):
     '''Stream a URL to dest with requests (handles query-string URLs; no shell).
     Retries with backoff on transient network errors — the public data servers

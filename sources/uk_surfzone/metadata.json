@@ -4,5 +4,6 @@
     "website": "https://environment.data.gov.uk/dataset/77e6f743-d708-4909-a80f-9510b7dbaa16",
     "license": "Open Government Licence v3.0",
     "max_zoom": 14,
-    "datum": "Ordnance Datum Newlyn (~MSL); elevation, seafloor negative (like GEBCO) — no transform"
+    "datum": "Ordnance Datum Newlyn (~MSL); elevation, seafloor negative (like GEBCO) \u2014 no transform",
+    "crs": "EPSG:27700"
 }

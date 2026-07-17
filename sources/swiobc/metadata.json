@@ -3,5 +3,6 @@
     "producer": "Dorschel et al. / Alfred Wegener Institute",
     "website": "https://doi.org/10.1594/PANGAEA.880618",
     "license": "CC-BY 3.0",
-    "datum": "unstated (~MSL)"
+    "datum": "unstated (~MSL)",
+    "crs": "EPSG:4326"
 }

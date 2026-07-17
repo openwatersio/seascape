@@ -8,7 +8,7 @@ runs:
   using: composite
   steps:
     - shell: bash
-      run: echo "IMAGE_TAG=deps-${{ hashFiles('Dockerfile', 'pipelines/pyproject.toml', 'pipelines/uv.lock') }}" >> "$GITHUB_ENV"
+      run: echo "IMAGE_TAG=deps-${{ hashFiles('Dockerfile', 'pyproject.toml', 'uv.lock') }}" >> "$GITHUB_ENV"
     - shell: bash
       env:
         GHCR_TOKEN: ${{ github.token }}

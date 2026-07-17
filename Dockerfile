@@ -48,8 +48,8 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 # ever drifts from the baked env).
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 WORKDIR /app
-COPY pipelines/pyproject.toml pipelines/uv.lock /app/pipelines/
-RUN cd pipelines && uv sync --frozen --no-install-project
+COPY pyproject.toml uv.lock /app/
+RUN uv sync --frozen --no-install-project
 ENV PATH="/opt/venv/bin:${PATH}"
 
 # Recipes run from /app; the Justfile redirects into pipelines/ itself. e.g.

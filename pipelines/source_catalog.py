@@ -19,6 +19,7 @@ absent item must fail the source's registration, never surface later as a silent
 Run from pipelines/:  uv run python source_catalog.py <source-id>
 """
 
+import hashlib
 import json
 import os
 import sys
@@ -29,6 +30,24 @@ from rasterio.warp import transform_bounds
 
 import config
 import utils
+
+
+def recipe_hash(source):
+    """Content hash of sources/<id>/** — what RECIPE_HASH carries in the legacy workflow
+    (there via GitHub's hashFiles), computed here directly so the Snakemake lane stamps it
+    without a CI env var. Path-relative + content, sorted, so it's stable across checkouts.
+    Not equal to hashFiles' value — each lane compares only against its own stamps, and the
+    one-time mismatch at cutover re-aggregates affected tiles once, like any re-registration."""
+    root = f"{config.SOURCES_DIR}/{source}"
+    h = hashlib.sha256()
+    for dirpath, _dirnames, filenames in sorted(os.walk(root)):
+        for name in sorted(filenames):
+            path = os.path.join(dirpath, name)
+            h.update(os.path.relpath(path, root).encode())
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+    return h.hexdigest()
 
 
 def _bbox_and_count(source):
@@ -157,13 +176,18 @@ def build_item(source, recipe_hash=None):
 
 
 def main():
-    if len(sys.argv) != 2:
-        sys.exit("usage: source_catalog.py <source-id>")
-    source = sys.argv[1]
-    item = build_item(source, os.environ.get("RECIPE_HASH") or None)
+    args = [a for a in sys.argv[1:] if a != "--hash-recipe"]
+    if len(args) != 1:
+        sys.exit("usage: source_catalog.py <source-id> [--hash-recipe]")
+    source = args[0]
+    # --hash-recipe: compute the recipe hash here (the Snakemake lane); default: the
+    # caller-supplied env (the legacy workflow's hashFiles; empty on a laptop).
+    rh = recipe_hash(source) if "--hash-recipe" in sys.argv else os.environ.get("RECIPE_HASH")
+    item = build_item(source, rh or None)
     out = f"store/source/{source}/catalog.json"
-    with open(out, "w") as f:
-        json.dump(item, f, indent=2)
+    # Write-if-changed: an unchanged item keeps its mtime, so a no-op re-catalog
+    # doesn't cascade into cover/coverage/publish.
+    utils.write_if_changed(out, json.dumps(item, indent=2))
     props = item["properties"]
     print(f"{source}: catalog.json ({props['seascape:file_count']} file(s), "
           f"datum_offset={props['seascape:datum_offset_m']}, negate={props['seascape:negate']}, "
@@ -202,6 +226,14 @@ def _check():
             f.write("filename,left,bottom,right,top,width,height\n"
                     "a.tif,0.0,0.0,111319.49,111325.14,10,10\n"
                     "b.tif,111319.49,0.0,222638.98,55787.5,10,10\n")
+
+        # recipe_hash(): deterministic, and sensitive to both content and filename
+        h1 = recipe_hash(sid)
+        assert h1 == recipe_hash(sid)
+        with open(f"sources/{sid}/file_list.txt", "w") as f:
+            f.write("https://x/a.tif\n")
+        h2 = recipe_hash(sid)
+        assert h1 != h2, "recipe hash must change when a recipe file changes"
 
         item = build_item(sid, recipe_hash="abc123")
         p = item["properties"]

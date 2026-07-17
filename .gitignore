@@ -10,3 +10,5 @@ node_modules
 __pycache__
 .playwright-mcp
 pipelines/store
+pipelines/.snakemake/
+.snakemake

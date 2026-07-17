@@ -39,8 +39,9 @@ def main():
         if j % 100 == 0:
             print(f"{j} / {len(filepaths)}")
 
-    with open(f"store/source/{source}/bounds.csv", "w") as f:
-        f.writelines(lines)
+    # Write-if-changed: a re-prep that reproduces identical bounds leaves the mtime
+    # alone, so nothing downstream (polygon/cover/coverage) re-runs off a no-op.
+    utils.write_if_changed(f"store/source/{source}/bounds.csv", "".join(lines))
 
 
 if __name__ == "__main__":
