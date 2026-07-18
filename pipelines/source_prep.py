@@ -345,16 +345,12 @@ def _check_raster(path):
 def prep(source):
     meta = config.load_metadata(source)
     stage(source)
-    # *.tif only — exact legacy parity: source_datum/source_normalize glob *.tif, so
-    # extracted .tiff members (ausbathytopo's raw twins) stay raw there and here.
-    tifs = sorted(glob(f"store/source/{source}/*.tif"))
+    tifs = sorted(glob(f"store/source/{source}/*.tif"))  # *.tif only: legacy parity (.tiff stays raw)
 
     negate = bool(meta.get("negate", False))
     offset = float(meta.get("datum_offset_m", 0.0))
     clamp = bool(meta.get("clamp_positive", False))
-    # The sidecar is written even for a no-op, so the catalog's invariant holds
-    # uniformly — and negate publishes False downstream once it's baked here.
-    write_sidecar(source, negate, offset, clamp)
+    write_sidecar(source, negate, offset, clamp)  # even for a no-op: the catalog's invariant
     if negate or offset or clamp:
         print(f"{source}: datum negate={negate} offset={offset} clamp_positive={clamp}")
         for tif in tifs:

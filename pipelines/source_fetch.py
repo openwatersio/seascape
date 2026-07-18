@@ -25,9 +25,7 @@ def fetch(source, index):
         sys.exit(f"{source}: index {index} out of range (file_list has {len(urls)} entries)")
     dest = f"store/source/{source}/raw/{index}"
     os.makedirs(os.path.dirname(dest), exist_ok=True)
-    # Dot-prefixed temp: raw/* globs skip dotfiles, so a crashed download can never be
-    # mistaken for a raw asset by staging; removed on failure so nothing lingers at all.
-    tmp = f"store/source/{source}/raw/.{index}.tmp"
+    tmp = f"store/source/{source}/raw/.{index}.tmp"  # dotfile: invisible to raw/* globs
     print(f"{source}[{index}]: {urls[index]} -> {dest}")
     try:
         utils.http_download(urls[index], tmp)

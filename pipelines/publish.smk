@@ -1,22 +1,10 @@
-# Per-source publish choreography, ported from .github/workflows/sources.yml (the "Mirror
-# upstream objects", "Push source to R2", and "Publish bounds.csv + catalog marker" steps).
-# Publishing is a rule: it pushes a source's artifacts, then bounds.csv, then catalog.json
-# LAST — that ordering is the atomic-pointer mechanism (bounds.csv drives the covering; the
-# catalog's recipe hash is the staleness marker, so whatever vouches "current" lands after
-# everything it vouches for). These rules only run on the box that owns rclone + the R2
-# credentials; a dry run is pure — the destination and ordering are decided here at parse,
-# the network happens in the shell.
-#
-# Destination: r2:$DATA_BUCKET/<data_prefix>/…, defaulting to the production prefix — the
-# lanes share one store and one mirror (the source contract is identical); data_prefix
-# remains a config knob only for ad-hoc experiments against a scratch prefix.
+# Per-source R2 publish rules. Ordering is the atomicity mechanism: artifacts, then
+# bounds.csv, then catalog.json LAST (the currency marker lands after what it vouches for).
 
 DATA_PREFIX = config.get("data_prefix", "bathymetry")
 DEST = f"r2:$DATA_BUCKET/{DATA_PREFIX}"  # $DATA_BUCKET stays a shell env var (no braces)
 
-# Fail fast in every publish shell when the box isn't set up for R2 — rclone missing, or the
-# ambient RCLONE_CONFIG_R2_* env / DATA_BUCKET unset. Never trips a dry run (shells don't run).
-# The doubled braces are Snakemake shell-string format-escaping: {{ }} reaches bash as { }.
+# Fail fast without rclone/R2 env; {{ }} is Snakemake format-escaping, bash sees { }.
 PUBLISH_GUARD = (
     'command -v rclone >/dev/null || {{ echo "rclone not found — publish runs on the box only" >&2; exit 1; }}; '
     ': "${{DATA_BUCKET:?DATA_BUCKET unset — publish runs on the box only}}"; '
@@ -25,10 +13,7 @@ PUBLISH_GUARD = (
 
 
 def publish_inputs(wc):
-    """publish_source's inputs: bounds.csv + catalog.json always, plus the polygon for a
-    prepped source (its footprint publishes alongside) or the objects-mirror stamp for a
-    volatile source (every object a bounds.csv row references must be verified-present in
-    the mirror before the pointer lands)."""
+    """bounds + catalog always; polygon (prepped) or the objects stamp (volatile)."""
     ins = {"bounds": f"store/source/{wc.source}/bounds.csv",
            "catalog": f"store/source/{wc.source}/catalog.json"}
     if wc.source in MIRRORED:
@@ -38,10 +23,8 @@ def publish_inputs(wc):
     return ins
 
 
-# Volatile only: top up the store's objects/ from upstream (newly-listed keys; existing
-# ones skip by size+mtime), then push the same objects to R2. With the single shared store
-# both copies already exist from the legacy lane, so steady-state this moves only the
-# week's churn. Neither leg ever deletes.
+# Top up objects/ from upstream, then push to R2 — steady-state moves only the week's
+# churn; neither leg ever deletes.
 rule mirror_objects:
     input:
         mirror="store/source/{source}/mirror.txt",
@@ -50,7 +33,7 @@ rule mirror_objects:
         touch("store/meta/publish/{source}.objects")
     wildcard_constraints:
         source=pat(MIRRORED)
-    priority: 5000  # CUDEM's object mirror moves ~190 GB — the longest data leg when it runs
+    priority: 5000  # ~190 GB when it runs; start first
     shell:
         PUBLISH_GUARD +
         'printf "[upstream]\\ntype = s3\\nprovider = AWS\\nregion = us-east-1\\n" > /tmp/upstream-{wildcards.source}.conf; '
@@ -63,9 +46,8 @@ rule mirror_objects:
         '--stats 60s --stats-one-line'
 
 
-# Push one source to R2, catalog.json last. Prepped: sync (excluded files are invisible to
-# --delete, so bounds/catalog are never swept) + the footprint. Volatile: copy (never sync —
-# objects/ under the same prefix must never be deleted), objects already mirrored above.
+# Push one source, catalog.json last. Prepped: sync + footprint. Volatile: copy, never
+# sync (objects/ under the prefix must never be swept).
 rule publish_source:
     input:
         unpack(publish_inputs)
@@ -90,8 +72,6 @@ rule publish_source:
         'rclone copyto "$src/catalog.json" "$dest/catalog.json" --retries 5'
 
 
-# The source-coverage tileset (store/bundle/coverage.pmtiles) is a stage-1 product too —
-# publish it to <prefix>/coverage/coverage.pmtiles, same env gating + prefix guard.
 rule publish_coverage:
     input:
         "store/bundle/coverage.pmtiles"
@@ -103,8 +83,7 @@ rule publish_coverage:
         '"{DEST}/coverage/coverage.pmtiles" --retries 5 --stats 30s --stats-one-line'
 
 
-# Both masks → <prefix>/landmask/ — same guard/env pattern. One stamp for both: one
-# module (landmask.py) builds both, so they can never publish different snapshots.
+# One stamp for both masks: one module builds both, so they can't publish different snapshots.
 rule publish_masks:
     input:
         land="store/landmask/land.fgb",
@@ -117,10 +96,7 @@ rule publish_masks:
         'rclone copyto "{input.water}" "{DEST}/landmask/water.fgb" --retries 5'
 
 
-# The publish aggregate target — every converted source's publish stamp, plus the coverage
-# tileset and the masks on a full run (a single-source dispatch, --config source=<id>,
-# publishes only that source: coverage is planet-wide, so building it would pull every
-# other source's footprint, and the masks are source-independent).
+# A single-source dispatch publishes only that source; full runs add coverage + masks.
 rule publish:
     input:
         expand("store/meta/publish/{source}", source=TARGETS),

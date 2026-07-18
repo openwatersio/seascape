@@ -184,16 +184,8 @@ jobs:
             extra+=("source=$INPUT_SOURCE")
           fi
           if [ "$INPUT_FORCE" = "true" ]; then extra+=(-F); fi
-          # catalogs + publish: catalogs pulls the masks, covering, and coverage tileset in
-          # addition to every source. --rerun-incomplete resumes cleanly after a hard kill.
-          # --cores 16 (> the 8 vCPUs): the fetch phase is network-bound at 2-4 cores and
-          # ~35% NIC, so cores is the width knob for cheap IO jobs while the mem budget
-          # stays the honest limiter for heavy ones (fetch ≤14 via 28/2, prep ≤3 via 28/8 —
-          # CPU-bound normalizes can't oversubscribe). Box-only: laptops run with no
-          # --resources budget, so the profile's cores:all remains their safety cap.
-          # --resources mem_gb=28: ccx33 has 32 GB; 4 GB reserved for OS + Snakemake + rclone.
-          # Per-job reservations are scheduler accounting only — kernel cgroup caps per job
-          # are a stage-2 (mosaic) item, not wired here.
+          # --cores 16 > vCPUs: width for IO-bound fetches; mem_gb caps the heavy jobs
+          # (28 = 32 GB - 4 reserved). Box-only — laptops keep cores:all as their cap.
           docker run --rm \
             -e RCLONE_CONFIG_R2_TYPE -e RCLONE_CONFIG_R2_PROVIDER -e RCLONE_CONFIG_R2_ENDPOINT \
             -e RCLONE_CONFIG_R2_ACCESS_KEY_ID -e RCLONE_CONFIG_R2_SECRET_ACCESS_KEY \

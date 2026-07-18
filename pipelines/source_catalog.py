@@ -6,17 +6,11 @@ validation — project-specific fields live under ``seascape:`` keys. It consoli
 today is scattered across ``metadata.json`` (hand-edited attribution + flags), ``bounds.csv``
 (per-file bounds → overall bbox + file count), the normalized COG's CRS, the datum sidecar
 ``source_datum`` records at prep time (``negate`` + applied ``offset`` + ``clamp_positive``),
-and the recipe content hash the caller supplies via ``RECIPE_HASH`` (empty locally).
+and the recipe content hash (``--hash-recipe`` computes it; the ``RECIPE_HASH`` env is
+the legacy override). Missing metadata.json is a hard error — an incomplete item must
+fail registration, never surface later as a silent merge default.
 
-Composed into the shared source tail (``just source <id>``) after the per-source recipe, so
-every source — prepared or mirrored — gets one without editing each recipe. Runs after
-``bounds.csv`` exists; downstream still reads ``metadata.json`` for now, so this is additive.
-
-Validation (registration-time, not aggregation): a source whose recipe runs ``source_datum``
-but left no datum sidecar, or one missing ``metadata.json``, is a hard error here — a stale or
-absent item must fail the source's registration, never surface later as a silent merge default.
-
-Run from pipelines/:  uv run python source_catalog.py <source-id>
+Run from pipelines/:  uv run python source_catalog.py <source-id> [--hash-recipe]
 """
 
 import hashlib
@@ -170,8 +164,6 @@ def main():
     if len(args) != 1:
         sys.exit("usage: source_catalog.py <source-id> [--hash-recipe]")
     source = args[0]
-    # --hash-recipe: compute the recipe hash here (the Snakemake lane); default: the
-    # caller-supplied env (the legacy workflow's hashFiles; empty on a laptop).
     rh = recipe_hash(source) if "--hash-recipe" in sys.argv else os.environ.get("RECIPE_HASH")
     item = build_item(source, rh or None)
     out = f"store/source/{source}/catalog.json"

@@ -313,11 +313,7 @@ def register(source, keys, header):
                     print(f"  {done}/{len(todo)} headers")
             return i, row, None
 
-        # Header reads are network-bound (one ranged GET each, or a gdalinfo subprocess
-        # for .h5) — the box CPU sits idle through this sweep, so the pool runs wide.
-        # noaa_s102 alone is ~4.3k headers; at 16 workers that measured ~2 h, so a fresh
-        # registration dominates the run. MIRROR_HEADER_WORKERS tunes it down if an
-        # upstream throttles.
+        # network-bound sweep; tune down if an upstream throttles
         workers = int(os.environ.get("MIRROR_HEADER_WORKERS", "48"))
         broken = []
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -332,13 +328,10 @@ def register(source, keys, header):
             sys.exit(f"{source}: {len(broken)} listed products are unreadable "
                      f"(> {BROKEN_TOLERANCE}) — upstream looks half-broken; refusing to "
                      "publish over the previous registration")
-        # One row per previous CELL: a broken new issue keeps serving the superseded one
-        # from our mirror (upstream deletes the old object when re-issuing, but the
-        # never-delete mirror still holds it).
         prev_by_cell = {cell_key(_upstream_key(rel)): row for rel, row in prev.items()}
         drop = set()
         for i, key, err in sorted(broken):
-            # the cell concept is S-102's fixed-width issue naming; other keys just drop
+            # cell-matching is S-102's naming scheme; non-.h5 keys just drop
             carried = prev_by_cell.get(cell_key(key)) if key.lower().endswith(".h5") else None
             healthy.discard(key)
             if carried:

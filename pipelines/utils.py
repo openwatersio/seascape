@@ -220,10 +220,7 @@ def http_download(url, dest, chunk=1 << 20, retries=5):
                 with open(dest, 'wb') as f:
                     for part in r.iter_content(chunk):
                         written += f.write(part)
-                # A server can truncate mid-body and still look like success (a cut zip
-                # keeps its PK magic). Verify against Content-Length when it describes
-                # the bytes on the wire (identity encoding only) and retry a short read.
-                # A malformed header skips the check rather than escaping the retry loop.
+                # a truncated body can still look like success (a cut zip keeps its PK magic)
                 expected = r.headers.get('Content-Length', '')
                 if expected.isdigit() and r.headers.get('Content-Encoding', 'identity') == 'identity' \
                         and written != int(expected):
