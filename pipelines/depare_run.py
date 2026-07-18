@@ -144,27 +144,15 @@ def partitions(dem, levels, raw_fgb):
     return g
 
 
-def generate(filepath, out):
-    """Partition one aggregation tile's merged DEM into depth-area / drying / nodata polygons at
-    ``out`` (the caller's content-addressed FGB name). Writes ``out`` atomically only when there
-    ARE rows — an all-ocean-deep / all-land tile returns having written nothing, and the caller
-    records the empty marker. The caller superseded this stem's old-key siblings before calling,
-    so a crash here leaves the fork reading stale."""
+def _depare_dem(dem, tile_obj, tmp, label):
+    """Partition any DEM covering the tile's buffered extent into depth-area / drying / nodata
+    rows. Returns (final_path, count) inside ``tmp``, or None when there is no water."""
     import geopandas as gpd
     import landmask
     from shapely import make_valid
     from shapely.geometry import box
 
-    agg_id, filename = filepath.split("/")[-2:]
-    z, x, y, child_z = (int(a) for a in filename.replace("-aggregation.csv", "").split("-"))
-    tile = mercantile.Tile(x=x, y=y, z=z)
-    tmp = f"store/aggregation/{agg_id}/{z}-{x}-{y}-{child_z}-tmp"
-    dem = f"{tmp}/{len(glob(f'{tmp}/*.tiff')) - 1}-3857.tiff"
-    if not os.path.exists(dem):
-        print(f"depare: no merged DEM for {filename}")
-        return
-
-    clip = box(*mercantile.xy_bounds(tile))  # unbuffered, tile-aligned (EPSG:3857)
+    clip = box(*mercantile.xy_bounds(tile_obj))  # unbuffered, tile-aligned (EPSG:3857)
     with rasterio.open(dem) as d:
         b, res = d.bounds, abs(d.transform.a)
     bbox = (b.left, b.bottom, b.right, b.top)  # the DEM's full (buffered) extent, EPSG:3857
@@ -261,17 +249,64 @@ def generate(filepath, out):
                                  "sys": None, "kind": kind, "rank": NODATA_RANK})
 
     if not rows:
-        print(f"depare: no water in tile bbox for {filename}")
-        return
+        print(f"depare: no water in tile bbox for {label}")
+        return None
 
     # A mixed schema across the three kinds: a row omits a key it doesn't carry, geopandas writes
     # the gap as NULL (NaN for float drval, None for str sys/kind), and FlatGeobuf -> tippecanoe
     # encode that as an ABSENT MVT property — so nodata truly has no drval1, the fill's switch key.
-    # Write into the tmp folder, then atomically publish into the content name.
     final = f"{tmp}/depare-final.fgb"
     gpd.GeoDataFrame(rows, crs="EPSG:3857").to_crs("EPSG:4326").to_file(final, driver="FlatGeobuf")
-    keys.publish(final, out)
-    print(f"depare: {filename} -> {len(rows)} polygons")
+    return final, len(rows)
+
+
+def generate(filepath, out):
+    """Partition one aggregation tile's merged DEM into depth-area / drying / nodata polygons at
+    ``out`` (the caller's content-addressed FGB name). Writes ``out`` atomically only when there
+    ARE rows — an all-ocean-deep / all-land tile returns having written nothing, and the caller
+    records the empty marker. The caller superseded this stem's old-key siblings before calling,
+    so a crash here leaves the fork reading stale."""
+    agg_id, filename = filepath.split("/")[-2:]
+    z, x, y, child_z = (int(a) for a in filename.replace("-aggregation.csv", "").split("-"))
+    tmp = f"store/aggregation/{agg_id}/{z}-{x}-{y}-{child_z}-tmp"
+    dem = f"{tmp}/{len(glob(f'{tmp}/*.tiff')) - 1}-3857.tiff"
+    if not os.path.exists(dem):
+        print(f"depare: no merged DEM for {filename}")
+        return
+    res = _depare_dem(dem, mercantile.Tile(x=x, y=y, z=z), tmp, filename)
+    if res:
+        final, n = res
+        keys.publish(final, out)
+        print(f"depare: {filename} -> {n} polygons")
+
+
+def tile(stem):
+    """The stage-3 Snakemake job (5c re-pointed): partition one stem from a BUFFERED mosaic
+    window, smoothed at read with the one shared f(depth, zoom), output at the PLAIN stable
+    name (depare also reads the land + water masks). A waterless tile writes a 0-byte
+    sentinel; bundling filters empties by size."""
+    import shutil
+
+    import mosaic
+    import smooth
+    z, x, y, child_z = (int(a) for a in stem.split("-"))
+    out = f"store/depare/{stem}.fgb"
+    tmp = f"store/depare/{stem}-tmp"
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp)
+    dem = mosaic.window_dem(stem, f"{tmp}/dem.tiff")
+    if not os.environ.get("SKIP_SMOOTH"):
+        smooth.smooth_tiff(dem)
+    res = _depare_dem(dem, mercantile.Tile(x=x, y=y, z=z), tmp, stem)
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    if res:
+        final, n = res
+        os.replace(final, out)
+        print(f"depare tile {stem}: {n} polygons")
+    else:
+        open(out, "w").close()
+        print(f"depare tile {stem}: empty")
+    shutil.rmtree(tmp)
 
 
 # ── bundle ───────────────────────────────────────────────────────────────────
@@ -439,9 +474,11 @@ def _check():
 
 if __name__ == "__main__":
     a = sys.argv[1:]
-    if a[:1] == ["bundle"]:
+    if a[:1] == ["tile"] and len(a) == 2:
+        tile(a[1])
+    elif a[:1] == ["bundle"]:
         bundle()
     elif a[:1] == ["check"]:
         _check()
     else:
-        sys.exit("usage: depare_run.py bundle | check")
+        sys.exit("usage: depare_run.py tile <stem> | bundle | check")

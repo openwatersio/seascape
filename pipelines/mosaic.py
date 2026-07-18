@@ -454,6 +454,43 @@ def covering_stems(covering_path="store/aggregation/covering.txt"):
     return [s for s in stems if hits(s)]
 
 
+def intersecting_tiles(stem):
+    """The covering stems whose tiles intersect this stem's BUFFERED bounds — the stage-3
+    windowed-read input set. From the (BBOX-scoped) covering only, never the global GTI:
+    a stem's tile jobs depend on their neighborhood, not on every tile."""
+    z, x, y, _cz = (int(a) for a in stem.split("-"))
+    l, b, r, t = aggregation_reproject.buffered_bounds(
+        mercantile.Tile(x=x, y=y, z=z), utils.macrotile_buffer_3857)
+    out = []
+    for s in covering_stems():
+        sz, sx, sy, _scz = (int(a) for a in s.split("-"))
+        sb = mercantile.xy_bounds(mercantile.Tile(x=sx, y=sy, z=sz))
+        if sb.left < r and sb.right > l and sb.bottom < t and sb.top > b:
+            out.append(s)
+    return out
+
+
+def window_dem(stem, out_tif):
+    """Materialize the stem's BUFFERED window from the plain mosaic tiles — the stage-3 read
+    primitive (the 5c re-pointing): a throwaway VRT over the intersecting tiles, translated
+    to one bounded raster at the stem's native resolution. A coarser neighbor's halo pixels
+    upsample bilinearly (the named equivalent-not-equal behavior change; the seam check in
+    Validation gates it)."""
+    z, x, y, child_z = (int(a) for a in stem.split("-"))
+    l, b, r, t = aggregation_reproject.buffered_bounds(
+        mercantile.Tile(x=x, y=y, z=z), utils.macrotile_buffer_3857)
+    res = aggregation_reproject.get_resolution(child_z)
+    tiles = " ".join(tile_artifact(s) for s in intersecting_tiles(stem))
+    vrt = out_tif + ".vrt"
+    utils.run_command(f"gdalbuildvrt -overwrite -te {l} {b} {r} {t} -tr {res} {res} "
+                      f"-r bilinear {vrt} {tiles}")
+    utils.run_command(f"GDAL_CACHEMAX=512 gdal_translate -q -ot Float32 -a_nodata {NODATA} "
+                      "-co TILED=YES -co BLOCKSIZE=512 -co COMPRESS=ZSTD -co PREDICTOR=3 "
+                      f"{vrt} {out_tif}")
+    os.remove(vrt)
+    return out_tif
+
+
 def build_index_stable():
     """The Snakemake lane's index + planet z8 + pointer, off the --stable covering (BBOX-scoped
     like the build invocation): plain names throughout, freshness owned by the engine (this runs

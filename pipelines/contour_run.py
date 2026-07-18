@@ -21,6 +21,7 @@ real seam mitigation.)
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from glob import glob
@@ -150,13 +151,47 @@ def generate(filepath, out):
     this stem's old-key siblings before calling, so a crash here leaves the fork reading stale."""
     agg_id, filename = filepath.split("/")[-2:]
     z, x, y, child_z = (int(a) for a in filename.replace("-aggregation.csv", "").split("-"))
-    tile = mercantile.Tile(x=x, y=y, z=z)
+    tile_obj = mercantile.Tile(x=x, y=y, z=z)
     tmp = f"store/aggregation/{agg_id}/{z}-{x}-{y}-{child_z}-tmp"
     dem = f"{tmp}/{len(glob(f'{tmp}/*.tiff')) - 1}-3857.tiff"
     if not os.path.exists(dem):
         print(f"contour: no merged DEM for {filename}")
         return
+    final = _contour_dem(dem, tile_obj, child_z, tmp, filename)
+    if final:
+        keys.publish(final, out)
+        print(f"contour: {filename} -> {feature_count(out)} features")
 
+
+def tile(stem):
+    """The stage-3 Snakemake job (5c re-pointed): contour one stem from a BUFFERED mosaic
+    window, smoothed at read with the one shared f(depth, zoom), output at the PLAIN stable
+    name. A featureless tile writes a 0-byte sentinel so the engine sees a complete output;
+    bundling filters empties by size."""
+    import mosaic
+    import smooth
+    z, x, y, child_z = (int(a) for a in stem.split("-"))
+    out = f"store/contour/{stem}.fgb"
+    tmp = f"store/contour/{stem}-tmp"
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp)
+    dem = mosaic.window_dem(stem, f"{tmp}/dem.tiff")
+    if not os.environ.get("SKIP_SMOOTH"):
+        smooth.smooth_tiff(dem)
+    final = _contour_dem(dem, mercantile.Tile(x=x, y=y, z=z), child_z, tmp, stem)
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    if final:
+        os.replace(final, out)
+        print(f"contour tile {stem}: {feature_count(out)} features")
+    else:
+        open(out, "w").close()
+        print(f"contour tile {stem}: empty")
+    shutil.rmtree(tmp)
+
+
+def _contour_dem(dem, tile_obj, child_z, tmp, label):
+    """gdal_contour -> smooth/enrich -> clip -> reproject, off any DEM covering the tile's
+    buffered extent. Returns the final FGB path inside ``tmp``, or None when featureless."""
     levels = " ".join(str(l) for l in config.CONTOUR_LEVELS)
     raw = f"{tmp}/contour-raw.fgb"
     _run(f"gdal_contour -q -fl {levels} -a depth_m -f FlatGeobuf {dem} {raw}", "gdal_contour m")
@@ -170,27 +205,25 @@ def generate(filepath, out):
         sources.append((raw_ft, "ft"))
 
     if sum(feature_count(f) for f, _ in sources) == 0:
-        print(f"contour: no ocean features for {filename}")
-        return
+        print(f"contour: no ocean features for {label}")
+        return None
 
     smoothed = f"{tmp}/contour-smooth.fgb"
     smooth_and_enrich(sources, smoothed, tol=get_resolution(child_z))
 
-    b = mercantile.xy_bounds(tile)  # unbuffered, tile-aligned (EPSG:3857)
+    b = mercantile.xy_bounds(tile_obj)  # unbuffered, tile-aligned (EPSG:3857)
     clipped = f"{tmp}/contour-clip.fgb"
     _run(f"ogr2ogr -f FlatGeobuf -overwrite -nlt PROMOTE_TO_MULTI "
          f"-clipsrc {b.left} {b.bottom} {b.right} {b.top} {clipped} {smoothed}", "ogr2ogr clip")
     if feature_count(clipped) == 0:
-        print(f"contour: no features in tile bbox for {filename}")
-        return
+        print(f"contour: no features in tile bbox for {label}")
+        return None
 
-    # Reproject into the tmp folder, then atomically publish into the content name — the content
-    # file only ever appears complete (a crash mid-reproject leaves the temp, reads stale).
+    # Reproject inside tmp; the caller owns the atomic move into its lane's name.
     final = f"{tmp}/contour-final.fgb"
     _run(f"ogr2ogr -f FlatGeobuf -overwrite -nlt PROMOTE_TO_MULTI -t_srs EPSG:4326 {final} {clipped}",
          "ogr2ogr reproject")
-    keys.publish(final, out)
-    print(f"contour: {filename} -> {feature_count(out)} features")
+    return final
 
 
 # ── bundle ───────────────────────────────────────────────────────────────────
@@ -515,11 +548,13 @@ def _check():
 
 if __name__ == "__main__":
     a = sys.argv[1:]
-    if a[:1] == ["bundle"]:
+    if a[:1] == ["tile"] and len(a) == 2:
+        tile(a[1])
+    elif a[:1] == ["bundle"]:
         bundle()
     elif a[:1] == ["coverage"]:
         coverage_bundle()
     elif a[:1] == ["check"]:
         _check()
     else:
-        sys.exit("usage: contour_run.py bundle | coverage | check")
+        sys.exit("usage: contour_run.py tile <stem> | bundle | coverage | check")

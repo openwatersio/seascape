@@ -143,29 +143,18 @@ def _pyramid(src, nodata, bbox, min_depth, z, child_z):
     return pts
 
 
-def generate(filepath, out):
-    """Sound one aggregation tile's merged DEM into ``out`` (the caller's content-addressed
-    geojson name). Writes ``out`` atomically only when there ARE points — a dry / all-land tile
-    returns having written nothing, and the caller records the empty marker. The caller superseded
-    this stem's old-key siblings before calling, so a crash here leaves the fork reading stale."""
+def _sound_dem(dem, tile_obj, z, child_z, tmp, label):
+    """Sound any DEM covering the tile's extent: grid-decimated shoalest picks into a tmp
+    geojson. Returns (final_path, count), or None when dry / all-land."""
     import rasterio
     from pyproj import Transformer
-    agg_id, filename = filepath.split("/")[-2:]
-    z, x, y, child_z = (int(a) for a in filename.replace("-aggregation.csv", "").split("-"))
-    tile = mercantile.Tile(x=x, y=y, z=z)
-    tmp = f"store/aggregation/{agg_id}/{z}-{x}-{y}-{child_z}-tmp"
-    dem = f"{tmp}/{len(glob(f'{tmp}/*.tiff')) - 1}-3857.tiff"
-    if not os.path.exists(dem):
-        print(f"soundings: no merged DEM for {filename}")
-        return
-
-    bbox = mercantile.xy_bounds(tile)  # unbuffered, tile-aligned (EPSG:3857)
+    bbox = mercantile.xy_bounds(tile_obj)  # unbuffered, tile-aligned (EPSG:3857)
     with rasterio.open(dem) as src:
         nodata = src.nodata if src.nodata is not None else NODATA
         pts = _pyramid(src, nodata, bbox, SOUND_MIN_DEPTH_M, z, child_z)
     if not pts:
-        print(f"soundings: no wet cells for {filename}")
-        return
+        print(f"soundings: no wet cells for {label}")
+        return None
 
     to4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
     feats = []
@@ -177,12 +166,57 @@ def generate(filepath, out):
                       "properties": _depths(d),
                       "geometry": {"type": "Point", "coordinates": [round(lon, 6), round(lat, 6)]}})
 
-    # Write into the tmp folder, then atomically publish into the content name.
     final = f"{tmp}/soundings.geojson"
     with open(final, "w") as f:
         json.dump({"type": "FeatureCollection", "features": feats}, f)
-    keys.publish(final, out)
-    print(f"soundings: {filename} -> {len(feats)} points")
+    return final, len(feats)
+
+
+def generate(filepath, out):
+    """Sound one aggregation tile's merged DEM into ``out`` (the caller's content-addressed
+    geojson name). Writes ``out`` atomically only when there ARE points — a dry / all-land tile
+    returns having written nothing, and the caller records the empty marker. The caller superseded
+    this stem's old-key siblings before calling, so a crash here leaves the fork reading stale."""
+    agg_id, filename = filepath.split("/")[-2:]
+    z, x, y, child_z = (int(a) for a in filename.replace("-aggregation.csv", "").split("-"))
+    tmp = f"store/aggregation/{agg_id}/{z}-{x}-{y}-{child_z}-tmp"
+    dem = f"{tmp}/{len(glob(f'{tmp}/*.tiff')) - 1}-3857.tiff"
+    if not os.path.exists(dem):
+        print(f"soundings: no merged DEM for {filename}")
+        return
+    res = _sound_dem(dem, mercantile.Tile(x=x, y=y, z=z), z, child_z, tmp, filename)
+    if res:
+        final, n = res
+        keys.publish(final, out)
+        print(f"soundings: {filename} -> {n} points")
+
+
+def tile(stem):
+    """The stage-3 Snakemake job (5c re-pointed): sound one stem from a BUFFERED mosaic window,
+    smoothed at read with the one shared f(depth, zoom), output at the PLAIN stable name. A dry
+    tile writes a 0-byte sentinel; bundling filters empties by size."""
+    import shutil
+
+    import mosaic
+    import smooth
+    z, x, y, child_z = (int(a) for a in stem.split("-"))
+    out = f"store/soundings/{stem}.geojson"
+    tmp = f"store/soundings/{stem}-tmp"
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp)
+    dem = mosaic.window_dem(stem, f"{tmp}/dem.tiff")
+    if not os.environ.get("SKIP_SMOOTH"):
+        smooth.smooth_tiff(dem)
+    res = _sound_dem(dem, mercantile.Tile(x=x, y=y, z=z), z, child_z, tmp, stem)
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    if res:
+        final, n = res
+        os.replace(final, out)
+        print(f"soundings tile {stem}: {n} points")
+    else:
+        open(out, "w").close()
+        print(f"soundings tile {stem}: empty")
+    shutil.rmtree(tmp)
 
 
 def _live(paths, stems):
@@ -305,9 +339,11 @@ def _check():
 
 if __name__ == "__main__":
     a = sys.argv[1:]
-    if a[:1] == ["bundle"]:
+    if a[:1] == ["tile"] and len(a) == 2:
+        tile(a[1])
+    elif a[:1] == ["bundle"]:
         bundle()
     elif a[:1] == ["check"]:
         _check()
     else:
-        sys.exit("usage: soundings_run.py bundle | check")
+        sys.exit("usage: soundings_run.py tile <stem> | bundle | check")
