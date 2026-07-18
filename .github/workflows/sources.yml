@@ -2,12 +2,16 @@ name: Sources
 
 # Source registration + preparation, split out of the build (see
 # docs/plans/2026-07-08-sources-mirror.md): builds must never contact a source
-# upstream, so this workflow owns everything under bathymetry/source/ in R2.
-# Prepared sources are fetched → normalized → pushed exactly as they were in
-# build.yml (recipe-hash-gated, so an unchanged source is a no-op). Volatile
-# sources (NOAA S-102, CUDEM — upstream catalogs that drift) re-register on every
-# run: enumerate the public bucket → MIRROR the objects into the data bucket →
-# push registration files → publish bounds.csv → publish catalog.json LAST.
+# upstream, so this workflow owns all source state. It runs on an on-demand
+# Hetzner box with the PERSISTENT STORE VOLUME attached and writes sources,
+# masks, and footprints THERE — the volume is what planet builds read (local
+# files, zero build-time R2/data.openwaters.io reads) — then pushes the same
+# state to R2, the publish mirror that laptops (`just preview`) and bbox smokes
+# stream from. Prepared sources are fetched → normalized → written to the volume
+# → mirrored to R2 (recipe-hash-gated, so an unchanged source is a no-op).
+# Volatile sources (NOAA S-102, CUDEM — upstream catalogs that drift) re-register
+# on every run: enumerate the public bucket → mirror the objects to the volume →
+# push objects + registration files to R2 → publish bounds.csv → catalog.json LAST.
 #
 # That publish order is the atomicity mechanism. bounds.csv drives the build's
 # covering, and every object a row references is verified-present in R2 before the
@@ -45,21 +49,31 @@ on:
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
-  # The public "data" bucket (data.openwaters.io) — the same store build.yml
-  # reads; see build.yml for the bucket layout.
+  # The public "data" bucket (data.openwaters.io). R2 is now the PUBLISH MIRROR only —
+  # laptops (`just preview`) and bbox smokes stream from it; planet builds read sources
+  # from the persistent volume this workflow populates. See build.yml for the layout.
   DATA_BUCKET: data
   # Volatile registration refuses to publish a >5% row shrink (a mass upstream
   # disappearance) unless deliberately forced — see pipelines/source_mirror.py.
   MIRROR_ALLOW_SHRINK: ${{ github.event.inputs.force == 'true' && '1' || '' }}
-  # R2 via the S3 API (aws-cli v2 honours AWS_ENDPOINT_URL).
-  AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-  AWS_DEFAULT_REGION: auto
-  AWS_ENDPOINT_URL: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
-  # R2 occasionally returns a transient 500 InternalError; the CLI default (~3 tries)
-  # gives up mid-sync. Adaptive retry + a high ceiling rides it out across every aws s3 call.
-  AWS_RETRY_MODE: adaptive
-  AWS_MAX_ATTEMPTS: "10"
+  # R2 via rclone's env-var remote (remote "r2" exists ambiently in every rclone call —
+  # no config file, no aws-cli on the box).
+  RCLONE_CONFIG_R2_TYPE: s3
+  RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+  RCLONE_CONFIG_R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+  RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
+  # The Hetzner box + the persistent store volume (shared with build.yml — same
+  # SERVER_LOCATION pinning, same volume; the r2-store concurrency group guarantees
+  # this workflow and a build never race for the attach). Sources prep is network-
+  # and single-file-CPU-bound — ccx33 (8 vCPU/32 GB) is plenty.
+  SERVER_TYPE: ccx33
+  SERVER_IMAGE: ubuntu-24.04
+  SERVER_LOCATION: fsn1
+  STORE_VOLUME: seascape-store
+  STORE_VOLUME_GB: "750"
+  NAME: seascape-sources-${{ github.run_id }}
 
 # The store is shared with the build: prepared-source syncs use --delete, which
 # must never run under an active build's aggregate shards — so this workflow and
@@ -99,7 +113,50 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # Mirror the OSM land mask AND the Overture inland-water mask to R2, rebuilding both when
+  # Boot the Hetzner box that runs every store-writing job below (the landmask + the per-source
+  # matrix serialize onto this ONE runner — the action registers it non-ephemerally, so queued
+  # jobs reuse it) and attach the persistent store volume. Same pattern as build.yml's
+  # create-runner; the r2-store concurrency group means a build can never hold the volume while
+  # this workflow wants it.
+  create-runner:
+    runs-on: ubuntu-latest
+    permissions: { contents: read }
+    outputs:
+      label: ${{ steps.runner.outputs.label }}
+      server_id: ${{ steps.runner.outputs.server_id }}
+    steps:
+      - name: Create runner
+        id: runner
+        uses: Cyclenerd/hcloud-github-runner@v1.4.1
+        with:
+          mode: create
+          github_token: ${{ secrets.RUNNER_PAT }}
+          hcloud_token: ${{ secrets.HCLOUD_TOKEN }}
+          name: ${{ env.NAME }}
+          server_type: ${{ env.SERVER_TYPE }}
+          location: ${{ env.SERVER_LOCATION }}
+          image: ${{ env.SERVER_IMAGE }}
+          volume: 'null'
+      - name: Attach persistent store volume
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+          SERVER_ID: ${{ steps.runner.outputs.server_id }}
+        run: |
+          set -euo pipefail
+          # Pinned + sha256-verified hcloud (this job holds HCLOUD_TOKEN — same discipline as build.yml).
+          curl -fsSL -o /tmp/hcloud.tgz https://github.com/hetznercloud/cli/releases/download/v1.66.0/hcloud-linux-amd64.tar.gz
+          echo "8b1a8598858232c491f58cbf65ce1bd0ec6f725114bb62ec967a20ab03e29a86  /tmp/hcloud.tgz" | sha256sum -c
+          tar xzf /tmp/hcloud.tgz -C /tmp hcloud
+          sudo mv /tmp/hcloud /usr/local/bin/
+          if ! hcloud volume describe "$STORE_VOLUME" >/dev/null 2>&1; then
+            echo "store volume $STORE_VOLUME does not exist — creating (${STORE_VOLUME_GB} GB, $SERVER_LOCATION; one-time bootstrap)"
+            hcloud volume create --name "$STORE_VOLUME" --size "$STORE_VOLUME_GB" --location "$SERVER_LOCATION"
+          fi
+          hcloud volume attach "$STORE_VOLUME" --server "$SERVER_ID"
+          echo "volume $STORE_VOLUME attached to server $SERVER_ID"
+
+  # Mirror the OSM land mask AND the Overture inland-water mask to the VOLUME (the planet
+  # build's source of truth) and R2 (the publish mirror laptops/bbox stream), rebuilding when
   # landmask.py's recipe changes. They belong here, not in the build: they are source-shaped
   # inputs fetched from upstream (OSM/Overture), on their own upstream cadence, and a build must
   # never fetch from an upstream — it consumes land.fgb/water.fgb from R2 via /vsicurl like any
@@ -115,46 +172,79 @@ jobs:
   # no force dispatch. This job keeps its own .recipe-hash object: the masks have no catalog item
   # to absorb it. force here doesn't apply: the pinned inputs can't drift under an unchanged recipe.
   landmask:
-    needs: image
-    runs-on: ubuntu-latest
+    needs: [image, create-runner]
+    runs-on: ${{ needs.create-runner.outputs.label }}
+    timeout-minutes: 720
     permissions: { contents: read, packages: read }
     steps:
       - uses: actions/checkout@v6
+      # Idempotent box setup — docker + pinned rclone + the store volume mount. Every box job
+      # (this + each per-source matrix job) carries this same step: they serialize onto ONE
+      # runner, so after the first job it's a few no-op checks. The old free-disk-space dance is
+      # gone — the box's NVMe holds the Overture .raw.gpkg spool with room to spare.
+      - name: Set up box (docker + rclone + store volume)
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          command -v unzip >/dev/null || { apt-get update -qq; apt-get install -y -qq unzip; }
+          command -v docker >/dev/null || curl -fsSL https://get.docker.com | sh
+          if ! command -v rclone >/dev/null; then
+            curl -fsSL -o /tmp/rclone.zip "https://downloads.rclone.org/v1.74.4/rclone-v1.74.4-linux-amd64.zip"
+            echo "fe435e0c36228e7c2f116a8701f01127bb1f694005fc11d1f27186c8bca4115d  /tmp/rclone.zip" | sha256sum -c
+            unzip -q -j /tmp/rclone.zip '*/rclone' -d /tmp/rclone-bin
+            install /tmp/rclone-bin/rclone /usr/local/bin/rclone
+          fi
+          if ! mountpoint -q /mnt/seascape-store; then
+            dev=""
+            for _ in $(seq 1 30); do
+              for d in /dev/disk/by-id/scsi-0HC_Volume_*; do [ -e "$d" ] && dev="$d" && break; done
+              [ -n "$dev" ] && break
+              sleep 2
+            done
+            [ -n "$dev" ] || { echo "store volume device never appeared — attach step skipped or volume held elsewhere?" >&2; exit 1; }
+            blkid "$dev" >/dev/null 2>&1 || { echo "blank volume — one-time mkfs"; mkfs.ext4 -q -L seascape-store "$dev"; }
+            mkdir -p /mnt/seascape-store
+            mount -o noatime "$dev" /mnt/seascape-store
+          fi
+          STORE=/mnt/seascape-store/store
+          mkdir -p "$STORE"
+          echo "STORE=$STORE" >> "$GITHUB_ENV"
+          # One-time seed of a BLANK volume from the R2 mirror (order-independent bootstrap:
+          # build.yml's fuller seed sets its own marker, which this respects — whichever workflow
+          # touches a blank volume first pays a line-rate R2 copy instead of a from-upstream
+          # re-prep of every source). Marker-gated: every later boot is a no-op.
+          if [ ! -e "$STORE/.seeded-sources-from-r2" ] && [ ! -e "$STORE/.seeded-from-r2" ]; then
+            echo "one-time seed: source mirror + masks + footprints from R2"
+            for p in source polygon landmask; do
+              rclone copy "r2:$DATA_BUCKET/bathymetry/$p" "$STORE/$p" --transfers 32 --checkers 64 --fast-list --retries 5 --stats 30s --stats-one-line
+            done
+            touch "$STORE/.seeded-sources-from-r2"
+          fi
       - uses: ./.github/actions/ghcr-login
-      # prep-water spools EVERY non-ocean Overture water feature (rivers, lakes, canals, plus the
-      # river/stream centerlines the second pass filters out) into a temp .raw.gpkg before the
-      # polygon-only filter — tens of GB planet-wide, more than a stock runner's free root disk.
-      # Free it, so the raw copy can't fill the disk mid-refresh. The recipe-skip path exits before
-      # writing anything, so running this unconditionally is harmless and off the hot path.
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: true
-      - name: Ensure land + water masks in R2
+      - name: Ensure land + water masks on the volume + R2
         env:
           RECIPE_HASH: ${{ hashFiles('pipelines/landmask.py') }}
         run: |
-          have=$(aws s3 cp "s3://$DATA_BUCKET/bathymetry/landmask/.recipe-hash" - 2>/dev/null || true)
-          if [ -n "$RECIPE_HASH" ] && [ "$have" = "$RECIPE_HASH" ]; then
-            echo "land + water masks current in R2 (recipe unchanged)"; exit 0
+          # Current only when the recipe hash matches BOTH copies: the volume marker (what planet
+          # builds read) AND the R2 marker (what laptops/bbox stream) — so a crash between the two
+          # publishes heals on the next run instead of leaving one side stale forever.
+          have_v=$(cat "$STORE/landmask/.recipe-hash" 2>/dev/null || true)
+          have_r=$(rclone cat "r2:$DATA_BUCKET/bathymetry/landmask/.recipe-hash" 2>/dev/null || true)
+          if [ -n "$RECIPE_HASH" ] && [ "$have_v" = "$RECIPE_HASH" ] && [ "$have_r" = "$RECIPE_HASH" ] \
+             && [ -f "$STORE/landmask/land.fgb" ] && [ -f "$STORE/landmask/water.fgb" ]; then
+            echo "land + water masks current on volume + R2 (recipe unchanged)"; exit 0
           fi
-          echo "masks stale or missing (recipe=$RECIPE_HASH r2=${have:-none}) — rebuilding both"
-          mkdir -p store
+          echo "masks stale or missing (recipe=$RECIPE_HASH volume=${have_v:-none} r2=${have_r:-none}) — rebuilding both"
           # No `|| true` / continue-on-error on either build: a broken water mask fails the job
-          # exactly like a broken land mask, and the marker below is written last so a failure
+          # exactly like a broken land mask, and the markers below are written last so a failure
           # anywhere leaves the hash stale → next run retries instead of trusting a half-mirror.
-          docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just landmask
-          docker run --rm -v "$PWD:/app" -v "$PWD/store:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just watermask
-          aws s3 cp store/landmask/land.fgb "s3://$DATA_BUCKET/bathymetry/landmask/land.fgb"
-          aws s3 cp store/landmask/water.fgb "s3://$DATA_BUCKET/bathymetry/landmask/water.fgb"
-          # Marker last, only after BOTH uploads land: a crash in between re-runs next time
-          # rather than parking a "current" hash over a missing/stale water.fgb.
-          printf '%s' "$RECIPE_HASH" | aws s3 cp - "s3://$DATA_BUCKET/bathymetry/landmask/.recipe-hash"
+          docker run --rm -v "$PWD:/app" -v "$STORE:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just landmask
+          docker run --rm -v "$PWD:/app" -v "$STORE:/app/pipelines/store" "$IMAGE:$IMAGE_TAG" just watermask
+          rclone copyto "$STORE/landmask/land.fgb" "r2:$DATA_BUCKET/bathymetry/landmask/land.fgb" --retries 5
+          rclone copyto "$STORE/landmask/water.fgb" "r2:$DATA_BUCKET/bathymetry/landmask/water.fgb" --retries 5
+          # Markers last, only after BOTH uploads land — volume then R2.
+          printf '%s' "$RECIPE_HASH" > "$STORE/landmask/.recipe-hash"
+          printf '%s' "$RECIPE_HASH" | rclone rcat "r2:$DATA_BUCKET/bathymetry/landmask/.recipe-hash"
 
   # Enumerate the sources (one dir per source) into a matrix.
   discover:
@@ -176,14 +266,16 @@ jobs:
           fi
           echo "sources=$(echo "$all" | jq -R -s -c 'split("\n")|map(select(length>0))')" >> "$GITHUB_OUTPUT"
 
-  # Prepare each source and push its store/source/<id> to R2. One source failing
-  # doesn't sink the rest (fail-fast: false): a failed source simply doesn't
-  # refresh its R2 state, so builds keep covering from its last successful
-  # bounds.csv. The recipe hash in the published catalog.json skips sources whose
-  # recipe (and, for non-volatile sources, data) can't have changed.
+  # Prepare each source ONTO THE VOLUME (the planet build's source of truth) and push it to R2
+  # (the publish mirror laptops/bbox stream). The matrix serializes onto the one box runner.
+  # One source failing doesn't sink the rest (fail-fast: false): a failed source simply doesn't
+  # refresh its state, so builds keep covering from its last successful bounds.csv. The recipe
+  # hash in the catalog.json skips sources whose recipe (and, for non-volatile sources, data)
+  # can't have changed.
   sources:
-    needs: [image, discover]
-    runs-on: ubuntu-latest
+    needs: [image, discover, create-runner]
+    runs-on: ${{ needs.create-runner.outputs.label }}
+    timeout-minutes: 720
     permissions: { contents: read, packages: read }
     strategy:
       fail-fast: false
@@ -191,48 +283,84 @@ jobs:
         source: ${{ fromJSON(needs.discover.outputs.sources) }}
     steps:
       - uses: actions/checkout@v6
+      # Same idempotent box setup as the landmask job — a no-op after the first job on the box.
+      - name: Set up box (docker + rclone + store volume)
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          command -v unzip >/dev/null || { apt-get update -qq; apt-get install -y -qq unzip; }
+          command -v docker >/dev/null || curl -fsSL https://get.docker.com | sh
+          if ! command -v rclone >/dev/null; then
+            curl -fsSL -o /tmp/rclone.zip "https://downloads.rclone.org/v1.74.4/rclone-v1.74.4-linux-amd64.zip"
+            echo "fe435e0c36228e7c2f116a8701f01127bb1f694005fc11d1f27186c8bca4115d  /tmp/rclone.zip" | sha256sum -c
+            unzip -q -j /tmp/rclone.zip '*/rclone' -d /tmp/rclone-bin
+            install /tmp/rclone-bin/rclone /usr/local/bin/rclone
+          fi
+          if ! mountpoint -q /mnt/seascape-store; then
+            dev=""
+            for _ in $(seq 1 30); do
+              for d in /dev/disk/by-id/scsi-0HC_Volume_*; do [ -e "$d" ] && dev="$d" && break; done
+              [ -n "$dev" ] && break
+              sleep 2
+            done
+            [ -n "$dev" ] || { echo "store volume device never appeared — attach step skipped or volume held elsewhere?" >&2; exit 1; }
+            blkid "$dev" >/dev/null 2>&1 || { echo "blank volume — one-time mkfs"; mkfs.ext4 -q -L seascape-store "$dev"; }
+            mkdir -p /mnt/seascape-store
+            mount -o noatime "$dev" /mnt/seascape-store
+          fi
+          STORE=/mnt/seascape-store/store
+          mkdir -p "$STORE"
+          echo "STORE=$STORE" >> "$GITHUB_ENV"
+          # One-time seed of a BLANK volume from the R2 mirror (order-independent bootstrap:
+          # build.yml's fuller seed sets its own marker, which this respects — whichever workflow
+          # touches a blank volume first pays a line-rate R2 copy instead of a from-upstream
+          # re-prep of every source). Marker-gated: every later boot is a no-op.
+          if [ ! -e "$STORE/.seeded-sources-from-r2" ] && [ ! -e "$STORE/.seeded-from-r2" ]; then
+            echo "one-time seed: source mirror + masks + footprints from R2"
+            for p in source polygon landmask; do
+              rclone copy "r2:$DATA_BUCKET/bathymetry/$p" "$STORE/$p" --transfers 32 --checkers 64 --fast-list --retries 5 --stats 30s --stats-one-line
+            done
+            touch "$STORE/.seeded-sources-from-r2"
+          fi
       - uses: ./.github/actions/ghcr-login
       # Volatile sources re-register on EVERY run — their upstream drifts under an
       # unchanged recipe, and tracking that drift is this workflow's whole purpose.
-      # The rest short-circuit when the recipe hash in R2 matches.
-      - name: Already current in R2?
+      # The rest short-circuit when the recipe hash matches BOTH the volume catalog
+      # (planet builds) and the R2 catalog (laptops/bbox) — a crash between the two
+      # publishes heals next run instead of leaving one side stale.
+      - name: Already current?
         id: check
         env:
           RECIPE_HASH: ${{ hashFiles(format('sources/{0}/**', matrix.source)) }}
           FORCE: ${{ github.event.inputs.force == 'true' && 'true' || 'false' }}
         run: |
           volatile=$(jq -r '.volatile // false' "sources/${{ matrix.source }}/metadata.json")
-          # The recipe hash lives IN the published catalog.json (seascape:recipe_hash — the
-          # retired .recipe-hash marker's successor). A source registered before the catalog
-          # existed, or whose catalog carries no hash, reads as stale and rebuilds once.
-          have=$(aws s3 cp "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/catalog.json" - 2>/dev/null \
+          # The recipe hash lives IN the catalog.json (seascape:recipe_hash). A source
+          # registered before the catalog existed, or whose catalog carries no hash,
+          # reads as stale and rebuilds once.
+          have_v=$(jq -r '.properties["seascape:recipe_hash"] // empty' \
+                   "$STORE/source/${{ matrix.source }}/catalog.json" 2>/dev/null || true)
+          have_r=$(rclone cat "r2:$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/catalog.json" 2>/dev/null \
                  | jq -r '.properties["seascape:recipe_hash"] // empty' 2>/dev/null || true)
-          # A source whose recipe polygonizes must have its footprint in R2 (the
-          # build's coverage tileset builds from bathymetry/polygon/). Missing means
-          # the source last built before the polygon push existed — rebuild once.
+          # A source whose recipe polygonizes must have its footprint on both sides (the
+          # coverage tileset builds from polygon/). Missing means it last built before
+          # the polygon push existed — rebuild once.
           poly_ok=true
           if grep -q source_polygonize "sources/${{ matrix.source }}/Justfile"; then
-            aws s3 ls "s3://$DATA_BUCKET/bathymetry/polygon/${{ matrix.source }}.gpkg" >/dev/null || poly_ok=false
+            [ -f "$STORE/polygon/${{ matrix.source }}.gpkg" ] || poly_ok=false
+            rclone lsf "r2:$DATA_BUCKET/bathymetry/polygon/${{ matrix.source }}.gpkg" 2>/dev/null | grep -q . || poly_ok=false
           fi
           if [ "$volatile" = "true" ] || [ "$FORCE" = "true" ]; then current=false
-          elif [ -n "$RECIPE_HASH" ] && [ "$have" = "$RECIPE_HASH" ] && [ "$poly_ok" = "true" ]; then current=true
+          elif [ -n "$RECIPE_HASH" ] && [ "$have_v" = "$RECIPE_HASH" ] && [ "$have_r" = "$RECIPE_HASH" ] && [ "$poly_ok" = "true" ]; then current=true
           else current=false; fi
           {
             echo "current=$current"
             echo "hash=$RECIPE_HASH"
             echo "volatile=$volatile"
           } >> "$GITHUB_OUTPUT"
-          echo "${{ matrix.source }}: recipe=$RECIPE_HASH r2=${have:-none} volatile=$volatile force=$FORCE → current=$current"
-      # Seed the previous bounds.csv so re-registration is incremental: a mirrored
-      # source carries every still-listed row forward with zero header reads, and
-      # the shrink guard has a baseline to diff against. Harmless for the rest: a
-      # prepared source overwrites it.
-      - name: Seed previous bounds
-        if: steps.check.outputs.current != 'true'
-        run: |
-          mkdir -p "store/source/${{ matrix.source }}"
-          aws s3 cp "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/bounds.csv" \
-            "store/source/${{ matrix.source }}/bounds.csv" 2>/dev/null || true
+          echo "${{ matrix.source }}: recipe=$RECIPE_HASH volume=${have_v:-none} r2=${have_r:-none} volatile=$volatile force=$FORCE → current=$current"
+      # (The old "Seed previous bounds" step is gone: bounds.csv now LIVES on the volume, so
+      # incremental re-registration and the shrink guard's baseline are automatic.)
       # `just source` ends in source_catalog.py, which stamps the source's recipe hash into
       # the generated catalog.json (the staleness marker the check above reads back). Pass it
       # in; the pipeline stays R2-agnostic — RECIPE_HASH is just "the recipe content hash" to
@@ -242,90 +370,113 @@ jobs:
         env:
           RECIPE_HASH: ${{ steps.check.outputs.hash }}
         run: |
-          mkdir -p store
           docker run --rm -v "$PWD:/app" -e MIRROR_ALLOW_SHRINK -e RECIPE_HASH \
-            -v "$PWD/store:/app/pipelines/store" \
+            -v "$STORE:/app/pipelines/store" \
             "$IMAGE:$IMAGE_TAG" just source ${{ matrix.source }}
-      # Mirror the upstream objects the registration just enumerated. mirror.txt is
-      # the FULL upstream key list (not just new keys), so a partial prior mirror
-      # self-heals here every refresh. rclone streams object→object with no runner
-      # disk (CUDEM is ~188 GB), skips keys already present (size + preserved
-      # upstream mtime), verifies each transfer against the upstream MD5 ETag
-      # (NOAA's objects are single-part uploads, so the ETag is a real MD5), and
-      # NEVER deletes — superseded objects are ~$3/month of hoarding, and pruning
-      # under a concurrent build would be a delete race.
-      - name: Mirror upstream objects to R2
+      # Mirror the upstream objects the registration just enumerated ONTO THE VOLUME (the
+      # planet build reads them as local files — no /vsicurl, no build-time R2), then push
+      # the same objects up to R2 for the laptops/bbox streaming mirror. mirror.txt is the
+      # FULL upstream key list (not just new keys), so a partial prior mirror self-heals
+      # every refresh; both copies skip keys already present (size + preserved upstream
+      # mtime) and NEVER delete — superseded objects are ~$3/month of hoarding, and pruning
+      # under a concurrent build would be a delete race. The upstream leg verifies against
+      # the upstream MD5 ETag (NOAA's objects are single-part uploads, so it's a real MD5).
+      - name: Mirror upstream objects to the volume + R2
         if: steps.check.outputs.current != 'true' && steps.check.outputs.volatile == 'true'
         run: |
           for f in mirror.txt mirror-bucket.txt; do
-            test -s "store/source/${{ matrix.source }}/$f" || {
+            test -s "$STORE/source/${{ matrix.source }}/$f" || {
               echo "volatile source produced no $f — registration is broken"; exit 1; }
           done
-          # Pinned release, sha256-verified — not apt: Ubuntu 24.04's rclone (1.60.1,
-          # 2022) records the x-amz-version-id R2 now returns on uploads, then 501s on
-          # its post-upload `HEAD ?versionId=` verification. The object still lands, so
-          # every transfer errors once and the retry pass goes green — noise that would
-          # bury a real failure.
-          curl -fsSL -o /tmp/rclone.zip "https://downloads.rclone.org/v1.74.4/rclone-v1.74.4-linux-amd64.zip"
-          echo "fe435e0c36228e7c2f116a8701f01127bb1f694005fc11d1f27186c8bca4115d  /tmp/rclone.zip" | sha256sum -c
-          unzip -q -j /tmp/rclone.zip '*/rclone' -d /tmp/rclone-bin
-          sudo install /tmp/rclone-bin/rclone /usr/local/bin/rclone
           # source_mirror enumerated the objects, enforced that they live on ONE
           # bucket, and wrote its name here — one URL parser, not a second in sed.
-          bucket=$(cat "store/source/${{ matrix.source }}/mirror-bucket.txt")
-          echo "mirroring $(wc -l < "store/source/${{ matrix.source }}/mirror.txt") objects from $bucket"
-          # Two remotes, no secrets on disk: the NOAA side is anonymous —
-          # env_auth=false so the R2 credentials in the env can't sign its requests —
-          # and the R2 side reads the standard AWS_* env vars + endpoint.
-          cat > /tmp/rclone.conf <<EOF
-          [upstream]
-          type = s3
-          provider = AWS
-          region = us-east-1
-          env_auth = false
-          [r2]
-          type = s3
-          provider = Cloudflare
-          env_auth = true
-          region = auto
-          endpoint = $AWS_ENDPOINT_URL
-          EOF
-          rclone --config /tmp/rclone.conf copy \
-            "upstream:$bucket" "r2:$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/objects" \
-            --files-from "store/source/${{ matrix.source }}/mirror.txt" \
+          bucket=$(cat "$STORE/source/${{ matrix.source }}/mirror-bucket.txt")
+          echo "mirroring $(wc -l < "$STORE/source/${{ matrix.source }}/mirror.txt") objects from $bucket"
+          # The upstream remote is anonymous (env_auth absent = false), defined in a temp
+          # config; the r2 remote exists ambiently via the RCLONE_CONFIG_R2_* env vars,
+          # which apply regardless of --config.
+          printf '[upstream]\ntype = s3\nprovider = AWS\nregion = us-east-1\n' > /tmp/upstream.conf
+          rclone --config /tmp/upstream.conf copy \
+            "upstream:$bucket" "$STORE/source/${{ matrix.source }}/objects" \
+            --files-from "$STORE/source/${{ matrix.source }}/mirror.txt" \
             --transfers 16 --checkers 32 --retries 5 --stats 60s --stats-one-line -v
-      # Push the registration files — everything EXCEPT bounds.csv and catalog.json, which
-      # publish last (below). Volatile sources sync without --delete: their objects/ tree
-      # lives under the same prefix and must never be swept by a registration sync.
-      # Prepared sources keep --delete so retired artifacts don't linger (this also sweeps
-      # the retired .recipe-hash object — its hash now rides inside catalog.json).
+          rclone copy "$STORE/source/${{ matrix.source }}/objects" \
+            "r2:$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/objects" \
+            --transfers 16 --checkers 32 --retries 5 --stats 60s --stats-one-line
+      # Push the registration files to the R2 mirror — everything EXCEPT bounds.csv and
+      # catalog.json, which publish last (below). Volatile sources copy without delete:
+      # their objects/ tree lives under the same prefix and must never be swept. Prepared
+      # sources sync (rclone sync deletes retired artifacts; excluded files are invisible
+      # to it, never deleted).
       - name: Push source to R2
         if: steps.check.outputs.current != 'true'
         run: |
           if [ "${{ steps.check.outputs.volatile }}" = "true" ]; then
-            aws s3 sync "store/source/${{ matrix.source }}" "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}" \
-              --exclude 'bounds.csv' --exclude 'catalog.json'
+            rclone copy "$STORE/source/${{ matrix.source }}" "r2:$DATA_BUCKET/bathymetry/source/${{ matrix.source }}" \
+              --exclude 'bounds.csv' --exclude 'catalog.json' --exclude 'objects/**' --retries 5
           else
-            aws s3 sync "store/source/${{ matrix.source }}" "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}" \
-              --delete --exclude 'bounds.csv' --exclude 'catalog.json'
+            rclone sync "$STORE/source/${{ matrix.source }}" "r2:$DATA_BUCKET/bathymetry/source/${{ matrix.source }}" \
+              --exclude 'bounds.csv' --exclude 'catalog.json' --retries 5
           fi
-          # Provenance footprint → bathymetry/polygon/ (the build's coverage tileset
-          # reads them all). Guarded: mirrored sources register remote objects and
-          # build none.
-          if [ -f "store/polygon/${{ matrix.source }}.gpkg" ]; then
-            aws s3 cp "store/polygon/${{ matrix.source }}.gpkg" "s3://$DATA_BUCKET/bathymetry/polygon/${{ matrix.source }}.gpkg"
+          # Provenance footprint → bathymetry/polygon/ (the coverage tileset reads them
+          # all). Guarded: mirrored sources register remote objects and build none.
+          if [ -f "$STORE/polygon/${{ matrix.source }}.gpkg" ]; then
+            rclone copyto "$STORE/polygon/${{ matrix.source }}.gpkg" "r2:$DATA_BUCKET/bathymetry/polygon/${{ matrix.source }}.gpkg" --retries 5
           fi
       # bounds.csv then catalog.json, in that order, LAST. bounds.csv is the atomic pointer
       # (every object a row references is already verified-present above, so a build
       # dispatched at any moment sees a complete registration). catalog.json lands after
-      # even that because its seascape:recipe_hash IS the staleness marker (the retired
-      # .recipe-hash): a crash anywhere above leaves the published hash stale, and the next
-      # run redoes the source instead of trusting a half-push. See the header comment for
-      # the (benign) bounds-ahead-of-catalog crash window this ordering accepts.
-      - name: Publish bounds.csv + catalog marker
+      # even that because its seascape:recipe_hash IS the staleness marker: a crash anywhere
+      # above leaves the published hash stale, and the next run redoes the source instead of
+      # trusting a half-push. The volume needs no publish ordering — its files land in place
+      # as `just source` writes them, and the volume catalog hash was stamped by the prepare.
+      - name: Publish bounds.csv + catalog marker to R2
         if: steps.check.outputs.current != 'true'
         run: |
-          aws s3 cp "store/source/${{ matrix.source }}/bounds.csv" \
-            "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/bounds.csv"
-          aws s3 cp "store/source/${{ matrix.source }}/catalog.json" \
-            "s3://$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/catalog.json"
+          rclone copyto "$STORE/source/${{ matrix.source }}/bounds.csv" \
+            "r2:$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/bounds.csv" --retries 5
+          rclone copyto "$STORE/source/${{ matrix.source }}/catalog.json" \
+            "r2:$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/catalog.json" --retries 5
+
+  # Destroy the box + deregister the runner, ALWAYS — even if landmask or any matrix source
+  # failed (server_id is emitted before the registration wait). The persistent store volume is
+  # deliberately NEVER deleted; Hetzner auto-detaches it when the server is deleted. Same
+  # LOUD-DESTROY discipline as build.yml.
+  delete-runner:
+    needs: [create-runner, landmask, sources]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions: { contents: read }
+    steps:
+      - name: Delete runner + server
+        if: ${{ needs.create-runner.outputs.server_id != '' }}
+        uses: Cyclenerd/hcloud-github-runner@v1.4.1
+        with:
+          mode: delete
+          github_token: ${{ secrets.RUNNER_PAT }}
+          hcloud_token: ${{ secrets.HCLOUD_TOKEN }}
+          name: ${{ env.NAME }}
+          server_id: ${{ needs.create-runner.outputs.server_id }}
+      - name: Verify no leaked resources
+        if: always()
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/hcloud.tgz https://github.com/hetznercloud/cli/releases/download/v1.66.0/hcloud-linux-amd64.tar.gz
+          echo "8b1a8598858232c491f58cbf65ce1bd0ec6f725114bb62ec967a20ab03e29a86  /tmp/hcloud.tgz" | sha256sum -c
+          tar xzf /tmp/hcloud.tgz -C /tmp hcloud
+          sudo mv /tmp/hcloud /usr/local/bin/
+          # A still-present server after teardown is billable — fail loudly. The persistent
+          # $STORE_VOLUME is expected to survive; only a stray per-run volume named after the
+          # server would be a leak.
+          fail=0
+          if hcloud server describe "$NAME" >/dev/null 2>&1; then
+            echo "::error::leaked billable resource: Hetzner server $NAME still exists — delete it manually"
+            fail=1
+          fi
+          if hcloud volume describe "$NAME" >/dev/null 2>&1; then
+            echo "::error::leaked billable resource: Hetzner volume $NAME still exists — delete it manually"
+            fail=1
+          fi
+          exit "$fail"
