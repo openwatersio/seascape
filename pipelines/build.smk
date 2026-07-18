@@ -143,6 +143,7 @@ rule mosaic:
 # ── stage 3 (cartographic products): every consumer reads windows of the persisted ──
 # ── mosaic, instead of riding inside the merge job as the legacy forks do            ──
 
+import bundle
 import contour_run
 import depare_run
 import smooth
@@ -312,9 +313,45 @@ rule vector_bundle:
         "{PY}/contour_run.py bundle --stable"
 
 
-# The bundle-inventory target: the vector layers, buildable alone against a warm mosaic.
+# ── terrain (raster) bundles — the planet base archive + one overlay per populated ──
+# OVERLAY_SPLIT_Z grid cell, concatenated from the PLAIN per-stem terrain pmtiles. The
+# planet holds z0..PLANET_MAX_ZOOM; each overlay cell holds its deeper tiles. Snakemake owns
+# freshness, so the `--stable` CLIs carry no key/sidecar; one cell per invocation (no internal
+# pool — the engine schedules the cells).
+
+rule terrain_planet_bundle:
+    input:
+        expand("store/pmtiles/{stem}.pmtiles", stem=RENDER_STEMS)
+    output:
+        "store/bundle/planet.pmtiles"
+    benchmark:
+        "store/bench/planet-bundle.tsv"
+    shell:
+        "{PY}/bundle.py planet --stable"
+
+
+wildcard_constraints:
+    cell=r"\d+-\d+-\d+"
+
+
+rule overlay_bundle:
+    input:
+        lambda wc: [f"store/pmtiles/{s}.pmtiles"
+                    for s in RENDER_STEMS if wc.cell in bundle.overlay_cells([s])]
+    output:
+        "store/bundle/overlay-{cell}.pmtiles"
+    benchmark:
+        "store/bench/overlay-{cell}.tsv"
+    shell:
+        "{PY}/bundle.py cell {wildcards.cell} --stable"
+
+
+# The bundle-inventory target: the vector layers + the raster planet/overlay archives,
+# buildable alone against a warm terrain render.
 rule bundles:
     input:
         rules.soundings_bundle.output,
         (rules.depare_bundle.output if DEPARE_STEMS else []),
         rules.vector_bundle.output,
+        rules.terrain_planet_bundle.output,
+        expand("store/bundle/overlay-{cell}.pmtiles", cell=bundle.overlay_cells(RENDER_STEMS)),

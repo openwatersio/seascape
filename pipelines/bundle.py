@@ -36,6 +36,7 @@ from pmtiles.writer import Writer
 
 import config
 import cache_versions
+import contour_run
 import keys
 import utils
 
@@ -114,10 +115,12 @@ def read_full_archive(filepath):
     return out
 
 
-def create_archive(filepaths, name):
+def create_archive(filepaths, name, stem_of=keys.stem_of):
     """Concat the single-zoom pmtiles into store/bundle/<archive_filename(name)>.
     For an overlay cell, tiles outside the cell (a coarse parent spanning cells)
-    are left to the sibling cells' archives."""
+    are left to the sibling cells' archives. ``stem_of`` parses a member's logical
+    {z}-{x}-{y}-{child_z} — the legacy content name by default, ``_plain_stem`` in the
+    engine lane where the flat basename IS the stem."""
     utils.create_folder("store/bundle")
     out_filepath = f"store/bundle/{archive_filename(name)}"
     min_z, max_z = math.inf, 0
@@ -129,7 +132,7 @@ def create_archive(filepaths, name):
 
         tile_ids_and_filepaths = []
         for filepath in filepaths:
-            z, x, y, child_z = (int(a) for a in keys.stem_of(filepath).split("-"))
+            z, x, y, child_z = (int(a) for a in stem_of(filepath).split("-"))
             parent = mercantile.Tile(x=x, y=y, z=z)
             tiles = [parent] if z == child_z else list(mercantile.children(parent, zoom=child_z))
             if name != "planet":
@@ -175,9 +178,9 @@ def attribution():
     return utils.ATTRIBUTION
 
 
-def bundle_group(name, filepaths):
+def bundle_group(name, filepaths, stem_of=keys.stem_of):
     print(f"bundling {archive_filename(name)} ({len(filepaths)} pmtiles)...")
-    return create_archive(filepaths, name)
+    return create_archive(filepaths, name, stem_of)
 
 
 def verify_complete(aggregation_id):
@@ -241,6 +244,64 @@ def _bundle_key(groups):
     return keys.stage_key(inputs, [cache_versions.TERRAIN_BUNDLE], cfg)
 
 
+# ── engine lane (--stable) ─────────────────────────────────────────────────────
+# Plain flat inventory (store/pmtiles/<stem>.pmtiles), one archive per invocation.
+# Snakemake owns freshness, so no keys, no sidecar, no fresh-skip, no manifest, and no
+# internal cell pool — the engine schedules the cells as jobs. Same grid partition
+# (stem_groups / cell_of) as the legacy bundle, so the archives are byte-identical.
+
+
+def _plain_stem(path):
+    """The logical stem of an engine-lane plain name (store/pmtiles/<stem>.pmtiles): the basename
+    minus extension IS the stem (no content-address key to strip)."""
+    return os.path.splitext(os.path.basename(path))[0]
+
+
+def _stable_inventory():
+    """{stem: plain path} over every render stem of the BBOX-scoped covering
+    (terrain.render_stems of mosaic.covering_stems). The render-stem set IS the inventory — no
+    content-name filter, no orphan sweep (the engine keeps the store consistent)."""
+    import mosaic
+    import terrain
+    stems = terrain.render_stems(mosaic.covering_stems())
+    return {s: f"store/pmtiles/{s}.pmtiles" for s in stems}
+
+
+def overlay_cells(stems):
+    """The populated overlay cell ids for a render-stem list — every non-planet group stem_groups
+    routes a stem into, grouped exactly as the legacy bundle. build.smk derives the per-cell
+    overlay outputs (and each cell's member stems) from this."""
+    cells = set()
+    for stem in stems:
+        cells.update(n for n in stem_groups(stem) if n != "planet")
+    return sorted(cells)
+
+
+def bundle_planet_stable():
+    """Build store/bundle/planet.pmtiles (z0..PLANET_MAX_ZOOM) from the plain inventory — the base
+    stems (stem_groups == ['planet']). Asserts every render stem's pmtiles is on disk first (a
+    MISSING one is an interrupted build), the only bundle-time gate the stable path keeps."""
+    inv = _stable_inventory()
+    stems = sorted(inv)
+    contour_run.require_stable_complete("terrain", stems, [inv[s] for s in stems])
+    filepaths = [inv[s] for s in stems if stem_groups(s) == ["planet"]]
+    bundle_group("planet", filepaths, stem_of=_plain_stem)
+    print(f"planet bundle (stable): store/bundle/planet.pmtiles ({len(filepaths)} pmtiles)")
+
+
+def bundle_cell_stable(cell):
+    """Build ONE store/bundle/overlay-<cell>.pmtiles from the plain inventory: every stem whose
+    stem_groups routes it into this cell (create_archive keeps only the cell's own tiles). One cell
+    per invocation — no internal pool; the engine schedules the cells. Asserts this cell's member
+    pmtiles are on disk first (a MISSING one is an interrupted build)."""
+    inv = _stable_inventory()
+    filepaths = [inv[s] for s in sorted(inv) if cell in stem_groups(s)]
+    stems = [_plain_stem(f) for f in filepaths]
+    contour_run.require_stable_complete("terrain", stems, filepaths)
+    bundle_group(cell, filepaths, stem_of=_plain_stem)
+    print(f"overlay bundle (stable): store/bundle/{archive_filename(cell)} ({len(filepaths)} pmtiles)")
+
+
 def main():
     """Bundle every group (planet base + one overlay per populated grid cell) and write
     manifest.json. Groups are independent — the overlay cells share no tiles and the planet
@@ -292,5 +353,10 @@ if __name__ == "__main__":
     a = sys.argv[1:]
     if not a:
         main()
+    elif a == ["planet", "--stable"]:
+        bundle_planet_stable()
+    elif a[:1] == ["cell"] and len(a) == 3 and a[2] == "--stable":
+        bundle_cell_stable(a[1])
     else:
-        sys.exit("usage: bundle.py  (no args — bundle planet + overlays + manifest.json)")
+        sys.exit("usage: bundle.py  (legacy: planet + overlays + manifest.json)  |  "
+                 "planet --stable  |  cell <cell> --stable")
