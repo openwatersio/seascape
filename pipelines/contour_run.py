@@ -164,7 +164,7 @@ def generate(filepath, out):
 
 
 def tile(stem):
-    """The stage-3 Snakemake job (5c re-pointed): contour one stem from a BUFFERED mosaic
+    """The per-stem Snakemake job — reads the PERSISTED mosaic instead of the transient merge: contour one stem from a BUFFERED mosaic
     window, smoothed at read with the one shared f(depth, zoom), output at the PLAIN stable
     name. A featureless tile writes a 0-byte sentinel so the engine sees a complete output;
     bundling filters empties by size."""

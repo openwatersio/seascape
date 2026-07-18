@@ -192,7 +192,7 @@ def generate(filepath, out):
 
 
 def tile(stem):
-    """The stage-3 Snakemake job (5c re-pointed): sound one stem from a BUFFERED mosaic window,
+    """The per-stem Snakemake job — reads the PERSISTED mosaic instead of the transient merge: sound one stem from a BUFFERED mosaic window,
     smoothed at read with the one shared f(depth, zoom), output at the PLAIN stable name. A dry
     tile writes a 0-byte sentinel; bundling filters empties by size."""
     import shutil

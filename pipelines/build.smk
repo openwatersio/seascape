@@ -1,13 +1,13 @@
 # Stage 2+ — the planet/preview invocation: `snakemake -s pipelines/build.smk mosaic`.
 #
-# A SEPARATE entry Snakefile is the plan's two-invocation split made structural: this
+# A SEPARATE entry Snakefile keeps the two invocations structurally apart: this
 # graph parses PURELY from disk (the --stable covering `snakemake catalogs` wrote) and
 # defines no rule that writes catalogs, masks, or coverings — and no fetch/mirror rule,
 # so builds can never contact upstream, by graph construction rather than discipline.
 #
 # Freshness here is ENGINE provenance (inputs + params). CODE is deliberately not an
 # input (force-only: `-R mosaic_tile`) — an innocuous merge-module edit must not
-# re-merge the planet by default; see the plan's Identity section.
+# re-merge the planet by default (docs/plans/2026-07-14-snakemake-build.md, Identity).
 
 include: "common.smk"
 
@@ -140,7 +140,8 @@ rule mosaic:
         rules.mosaic_index.output
 
 
-# ── stage 3: every consumer reads mosaic windows (5c re-pointed) ──────────────────────
+# ── stage 3 (cartographic products): every consumer reads windows of the persisted ──
+# ── mosaic, instead of riding inside the merge job as the legacy forks do            ──
 
 import contour_run
 import depare_run

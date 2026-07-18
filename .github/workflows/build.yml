@@ -6,8 +6,8 @@ name: Build
 # the catalogs invocation (covering from the volume's canonical sources), then the build
 # invocation (pipelines/build.smk), which parses purely from disk and structurally contains
 # no fetch rule. On this branch `gh workflow run build.yml --ref <branch>` runs THIS file
-# while main's legacy copy keeps planet production — merging the branch is cutover B
-# (docs/plans/2026-07-14-snakemake-build.md, phases 8-11).
+# while main's legacy copy keeps planet production — merging the branch makes this
+# the production build (docs/plans/2026-07-14-snakemake-build.md, phases 8-11).
 #
 # Scope today: stage 2 (the mosaic) only — the first dispatch is the MEASUREMENT run the
 # memory plan calls for. Every mosaic_tile job runs isolated with a benchmark: directive, so
@@ -19,7 +19,7 @@ name: Build
 #   - per-job kernel memory caps (cgroup / docker run --memory per job): added once the
 #     measurement run's benchmarks give real reservations to enforce; until then the global
 #     --resources budget + per-job process isolation + retries bound the blast radius.
-#   - planet-mosaic sizing vs the volume (plan phase 8): check before the first FULL planet
+#   - planet-mosaic sizing vs the volume: check before the first FULL planet
 #     dispatch; a bbox smoke first is the intended path.
 #   - a warm volume is assumed: if a source's registration is missing, the cover invocation
 #     can reach stage-1 prep rules (it is the catalogs invocation) — run sources.yml first.
@@ -153,7 +153,7 @@ jobs:
           [ -f "$STATE/store/aggregation/covering.txt" ] || { echo "volume has no covering — run sources.yml first (the covering is a stage-1 product; builds consume it read-only)" >&2; exit 1; }
           echo "STATE=$STATE" >> "$GITHUB_ENV"
       # One-time-per-content retirement of legacy derived state (idempotent; delete this
-      # step at plan phase 12). Production serves from R2, so local legacy build products
+      # step when the legacy lane is deleted). Production serves from R2, so local legacy build products
       # have no resume value; stage-1 products (sources, masks, footprints, the stable
       # covering + CSVs) and this lane's store/mosaic + bench stay.
       - name: Retire legacy derived state
