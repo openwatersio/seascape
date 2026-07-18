@@ -93,7 +93,8 @@ rule mirror_source:
         str(SOURCES_DIR / "{source}/file_list.txt"),
         metadata=str(SOURCES_DIR / "{source}/metadata.json"),
     output:
-        bounds="store/source/{source}/bounds.csv",
+        # Use `update` to keep the previous bounds in place.
+        bounds=update("store/source/{source}/bounds.csv"),
         mirror="store/source/{source}/mirror.txt",
         bucket="store/source/{source}/mirror-bucket.txt",
     wildcard_constraints:
