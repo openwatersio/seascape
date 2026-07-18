@@ -60,6 +60,7 @@ import mercantile
 import rasterio
 
 import config
+import cache_versions
 import contour_run
 import keys
 import utils
@@ -305,7 +306,7 @@ def bundle():
     # iterative loop; the box's store/bundle is never hydrated, so a box build always rebuilds).
     # The key rides in each member's content name.
     dkey = keys.stage_key([os.path.basename(f) for f in fgbs],
-                          ["depare_run", "contour_run", "utils"],
+                          [cache_versions.DEPARE_BUNDLE],
                           {"maxz": maxz, "min_zoom": MIN_ZOOM,
                            "simplification": os.environ.get("DEPARE_SIMPLIFICATION", "8")})
     if keys.is_fresh(out, dkey):

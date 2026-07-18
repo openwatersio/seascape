@@ -51,6 +51,7 @@ import numpy as np
 import rasterio
 
 import aggregation_reproject
+import cache_versions
 import encode
 import keys
 import mosaic
@@ -61,10 +62,10 @@ import utils
 NODATA = -9999
 
 # Code the served terrain render depends on: the smoothing (the ONE f(depth,zoom)), the encode
-# (bias-shallow quantization), the mosaic reader (whose module bytes + resolution math shape the
-# window), and this renderer. A change to any re-keys the render — but NOT the mosaic (the stage
-# split: a smoothing/quantization change re-renders from a fully cached mosaic, no re-merge).
-TERRAIN_MODULES = ["smooth", "encode", "aggregation_reproject", "mosaic", "utils", "terrain"]
+# Explicit contracts for the index/GTI semantics and terrain renderer. Output-affecting changes
+# bump these versions; the mosaic tile keys enter separately as terrain inputs.
+TERRAIN_VERSIONS = [cache_versions.MOSAIC_INDEX, cache_versions.MOSAIC_GTI,
+                    cache_versions.SMOOTH, cache_versions.ENCODE, cache_versions.TERRAIN]
 
 
 # ── the mosaic GTI, read through the system gdal by absolute path ──────────────────────────────
@@ -157,15 +158,15 @@ def _render(stem, out_pmtiles):
     tmp = f"store/terrain-tmp/{stem}"
     utils.create_folder(tmp)
     window = f"{tmp}/window.tif"
-    # Reserve this stem's memory weight across the RAM peak: the gdalwarp window read + the smooth
-    # hold the multi-GB window array (a native macrotile window is 32768² float32). The budget
-    # bounds how many dense windows warp+smooth at once so a spawn Pool sized to cores can't OOM.
-    # The per-512-tile encode below reads small windows off the on-disk smoothed tiff — light, so it
-    # runs outside the reservation (scheduler.reserve is try/finally: a warp/smooth error frees it).
-    with scheduler.reserve(stem):
-        core, halo = _read_window(anchor, cz, halo, window)
-        if not os.environ.get("SKIP_SMOOTH"):
-            smooth.smooth_tiff(window)  # the ONE f(depth,zoom); halo makes interior identical to whole
+    # This stem's memory weight was reserved in the PARENT before dispatch (scheduler.map_budgeted
+    # in run()); the RAM peak it prices is here — the gdalwarp window read + the smooth hold the
+    # multi-GB window array (a native macrotile window is 32768² float32), so a spawn Pool sized
+    # to cores can't OOM. The reservation now also spans the per-512-tile encode below (light,
+    # small on-disk windows) — released at task completion, a slightly longer hold traded for
+    # workers that never block.
+    core, halo = _read_window(anchor, cz, halo, window)
+    if not os.environ.get("SKIP_SMOOTH"):
+        smooth.smooth_tiff(window)  # the ONE f(depth,zoom); halo makes interior identical to whole
 
     x_min, y_min = x * span, y * span
     from concurrent.futures import ThreadPoolExecutor
@@ -320,7 +321,7 @@ def _config():
 
 
 def terrain_key(stem, agg_keys):
-    return keys.stage_key(_intersecting_keys(stem, agg_keys), TERRAIN_MODULES,
+    return keys.stage_key(_intersecting_keys(stem, agg_keys), TERRAIN_VERSIONS,
                           {**_config(), "product": "terrain"})
 
 
@@ -374,25 +375,26 @@ def run():
         print("terrain: nothing to render")
         return
     work = [(s, terrain_key(s, agg_keys)) for s in stems]
-    # Pool size = cores (TERRAIN_PROCESSES, unset/0 = all cores); peak RAM is bounded separately by a
-    # shared GB budget (TERRAIN_MEM_BUDGET_GB) each worker reserves across the window warp+smooth in
-    # _render, so the densest native windows can't all peak at once. Budget unset/0 = plain pool.
-    # The budget's Manager proxies pickle into the SPAWN workers via the Pool initializer.
-    procs = int(os.environ.get("TERRAIN_PROCESSES", "0")) or None
+    # Pool size = cores (TERRAIN_PROCESSES, unset/0 = all cores); peak RAM is bounded separately
+    # by a shared GB budget (TERRAIN_MEM_BUDGET_GB), enforced in THIS process: map_budgeted
+    # dispatches a stem into the spawn pool only once its weight fits (heaviest admissible first),
+    # so the densest native windows can't all peak at once and a stem that doesn't fit waits here,
+    # never inside a worker. Budget unset/0 = plain pool.
+    procs = int(os.environ.get("TERRAIN_PROCESSES", "0")) or os.cpu_count()
     budget = int(os.environ.get("TERRAIN_MEM_BUDGET_GB", "0"))
-    mgr, pool_kwargs = scheduler.pool_kwargs(budget)
     print(f"terrain: rendering {len(work)} stem(s) from the mosaic...")
     done, last = 0, time.monotonic()
-    try:
-        with get_context("spawn").Pool(procs, **pool_kwargs) as pool:
-            for _stem in pool.imap_unordered(_run_one, work, chunksize=1):
-                done += 1
-                if time.monotonic() - last > 30:
-                    print(f"  {done}/{len(work)} stems rendered", flush=True)
-                    last = time.monotonic()
-    finally:
-        if mgr is not None:
-            mgr.shutdown()
+
+    def _progress(_item):
+        nonlocal done, last
+        done += 1
+        if time.monotonic() - last > 30:
+            print(f"  {done}/{len(work)} stems rendered", flush=True)
+            last = time.monotonic()
+
+    with get_context("spawn").Pool(procs, **scheduler.pool_kwargs()) as pool:
+        scheduler.map_budgeted(pool, _run_one, work, budget, procs,
+                               stem_of=lambda w_: w_[0], on_done=_progress)
     print(f"terrain: {done} stem(s) rendered")
 
 

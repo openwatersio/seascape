@@ -1,8 +1,8 @@
 """Content-hash cache keys: skip a stage output whose inputs, code, config, and toolchain
 are all unchanged.
 
-A stage computes ``stage_key(inputs, modules, config)`` — a short stable hash of the resolved
-config values, the bytes of each pipeline module it depends on, each input's own hash, and the
+A stage computes ``stage_key(inputs, versions, config)`` — a short stable hash of the resolved
+config values, explicit artifact contract versions, each input's own hash, and the
 toolchain identity. That 12-hex key then rides IN the artifact's filename
 (``store/pmtiles/<stem>-<key>.pmtiles``, ``content_path``): the artifact is CONTENT-ADDRESSED, so
 freshness is simply "the content-named file exists" (``fork_fresh``) — no sidecar to match. A
@@ -23,10 +23,8 @@ sidecar user: the per-sha bundle outputs (``store/bundle/*``), which are never h
 rebuilt every box build, so a local ``.key`` sidecar is the cheapest laptop skip. The
 content-addressed STORE (pmtiles / contour / soundings / depare / overviews) carries no sidecars.
 
-Module hashing is per-module and COARSE on purpose: a stage lists the ``pipelines/*.py`` it
-depends on and the key hashes those whole files, so a comment edit over-invalidates the stage.
-Over-invalidation is accepted; under-invalidation is the bug this exists to kill — a smoothing /
-contour / encode change the old covering diff couldn't see, silently serving stale tiles. Config
+Artifact contracts are explicit in ``cache_versions.py``. Output-affecting changes bump the
+corresponding version; orchestration, logging, comments, and pointer-only changes do not. Config
 enters as the RESOLVED VALUES a stage read (a level list, a sigma), never env-var names.
 
 R2-agnostic like the rest of ``pipelines/``: the toolchain identity comes from a ``TOOLCHAIN``
@@ -36,27 +34,16 @@ local GDAL version so a laptop's keys stay honest about GDAL skew. No bucket nam
   python keys.py --check   self-check
 """
 
+import errno
 import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from functools import lru_cache
 from glob import glob
-
-# This directory — listed modules are resolved against it.
-PIPELINES_DIR = os.path.dirname(os.path.abspath(__file__))
-
-
-@lru_cache(maxsize=None)
-def _module_bytes(name):
-    """Bytes of a listed pipeline module (a bare name like ``smooth`` or ``smooth.py``). Cached,
-    so a module is read+hashed once per process, not once per tile."""
-    fn = name if name.endswith(".py") else f"{name}.py"
-    with open(os.path.join(PIPELINES_DIR, fn), "rb") as f:
-        return f.read()
-
 
 @lru_cache(maxsize=1)
 def toolchain():
@@ -84,21 +71,21 @@ def _canonical(config):
     return json.dumps(config, sort_keys=True, separators=(",", ":"), default=str).encode()
 
 
-def stage_key(inputs, modules, config):
-    """``H(canonical(config) ‖ each module's bytes ‖ each input hash ‖ toolchain)`` → 12 hex.
+def stage_key(inputs, versions, config):
+    """``H(canonical(config) ‖ artifact versions ‖ input hashes ‖ toolchain)`` → 12 hex.
 
     inputs: already-resolved hashes/identities (``str``) or raw ``bytes`` — a source recipe hash,
       a parent artifact's key, a covering-row string. ``None`` entries are tolerated (an
       unregistered source with no recipe hash) and contribute a fixed separator only, so an input
       appearing/vanishing still moves the key.
-    modules: pipeline module names whose whole-file bytes are the stage's code dependency.
+    versions: explicit cache contract tokens from ``cache_versions.py``.
     config: the resolved config VALUES the stage read (never env-var names).
     """
     h = hashlib.sha256()
     h.update(_canonical(config))
-    for name in modules:
-        h.update(b"\x00M\x00")
-        h.update(_module_bytes(name))
+    for version in versions:
+        h.update(b"\x00V\x00")
+        h.update(version.encode())
     for inp in inputs:
         h.update(b"\x00I\x00")
         if inp is None:
@@ -214,12 +201,22 @@ def fork_fresh(artifact, key):
 
 
 def publish(tmp_path, final_path):
-    """Atomically move a fully-written temp file to its content-addressed name (``os.replace``
-    within one filesystem is atomic). The final name only ever appears complete — a crash mid-write
-    leaves the temp, which no freshness check looks at, and the fork reads stale next run. The
-    content-addressed analog of phase-3's sidecar-last rule."""
+    """Publish a fully-written temp file atomically, including across filesystems.
+
+    ``os.replace`` is the fast path. If scratch and the store are different mounts, copy to a temp
+    beside the final path first, then rename there. The final name therefore only appears complete;
+    a crash leaves a temp no freshness check considers.
+    """
     os.makedirs(os.path.dirname(final_path), exist_ok=True)
-    os.replace(tmp_path, final_path)
+    try:
+        os.replace(tmp_path, final_path)
+    except OSError as error:
+        if error.errno != errno.EXDEV:
+            raise
+        destination_tmp = final_path + ".tmp"
+        shutil.copyfile(tmp_path, destination_tmp)
+        os.replace(destination_tmp, final_path)
+        os.remove(tmp_path)
 
 
 def write_empty(artifact, key):
@@ -267,51 +264,30 @@ def file_hash(path):
 
 
 def _check():
-    """Key stable across a no-op recompute; moves on a config-value change, an input change, and a
-    LISTED module's byte change; ignores an UNLISTED module's byte change; the toolchain enters the
-    key; the sidecar skip rule + the FORCE bypass."""
-    import shutil
+    """Key stability and explicit invalidation contract, plus freshness primitives."""
     import tempfile
+    from unittest.mock import patch
 
-    global PIPELINES_DIR
-    saved_dir, saved_force = PIPELINES_DIR, os.environ.pop("FORCE_REBUILD", None)
+    saved_force = os.environ.pop("FORCE_REBUILD", None)
     saved_tc = os.environ.pop("TOOLCHAIN", None)
     d = tempfile.mkdtemp()
     try:
-        PIPELINES_DIR = d
-        _module_bytes.cache_clear()
         toolchain.cache_clear()
-        with open(f"{d}/mod_a.py", "w") as f:
-            f.write("A = 1\n")
-        with open(f"{d}/mod_b.py", "w") as f:
-            f.write("B = 1\n")
-
         cfg = {"levels": [1, 2], "cap": 3}
-        base = stage_key(["in1", "in2"], ["mod_a"], cfg)
-        assert stage_key(["in1", "in2"], ["mod_a"], dict(cfg)) == base, "key not stable on a no-op recompute"
-        assert stage_key(["in1", "in2"], ["mod_a"], {"levels": [1, 3], "cap": 3}) != base, "config-value change must move the key"
-        assert stage_key(["in1", "in9"], ["mod_a"], cfg) != base, "input change must move the key"
-        assert stage_key([None, "in2"], ["mod_a"], cfg) != base, "a vanished input must move the key"
-
-        # an UNLISTED module's byte change is ignored (mod_b changes; a mod_a-only key holds)
-        with open(f"{d}/mod_b.py", "w") as f:
-            f.write("B = 999\n")
-        _module_bytes.cache_clear()
-        assert stage_key(["in1", "in2"], ["mod_a"], cfg) == base, "unlisted module change must NOT move the key"
-
-        # a LISTED module's byte change moves the key
-        with open(f"{d}/mod_a.py", "w") as f:
-            f.write("A = 2\n")
-        _module_bytes.cache_clear()
-        assert stage_key(["in1", "in2"], ["mod_a"], cfg) != base, "listed module byte change must move the key"
+        base = stage_key(["in1", "in2"], ["product-v1"], cfg)
+        assert stage_key(["in1", "in2"], ["product-v1"], dict(cfg)) == base, "key not stable on a no-op recompute"
+        assert stage_key(["in1", "in2"], ["product-v1"], {"levels": [1, 3], "cap": 3}) != base, "config-value change must move the key"
+        assert stage_key(["in1", "in9"], ["product-v1"], cfg) != base, "input change must move the key"
+        assert stage_key([None, "in2"], ["product-v1"], cfg) != base, "a vanished input must move the key"
+        assert stage_key(["in1", "in2"], ["product-v2"], cfg) != base, "version bump must move the key"
 
         # the toolchain enters the key
         os.environ["TOOLCHAIN"] = "img:v1"
         toolchain.cache_clear()
-        k1 = stage_key([], ["mod_b"], {})
+        k1 = stage_key([], ["product-v1"], {})
         os.environ["TOOLCHAIN"] = "img:v2"
         toolchain.cache_clear()
-        assert stage_key([], ["mod_b"], {}) != k1, "toolchain must enter the key"
+        assert stage_key([], ["product-v1"], {}) != k1, "toolchain must enter the key"
         os.environ.pop("TOOLCHAIN")
         toolchain.cache_clear()
 
@@ -353,6 +329,28 @@ def _check():
         assert os.path.isfile(cpath) and not os.path.isfile(tmp), "publish moves atomically"
         assert fork_fresh(logical, k), "content file present -> fresh"
         os.remove(cpath)
+
+        # NVMe scratch and the persistent store are separate mounts in production.
+        with open(tmp, "wb") as f:
+            f.write(b"cross-filesystem")
+        real_replace = os.replace
+        replace_calls = 0
+
+        def exdev_once(src, dst):
+            nonlocal replace_calls
+            replace_calls += 1
+            if replace_calls == 1:
+                raise OSError(errno.EXDEV, "cross-device link")
+            return real_replace(src, dst)
+
+        with patch.object(os, "replace", side_effect=exdev_once):
+            publish(tmp, cpath)
+        with open(cpath, "rb") as f:
+            assert f.read() == b"cross-filesystem"
+        assert not os.path.exists(tmp) and not os.path.exists(cpath + ".tmp"), \
+            "cross-filesystem publish must clean both temp files"
+        os.remove(cpath)
+
         write_empty(logical, k)
         assert os.path.isfile(empty_marker(logical, k)) and fork_fresh(logical, k), \
             "an empty marker alone marks the fork fresh (the legitimately-empty fork)"
@@ -371,8 +369,6 @@ def _check():
             "supersede must not touch a different logical stem"
         print("keys.py self-check ok")
     finally:
-        PIPELINES_DIR = saved_dir
-        _module_bytes.cache_clear()
         toolchain.cache_clear()
         if saved_force is not None:
             os.environ["FORCE_REBUILD"] = saved_force

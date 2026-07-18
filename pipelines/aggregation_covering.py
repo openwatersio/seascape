@@ -75,6 +75,30 @@ def get_smallest_overzoom(left, bottom, right, top, width, height, mercator_reso
     raise ValueError(f"no overzoom for {(left, bottom, right, top, width, height)}")
 
 
+def source_maxzooms():
+    """Resolved native/capped maxzoom per registered source, directly from bounds.csv."""
+    resolutions = get_mercator_resolutions(0, 32)
+    result = {}
+    for filepath in sorted(glob("store/source/*/bounds.csv")):
+        source = filepath.split("/")[-2]
+        if not os.path.isfile(f"{config.SOURCES_DIR}/{source}/metadata.json"):
+            continue
+        cap = config.source_property(source, "max_zoom")
+        with open(filepath) as f:
+            f.readline()
+            for line in f:
+                if not line.strip():
+                    continue
+                _filename, left, bottom, right, top, width, height = line.strip().split(",")
+                zoom = get_smallest_overzoom(
+                    *(float(a) for a in (left, bottom, right, top)),
+                    int(width), int(height), resolutions)
+                if cap is not None:
+                    zoom = min(zoom, cap)
+                result[source] = max(result.get(source, 0), zoom, utils.macrotile_z)
+    return result
+
+
 def bbox_3857():
     """The BBOX env (W,S,E,N lon/lat) as 3857 bounds, or None."""
     bbox = os.environ.get("BBOX", "").strip()

@@ -438,12 +438,52 @@ jobs:
           rclone copyto "$STORE/source/${{ matrix.source }}/catalog.json" \
             "r2:$DATA_BUCKET/bathymetry/source/${{ matrix.source }}/catalog.json" --retries 5
 
-  # Destroy the box + deregister the runner, ALWAYS — even if landmask or any matrix source
+  # Coverage is source-derived: rebuild it only when the published source registrations,
+  # footprints, or renderer change. Planet builds consume this completed artifact.
+  coverage:
+    needs: [image, create-runner, sources]
+    runs-on: ${{ needs.create-runner.outputs.label }}
+    timeout-minutes: 120
+    permissions: { contents: read, packages: read }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/ghcr-login
+      - name: Build and publish source coverage
+        run: |
+          set -euo pipefail
+          STORE=/mnt/seascape-store/store
+          mountpoint -q /mnt/seascape-store || { echo "store volume is not mounted" >&2; exit 1; }
+          mkdir -p "$STORE/bundle"
+          inputs=$(
+            { find "$STORE/source" -mindepth 2 -maxdepth 2 \( -name bounds.csv -o -name catalog.json \) -type f -print0
+              find "$STORE/polygon" -maxdepth 1 -name '*.gpkg' -type f -print0
+              printf '%s\0' pipelines/contour_run.py pipelines/aggregation_covering.py pipelines/cache_versions.py; } \
+              | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1
+          )
+          have_v=$(cat "$STORE/bundle/coverage.inputs.sha256" 2>/dev/null || true)
+          have_r=$(rclone cat "r2:$DATA_BUCKET/bathymetry/coverage/inputs.sha256" 2>/dev/null || true)
+          if [ "$have_v" = "$inputs" ] && [ "$have_r" = "$inputs" ] \
+             && [ -s "$STORE/bundle/coverage.pmtiles" ]; then
+            echo "coverage current for source generation $inputs"
+            exit 0
+          fi
+          docker run --rm -v "$PWD:/app" -v "$STORE:/app/pipelines/store" \
+            "$IMAGE:$IMAGE_TAG" just coverage
+          test -s "$STORE/bundle/coverage.pmtiles"
+          rclone copyto "$STORE/bundle/coverage.pmtiles" \
+            "r2:$DATA_BUCKET/bathymetry/coverage/coverage.pmtiles" --retries 5 \
+            --stats 30s --stats-one-line --stats-log-level NOTICE
+          printf '%s' "$inputs" > "$STORE/bundle/coverage.inputs.sha256"
+          printf '%s' "$inputs" | rclone rcat \
+            "r2:$DATA_BUCKET/bathymetry/coverage/inputs.sha256"
+
+  # Destroy the box + deregister the runner, ALWAYS — even if landmask, a matrix source, or
+  # coverage failed (server_id is emitted before the registration wait).
   # failed (server_id is emitted before the registration wait). The persistent store volume is
   # deliberately NEVER deleted; Hetzner auto-detaches it when the server is deleted. Same
   # LOUD-DESTROY discipline as build.yml.
   delete-runner:
-    needs: [create-runner, landmask, sources]
+    needs: [create-runner, landmask, sources, coverage]
     if: always()
     runs-on: ubuntu-latest
     permissions: { contents: read }

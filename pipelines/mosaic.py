@@ -30,7 +30,7 @@ NO smoothing, NO encoding: that is stage-3 display generalization. The mosaic is
 diff between builds, and could publish as an open dataset. The mosaic KEY (mosaic_key) hashes the
 same determinants that produce the merged DEM MINUS smoothing — intersecting sources' recipe
 hashes + covering row + per-source priority/maxzoom/offset/land_clamp/negate/band, the reproject/
-merge/clamp module bytes, resample + covering params, and the toolchain — so a precedence or source
+explicit cache contract, resample + covering params, and the toolchain — so a precedence or source
 change re-keys the tile while a smoothing change does not touch it. Content-addressed exactly like
 the other store artifacts: freshness is "the named COG exists" (keys.fork_fresh).
 
@@ -52,6 +52,7 @@ import mercantile
 import rasterio
 
 import aggregation_reproject
+import cache_versions
 import config
 import keys
 import landmask
@@ -59,12 +60,10 @@ import utils
 
 NODATA = -9999
 
-# Code the mosaic tile depends on: the merge/reproject/clamp modules + this writer. smooth.py and
-# encode.py are DELIBERATELY absent — the mosaic is unsmoothed, unencoded truth, so a smoothing or
-# quantization change must NOT re-key it (that is the whole point of the stage split). landmask
-# stands in for the land + water masks (their recipe-hash marker is hashFiles(landmask.py), same
-# rationale as aggregation_run.MERGE_MODULES).
-MOSAIC_MODULES = ["aggregation_reproject", "aggregation_merge", "landmask", "utils", "mosaic"]
+# Explicit output contracts for the unsmoothed merged COG. Input recipes, resolved merge config,
+# masks, and toolchain enter separately below; unrelated source edits and pointer changes do not.
+MOSAIC_TILE_VERSIONS = [cache_versions.MERGE, cache_versions.LANDMASK,
+                        cache_versions.MOSAIC_TILE]
 
 # The per-source build props that shape the merged surface (priority + maxzoom set merge order;
 # offset is the recorded datum shift; land_clamp/negate/band/mixed_crs change the warped values).
@@ -149,7 +148,7 @@ def _inputs_config(filepath):
 
 def mosaic_key(filepath):
     inputs, cfg = _inputs_config(filepath)
-    return keys.stage_key(inputs, MOSAIC_MODULES, {**cfg, "product": "mosaic"})
+    return keys.stage_key(inputs, MOSAIC_TILE_VERSIONS, {**cfg, "product": "mosaic"})
 
 
 def stale(filepath):
@@ -284,8 +283,9 @@ def _write_index(filepath_out, features):
 
 def _planet_key(tile_keys):
     """The planet z8 COG's content key: a hash of every tile key (so any tile change re-keys the
-    overview) + the mosaic modules + the z8 base resolution + toolchain."""
-    return keys.stage_key(sorted(tile_keys), MOSAIC_MODULES,
+    overview) + its explicit index/overview contracts + z8 base resolution + toolchain."""
+    return keys.stage_key(sorted(tile_keys),
+                          [cache_versions.MOSAIC_INDEX, cache_versions.PLANET_OVERVIEW],
                           {"product": "planet-z8", "macrotile_z": utils.macrotile_z})
 
 
@@ -312,7 +312,7 @@ def _build_planet_z8(index_path, tile_keys):
     return cpath, key
 
 
-def _write_gti(index_path, planet_path):
+def _write_gti(index_path, planet_path, resolution):
     """Write the mosaic.gti pointer LAST: a small XML naming the current index + the z8 overview.
     IndexDataset / Overview are stored RELATIVE to the .gti file so the store prefix is portable
     (rclone carries it as-is); GDAL opens the planet mosaic straight from this file. One atomic
@@ -328,6 +328,8 @@ def _write_gti(index_path, planet_path):
         f"  <IndexDataset>{rel_index}</IndexDataset>\n"
         "  <LocationField>location</LocationField>\n"
         "  <SRS>EPSG:3857</SRS>\n"
+        f"  <ResX>{resolution}</ResX>\n"
+        f"  <ResY>{resolution}</ResY>\n"
         f"  <NoDataValue>{NODATA}</NoDataValue>\n"
         "  <Overview>\n"
         f"    <Dataset>{rel_planet}</Dataset>\n"
@@ -359,9 +361,11 @@ def build_index():
     index_path = f"{index_dir()}/{aid}.parquet"
     _write_index(index_path, features)
     planet_path, _pk = _build_planet_z8(index_path, tile_keys)
-    _write_gti(index_path, planet_path)  # pointer LAST
+    child_z = max(int(_stem(fp).split("-")[3]) for fp in csvs)
+    resolution = aggregation_reproject.get_resolution(child_z)
+    _write_gti(index_path, planet_path, resolution)  # pointer LAST
     print(f"mosaic index: {len(features)} tile(s) -> {index_path}; planet z8 {planet_path}; "
-          f"pointer {gti_path()}")
+          f"pointer {gti_path()} at z{child_z} ({resolution} m)")
 
 
 def _check():
@@ -454,7 +458,7 @@ def _check():
         assert not stale(fp), "a produced tile must read fresh"
 
         # priority change re-keys; a smoothing-style config change does NOT (mosaic is unsmoothed —
-        # smooth.py isn't in MOSAIC_MODULES, and its knobs aren't in the mosaic config)
+        # smoothing knobs are absent from the mosaic config and do not move its explicit version)
         with open("sources/reef/metadata.json", "w") as f:
             json.dump({"name": "reef", "priority": 9, "max_zoom": 10, "datum": "MLLW"}, f)
         config._catalog_cache.clear()
@@ -476,6 +480,7 @@ def _check():
         info, _ = utils.run_command(f"gdalinfo {os.path.abspath(gti)}")
         assert "Driver: GTI/GDAL Raster Tile Index" in info, info[:200]
         assert f"Size is {core}, {core}" in info, info[:400]
+        assert f"Pixel Size = ({res:.15f},-{res:.15f})" in info, info[:500]
         assert "Type=Float32" in info and f"NoData Value={NODATA}" in info, info[:400]
         assert "Overviews:" in info, "the planet z8 COG must register as the mosaic overview"
         # the parquet manifest carries the seascape: columns with the composited provenance

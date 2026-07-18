@@ -32,6 +32,7 @@ from glob import glob
 import mercantile
 
 import contour_run
+import cache_versions
 import keys
 import utils
 
@@ -219,7 +220,7 @@ def bundle():
     # layer's own regional max would truncate it out of deeper joined tiles.
     maxz = contour_run.bundle_maxz(max(int(keys.stem_of(g).split("-")[3]) for g in gj))
     skey = keys.stage_key([os.path.basename(g) for g in gj],  # the key rides in each member's name
-                          ["soundings_run", "contour_run", "utils"], {"maxz": maxz})
+                          [cache_versions.SOUNDINGS_BUNDLE], {"maxz": maxz})
     if keys.is_fresh(out, skey):
         print("soundings bundle: inputs unchanged — skip")
         return
@@ -230,11 +231,16 @@ def bundle():
     for stale in (out, keys.sidecar(out)):
         if os.path.isfile(stale):
             os.remove(stale)
-    subprocess.run(
-        ["tippecanoe", "-o", out, "-f", "-l", "soundings",
-         "-n", "Bathymetric soundings", "-A", utils.ATTRIBUTION, "-Z", "0", "-z", str(maxz),
-         "-P", "-q", "-r1", "-y", "depth_m", "-y", "depth_ft", "-y", "depth_fm",
-         *gj], check=True)
+    tmp_out = utils.vector_scratch("soundings.pmtiles")
+    if os.path.exists(tmp_out):
+        os.remove(tmp_out)
+    with utils.log_group(f"soundings tippecanoe ({len(gj)} inputs, z0-{maxz})"):
+        utils.run_monitored(
+            ["tippecanoe", "-o", tmp_out, "-f", "-l", "soundings",
+             "-n", "Bathymetric soundings", "-A", utils.ATTRIBUTION, "-Z", "0", "-z", str(maxz),
+             "-P", "-q", "-r1", "-y", "depth_m", "-y", "depth_ft", "-y", "depth_fm",
+             *gj], "soundings tippecanoe", tmp_out)
+    keys.publish(tmp_out, out)
     keys.write_key(out, skey)
     print(f"soundings bundle: {out} (z0-{maxz}, {len(gj)} tiles)")
 

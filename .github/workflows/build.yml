@@ -49,6 +49,10 @@ on:
         description: "Hetzner type — ccx63 (48 vCPU/192 GB, dedicated-vCPU quota approved); ccx33 (8/32) for a cheaper smoke. Worker knobs (AGG/TERRAIN/BUNDLE_PROCESSES, GDAL_CACHEMAX) auto-size from the box's RAM."
         required: false
         default: ccx63
+      vector_sample:
+        description: "Benchmark only: sample this many persisted planet vector tiles (0 = normal build)"
+        type: number
+        default: 0
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
@@ -74,6 +78,7 @@ env:
   # shell line — a bbox like `$(cmd)` would otherwise run under command substitution.
   BBOX: ${{ github.event.inputs.bbox }}
   FORCE: ${{ github.event.inputs.force }}
+  VECTOR_SAMPLE: ${{ github.event.inputs.vector_sample || '0' }}
 
 # One store-mutating workflow at a time, globally (not per-ref): the store is shared, so a build
 # must never interleave with another build, a sources.yml refresh (whose prepared-source syncs use
@@ -140,7 +145,7 @@ jobs:
           # 'null' = the action attaches no volume of its own ('' fails its int check). The PERSISTENT
           # store volume is attached by the step below instead — the action's volume support only
           # creates+deletes per-run volumes, which is the opposite of a persistent cache.
-          volume: 'null'
+          volume: "null"
 
       # ── attach the PERSISTENT store volume (planet builds only) ── the build cache (content-
       # addressed store + hydrated sources) lives on a long-lived Hetzner volume, so a fresh box
@@ -218,7 +223,7 @@ jobs:
           #    responses — same pin as sources.yml/release.yml). The runner runs as root, so no
           #    sudo. ──
           apt-get update -qq
-          apt-get install -y -qq unzip
+          apt-get install -y -qq unzip jq
           command -v docker >/dev/null || curl -fsSL https://get.docker.com | sh
           curl -fsSL -o /tmp/rclone.zip "https://downloads.rclone.org/v1.74.4/rclone-v1.74.4-linux-amd64.zip"
           echo "fe435e0c36228e7c2f116a8701f01127bb1f694005fc11d1f27186c8bca4115d  /tmp/rclone.zip" | sha256sum -c
@@ -237,13 +242,13 @@ jobs:
           #    the long-lived volume; mount it and point STORE there. The store survives the box, so
           #    content keys skip everything ANY prior run finished — the hydrate/push-loop/resume
           #    machinery this replaces is deleted below. First boot: blank volume → mkfs (one-time).
-          #    AGGREGATION SCRATCH stays on the box's local NVMe: store/aggregation holds only the
-          #    per-run covering plan + each tile's multi-GB reproject/merge tmp churn — regenerated
-          #    every run, never worth persisting, and its IO (TBs across a planet run) would saturate
-          #    a Ceph-backed volume (~300 MB/s) that shrugs at the durable artifacts' write rate.
-          #    dr() nested-binds it over the volume mount, so the pipeline sees one store path.
+          #    DISPOSABLE SCRATCH stays on the box's local NVMe: aggregation holds the per-run
+          #    covering plan + multi-GB reproject/merge churn; terrain-tmp holds render windows,
+          #    smoothed TIFFs, WebPs, and pre-publish PMTiles. None is worth persisting, and its IO
+          #    would saturate Ceph. dr() nested-binds both over the volume's store mount.
           SCRATCH="$GITHUB_WORKSPACE/pipelines/store-scratch"
-          mkdir -p "$SCRATCH"
+          TERRAIN_SCRATCH="$GITHUB_WORKSPACE/pipelines/terrain-scratch"
+          mkdir -p "$SCRATCH" "$TERRAIN_SCRATCH"
           if [ -z "${BBOX:-}" ]; then
             dev=""
             for _ in $(seq 1 30); do
@@ -255,16 +260,37 @@ jobs:
             blkid "$dev" >/dev/null 2>&1 || { echo "blank volume — one-time mkfs"; mkfs.ext4 -q -L seascape-store "$dev"; }
             mkdir -p /mnt/seascape-store
             mount -o noatime "$dev" /mnt/seascape-store
+            # Hetzner enlarges the block device but not its ext4 filesystem. Online resize is
+            # idempotent: it grows after a console resize and is a no-op on later builds.
+            resize2fs "$dev"
             STORE="/mnt/seascape-store/store"
             mkdir -p "$STORE"
             avail_gb=$(df -BG --output=avail "$STORE" | tail -1 | tr -dc '0-9')
             [ "${avail_gb:-0}" -ge 100 ] || { echo "store volume has only ${avail_gb:-?} GiB free — grow $STORE_VOLUME in the console (resizable live)" >&2; exit 1; }
             scratch_gb=$(df -BG --output=avail "$SCRATCH" | tail -1 | tr -dc '0-9')
-            [ "${scratch_gb:-0}" -ge 300 ] || { echo "root NVMe has only ${scratch_gb:-?} GiB free for aggregation scratch — a planet build churns ~300; use a bigger box" >&2; exit 1; }
+            if [ "${VECTOR_SAMPLE:-0}" -gt 0 ]; then
+              [ "${scratch_gb:-0}" -ge 100 ] || { echo "root NVMe has only ${scratch_gb:-?} GiB free for the vector benchmark; use a bigger box" >&2; exit 1; }
+            else
+              [ "${scratch_gb:-0}" -ge 300 ] || { echo "root NVMe has only ${scratch_gb:-?} GiB free for aggregation scratch — a planet build churns ~300; use a bigger box" >&2; exit 1; }
+            fi
             echo "store on volume $STORE_VOLUME: ${avail_gb} GiB free at $STORE; scratch on NVMe: ${scratch_gb} GiB free"
           else
             STORE="$GITHUB_WORKSPACE/pipelines/store"
             mkdir -p "$STORE"
+          fi
+
+          # Vector-only benchmark: attach the planet cache, sample persisted per-tile artifacts,
+          # and exercise the production bundlers on NVMe without replaying aggregation/terrain.
+          if [ "${VECTOR_SAMPLE:-0}" -gt 0 ]; then
+            [ -z "${BBOX:-}" ] || { echo "vector_sample requires an empty bbox" >&2; exit 1; }
+            BENCH_STORE="$GITHUB_WORKSPACE/pipelines/vector-benchmark-store"
+            rm -rf "$BENCH_STORE"
+            scripts/prepare-vector-benchmark "$STORE" "$BENCH_STORE" "$VECTOR_SAMPLE"
+            docker run --rm -v "$GITHUB_WORKSPACE:/app" -v "$STORE:/planet-store:ro" \
+              -v "$BENCH_STORE:/app/pipelines/store" -e FORCE_REBUILD=1 -e TOOLCHAIN \
+              -e VECTOR_SCRATCH=/app/pipelines/store/vector-tmp "$IMAGE:$IMAGE_TAG" \
+              bash -lc 'just soundings && just contours'
+            exit 0
           fi
 
           # ── swap SAFETY NET (planet builds only; the LOCAL NVMe root disk, never the attached
@@ -294,20 +320,24 @@ jobs:
           #      * AGG/TERRAIN_PROCESSES = CORES — the POOL SIZE (max workers), so cheap tiles (weight
           #        1) fill every core. (Python: unset/0 would also default to cpu_count; set it
           #        explicitly for the log line + clarity.)
-          #      * AGG/TERRAIN_MEM_BUDGET_GB = MEM_GB − RESERVE — a shared GB budget each worker draws
-          #        from (scheduler.reserve) across its tile's memory-peak section, sized to
-          #        weight(tile). This BOUNDS THE CONCURRENT HEAVY-TILE PEAK: the densest coastal
-          #        macrotiles can't all merge at once (the OOM), while cores stay full of light tiles.
-          #    RESERVE (~40) covers OS/docker + page cache for the volume writes during aggregate
-          #    (coverage is sequential — run #6's OOM was the two overlapping; the push loop is gone). The budget is sized to PHYSICAL RAM only — the
+          #      * AGG/TERRAIN_MEM_BUDGET_GB = MEM_GB − RESERVE — a shared GB budget enforced in the
+          #        POOL PARENT (scheduler.map_budgeted): a tile enters the pool only once its
+          #        weight(tile) fits, released on completion. This BOUNDS THE CONCURRENT HEAVY-TILE
+          #        PEAK (the densest coastal macrotiles can't all merge at once — the OOM) without a
+          #        blocked tile ever occupying a worker, so cores stay full of light tiles.
+          #    RESERVE (~24) covers OS/docker + page cache for the volume writes during aggregate
+          #    (coverage is sequential — run #6's OOM was the two overlapping; the push loop is gone).
+          #    24, down from 40: run #8 (29371657768) peaked the WHOLE box at 121/184 GB with zero
+          #    swap — the old 40 never came close to being needed, and each reclaimed GB is budget
+          #    for the heavy lane. The budget is sized to PHYSICAL RAM only — the
           #    64 GB swap above is a safety net for a tile that peaks past its estimate, NOT budget
           #    headroom (swapping the hot merge arrays would thrash). ccx63 (48/192): pool 48, budget
-          #    ~150 GB. ccx33 (8/32): reserve shrinks with RAM so a small box still gets a real budget.
+          #    ~160 GB. ccx33 (8/32): reserve shrinks with RAM so a small box still gets a real budget.
           #    GDAL_CACHEMAX=256 MB (sources are LOCAL now via selective hydrate, so the block cache
           #    matters far less) trims every worker's footprint. ──
           CORES=$(nproc)
           MEM_GB=$(( $(getconf _PHYS_PAGES) * $(getconf PAGE_SIZE) / 1073741824 ))
-          RESERVE=$(( MEM_GB / 4 )); [ "$RESERVE" -gt 40 ] && RESERVE=40
+          RESERVE=$(( MEM_GB / 4 )); [ "$RESERVE" -gt 24 ] && RESERVE=24
           BUDGET=$(( MEM_GB - RESERVE )); [ "$BUDGET" -lt 4 ] && BUDGET=4
           BND=$(( MEM_GB / 8 )); [ "$BND" -gt "$CORES" ] && BND=$CORES; [ "$BND" -lt 1 ] && BND=1
           export AGG_PROCESSES=$CORES
@@ -317,11 +347,20 @@ jobs:
           # Weight factor (scheduler.weight): 4. Run #7 settled this with fresh-worker (ratchet-proof)
           # measurements: dense z14 tiles REALLY peak 12.4+ GB in a single worker — the factor-1
           # experiment misread a light-tile log window as the whole distribution and OOM'd runs #6+#7
-          # in ~30 min (48 workers × real 12 GB heavies admitted at weight 5 → ~245 GB demand).
-          # factor 4 → weight(z14)=18 → ~8 concurrent heavies ≈ 110 GB, proven stable for hours by
-          # run #4; the SHUFFLE keeps the other pool slots busy on weight-1 light tiles between
-          # heavies, so this no longer costs the idle cores it did pre-shuffle.
+          # in ~30 min (~28 heavies admitted — budget 144 / weight 5 — × real ~12 GB ≈ 340 GB demand).
+          # factor 4 → weight(z14)=18 → ~8-9 concurrent heavies ≈ 110 GB, proven stable for hours
+          # by run #4. Dispatch is heaviest-admissible-first in the pool parent (map_budgeted), so
+          # the z14 backlog (the critical path) drains from t=0; light tiles stay dispatchable via
+          # the CHEAP LANE (heavies must leave 16 GB of budget unclaimed — run #8 showed 8×18 = the
+          # exact budget, starving even 1 GB tiles for 6 h at cpu 17/48).
+          # Forks inside a tile now run concurrently — re-fit this factor from the first
+          # parallel-fork run's log_peak data (serial-run peaks no longer price it).
           export AGG_MEM_FACTOR=4
+          # Temporary completion mode: run 29437160867 exposed unbounded DEPARE/GEOS work in a
+          # small pathological tail. Keep the raster, contours, and soundings product shippable;
+          # the workflow removes any stale DEPARE bundle before the final vector join.
+          # Remove this one export to restore DEPARE after its geometry path is bounded.
+          export SKIP_DEPARE=1
           export BUNDLE_PROCESSES=$BND
           export GDAL_CACHEMAX=256
           # The toolchain identity for the content-hash keys (pipelines/keys.py): the deps-keyed
@@ -360,20 +399,33 @@ jobs:
 
           # docker run wrapper: repo code at /app, the store bind-mounted, BBOX/FORCE/TOOLCHAIN
           # forwarded (+ BUNDLE_PROCESSES — only bundle.py reads it; harmless elsewhere).
-          # store/aggregation is NESTED-bound to NVMe scratch over the volume mount (see the store
-          # block above): the pipeline sees one store path, the volume never sees the tmp churn.
+          # Disposable aggregation and terrain intermediates are nested-bound to local NVMe over
+          # the volume mount: the pipeline sees one store path, while Ceph avoids the tmp churn.
           dr() { docker run --rm -v "$GITHUB_WORKSPACE:/app" -v "$STORE:/app/pipelines/store" \
             -v "$SCRATCH:/app/pipelines/store/aggregation" \
+            -v "$TERRAIN_SCRATCH:/app/pipelines/store/terrain-tmp" \
             -e BBOX -e FORCE_REBUILD -e TOOLCHAIN -e BUNDLE_PROCESSES \
-            -e TERRAIN_PROCESSES -e TERRAIN_MEM_BUDGET_GB -e AGG_MEM_FACTOR \
+            -e TERRAIN_PROCESSES -e TERRAIN_MEM_BUDGET_GB -e AGG_MEM_FACTOR -e SKIP_DEPARE \
             -e GDAL_CACHEMAX "$IMAGE:$IMAGE_TAG" just "$@"; }
+
+          # The planet-z8 COG is larger than classic TIFF's 4 GiB ceiling. Inject BIGTIFF only for
+          # mosaic-index rather than editing mosaic.py: that module's bytes are part of every
+          # persisted mosaic tile key, so changing it during recovery would dirty the whole planet.
+          dr_mosaic_index() { docker run --rm -v "$GITHUB_WORKSPACE:/app" \
+            -v "$STORE:/app/pipelines/store" \
+            -v "$SCRATCH:/app/pipelines/store/aggregation" \
+            -v "$GITHUB_WORKSPACE/.github/scripts/gdalwarp-bigtiff:/usr/local/bin/gdalwarp:ro" \
+            -v "$TERRAIN_SCRATCH:/app/pipelines/store/terrain-tmp" \
+            -e BBOX -e FORCE_REBUILD -e TOOLCHAIN -e GDAL_CACHEMAX \
+            "$IMAGE:$IMAGE_TAG" just mosaic-index; }
 
           R2="R2:$DATA_BUCKET/bathymetry"
           # --retries 5: R2 occasionally returns a transient 500 InternalError; ride it out
           # instead of failing the stage (same convention as sources.yml's mirror). Applied to
           # EVERY transfer, the single-file copyto publishes included — a flake on manifest.json
           # would break the completeness contract.
-          XFER=(--transfers 32 --checkers 64 --fast-list --retries 5 --stats 30s --stats-one-line)
+          XFER=(--transfers 32 --checkers 64 --fast-list --retries 5 --stats 30s --stats-one-line
+                --stats-log-level NOTICE)
           hydrate()    { rclone copy "$R2/$1" "$STORE/$2" "${XFER[@]}" "${@:3}"; }
           # Content-addressed store: an unchanged key is skipped and a push is delta-sized. ONE
           # pass, no ordering to get right — the per-tile artifacts self-mark (the key is IN the
@@ -382,16 +434,19 @@ jobs:
           # re-key leaves last build's object as garbage, never clobbers a concurrent write.
           push() { rclone copy "$STORE/$1" "$R2/$2" "${XFER[@]}" "${@:3}"; }
           push_build() { rclone copyto "$STORE/bundle/$1" "$R2/build/$SHA/$1" "${XFER[@]}"; }
+          group() { echo "::group::$*"; }
+          end_group() { echo "::endgroup::"; }
 
-          # ── NO STORE HYDRATE, NO SOURCE HYDRATE (planet). The store IS the volume — whatever any
+          # ── NO STORE HYDRATE, NO R2 SOURCE HYDRATE (planet). The store IS the volume — whatever any
           #    prior run finished (completed or interrupted) is already at $STORE, and the
           #    content-addressed names are self-certifying (key in the filename; local writes are
           #    atomic), so freshness checks skip it directly. Sources, masks, and footprints are
           #    ALSO on the volume — sources.yml runs on a box with this same volume attached and
-          #    writes them there — so a planet build reads NOTHING from R2/data.openwaters.io. The
-          #    old manifest hydrate, the selective dirty-set source hydrate, and the resume problem
-          #    are all deleted, not ported. A bbox build keeps the NVMe scratch store, hydrates
-          #    bounds/catalog/footprints from the R2 mirror, and streams source bytes. ──
+          #    writes them there — so a planet build reads NOTHING from R2/data.openwaters.io. Before
+          #    aggregate, the dirty tiles' deduplicated source set is copied once from the volume to
+          #    local NVMe; GDAL then reads NVMe instead of making 48 workers contend on Ceph. A bbox
+          #    build keeps the NVMe scratch store, hydrates bounds/catalog/footprints from the R2
+          #    mirror, and streams source bytes. ──
 
           # ── ONE-TIME SEED from R2 (first boot of a blank volume only, marker-gated) ── the old
           #    push loops left thousands of finished tiles' artifacts AND the full prepared-source
@@ -402,26 +457,29 @@ jobs:
           #    line rate, and every later boot skips it entirely. It also copies superseded-key
           #    garbage (~one GC generation's worth) — harmless cache bloat a volume cleanup can drop.
           if [ -z "${BBOX:-}" ] && [ ! -e "$STORE/.seeded-from-r2" ]; then
-            echo "── one-time seed: prior runs' aggregate output + the source mirror from R2 ──"
+            group "one-time seed: prior aggregate output + source mirror"
             for p in mosaic/tiles contour soundings depare source polygon landmask; do hydrate "$p" "$p"; done
             touch "$STORE/.seeded-from-r2"
+            end_group
           fi
           if [ -n "${BBOX:-}" ]; then
             hydrate source source --include '*/bounds.csv' --include '*/catalog.json'
             hydrate polygon polygon
           fi
 
-          # ── aggregate env. Planet builds read sources + masks from LOCAL disk (the volume,
-          #    populated by sources.yml + the one-time seed): two real runs streaming per tile
+          # ── aggregate env. Planet builds read masks from the volume and source COGs from
+          #    local NVMe (staged after cover from the volume's sources.yml-owned mirror): two real
+          #    runs streaming per tile
           #    banked ZERO tiles in 2.5-3.9 healthy hours — a coastal macrotile re-reads the
-          #    same S-102/CUDEM bytes over /vsicurl for every tile, >2.5 h each. With no
-          #    SOURCE_VSI_BASE / LANDMASK / WATERMASK set, config.source_path and the landmask
-          #    defaults resolve store/source/<id>/<file> and store/landmask/{land,water}.fgb —
-          #    the volume's local copies (the preview-local read path). A legacy bounds row
-          #    whose filename is already an absolute /vsi path passes through source_path
-          #    untouched and still streams — acceptable fallback. bbox builds are
+          #    same S-102/CUDEM bytes over /vsicurl for every tile, >2.5 h each. Planet aggregate
+          #    sets SOURCE_VSI_BASE=/local-source after staging; masks keep their default volume
+          #    paths at store/landmask/{land,water}.fgb. A legacy bounds row whose filename is
+          #    already an absolute /vsi path passes through source_path untouched and still streams
+          #    — acceptable fallback. bbox builds are
           #    self-contained (no volume) and keep streaming everything, as before. ──
-          AGG_ENV=(-e AGG_PROCESSES -e AGG_MEM_BUDGET_GB -e AGG_MEM_FACTOR -e GDAL_CACHEMAX)
+          AGG_ENV=(-e AGG_PROCESSES -e AGG_MEM_BUDGET_GB -e AGG_MEM_FACTOR -e GDAL_CACHEMAX
+                   -e SKIP_DEPARE)
+          AGG_MOUNTS=()
           if [ -n "${BBOX:-}" ]; then
             # Flagged coarse sources (GEBCO/EMODnet) clamp land + subtract inland water over
             # /vsicurl. WATERMASK only when it exists in R2 (landmask._present assumes any
@@ -438,11 +496,13 @@ jobs:
           # legacy absolute-path rows): 5 MB range reads (S-102's HDF5 driver is the chattiest
           # reader — big chunks amortize its many small requests), a real per-process curl
           # cache and small per-open-dataset VSI cache (both budgeted in the RAM math above),
-          # HTTP/2 multiplexing (R2 speaks it), and a 512 KB first read at open instead of
-          # 16 KB (many opens per tile). Inert for local reads, so set unconditionally.
+          # HTTP/1.1 for reliable Cloudflare range reads, and a 512 KB first read at open instead
+          # of 16 KB (many opens per tile). Run 29576789428 repeatedly got a zero-byte TIFF tile
+          # near the end of the same CUDEM read under forced HTTP/2 multiplexing; the exact range
+          # succeeds over HTTP/1.1. Inert for local reads, so set unconditionally.
           AGG_ENV+=(-e CPL_VSIL_CURL_CHUNK_SIZE=5242880
                     -e CPL_VSIL_CURL_CACHE_SIZE=268435456
-                    -e GDAL_HTTP_MULTIPLEX=YES -e GDAL_HTTP_VERSION=2
+                    -e GDAL_HTTP_MULTIPLEX=NO -e GDAL_HTTP_VERSION=1.1
                     -e VSI_CACHE=TRUE -e VSI_CACHE_SIZE=33554432
                     -e GDAL_INGESTED_BYTES_AT_OPEN=524288)
           # A dead multiplexed connection must error-and-retry, never hang: the tuned run's
@@ -456,52 +516,88 @@ jobs:
 
           # ── BUILD, stage by stage, pushing after each so an interruption loses at most one
           #    stage. The stage order matches `just planet`; the box just interleaves pushes. ──
-          echo "── cover ──"
+          group "cover"
           dr cover                        # writes the covering (the tiling plan; keys drive dirtiness)
+          dr key-diagnostics              # expected/stored keys + determinants for resume failures
+          end_group
 
-          # ── sources are ALREADY LOCAL (planet) ── sources.yml writes every prepared source,
-          #    mask, and footprint straight onto this volume (the one-time seed above covers the
-          #    pre-volume backlog), so the old selective dirty-set hydrate (sources-manifest +
-          #    files-from pull) is deleted — there is nothing to pull. Fail fast if the masks are
-          #    missing (flagged coarse sources exist planet-wide; a mask-less run would clamp
-          #    nothing) rather than per-tile deep in the pool.
+          # ── stage dirty source COGs onto local NVMe (planet) ── the persistent volume is
+          #    the durable source cache, not the hot read path: 48 parallel GDAL workers otherwise
+          #    contend on its Ceph bandwidth and leave the expensive box idle. Reuse the pipeline's
+          #    exact dirty-tile derivation to copy each referenced source file ONCE to NVMe, then
+          #    point source_path there. Catalogs/bounds stay visible on the volume; SOURCE_VSI_BASE
+          #    changes only raster filenames. Absolute /vsi legacy rows keep streaming untouched.
           if [ -z "${BBOX:-}" ]; then
             [ -f "$STORE/landmask/land.fgb" ] || { echo "no land.fgb on the volume — run sources.yml (landmask job) first" >&2; exit 1; }
+            group "stage dirty-set sources to NVMe"
+            dr sources-manifest
+            grep -v -e '://' -e '/vsi' "$STORE/source-manifest.txt" > /tmp/source-files.txt || true
+            legacy=$(grep -c -e '://' -e '/vsi' "$STORE/source-manifest.txt" || true)
+            [ "${legacy:-0}" -eq 0 ] || echo "$legacy legacy absolute-path row(s) keep streaming"
+            # NOT under $SCRATCH — that dir is bind-mounted at store/aggregation, and
+            # utils.get_aggregation_ids() globs store/aggregation/* and takes the lexically-last as
+            # the current covering. A "source" subdir there sorts AFTER the ULID covering, so
+            # aggregate read an EMPTY covering and did "nothing to do" while 1245 tiles were dirty
+            # (run 29431716434). A sibling NVMe dir, mounted only at /local-source, stays invisible
+            # to that glob.
+            LOCAL_SOURCE="$GITHUB_WORKSPACE/pipelines/local-source"
+            rm -rf "$LOCAL_SOURCE"; mkdir -p "$LOCAL_SOURCE"
+            source_bytes=$(rclone size "$STORE/source" --files-from /tmp/source-files.txt --json | jq -r .bytes)
+            avail_bytes=$(df -B1 --output=avail "$SCRATCH" | tail -1 | tr -dc '0-9')
+            reserve_bytes=$(( 300 * 1024 * 1024 * 1024 ))
+            [ "$avail_bytes" -ge $(( source_bytes + reserve_bytes )) ] || {
+              echo "NVMe needs $(( source_bytes / 1073741824 )) GiB for dirty sources plus 300 GiB aggregation scratch; only $(( avail_bytes / 1073741824 )) GiB free" >&2
+              exit 1
+            }
+            echo "staging $(wc -l < /tmp/source-files.txt) source file(s), $(( source_bytes / 1073741824 )) GiB, from volume to NVMe"
+            rclone copy "$STORE/source" "$LOCAL_SOURCE" --files-from /tmp/source-files.txt "${XFER[@]}"
+            AGG_MOUNTS=(-v "$LOCAL_SOURCE:/local-source:ro")
+            AGG_ENV+=(-e SOURCE_VSI_BASE=/local-source)
+            end_group
           fi
 
-          echo "── aggregate ──"
+          # Coverage belongs to sources.yml: its only inputs are source registrations + footprints.
+          # Planet builds consume the completed volume artifact. Regional builds have no volume and
+          # retain bbox-scoped coverage for faithful local/CI previews.
+          if [ -n "${BBOX:-}" ]; then
+            group "regional coverage"
+            dr coverage
+            end_group
+          else
+            test -s "$STORE/bundle/coverage.pmtiles" || {
+              echo "coverage.pmtiles is missing — run sources.yml first" >&2; exit 1; }
+          fi
+          push_build coverage.pmtiles
+
+          group "aggregate"
           # Aggregate produces the stage-2 MOSAIC tiles + the vector forks (NOT terrain pmtiles —
           # those are stage 3's per-zoom render) straight onto the persistent volume, so every
           # finished tile is durable the moment it lands. The old 20-min push_agg loop (mid-build
           # R2 durability, torn-copy caveats and all) is deleted — its entire job is now a property
           # of the storage. R2 sees mosaic tiles only at the mosaic-publish step below.
+          agg_rc=0
           docker run --rm -v "$GITHUB_WORKSPACE:/app" -v "$STORE:/app/pipelines/store" \
             -v "$SCRATCH:/app/pipelines/store/aggregation" \
-            -e BBOX -e FORCE_REBUILD -e TOOLCHAIN "${AGG_ENV[@]}" "$IMAGE:$IMAGE_TAG" just aggregate
-
-          # ── coverage ── SEQUENTIAL, after aggregate: run #6 proved the two can't share the box —
-          # full-speed aggregate (~110 GB across 48 workers) + the planet tippecanoe (~130 GB,
-          # --no-tile-size-limit over every footprint) oversubscribed 184 GB RAM + 64 GB swap and the
-          # kernel OOM-killed both. The overlap only ever paid when the old weight factor throttled
-          # aggregate into leaving coverage headroom. Each stage now gets the whole box; under set -e
-          # a coverage failure still fails the build before manifest.json.
-          echo "── coverage ──"
-          dr coverage
-          push_build coverage.pmtiles
+            "${AGG_MOUNTS[@]}" -e BBOX -e FORCE_REBUILD -e TOOLCHAIN \
+            "${AGG_ENV[@]}" "$IMAGE:$IMAGE_TAG" just aggregate || agg_rc=$?
+          [ "$agg_rc" -eq 0 ] || exit "$agg_rc"
+          end_group
 
           # ── mosaic index (LOCAL, for the on-box terrain render) ── build the GTI + planet z8 +
           #    index parquet from the mosaic tiles the aggregate persisted; terrain (stage 3) reads
           #    the GTI, so this MUST run before it. NO MOSAIC_VSI_BASE here: the index records LOCAL
           #    absolute tile paths so terrain reads the mosaic off local disk. The PUBLISHED index
           #    (with /vsicurl tile URLs) is rebuilt at the mosaic-publish step below (after terrain).
-          echo "── mosaic index (local) ──"
-          dr mosaic-index
+          group "mosaic index (local)"
+          dr_mosaic_index
+          end_group
 
           # ── terrain (stage 3) ── the per-zoom Terrarium render from the mosaic (native + coalesced
           #    overviews), replacing the old 2x2-average downsample pyramid. TERRAIN_PROCESSES caps
           #    concurrent render windows (each multi-GB). Reads mosaic.gti by local path.
-          echo "── terrain (per-zoom render from the mosaic) ──"
+          group "terrain (per-zoom render from the mosaic)"
           dr terrain
+          end_group
           if [ -z "${BBOX:-}" ]; then
             # No terrain-pmtiles or store push: those prefixes were R2-store STATE for the deleted
             # hydrate, and the store now persists on the volume. The store manifest + pointer flip
@@ -516,9 +612,10 @@ jobs:
             #    above used local paths, invalid off-box). planet-z8 is content-addressed → reused,
             #    no re-decimation. Push everything the .gti references (tiles + planet-z8 <Overview>
             #    + index) BEFORE flipping the mosaic.gti pointer — pointer-last atomic publish.
-            echo "── mosaic publish (/vsicurl index) ──"
+            group "mosaic publish (/vsicurl index)"
             docker run --rm -v "$GITHUB_WORKSPACE:/app" -v "$STORE:/app/pipelines/store" \
               -v "$SCRATCH:/app/pipelines/store/aggregation" \
+              -v "$GITHUB_WORKSPACE/.github/scripts/gdalwarp-bigtiff:/usr/local/bin/gdalwarp:ro" \
               -e TOOLCHAIN -e MOSAIC_VSI_BASE="/vsicurl/$PUBLIC_BASE/mosaic/tiles" \
               "$IMAGE:$IMAGE_TAG" just mosaic-index
             push mosaic/tiles mosaic/tiles                 # immutable tile COGs (delta-sized: unchanged keys skip)
@@ -526,21 +623,33 @@ jobs:
             push mosaic/index mosaic/index                 # the /vsicurl GeoParquet index
             rclone copyto "$STORE/mosaic/mosaic.gti" "$R2/mosaic/mosaic.gti" "${XFER[@]}"  # pointer LAST
             echo "mosaic published: tiles + planet-z8 + index pushed, mosaic.gti pointer flipped"
+            end_group
           fi
 
-          echo "── bundle (terrain) ──"
+          group "bundle (terrain)"
           dr bundle
           rclone copy "$STORE/bundle" "$R2/build/$SHA" "${XFER[@]}" --include 'planet.pmtiles' --include 'overlay-*.pmtiles'
+          end_group
 
-          echo "── vector layers ──"
+          group "vector layers"
           # Completeness is SELF-ENFORCED here, not step order: each bundler verifies every
           # covering tile left an artifact or .empty marker (contour_run.verify_vector_complete)
           # before bundling — the same invariant the store manifest hard-failed on above, so
           # reordering these steps past the manifest can't silently bundle a holed layer.
-          dr soundings                    # soundings + depare bundle BEFORE contours: the single
-          dr depare                       # tile-join folds them into vector.pmtiles
+          dr soundings                    # bundled before contours' single tile-join
+          if [ -z "${SKIP_DEPARE:-}" ]; then
+            dr depare
+          else
+            echo "DEPARE disabled for this build"
+            # Derived bundles only: per-tile DEPARE artifacts stay cached for later diagnosis.
+            # Removing vector.pmtiles forces contour_run to rejoin contours + soundings without
+            # accidentally reusing a previously keyed vector archive that already contains DEPARE.
+            rm -f "$STORE/bundle/depare.pmtiles" "$STORE/bundle/depare.pmtiles.key" \
+                  "$STORE/bundle/vector.pmtiles" "$STORE/bundle/vector.pmtiles.key"
+          fi
           dr contours
           push_build vector.pmtiles
+          end_group
 
           # ── No prune here. Deletion is OUT-OF-BAND: gc.yml (weekly + dispatch, sharing the
           #    r2-store concurrency group so it never runs during a build) is the ONLY deletion
@@ -554,7 +663,34 @@ jobs:
           #    without one). Everything it references (planet + overlays + vector + coverage) is
           #    already up. ──
           push_build manifest.json
-          echo "── build complete → $R2/build/$SHA ──"
+          echo "::notice::build complete → $R2/build/$SHA"
+
+  # Capture provider-side CPU, disk, and network series while the ephemeral server still exists.
+  # The guest-level [res] sampler remains the source for memory, swap, load, and process RSS.
+  # Collection is best-effort: teardown waits for this job, but runs regardless of its result.
+  collect-metrics:
+    needs: [create-runner, build]
+    if: ${{ always() && needs.create-runner.outputs.server_id != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Fetch Hetzner host metrics
+        continue-on-error: true
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+          SERVER_ID: ${{ needs.create-runner.outputs.server_id }}
+        run: scripts/collect-hcloud-metrics "$SERVER_ID"
+
+      - name: Upload Hetzner host metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hcloud-metrics-${{ github.run_id }}-${{ needs.create-runner.outputs.server_id }}
+          path: hcloud-metrics/
+          if-no-files-found: warn
+          retention-days: 90
 
   # Destroy the box + deregister the runner, ALWAYS — on build success, build failure, OR a
   # create-runner failure (server_id is emitted before the registration wait, so it is present even
@@ -564,7 +700,7 @@ jobs:
   # resource and fails the step (a stray per-run volume named after the server is flagged too;
   # $STORE_VOLUME never matches that name).
   delete-runner:
-    needs: [create-runner, build]
+    needs: [create-runner, build, collect-metrics]
     if: always()
     runs-on: ubuntu-latest
     permissions: { contents: read }
@@ -611,7 +747,7 @@ jobs:
   # build is a window slice and never claims planet validity, so it never releases.
   release:
     needs: build
-    if: ${{ github.ref == 'refs/heads/main' && github.event.inputs.bbox == '' && needs.build.result == 'success' }}
+    if: ${{ github.ref == 'refs/heads/main' && github.event.inputs.bbox == '' && github.event.inputs.vector_sample == '0' && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
     permissions: { actions: write }
     steps:

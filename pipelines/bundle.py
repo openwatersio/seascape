@@ -35,6 +35,7 @@ from pmtiles.reader import Reader, MmapSource, all_tiles
 from pmtiles.writer import Writer
 
 import config
+import cache_versions
 import keys
 import utils
 
@@ -227,9 +228,6 @@ def _bundle_one(item):
 # that leaves every member's key untouched — a contour-config edit re-merging tiles but not
 # rewriting their pmtiles — leaves this key unchanged and the whole bundle skips. config.sources()
 # rides in because it becomes the manifest's source_ids.
-BUNDLE_MODULES = ["bundle", "utils"]
-
-
 def _bundle_key(groups):
     inputs = []
     for name in sorted(groups):
@@ -240,7 +238,7 @@ def _bundle_key(groups):
     inputs += [f"source:{s}" for s in config.sources()]
     cfg = {"planet_max_zoom": PLANET_MAX_ZOOM, "split_z": SPLIT_Z,
            "macrotile_z": utils.macrotile_z, "num_overviews": utils.num_overviews}
-    return keys.stage_key(inputs, BUNDLE_MODULES, cfg)
+    return keys.stage_key(inputs, [cache_versions.TERRAIN_BUNDLE], cfg)
 
 
 def main():

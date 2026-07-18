@@ -87,15 +87,21 @@ def _crs_epsg(source, mixed_crs):
 
 
 def _datum(source):
-    """The applied value transform — from the datum sidecar source_datum records if present,
-    else the metadata negate flag (a mirrored source negates at reproject, no sidecar) with a
-    zero offset. Returns (negate, offset_m, clamp_positive). Enforces the invariant that a
-    recipe running source_datum must leave a sidecar behind."""
+    """The datum facts downstream reads: (negate, offset_m, clamp_positive).
+
+    ``negate`` is the one field with a machine consumer — aggregation_reproject flips band 1
+    when it's true — so it must mean "negate at aggregation", which only a mirrored/streamed
+    source (no sidecar; negates nothing at prep) ever needs. A sidecar means source_datum
+    already baked the transform into the prepared COGs, so negate is False regardless of what
+    was applied — publishing the applied flag here made aggregation flip prepared depths back
+    to positive (the african_great_lakes/ddm double-negation). ``offset_m``/``clamp_positive``
+    stay the applied-at-prep record (provenance + tile keying; nothing re-applies them).
+    Enforces the invariant that a recipe running source_datum must leave a sidecar behind."""
     sidecar = f"store/source/{source}/datum.json"
     if os.path.isfile(sidecar):
         with open(sidecar) as f:
             d = json.load(f)
-        return bool(d.get("negate", False)), float(d.get("offset_m", 0.0)), bool(d.get("clamp_positive", False))
+        return False, float(d.get("offset_m", 0.0)), bool(d.get("clamp_positive", False))
     justfile = f"{config.SOURCES_DIR}/{source}/Justfile"
     if os.path.isfile(justfile):
         with open(justfile) as f:
@@ -142,7 +148,7 @@ def build_item(source, recipe_hash=None):
             "seascape:band": meta.get("band"),
             "seascape:vertical_datum": meta.get("datum"),
             "seascape:datum_offset_m": offset_m,
-            "seascape:negate": negate,
+            "seascape:negate": negate,  # negate at aggregation — false once baked at prep
             "seascape:clamp_positive": clamp_positive,
             "seascape:file_count": file_count,
             "seascape:recipe_hash": recipe_hash or None,
@@ -200,7 +206,10 @@ def _check():
         item = build_item(sid, recipe_hash="abc123")
         p = item["properties"]
         assert item["id"] == sid and item["type"] == "Feature", item
-        assert p["seascape:datum_offset_m"] == -1.0 and p["seascape:negate"] is True, p
+        # A sidecar means the transform is baked into the COGs: the offset is recorded as
+        # provenance, but negate must publish False — aggregation would otherwise flip the
+        # already-negated values back to positive depth (the double-negation regression).
+        assert p["seascape:datum_offset_m"] == -1.0 and p["seascape:negate"] is False, p
         assert p["seascape:clamp_positive"] is False, p
         assert p["seascape:land_clamp"] is True and p["seascape:max_zoom"] == 12, p
         assert p["seascape:vertical_datum"] == "MSL (approx)", p

@@ -27,6 +27,8 @@ from glob import glob
 
 import mercantile
 
+import aggregation_covering
+import cache_versions
 import config
 import keys
 import utils
@@ -228,18 +230,19 @@ PER_ZOOM_FILTER = _per_zoom_filter()
 
 
 def _tippecanoe(fgbs, minz, maxz, out):
-    subprocess.run(
-        ["tippecanoe", "-o", out, "-f", "-l", "contours",
-         "-n", "Bathymetric contours", "-A", utils.ATTRIBUTION,
-         "-Z", str(minz), "-z", str(maxz), "-P", "-q", "--drop-densest-as-needed",
-         # Aggressive low-zoom vertex thinning (tolerance scales with zoom distance from
-         # maxz, so maxz detail is untouched). Env-tunable to dial on a re-bundle.
-         "--simplification", os.environ.get("CONTOUR_SIMPLIFICATION", "8"),
-         "-y", "depth_m", "-y", "depth_abs_m", "-y", "sys", "-y", "depth_ft", "-y", "depth_fm",
-         # FlatGeobuf Integer64 attributes otherwise land in the MVT as strings.
-         "-T", "depth_abs_m:int", "-T", "depth_ft:int", "-T", "depth_fm:int",
-         "-j", PER_ZOOM_FILTER, *fgbs],
-        check=True)
+    with utils.log_group(f"contour tippecanoe ({len(fgbs)} inputs, z{minz}-{maxz})"):
+        utils.run_monitored(
+            ["tippecanoe", "-o", out, "-f", "-l", "contours",
+             "-n", "Bathymetric contours", "-A", utils.ATTRIBUTION,
+             "-Z", str(minz), "-z", str(maxz), "-P", "-q", "--drop-densest-as-needed",
+             # Aggressive low-zoom vertex thinning (tolerance scales with zoom distance from
+             # maxz, so maxz detail is untouched). Env-tunable to dial on a re-bundle.
+             "--simplification", os.environ.get("CONTOUR_SIMPLIFICATION", "8"),
+             "-y", "depth_m", "-y", "depth_abs_m", "-y", "sys", "-y", "depth_ft", "-y", "depth_fm",
+             # FlatGeobuf Integer64 attributes otherwise land in the MVT as strings.
+             "-T", "depth_abs_m:int", "-T", "depth_ft:int", "-T", "depth_fm:int",
+             "-j", PER_ZOOM_FILTER, *fgbs],
+            "contour tippecanoe", out)
 
 
 def _global_maxz(fgbs):
@@ -285,20 +288,8 @@ COVERAGE_MAX_ZOOM = int(os.environ.get("COVERAGE_MAX_ZOOM", "8"))
 
 
 def _source_maxzooms():
-    """{source: native maxzoom} from the newest covering's aggregation CSVs — the pipeline's
-    authoritative per-source zoom (resolution-derived, capped/floored). Empty when no covering
-    is local (a CI contour job). Note: metadata.json's max_zoom is only an optional *cap*, so
-    most regional sources don't carry it — read the real zoom from the covering instead."""
-    ids = utils.get_aggregation_ids()
-    if not ids:
-        return {}
-    mz = {}
-    for csv in glob(f"store/aggregation/{ids[-1]}/*-aggregation.csv"):
-        with open(csv) as f:
-            for line in f.readlines()[1:]:
-                s, _fn, z = line.strip().split(",")
-                mz[s] = max(mz.get(s, 0), int(z))
-    return mz
+    """{source: resolved native/capped maxzoom}, independent of a planet covering."""
+    return aggregation_covering.source_maxzooms()
 
 
 def _coverage_geojson():
@@ -359,7 +350,7 @@ def coverage_bundle():
     print(f"coverage bundle: {out} (z0-{COVERAGE_MAX_ZOOM})")
 
 
-def _finalize_contours(archives):
+def _finalize_contours(archives, out):
     """tile-join the contour lines pmtiles + the soundings/depare pmtiles (bundled first)
     into store/bundle/vector.pmtiles. ONE join: tile-join rewrites every tile of the whole
     archive, so folding each sparse layer in afterwards re-paid the planet-wide join
@@ -370,8 +361,10 @@ def _finalize_contours(archives):
     layers = [p for p in ["store/bundle/soundings.pmtiles",
                           "store/bundle/depare.pmtiles"]
               if os.path.isfile(p)]
-    subprocess.run(["tile-join", "-o", "store/bundle/vector.pmtiles", "-f", "-pk",
-                    *archives, *layers], check=True)
+    with utils.log_group(f"vector tile-join ({len(archives) + len(layers)} archives)"):
+        utils.run_monitored(["tile-join", "-o", out, "-f", "-pk",
+                             *archives, *layers], "vector tile-join",
+                            out)
 
 
 def _current_stems():
@@ -424,9 +417,6 @@ def verify_vector_complete(layer, paths):
 # layers' modules (the tippecanoe filter + flags live in them) + the env-tunable simplifications.
 # A per-tile fork whose key changed (a contour-levels edit) moves this key; an unchanged set skips
 # the whole tippecanoe + planet-wide tile-join.
-VECTOR_MODULES = ["contour_run", "soundings_run", "depare_run", "utils"]
-
-
 def _vector_key(maxz):
     stems = _current_stems()
     inputs = []
@@ -445,7 +435,7 @@ def _vector_key(maxz):
     cfg = {"maxz": maxz,
            "contour_simplification": os.environ.get("CONTOUR_SIMPLIFICATION", "8"),
            "depare_simplification": os.environ.get("DEPARE_SIMPLIFICATION", "8")}
-    return keys.stage_key(inputs, VECTOR_MODULES, cfg)
+    return keys.stage_key(inputs, [cache_versions.VECTOR_BUNDLE], cfg)
 
 
 def bundle():
@@ -479,10 +469,15 @@ def bundle():
     for stale in (vec, keys.sidecar(vec)):
         if os.path.isfile(stale):
             os.remove(stale)
-    lines = "store/contour/contours-lines.pmtiles"
+    lines = utils.vector_scratch("contours-lines.pmtiles")
+    vector_tmp = utils.vector_scratch("vector.pmtiles")
+    for path in (lines, vector_tmp):
+        if os.path.exists(path):
+            os.remove(path)
     _tippecanoe(fgbs, 0, maxz, lines)
-    _finalize_contours([lines])
+    _finalize_contours([lines], vector_tmp)
     os.remove(lines)
+    keys.publish(vector_tmp, vec)
     keys.write_key(vec, vkey)
     print(f"contour bundle: {vec} (z0-{maxz}, {len(fgbs)} FGBs)")
 
