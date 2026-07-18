@@ -64,8 +64,17 @@ rule prep_source:
         "{PY}/source_prep.py {wildcards.source} && {PY}/source_bounds.py {wildcards.source}"
 
 
+# The weekly forced source refresh — run as its OWN invocation before catalogs/publish:
+# a forced producer schedules all dependents at plan time, but across an invocation
+# boundary the engine's checksums cure unchanged registrations, so the main invocation
+# cascades only on real upstream drift.
+rule refresh:
+    input:
+        expand("store/source/{source}/bounds.csv", source=MIRRORED),
+
+
 # Volatile mirrored collections register objects/<key> rows off the public bucket.
-# Re-listing on cadence is the caller's job: the weekly workflow passes -R mirror_source.
+# Re-listing on cadence: the weekly workflow runs `refresh -R mirror_source` separately.
 rule mirror_source:
     input:
         str(SOURCES_DIR / "{source}/file_list.txt"),

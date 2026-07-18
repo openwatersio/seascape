@@ -184,8 +184,21 @@ jobs:
             extra+=("source=$INPUT_SOURCE")
           fi
           if [ "$INPUT_FORCE" = "true" ]; then extra+=(-F); fi
+          # Two invocations: the forced re-listing first, alone — across the invocation
+          # boundary the engine's input checksums cure unchanged registrations, so the
+          # main invocation cascades (catalog → cover → coverage → publish) only on real
+          # drift. A red refresh still lets the rest publish; the step exits red after.
           # --cores 16 > vCPUs: width for IO-bound fetches; mem_gb caps the heavy jobs
           # (28 = 32 GB - 4 reserved). Box-only — laptops keep cores:all as their cap.
+          rc=0
+          docker run --rm \
+            -e RCLONE_CONFIG_R2_TYPE -e RCLONE_CONFIG_R2_PROVIDER -e RCLONE_CONFIG_R2_ENDPOINT \
+            -e RCLONE_CONFIG_R2_ACCESS_KEY_ID -e RCLONE_CONFIG_R2_SECRET_ACCESS_KEY \
+            -e RCLONE_CONFIG_R2_NO_CHECK_BUCKET -e DATA_BUCKET -e MIRROR_ALLOW_SHRINK \
+            -v "$PWD:/app" -v "$STATE:/app/state" \
+            "$IMAGE:$IMAGE_TAG" \
+            uv run snakemake refresh --keep-going --rerun-incomplete \
+              --cores 16 --resources mem_gb=28 -R mirror_source "${extra[@]}" || rc=$?
           docker run --rm \
             -e RCLONE_CONFIG_R2_TYPE -e RCLONE_CONFIG_R2_PROVIDER -e RCLONE_CONFIG_R2_ENDPOINT \
             -e RCLONE_CONFIG_R2_ACCESS_KEY_ID -e RCLONE_CONFIG_R2_SECRET_ACCESS_KEY \
@@ -193,7 +206,8 @@ jobs:
             -v "$PWD:/app" -v "$STATE:/app/state" \
             "$IMAGE:$IMAGE_TAG" \
             uv run snakemake catalogs publish --keep-going --rerun-incomplete \
-              --cores 16 --resources mem_gb=28 -R mirror_source "${extra[@]}"
+              --cores 16 --resources mem_gb=28 "${extra[@]}" || rc=$?
+          exit "$rc"
       # Per-job wall/CPU/max-RSS from the benchmark: directives (this job runs on the box,
       # so the volume path is directly readable).
       - name: Upload snakemake benchmarks
