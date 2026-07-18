@@ -21,8 +21,11 @@ PIPE = os.path.dirname(os.path.abspath(__file__))
 STEMS = ["8-75-96-10", "8-76-96-10"]
 
 
-def snakemake(workdir, sources_dir, *args):
+def snakemake(workdir, sources_dir, *args, bbox=None):
     env = {**os.environ, "SOURCES_DIR": sources_dir}
+    env.pop("BBOX", None)  # scope is under test — never inherit the shell's window
+    if bbox:
+        env["BBOX"] = bbox
     return subprocess.run(
         ["uv", "run", "snakemake", "-s", os.path.join(PIPE, "build.smk"),
          "--config", f"workdir={workdir}", *args],
@@ -79,6 +82,15 @@ def main():
             assert not re.search(rf"(?m)^(rule )?{stage1}\s*[:\d]", out), \
                 f"stage-1 rule {stage1} reachable:\n{out}"
         assert store_tree(store) == before, "a dry run must not touch the store"
+
+        # BBOX scopes STEMS at parse — the covering is the full inventory, the window is
+        # the build's. A bbox over tile 8/75/96 only must schedule exactly one merge; a
+        # window over open ocean refuses at parse instead of silently building nothing.
+        p = snakemake(d, sources_dir, "-n", "mosaic", bbox="-74.3,40.5,-73.5,41.0")
+        assert p.returncode == 0, p.stderr
+        assert re.search(r"mosaic_tile\s+1", p.stdout), f"bbox must scope to 1 tile:\n{p.stdout}"
+        p = snakemake(d, sources_dir, "-n", "mosaic", bbox="10.0,-40.0,11.0,-39.0")
+        assert p.returncode != 0 and "no tiles in BBOX" in p.stderr + p.stdout
 
         print("test_build.py ok")
     finally:

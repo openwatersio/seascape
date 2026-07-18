@@ -24,12 +24,17 @@ import utils
 # file to track; its identity rides in the landmask cache version, as in the legacy keys.
 MASKS = [p for p in (landmask.path(), landmask.water_path()) if not p.startswith("/vsi")]
 
-# STEMS — parse-time, purely from disk. The covering is this invocation's parse input;
-# refusing to run without one (instead of silently building nothing) is the seam.
+# STEMS — parse-time, purely from disk, scoped to the BBOX env. The covering is the full
+# on-disk inventory (write-if-changed keeps out-of-window tiles — on the box it is the
+# PLANET), so the bbox filter lives here, not in the file's extent. Refusing to run without
+# a covering (instead of silently building nothing) is the seam.
 _covering = Path(config.get("workdir", str(SCRIPTS))) / "store" / "aggregation" / "covering.txt"
 if not _covering.is_file():
     raise WorkflowError(f"no covering at {_covering} — run `snakemake catalogs` first")
-STEMS = _covering.read_text().split()
+STEMS = mosaic_mod.covering_stems(str(_covering))
+if not STEMS:
+    raise WorkflowError(f"covering has no tiles in BBOX={os.environ.get('BBOX', '')!r} — "
+                        "check the window, or run `snakemake catalogs` first")
 
 
 wildcard_constraints:

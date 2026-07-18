@@ -173,14 +173,20 @@ jobs:
           VSI_CACHE_SIZE: "33554432"
         run: |
           set -euo pipefail
-          # Global budget: RAM minus a stated reserve (OS + Snakemake + curl/VSI caches +
-          # page-cache headroom). Scheduling only — the per-job kernel cap is the named
-          # follow-up in the header, informed by this run's benchmarks.
-          RESERVE_GB=22
+          # Global budget: RAM minus a reserve (OS + Snakemake + curl/VSI caches +
+          # page-cache headroom) that SCALES with the box — an eighth of RAM, floor 4 GB:
+          # ccx33 -> 28 GB budget (sources.yml's proven number), ccx63 -> 168 GB. A flat
+          # big-box reserve on a small box starves merge concurrency for no protection.
+          # Scheduling only — the per-job kernel cap is the named follow-up in the header.
           total_gb=$(awk '/MemTotal/ {print int($2/1024/1024)}' /proc/meminfo)
-          budget_gb=$((total_gb - RESERVE_GB))
-          cores=$(nproc)
-          echo "box: ${total_gb} GB RAM, ${cores} cores -> budget ${budget_gb} GB (reserve ${RESERVE_GB} GB)"
+          reserve_gb=$((total_gb / 8)); [ "$reserve_gb" -ge 4 ] || reserve_gb=4
+          budget_gb=$((total_gb - reserve_gb))
+          # --cores 2x vCPUs: width for IO-bound tiles (streamed source reads, Ceph-volume
+          # writes) — heavy merges are admitted by the mem_gb budget long before cores bind,
+          # so the extra width goes to light deep-ocean tiles backfilling blocked IO time.
+          # Same knob sources.yml uses for its fetches (16 on 8 vCPUs).
+          cores=$(( $(nproc) * 2 ))
+          echo "box: ${total_gb} GB RAM, --cores ${cores} -> budget ${budget_gb} GB (reserve ${reserve_gb} GB)"
           force=()
           if [ "$INPUT_FORCE" = "true" ]; then force=(-F); fi
           # Invocation 1 — the covering, from the volume's canonical stage-1 products.

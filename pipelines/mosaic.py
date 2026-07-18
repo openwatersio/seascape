@@ -64,6 +64,7 @@ from glob import glob as _glob
 import mercantile
 import rasterio
 
+import aggregation_covering
 import aggregation_merge
 import aggregation_reproject
 import cache_versions
@@ -432,17 +433,38 @@ def build_index():
           f"pointer {gti_path()} at z{child_z} ({resolution} m)")
 
 
+def covering_stems(covering_path="store/aggregation/covering.txt"):
+    """covering.txt filtered to the BBOX env (empty = every stem) — the ONE scope rule the
+    build invocation's parse (STEMS) and `index --stable` share. The covering is the full
+    on-disk inventory (write-if-changed keeps out-of-window tiles), so a bbox build must
+    scope here, not trust the file's extent."""
+    with open(covering_path) as f:
+        stems = sorted(f.read().split())
+    clip = aggregation_covering.bbox_3857()
+    if clip is None:
+        return stems
+    boxes = aggregation_covering.split_at_antimeridian(clip)
+
+    def hits(stem):
+        z, x, y, _cz = (int(a) for a in stem.split("-"))
+        b = mercantile.xy_bounds(mercantile.Tile(x=x, y=y, z=z))
+        return any(b.left < r and b.right > l and b.bottom < t and b.top > bo
+                   for (l, bo, r, t) in boxes)
+
+    return [s for s in stems if hits(s)]
+
+
 def build_index_stable():
-    """The Snakemake lane's index + planet z8 + pointer, off the --stable covering: plain names
-    throughout, freshness owned by the engine (this runs only when a tile changed). Same
-    artifacts-before-pointer discipline — the .gti is written last."""
+    """The Snakemake lane's index + planet z8 + pointer, off the --stable covering (BBOX-scoped
+    like the build invocation): plain names throughout, freshness owned by the engine (this runs
+    only when a tile changed). Same artifacts-before-pointer discipline — the .gti is written
+    last."""
     try:
-        with open("store/aggregation/covering.txt") as f:
-            stems = sorted(f.read().split())
+        stems = covering_stems()
     except FileNotFoundError:
         sys.exit("mosaic index: no covering — run `snakemake catalogs` first")
     if not stems:
-        sys.exit("mosaic index: empty covering — run `snakemake catalogs` first")
+        sys.exit("mosaic index: no covering tiles in BBOX — run `snakemake catalogs` first")
     csvs = [f"store/aggregation/{s}-aggregation.csv" for s in stems]
     features = [_tile_row_plain(fp) for fp in csvs]
     index_path = f"{index_dir()}/covering.parquet"
