@@ -223,7 +223,7 @@ jobs:
           echo "box: ${total_gb} GB RAM, --cores ${cores} -> budget ${budget_gb} GB (reserve ${reserve_gb} GB)"
           force=()
           if [ "$INPUT_FORCE" = "true" ]; then force=(-F); fi
-          ./docker.sh snakemake -s pipelines/build.smk mosaic publish \
+          ./docker.sh snakemake -s pipelines/build.smk bundles publish \
             --keep-going --rerun-incomplete \
             --cores "$cores" --resources mem_gb="$budget_gb" \
             --config workdir=/app/state "${force[@]}"
