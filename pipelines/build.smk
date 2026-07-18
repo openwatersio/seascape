@@ -140,6 +140,19 @@ rule mosaic:
         rules.mosaic_index.output
 
 
+# Content-address the plain tiles + planet-z8 to R2 under hashed names and write a CANDIDATE
+# pointer (index + gti). Publishing is remote, so there is no on-disk output — a plain
+# always-runnable target gated on the finished index. The serving pointer mosaic.gti is never
+# written from here; promotion is out of scope.
+rule publish:
+    input:
+        rules.mosaic_index.output
+    benchmark:
+        "store/bench/mosaic-publish.tsv"
+    shell:
+        "{PY}/mosaic.py publish"
+
+
 # ── stage 3 (cartographic products): every consumer reads windows of the persisted ──
 # ── mosaic, instead of riding inside the merge job as the legacy forks do            ──
 

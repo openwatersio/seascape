@@ -51,10 +51,13 @@ atomic-publish contract for concurrent readers, unchanged.
                                          (no smoothing, no vector forks — stage 3 reads windows)
   python mosaic.py index [--stable]      build the index + planet z8 COG + mosaic.gti
                                          (--stable: the Snakemake lane's covering + plain names)
+  python mosaic.py publish               content-address the plain COGs to R2 + a CANDIDATE
+                                         pointer; the serving pointer mosaic.gti is never touched
   python mosaic.py --check               self-check
 """
 
 import glob
+import hashlib
 import json
 import os
 import shutil
@@ -377,6 +380,24 @@ def _build_planet_z8(index_path, tile_keys):
     return cpath, key
 
 
+def _gti_xml(index_ref, planet_ref, resolution):
+    """The GTI pointer XML naming an index + z8 overview. index_ref / planet_ref are written
+    verbatim: RELATIVE paths for the local serving pointer (portable across store prefixes),
+    ABSOLUTE public URLs for the engine-lane candidate pointer (resolves off the bucket)."""
+    return (
+        "<GDALTileIndexDataset>\n"
+        f"  <IndexDataset>{index_ref}</IndexDataset>\n"
+        "  <LocationField>location</LocationField>\n"
+        "  <SRS>EPSG:3857</SRS>\n"
+        f"  <ResX>{resolution}</ResX>\n"
+        f"  <ResY>{resolution}</ResY>\n"
+        f"  <NoDataValue>{NODATA}</NoDataValue>\n"
+        "  <Overview>\n"
+        f"    <Dataset>{planet_ref}</Dataset>\n"
+        "  </Overview>\n"
+        "</GDALTileIndexDataset>\n")
+
+
 def _write_gti(index_path, planet_path, resolution):
     """Write the mosaic.gti pointer LAST: a small XML naming the current index + the z8 overview.
     IndexDataset / Overview are stored RELATIVE to the .gti file so the store prefix is portable
@@ -388,18 +409,7 @@ def _write_gti(index_path, planet_path, resolution):
     pointer (store_manifest.py) — then PUTs mosaic.gti last. This module only writes it locally."""
     rel_index = os.path.relpath(index_path, os.path.dirname(gti_path()))
     rel_planet = os.path.relpath(planet_path, os.path.dirname(gti_path()))
-    xml = (
-        "<GDALTileIndexDataset>\n"
-        f"  <IndexDataset>{rel_index}</IndexDataset>\n"
-        "  <LocationField>location</LocationField>\n"
-        "  <SRS>EPSG:3857</SRS>\n"
-        f"  <ResX>{resolution}</ResX>\n"
-        f"  <ResY>{resolution}</ResY>\n"
-        f"  <NoDataValue>{NODATA}</NoDataValue>\n"
-        "  <Overview>\n"
-        f"    <Dataset>{rel_planet}</Dataset>\n"
-        "  </Overview>\n"
-        "</GDALTileIndexDataset>\n")
+    xml = _gti_xml(rel_index, rel_planet, resolution)
     tmp = gti_path() + ".tmp"
     with open(tmp, "w") as f:
         f.write(xml)
@@ -431,6 +441,123 @@ def build_index():
     _write_gti(index_path, planet_path, resolution)  # pointer LAST
     print(f"mosaic index: {len(features)} tile(s) -> {index_path}; planet z8 {planet_path}; "
           f"pointer {gti_path()} at z{child_z} ({resolution} m)")
+
+
+# ── the engine-lane content-addressed R2 publish (mosaic.py publish) ──────────────────────────────
+#
+# Hash the finished plain COGs, hardlink them under content names, and push only what R2 lacks
+# (content-addressing makes existence == correctness). The parquet + GTI it uploads are a CANDIDATE
+# pointer; the serving pointer mosaic.gti is never produced from this path — promotion is separate.
+
+SERVING_GTI_NAME = "mosaic.gti"  # the serving pointer — promotion writes it; this path must not
+
+
+def publish_dir():
+    return "store/mosaic/publish"
+
+
+def public_base():
+    """The public base the CANDIDATE index locations + GTI refs resolve against — PUBLIC_BASE when
+    set (the workflow passes it), else the production bucket base."""
+    return os.environ.get("PUBLIC_BASE", "https://data.openwaters.io/bathymetry")
+
+
+def _hash12(path):
+    """12 hex of the plain COG's content hash — the R2 basename discriminator. Fails loudly on a
+    missing/remote path: publish hashes local plain COGs the mosaic rules just wrote."""
+    h = keys.file_hash(path)
+    if h is None:
+        sys.exit(f"mosaic publish: cannot hash {path} — missing or remote; run `snakemake mosaic` first")
+    return h[:12]
+
+
+def _stage_publish():
+    """Stage the content-addressed publish set LOCALLY — no network, so the test drives it directly.
+    Recreate publish/ each run; hardlink every covering tile COG to publish/tiles/<stem>-<hash12>.tif
+    and planet-z8 to publish/planet-z8-<hash12>.tif; build the CANDIDATE index (its `location` column
+    the PUBLIC hashed tile URLs) named by content (<idxhash12> over the sorted tile hashes); and write
+    the CANDIDATE GTI referencing the PUBLIC index + planet URLs (absolute, so it resolves off the
+    bucket). The serving name mosaic.gti is never produced. Returns (publish_dir, features, names)."""
+    stems = _stable_stems()
+    pubdir = publish_dir()
+    tiles_stage = f"{pubdir}/tiles"
+    shutil.rmtree(pubdir, ignore_errors=True)
+    os.makedirs(tiles_stage)
+
+    features, tile_files, tile_hashes = [], [], []
+    for stem in stems:
+        fp = f"store/aggregation/{stem}-aggregation.csv"
+        cpath = tile_artifact(stem)
+        if not os.path.isfile(cpath):
+            sys.exit(f"mosaic publish: missing {cpath} — run `snakemake mosaic` first")
+        h = _hash12(cpath)
+        tile_hashes.append(h)
+        name = f"{stem}-{h}.tif"
+        tile_files.append(name)
+        os.link(cpath, f"{tiles_stage}/{name}")
+        features.append(_feature(fp, cpath, f"{public_base()}/mosaic/tiles/{name}"))
+
+    planet = planet_artifact()
+    if not os.path.isfile(planet):
+        sys.exit(f"mosaic publish: missing {planet} — run `snakemake mosaic` first")
+    planet_name = f"planet-z8-{_hash12(planet)}.tif"
+    os.link(planet, f"{pubdir}/{planet_name}")
+
+    idxhash = hashlib.sha256("".join(sorted(tile_hashes)).encode()).hexdigest()[:12]
+    index_name = f"{idxhash}.parquet"
+    index_stage = f"{pubdir}/index/{index_name}"
+    _write_index(index_stage, features)
+
+    gti_name = f"mosaic-candidate-{idxhash}.gti"
+    assert gti_name != SERVING_GTI_NAME, "the candidate GTI must never be the serving pointer"
+    index_ref = f"{public_base()}/mosaic/index/{index_name}"
+    planet_ref = f"{public_base()}/mosaic/{planet_name}"
+    child_z = max(int(s.split("-")[3]) for s in stems)
+    resolution = aggregation_reproject.get_resolution(child_z)
+    gti_stage = f"{pubdir}/{gti_name}"
+    with open(gti_stage, "w") as f:
+        f.write(_gti_xml(index_ref, planet_ref, resolution))
+
+    names = {"tiles_dir": tiles_stage, "tile_files": tile_files, "planet": planet_name,
+             "index": index_name, "index_ref": index_ref, "planet_ref": planet_ref,
+             "gti": gti_name, "gti_path": gti_stage, "idxhash": idxhash}
+    return pubdir, features, names
+
+
+def _publish_guard():
+    """rclone + R2 creds are required — publish runs on the box only."""
+    if shutil.which("rclone") is None:
+        sys.exit("rclone not found — mosaic publish runs on the box only")
+    if not os.environ.get("RCLONE_CONFIG_R2_TYPE"):
+        sys.exit("RCLONE_CONFIG_R2_TYPE unset (no R2 creds) — mosaic publish runs on the box only")
+
+
+def publish():
+    """Push the content-addressed publish set to R2 and print a summary. One `rclone copy
+    --ignore-existing` per prefix moves only objects R2 lacks; the CANDIDATE GTI never overwrites
+    the serving pointer. $DATA_BUCKET stays a shell env var (rclone's env-var remote is `r2`)."""
+    _publish_guard()
+    pubdir, features, names = _stage_publish()
+    dest = "r2:$DATA_BUCKET/bathymetry/mosaic"
+
+    # Count new-vs-skipped from the remote's existing basenames before copying — content-addressing
+    # makes a name's presence proof of its bytes, so a listed name is already-published.
+    lsf, _ = utils.run_command(f"rclone lsf {dest}/tiles --files-only 2>/dev/null || true")
+    existing = set(lsf.split())
+    new = [n for n in names["tile_files"] if n not in existing]
+
+    utils.run_command(f"rclone copy --ignore-existing {names['tiles_dir']} {dest}/tiles "
+                      "--retries 5 --stats 60s --stats-one-line", silent=False)
+    utils.run_command(f"rclone copyto --ignore-existing {pubdir}/{names['planet']} "
+                      f"{dest}/{names['planet']} --retries 5", silent=False)
+    utils.run_command(f"rclone copyto {pubdir}/index/{names['index']} "
+                      f"{dest}/index/{names['index']} --retries 5", silent=False)
+    utils.run_command(f"rclone copyto {pubdir}/{names['gti']} {dest}/{names['gti']} --retries 5",
+                      silent=False)
+
+    print(f"mosaic publish: {len(features)} tiles staged, {len(new)} uploaded new, "
+          f"{len(features) - len(new)} already present; candidate GTI "
+          f"{public_base()}/mosaic/{names['gti']}", flush=True)
 
 
 def covering_stems(covering_path="store/aggregation/covering.txt"):
@@ -491,17 +618,24 @@ def window_dem(stem, out_tif):
     return out_tif
 
 
+def _stable_stems():
+    """The --stable covering scoped to the BBOX env — the stem set the engine-lane index and
+    publish both walk. Refuses (naming the catalogs invocation) rather than build nothing."""
+    try:
+        stems = covering_stems()
+    except FileNotFoundError:
+        sys.exit("mosaic: no covering — run `snakemake catalogs` first")
+    if not stems:
+        sys.exit("mosaic: no covering tiles in BBOX — run `snakemake catalogs` first")
+    return stems
+
+
 def build_index_stable():
     """The Snakemake lane's index + planet z8 + pointer, off the --stable covering (BBOX-scoped
     like the build invocation): plain names throughout, freshness owned by the engine (this runs
     only when a tile changed). Same artifacts-before-pointer discipline — the .gti is written
     last."""
-    try:
-        stems = covering_stems()
-    except FileNotFoundError:
-        sys.exit("mosaic index: no covering — run `snakemake catalogs` first")
-    if not stems:
-        sys.exit("mosaic index: no covering tiles in BBOX — run `snakemake catalogs` first")
+    stems = _stable_stems()
     csvs = [f"store/aggregation/{s}-aggregation.csv" for s in stems]
     features = [_tile_row_plain(fp) for fp in csvs]
     index_path = f"{index_dir()}/covering.parquet"
@@ -659,6 +793,37 @@ def _check():
         out, _ = utils.run_command(f"ogrinfo -q -al {index_dir()}/covering.parquet")
         assert "seascape:key" not in out, "the engine lane's index carries no key column"
         assert "gebco,reef" in out, "provenance columns must survive in the stable index"
+
+        # ── the engine-lane publish: stage content-addressed names LOCALLY, assert names + refs, no
+        # network (rclone is never called from _stage_publish; the serving pointer is unreachable) ──
+        pub_base = "https://data.example/bathymetry"
+        os.environ["PUBLIC_BASE"] = pub_base
+        try:
+            pubdir, feats, names = _stage_publish()
+        finally:
+            os.environ.pop("PUBLIC_BASE", None)
+        # hardlinks exist under the hashed names — same inode as the plain COGs, no byte copy
+        thash = _hash12(tile_artifact(stem))
+        staged_tile = f"{pubdir}/tiles/{stem}-{thash}.tif"
+        assert os.path.isfile(staged_tile), staged_tile
+        assert os.stat(staged_tile).st_ino == os.stat(tile_artifact(stem)).st_ino, "tile must be a hardlink"
+        phash = _hash12(planet_artifact())
+        staged_planet = f"{pubdir}/planet-z8-{phash}.tif"
+        assert os.path.isfile(staged_planet), staged_planet
+        assert os.stat(staged_planet).st_ino == os.stat(planet_artifact()).st_ino, "planet must be a hardlink"
+        # the candidate index locations carry PUBLIC_BASE + the hashed tile name
+        assert [f["properties"]["location"] for f in feats] == [f"{pub_base}/mosaic/tiles/{stem}-{thash}.tif"], \
+            [f["properties"]["location"] for f in feats]
+        # the candidate GTI references the PUBLIC index + planet URLs (absolute), not a local path
+        gti_xml = open(names["gti_path"]).read()
+        assert f"<IndexDataset>{pub_base}/mosaic/index/{names['index']}</IndexDataset>" in gti_xml, gti_xml
+        assert f"<Dataset>{pub_base}/mosaic/planet-z8-{phash}.tif</Dataset>" in gti_xml, gti_xml
+        # the index name is content-addressed by the sorted tile hashes
+        assert names["index"] == hashlib.sha256(thash.encode()).hexdigest()[:12] + ".parquet", names["index"]
+        # the serving pointer name is unreachable from this path — nowhere in the staged outputs
+        assert names["gti"] == f"mosaic-candidate-{names['idxhash']}.gti" and names["gti"] != SERVING_GTI_NAME
+        for root, _dirs, sfiles in os.walk(pubdir):
+            assert SERVING_GTI_NAME not in sfiles, f"the serving pointer must never be staged ({root})"
         print("mosaic.py self-check ok")
     finally:
         config.SOURCES_DIR = saved_dir
@@ -675,12 +840,14 @@ def main(argv):
         build_index()
     elif argv == ["index", "--stable"]:
         build_index_stable()
+    elif argv == ["publish"]:
+        publish()
     elif argv[:1] == ["tile"] and len(argv) == 2:
         tile(argv[1])
     elif argv[:1] == ["--check"]:
         _check()
     else:
-        sys.exit("usage: mosaic.py tile <covering-csv> | index [--stable] | --check")
+        sys.exit("usage: mosaic.py tile <covering-csv> | index [--stable] | publish | --check")
 
 
 if __name__ == "__main__":

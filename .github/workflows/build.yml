@@ -12,8 +12,9 @@ name: Build
 # Scope today: stage 2 (the mosaic) only — the first dispatch is the MEASUREMENT run the
 # memory plan calls for. Every mosaic_tile job runs isolated with a benchmark: directive, so
 # per-tile max-RSS data lands in store/bench/ and survives even if the run dies. Tiles are
-# plain-named on the volume; NOTHING publishes to R2 from this workflow yet (publish rules
-# arrive with stage 3), so serving state is structurally untouchable from here.
+# plain-named on the volume; the publish rule content-addresses them to R2 under hashed names
+# with a CANDIDATE pointer (index + gti) — the serving pointer mosaic.gti is never written
+# from here, so serving state is structurally untouchable.
 #
 # Named follow-ups, deliberately not in this revision:
 #   - per-job kernel memory caps (cgroup / docker run --memory per job): added once the
@@ -50,6 +51,10 @@ env:
   STORE_VOLUME: seascape-store
   STORE_VOLUME_GB: "750"
   NAME: seascape-build-${{ github.run_id }}
+  # The publish rule content-addresses tiles to this bucket and stamps the CANDIDATE index/GTI
+  # with these public URLs (mosaic.public_base); the serving pointer is never written from here.
+  DATA_BUCKET: data
+  PUBLIC_BASE: https://data.openwaters.io/bathymetry
 
 # One store-mutating workflow at a time, globally: builds, sources runs, and GC share this
 # group. NOTE: a second queued dispatch EVICTS the first (observed) — one dispatch at a time.
@@ -127,6 +132,15 @@ jobs:
     runs-on: ${{ needs.create-runner.outputs.label }}
     timeout-minutes: 2880
     permissions: { contents: read, packages: read }
+    # R2 via rclone's env-var remote (remote "r2" exists ambiently in every rclone call) —
+    # scoped to this job, the only one that publishes. Copied from sources.yml.
+    env:
+      RCLONE_CONFIG_R2_TYPE: s3
+      RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+      RCLONE_CONFIG_R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
     steps:
       - uses: actions/checkout@v6
       # Idempotent box setup — docker + the store volume mount. STATE is the volume root
@@ -209,7 +223,7 @@ jobs:
           echo "box: ${total_gb} GB RAM, --cores ${cores} -> budget ${budget_gb} GB (reserve ${reserve_gb} GB)"
           force=()
           if [ "$INPUT_FORCE" = "true" ]; then force=(-F); fi
-          ./docker.sh snakemake -s pipelines/build.smk mosaic \
+          ./docker.sh snakemake -s pipelines/build.smk mosaic publish \
             --keep-going --rerun-incomplete \
             --cores "$cores" --resources mem_gb="$budget_gb" \
             --config workdir=/app/state "${force[@]}"
