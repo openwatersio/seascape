@@ -358,8 +358,8 @@ def _warp_planet(index_path, out_tmp):
         os.remove(out_tmp)
     utils.run_command(
         f"GDAL_CACHEMAX=512 gdalwarp -q -overwrite -r average -tr {res8} {res8} "
-        f"-dstnodata {NODATA} -of COG -co COMPRESS=ZSTD -co PREDICTOR=3 -co BLOCKSIZE=512 "
-        f"-co OVERVIEW_RESAMPLING=AVERAGE -co NUM_THREADS=ALL_CPUS "
+        f"-dstnodata {NODATA} -of COG -co BIGTIFF=YES -co COMPRESS=ZSTD -co PREDICTOR=3 "
+        "-co BLOCKSIZE=512 -co OVERVIEW_RESAMPLING=AVERAGE -co NUM_THREADS=ALL_CPUS "
         f"GTI:{index_path} {out_tmp}")
 
 
