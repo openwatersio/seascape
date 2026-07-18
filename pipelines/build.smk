@@ -80,15 +80,18 @@ MERGE_CFG = json.dumps({
 }, sort_keys=True)
 
 
-# factor 1.5, not scheduler.DEFAULT_FACTOR (4): the legacy factor priced the pool job
-# with forks riding in it. The merge-only job with the windowed negate measures 3.9 GB
-# max RSS on the densest S-102 stem (52 products) on the box → z14 reserves 7 GB
-# (~1.8x margin); retries escalate. Re-fit from store/bench/mosaic/ when planet lands.
-MERGE_FACTOR = 1.5
+# factor 2.0, not scheduler.DEFAULT_FACTOR (4): the legacy factor priced the pool job
+# with forks riding in it. Fresh planet benchmarks with the windowed negate: z13 peaks
+# 2.31 GB (reserve 3), z14 typically 4-6 GB (reserve 9; 22 concurrent still fit 168).
+# Re-fit from store/bench/mosaic/ — FRESH rows only; the dir accrues stale runs.
+MERGE_FACTOR = 2.0
 
 
 def tile_weight(wc, input=None, attempt=None):
-    return scheduler.weight(wc.stem, factor=MERGE_FACTOR)
+    # x1000: the planet run showed small priorities losing to count-maximizing packing —
+    # 22 ready z14 heavies were admitted one at a time over 32 min while ~96 lights
+    # front-loaded, re-creating the straggler tail. Make priority dominate any objective.
+    return scheduler.weight(wc.stem, factor=MERGE_FACTOR) * 1000
 
 
 # One covering tile's merge, alone — the planet's memory hot spot, isolated in its own job.
@@ -107,7 +110,7 @@ rule mosaic_tile:
     priority: tile_weight  # heavy-first: shortens the tail; coastal tiles free stage-3 work first
     retries: 2
     resources:
-        mem_gb=lambda wc, attempt: scheduler.weight(wc.stem, factor=MERGE_FACTOR) * attempt
+        mem_gb=lambda wc, attempt: scheduler.weight(wc.stem, factor=MERGE_FACTOR) * attempt,
     benchmark:
         "store/bench/mosaic/{stem}.tsv"
     shell:
