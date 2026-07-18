@@ -194,6 +194,16 @@ jobs:
             "$IMAGE:$IMAGE_TAG" \
             uv run snakemake catalogs publish --keep-going --rerun-incomplete \
               --cores 16 --resources mem_gb=28 -R mirror_source "${extra[@]}"
+      # Per-job wall/CPU/max-RSS from the benchmark: directives (this job runs on the box,
+      # so the volume path is directly readable).
+      - name: Upload snakemake benchmarks
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snakemake-bench-${{ github.run_id }}
+          path: ${{ env.STATE }}/store/bench/
+          if-no-files-found: ignore
+          retention-days: 90
 
   # Capture provider-side CPU, disk, and network series while the ephemeral server still
   # exists — same pattern as build.yml. Best-effort: teardown waits for this job, but runs
