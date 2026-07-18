@@ -187,9 +187,10 @@ jobs:
           VSI_CACHE_SIZE: "33554432"
         run: |
           set -euo pipefail
-          # Disk headroom: a planet mosaic needs room for every tile COG; refuse early
-          # rather than fill the volume mid-run. bbox smokes write little.
-          need_gb=300; [ -n "$BBOX" ] && need_gb=50
+          # Disk headroom: the mosaic tiles live permanently on the volume (~360 G), so
+          # planet runs are incremental — 100 G covers the index/planet-z8/scratch churn
+          # (the legacy build's proven floor). Refuse early rather than fill mid-run.
+          need_gb=100; [ -n "$BBOX" ] && need_gb=50
           free_gb=$(df -BG --output=avail "$STATE" | tail -1 | tr -dc '0-9')
           [ "$free_gb" -ge "$need_gb" ] || { echo "only ${free_gb}G free on the store volume (need ${need_gb}G) — GC or resize first" >&2; exit 1; }
           # Global budget: RAM minus a reserve (OS + Snakemake + curl/VSI caches +
