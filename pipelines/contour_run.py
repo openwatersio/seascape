@@ -301,6 +301,15 @@ def bundle_maxz(own_max):
     return own_max
 
 
+def bundle_maxz_stable(own_max):
+    """The engine-lane twin of bundle_maxz: the shared tileset maxzoom every vector layer bundles
+    to, from the covering's max child_z (so contours/soundings/depare tile to the same depth and
+    tile-join cleanly), else the caller's own files' max. The covering is always present in the
+    engine lane (Snakemake refuses to run without it), so there is no None fallback."""
+    import mosaic
+    return max(own_max, _stems_maxz(mosaic.covering_stems()))
+
+
 # ── source coverage (provenance) layer ───────────────────────────────────────
 # Tile each source's union footprint (store/polygon/<id>.gpkg, from the source stage)
 # into its own store/bundle/coverage.pmtiles, so the viewer can show which source
@@ -446,6 +455,19 @@ def verify_vector_complete(layer, paths):
             f"{', '.join(missing[:15])}{' …' if len(missing) > 15 else ''}")
 
 
+def require_stable_complete(layer, stems, files):
+    """The engine-lane no-holes gate (the --stable twin of verify_vector_complete): every covering
+    stem must have its PLAIN per-stem file on disk — a 0-byte file is a legitimately empty tile, a
+    MISSING one is an incomplete build. Snakemake owns freshness, so this completeness assert is the
+    only bundle-time gate the stable path keeps (no keys, no markers)."""
+    missing = [s for s, f in zip(stems, files) if not os.path.exists(f)]
+    if missing:
+        raise SystemExit(
+            f"{layer} incomplete: {len(missing)} of {len(stems)} covering tiles have no per-tile "
+            f"file (an interrupted build) — e.g. {', '.join(missing[:5])}"
+            f"{' …' if len(missing) > 5 else ''}")
+
+
 # vector.pmtiles depends on every per-tile contour/sounding/depare artifact's key + the three
 # layers' modules (the tippecanoe filter + flags live in them) + the env-tunable simplifications.
 # A per-tile fork whose key changed (a contour-levels edit) moves this key; an unchanged set skips
@@ -515,6 +537,31 @@ def bundle():
     print(f"contour bundle: {vec} (z0-{maxz}, {len(fgbs)} FGBs)")
 
 
+def bundle_stable():
+    """Engine-lane vector bundle: tippecanoe the PLAIN per-stem contour FGBs for the covering into
+    contour lines, then tile-join the already-bundled soundings/depare pmtiles → vector.pmtiles.
+    A 0-byte per-tile file is a legitimately empty tile (filtered by size); a MISSING one is an
+    incomplete build (require_stable_complete). Snakemake decides when to invoke, so this always
+    rebuilds — no key, no sidecar, no fresh-skip. A missing depare.pmtiles (SKIP_DEPARE) is simply
+    not joined, exactly as the legacy _finalize_contours tolerates it (an isfile check)."""
+    import mosaic
+    stems = mosaic.covering_stems()
+    files = [f"store/contour/{s}.fgb" for s in stems]
+    require_stable_complete("contour", stems, files)
+    fgbs = [f for f in files if os.path.getsize(f) > 0]
+    vec = "store/bundle/vector.pmtiles"
+    utils.create_folder("store/bundle")
+    own_max = max((int(os.path.basename(f).split(".")[0].rsplit("-", 1)[1]) for f in fgbs), default=0)
+    maxz = bundle_maxz_stable(own_max)
+    lines = utils.vector_scratch("contours-lines.pmtiles")
+    if os.path.exists(lines):
+        os.remove(lines)
+    _tippecanoe(fgbs, 0, maxz, lines)
+    _finalize_contours([lines], vec)  # writes vector.pmtiles directly; Snakemake cleans a torn output
+    os.remove(lines)
+    print(f"contour bundle (stable): {vec} (z0-{maxz}, {len(fgbs)} FGBs)")
+
+
 def _check():
     """Deep micro-loops dropped; big deep ring and open lines kept."""
     import numpy as np
@@ -551,10 +598,10 @@ if __name__ == "__main__":
     if a[:1] == ["tile"] and len(a) == 2:
         tile(a[1])
     elif a[:1] == ["bundle"]:
-        bundle()
+        bundle_stable() if a[1:] == ["--stable"] else bundle()
     elif a[:1] == ["coverage"]:
         coverage_bundle()
     elif a[:1] == ["check"]:
         _check()
     else:
-        sys.exit("usage: contour_run.py tile <stem> | bundle | coverage | check")
+        sys.exit("usage: contour_run.py tile <stem> | bundle [--stable] | coverage | check")

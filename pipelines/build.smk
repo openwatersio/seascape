@@ -264,3 +264,57 @@ rule tiles:
         rules.soundings.input,
         rules.depare.input,
         rules.terrain.input,
+
+
+# ── bundles — the three vector layers tile-join into one vector.pmtiles ──
+# Each bundler consumes the PLAIN per-stem outputs (0-byte = an empty tile, kept by size),
+# asserts the covering is hole-free, and always rebuilds — Snakemake owns freshness, so the
+# `--stable` CLIs carry no key/sidecar. depare rides only when SKIP_DEPARE is unset (DEPARE_STEMS).
+
+rule soundings_bundle:
+    input:
+        expand("store/soundings/{stem}.geojson", stem=STEMS)
+    output:
+        "store/bundle/soundings.pmtiles"
+    benchmark:
+        "store/bench/soundings-bundle.tsv"
+    shell:
+        "{PY}/soundings_run.py bundle --stable"
+
+
+# Guarded out entirely when DEPARE_STEMS is empty (SKIP_DEPARE): the input list would be empty.
+if DEPARE_STEMS:
+    rule depare_bundle:
+        input:
+            expand("store/depare/{stem}.fgb", stem=DEPARE_STEMS)
+        output:
+            "store/bundle/depare.pmtiles"
+        benchmark:
+            "store/bench/depare-bundle.tsv"
+        shell:
+            "{PY}/depare_run.py bundle --stable"
+
+
+# The contour tippecanoe + the single tile-join that folds soundings (+ depare when enabled)
+# into vector.pmtiles — so both bundled layers are inputs, not just the contour FGBs.
+_VECTOR_DEPARE = ["store/bundle/depare.pmtiles"] if DEPARE_STEMS else []
+
+rule vector_bundle:
+    input:
+        expand("store/contour/{stem}.fgb", stem=STEMS),
+        "store/bundle/soundings.pmtiles",
+        _VECTOR_DEPARE,
+    output:
+        "store/bundle/vector.pmtiles"
+    benchmark:
+        "store/bench/vector-bundle.tsv"
+    shell:
+        "{PY}/contour_run.py bundle --stable"
+
+
+# The bundle-inventory target: the vector layers, buildable alone against a warm mosaic.
+rule bundles:
+    input:
+        rules.soundings_bundle.output,
+        (rules.depare_bundle.output if DEPARE_STEMS else []),
+        rules.vector_bundle.output,

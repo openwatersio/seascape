@@ -311,6 +311,24 @@ def tile(stem):
 
 # ── bundle ───────────────────────────────────────────────────────────────────
 
+def _tippecanoe(fgbs, maxz, out):
+    """tippecanoe the per-tile depare FGBs into `out` (layer `depare`, z MIN_ZOOM..maxz).
+    --detect-shared-borders keeps shared partition edges identical through per-zoom simplification
+    (no cracks between bands); --coalesce-smallest-as-needed, never --drop-densest: a dropped
+    partition is a tint hole, a coalesced one mis-tints a sub-pixel blob. drval1/drval2 are Real
+    (numeric MVT; absent on nodata, the fill's switch key); rank is FlatGeobuf Integer64, so
+    -T rank:int keeps it numeric (else it lands as a string, like the contour depth ints)."""
+    subprocess.run(
+        ["tippecanoe", "-o", out, "-f", "-l", "depare",
+         "-n", "Depth areas", "-A", utils.ATTRIBUTION,
+         "-Z", str(MIN_ZOOM), "-z", str(maxz), "-P", "-q",
+         "--detect-shared-borders", "--coalesce-smallest-as-needed",
+         "--simplification", os.environ.get("DEPARE_SIMPLIFICATION", "8"),
+         "-y", "drval1", "-y", "drval2", "-y", "sys", "-y", "kind", "-y", "rank",
+         "-T", "rank:int", *fgbs],
+        check=True)
+
+
 def bundle():
     """tippecanoe the per-tile depare FGBs into store/bundle/depare.pmtiles (layer `depare`,
     folded into vector.pmtiles by the contours tile-join, same as soundings), z
@@ -354,17 +372,27 @@ def bundle():
     for stale in (out, keys.sidecar(out)):
         if os.path.isfile(stale):
             os.remove(stale)
-    subprocess.run(
-        ["tippecanoe", "-o", out, "-f", "-l", "depare",
-         "-n", "Depth areas", "-A", utils.ATTRIBUTION,
-         "-Z", str(MIN_ZOOM), "-z", str(maxz), "-P", "-q",
-         "--detect-shared-borders", "--coalesce-smallest-as-needed",
-         "--simplification", os.environ.get("DEPARE_SIMPLIFICATION", "8"),
-         "-y", "drval1", "-y", "drval2", "-y", "sys", "-y", "kind", "-y", "rank",
-         "-T", "rank:int", *fgbs],
-        check=True)
+    _tippecanoe(fgbs, maxz, out)
     keys.write_key(out, dkey)
     print(f"depare bundle: {out} (z{MIN_ZOOM}-{maxz}, {len(fgbs)} FGBs)")
+
+
+def bundle_stable():
+    """Engine-lane depare bundle: tippecanoe the PLAIN per-stem FGBs for the covering into
+    store/bundle/depare.pmtiles. A 0-byte per-tile file is a legitimately waterless tile (filtered
+    by size); a MISSING one is an incomplete build (require_stable_complete). Snakemake decides when
+    to invoke, so this always rebuilds — no key, no sidecar, no fresh-skip."""
+    import mosaic
+    stems = mosaic.covering_stems()
+    files = [f"store/depare/{s}.fgb" for s in stems]
+    contour_run.require_stable_complete("depare", stems, files)
+    fgbs = [f for f in files if os.path.getsize(f) > 0]
+    out = "store/bundle/depare.pmtiles"
+    utils.create_folder("store/bundle")
+    own_max = max((int(os.path.basename(f).split(".")[0].rsplit("-", 1)[1]) for f in fgbs), default=0)
+    maxz = contour_run.bundle_maxz_stable(own_max)
+    _tippecanoe(fgbs, maxz, out)
+    print(f"depare bundle (stable): {out} (z{MIN_ZOOM}-{maxz}, {len(fgbs)} FGBs)")
 
 
 def _check():
@@ -477,8 +505,8 @@ if __name__ == "__main__":
     if a[:1] == ["tile"] and len(a) == 2:
         tile(a[1])
     elif a[:1] == ["bundle"]:
-        bundle()
+        bundle_stable() if a[1:] == ["--stable"] else bundle()
     elif a[:1] == ["check"]:
         _check()
     else:
-        sys.exit("usage: depare_run.py tile <stem> | bundle | check")
+        sys.exit("usage: depare_run.py tile <stem> | bundle [--stable] | check")

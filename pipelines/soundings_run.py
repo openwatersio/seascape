@@ -230,6 +230,17 @@ def _live(paths, stems):
     return [p for p in live if keys.stem_of(p) in stems]
 
 
+def _tippecanoe(gj, maxz, out):
+    """tippecanoe the per-tile soundings geojsons into `out` (layer `soundings`, z0..maxz). -r1
+    keeps every point: per-feature tippecanoe.minzoom already did the density thinning by zoom."""
+    with utils.log_group(f"soundings tippecanoe ({len(gj)} inputs, z0-{maxz})"):
+        utils.run_monitored(
+            ["tippecanoe", "-o", out, "-f", "-l", "soundings",
+             "-n", "Bathymetric soundings", "-A", utils.ATTRIBUTION, "-Z", "0", "-z", str(maxz),
+             "-P", "-q", "-r1", "-y", "depth_m", "-y", "depth_ft", "-y", "depth_fm",
+             *gj], "soundings tippecanoe", out)
+
+
 def bundle():
     """tippecanoe the per-tile soundings into store/bundle/soundings.pmtiles (layer `soundings`).
     Per-feature tippecanoe.minzoom places each point from the zoom the grid decimation assigned,
@@ -268,15 +279,28 @@ def bundle():
     tmp_out = utils.vector_scratch("soundings.pmtiles")
     if os.path.exists(tmp_out):
         os.remove(tmp_out)
-    with utils.log_group(f"soundings tippecanoe ({len(gj)} inputs, z0-{maxz})"):
-        utils.run_monitored(
-            ["tippecanoe", "-o", tmp_out, "-f", "-l", "soundings",
-             "-n", "Bathymetric soundings", "-A", utils.ATTRIBUTION, "-Z", "0", "-z", str(maxz),
-             "-P", "-q", "-r1", "-y", "depth_m", "-y", "depth_ft", "-y", "depth_fm",
-             *gj], "soundings tippecanoe", tmp_out)
+    _tippecanoe(gj, maxz, tmp_out)
     keys.publish(tmp_out, out)
     keys.write_key(out, skey)
     print(f"soundings bundle: {out} (z0-{maxz}, {len(gj)} tiles)")
+
+
+def bundle_stable():
+    """Engine-lane soundings bundle: tippecanoe the PLAIN per-stem geojsons for the covering into
+    store/bundle/soundings.pmtiles. A 0-byte per-tile file is a legitimately dry tile (filtered by
+    size); a MISSING one is an incomplete build (require_stable_complete). Snakemake decides when to
+    invoke, so this always rebuilds — no key, no sidecar, no fresh-skip."""
+    import mosaic
+    stems = mosaic.covering_stems()
+    files = [f"store/soundings/{s}.geojson" for s in stems]
+    contour_run.require_stable_complete("soundings", stems, files)
+    gj = [f for f in files if os.path.getsize(f) > 0]
+    out = "store/bundle/soundings.pmtiles"
+    utils.create_folder("store/bundle")
+    own_max = max((int(os.path.basename(g).split(".")[0].rsplit("-", 1)[1]) for g in gj), default=0)
+    maxz = contour_run.bundle_maxz_stable(own_max)
+    _tippecanoe(gj, maxz, out)
+    print(f"soundings bundle (stable): {out} (z0-{maxz}, {len(gj)} tiles)")
 
 
 def _check():
@@ -342,8 +366,8 @@ if __name__ == "__main__":
     if a[:1] == ["tile"] and len(a) == 2:
         tile(a[1])
     elif a[:1] == ["bundle"]:
-        bundle()
+        bundle_stable() if a[1:] == ["--stable"] else bundle()
     elif a[:1] == ["check"]:
         _check()
     else:
-        sys.exit("usage: soundings_run.py tile <stem> | bundle | check")
+        sys.exit("usage: soundings_run.py tile <stem> | bundle [--stable] | check")
