@@ -190,14 +190,6 @@ jobs:
           echo "box: ${total_gb} GB RAM, --cores ${cores} -> budget ${budget_gb} GB (reserve ${reserve_gb} GB)"
           force=()
           if [ "$INPUT_FORCE" = "true" ]; then force=(-F); fi
-          # NO cover invocation here: the volume's covering is a stage-1 product the sources
-          # cadence owns (sources.yml's catalogs target) — a build consumes it READ-ONLY, and
-          # BBOX scopes STEMS at parse. Running cover here with a bbox would flip its bbox
-          # param on the shared store and churn the next sources run (cover + coverage +
-          # publish redo). Laptops, with their own stores, run cover themselves.
-          # The mosaic invocation parses purely from the covering; contains no fetch rule by
-          # construction. keep-going: one failed tile leaves the rest building (and its
-          # benchmark row behind); the run goes red as the alert.
           ./docker.sh snakemake -s pipelines/build.smk mosaic \
             --keep-going --rerun-incomplete \
             --cores "$cores" --resources mem_gb="$budget_gb" \
