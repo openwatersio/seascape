@@ -45,11 +45,15 @@ def negate_band1(filepath):
     nothing. read_masks honours alpha-or-nodata validity (don't compare to a NODATA value:
     ADD_ALPHA moves the mask off the data band). Drop this when the pipeline goes
     depth-canonical internally."""
+    # Per-block, not full-band: a whole z14 band is ~4.3 GB and its masks another ~2 GB —
+    # measured as the job's RSS peak (glibc retains the high-water for the process's life).
     with rasterio.open(filepath, "r+", IGNORE_COG_LAYOUT_BREAK="YES") as ds:
-        a = ds.read(1)
-        mask = ds.read_masks(1) != 0
-        a[mask] = -a[mask]
-        ds.write(a, 1)
+        for _, window in ds.block_windows(1):
+            mask = ds.read_masks(1, window=window) != 0
+            if mask.any():
+                a = ds.read(1, window=window)
+                a[mask] = -a[mask]
+                ds.write(a, 1, window=window)
 
 
 def band_select(source):
