@@ -63,7 +63,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions: { contents: read, packages: write }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ghcr-login
       - name: Already in GHCR?
         id: have
@@ -73,9 +73,9 @@ jobs:
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
         if: steps.have.outputs.exists != 'true'
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         if: steps.have.outputs.exists != 'true'
         with:
           context: .
@@ -94,7 +94,7 @@ jobs:
     steps:
       - name: Create runner
         id: runner
-        uses: Cyclenerd/hcloud-github-runner@v1.4.1
+        uses: Cyclenerd/hcloud-github-runner@v1
         with:
           mode: create
           github_token: ${{ secrets.RUNNER_PAT }}
@@ -130,7 +130,7 @@ jobs:
     timeout-minutes: 720
     permissions: { contents: read, packages: read }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       # Idempotent box setup — docker + the store volume mount (rclone lives in the
       # toolchain image; every publish/mirror shell runs in-container). ONE store: the
       # Snakemake lane reads and writes the same /mnt/seascape-store/store the legacy
@@ -198,7 +198,7 @@ jobs:
       # so the volume path is directly readable).
       - name: Upload snakemake benchmarks
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: snakemake-bench-${{ github.run_id }}
           path: ${{ env.STATE }}/store/bench/
@@ -214,7 +214,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Fetch Hetzner host metrics
         continue-on-error: true
         env:
@@ -224,7 +224,7 @@ jobs:
 
       - name: Upload Hetzner host metrics
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: hcloud-metrics-${{ github.run_id }}-${{ needs.create-runner.outputs.server_id }}
           path: hcloud-metrics/
@@ -241,7 +241,7 @@ jobs:
     steps:
       - name: Delete runner + server
         if: ${{ needs.create-runner.outputs.server_id != '' }}
-        uses: Cyclenerd/hcloud-github-runner@v1.4.1
+        uses: Cyclenerd/hcloud-github-runner@v1
         with:
           mode: delete
           github_token: ${{ secrets.RUNNER_PAT }}
