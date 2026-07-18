@@ -4,12 +4,16 @@
 # preview`. No args → list the recipes. Forwards to `just` inside the container.
 #
 # The image holds only the toolchain + Python deps (the build is layer-cached and only
-# changes when Dockerfile or pipelines/pyproject.toml/uv.lock do); the repo is mounted
+# changes when Dockerfile or pyproject.toml/uv.lock do); the repo is mounted
 # at /app, so the current code runs as-is and outputs land on the host under
 # pipelines/store/. Pipeline env knobs are forwarded (unset ones stay unset inside).
 set -euo pipefail
 cd "$(dirname "$0")"
 if [ $# -eq 0 ]; then set -- --list; fi
+# `./docker.sh snakemake …` runs the Snakemake lane (repo-root Snakefile) instead
+# of a just recipe — the same container, deps, and mounts either way.
+cmd=(just "$@")
+if [ "$1" = "snakemake" ]; then shift; cmd=(uv run snakemake "$@"); fi
 docker build -t bathymetry .
 tty=""; if [ -t 0 ]; then tty="-it"; fi
 # `dev` serves the viewer/Worker — publish their ports to the host.
@@ -30,4 +34,4 @@ exec docker run --rm $tty $ports \
   -e SOUND_CELL_PX -e SOUND_MIN_DEPTH_M -e DRYING_CAP \
   -v "$PWD:/app" \
   -v seascape-node-modules:/app/node_modules \
-  bathymetry just "$@"
+  bathymetry "${cmd[@]}"

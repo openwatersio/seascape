@@ -6,19 +6,14 @@ validation — project-specific fields live under ``seascape:`` keys. It consoli
 today is scattered across ``metadata.json`` (hand-edited attribution + flags), ``bounds.csv``
 (per-file bounds → overall bbox + file count), the normalized COG's CRS, the datum sidecar
 ``source_datum`` records at prep time (``negate`` + applied ``offset`` + ``clamp_positive``),
-and the recipe content hash the caller supplies via ``RECIPE_HASH`` (empty locally).
+and the recipe content hash (``--hash-recipe`` computes it; the ``RECIPE_HASH`` env is
+the legacy override). Missing metadata.json is a hard error — an incomplete item must
+fail registration, never surface later as a silent merge default.
 
-Composed into the shared source tail (``just source <id>``) after the per-source recipe, so
-every source — prepared or mirrored — gets one without editing each recipe. Runs after
-``bounds.csv`` exists; downstream still reads ``metadata.json`` for now, so this is additive.
-
-Validation (registration-time, not aggregation): a source whose recipe runs ``source_datum``
-but left no datum sidecar, or one missing ``metadata.json``, is a hard error here — a stale or
-absent item must fail the source's registration, never surface later as a silent merge default.
-
-Run from pipelines/:  uv run python source_catalog.py <source-id>
+Run from pipelines/:  uv run python source_catalog.py <source-id> [--hash-recipe]
 """
 
+import hashlib
 import json
 import os
 import sys
@@ -29,6 +24,24 @@ from rasterio.warp import transform_bounds
 
 import config
 import utils
+
+
+def recipe_hash(source):
+    """Content hash of sources/<id>/** — what RECIPE_HASH carries in the legacy workflow
+    (there via GitHub's hashFiles), computed here directly so the Snakemake lane stamps it
+    without a CI env var. Path-relative + content, sorted, so it's stable across checkouts.
+    Not equal to hashFiles' value — each lane compares only against its own stamps, and the
+    one-time mismatch at cutover re-aggregates affected tiles once, like any re-registration."""
+    root = f"{config.SOURCES_DIR}/{source}"
+    h = hashlib.sha256()
+    for dirpath, _dirnames, filenames in sorted(os.walk(root)):
+        for name in sorted(filenames):
+            path = os.path.join(dirpath, name)
+            h.update(os.path.relpath(path, root).encode())
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+    return h.hexdigest()
 
 
 def _bbox_and_count(source):
@@ -91,28 +104,18 @@ def _datum(source):
 
     ``negate`` is the one field with a machine consumer — aggregation_reproject flips band 1
     when it's true — so it must mean "negate at aggregation", which only a mirrored/streamed
-    source (no sidecar; negates nothing at prep) ever needs. A sidecar means source_datum
-    already baked the transform into the prepared COGs, so negate is False regardless of what
-    was applied — publishing the applied flag here made aggregation flip prepared depths back
-    to positive (the african_great_lakes/ddm double-negation). ``offset_m``/``clamp_positive``
-    stay the applied-at-prep record (provenance + tile keying; nothing re-applies them).
-    Enforces the invariant that a recipe running source_datum must leave a sidecar behind."""
+    source (no sidecar; negates nothing at prep) ever needs. A sidecar means the transform is
+    already baked into the prepared COGs, so negate is False regardless of what was applied —
+    publishing the applied flag here made aggregation flip prepared depths back to positive
+    (the african_great_lakes/ddm double-negation). ``offset_m``/``clamp_positive`` stay the
+    applied-at-prep record (provenance + tile keying; nothing re-applies them). Every prepped
+    source has a sidecar (source_prep writes one even for a no-op transform); no sidecar
+    means a mirrored source, whose negate comes from metadata."""
     sidecar = f"store/source/{source}/datum.json"
     if os.path.isfile(sidecar):
         with open(sidecar) as f:
             d = json.load(f)
         return False, float(d.get("offset_m", 0.0)), bool(d.get("clamp_positive", False))
-    justfile = f"{config.SOURCES_DIR}/{source}/Justfile"
-    if os.path.isfile(justfile):
-        with open(justfile) as f:
-            # Recipe lines only — header comments legitimately mention source_datum
-            # (noaa_s102's explains why mirrored sources skip it) without running it.
-            runs_datum = any("source_datum" in line for line in f
-                             if not line.lstrip().startswith("#"))
-        if runs_datum:
-            raise SystemExit(
-                f"{source}: recipe runs source_datum but store/source/{source}/datum.json is "
-                "missing — the transform wasn't recorded; failing registration, not aggregation")
     meta = config.load_metadata(source)
     return bool(meta.get("negate", False)), 0.0, False
 
@@ -157,13 +160,16 @@ def build_item(source, recipe_hash=None):
 
 
 def main():
-    if len(sys.argv) != 2:
-        sys.exit("usage: source_catalog.py <source-id>")
-    source = sys.argv[1]
-    item = build_item(source, os.environ.get("RECIPE_HASH") or None)
+    args = [a for a in sys.argv[1:] if a != "--hash-recipe"]
+    if len(args) != 1:
+        sys.exit("usage: source_catalog.py <source-id> [--hash-recipe]")
+    source = args[0]
+    rh = recipe_hash(source) if "--hash-recipe" in sys.argv else os.environ.get("RECIPE_HASH")
+    item = build_item(source, rh or None)
     out = f"store/source/{source}/catalog.json"
-    with open(out, "w") as f:
-        json.dump(item, f, indent=2)
+    # Write-if-changed: an unchanged item keeps its mtime, so a no-op re-catalog
+    # doesn't cascade into cover/coverage/publish.
+    utils.write_if_changed(out, json.dumps(item, indent=2))
     props = item["properties"]
     print(f"{source}: catalog.json ({props['seascape:file_count']} file(s), "
           f"datum_offset={props['seascape:datum_offset_m']}, negate={props['seascape:negate']}, "
@@ -172,18 +178,14 @@ def main():
 
 def _check():
     """Offline synthetic self-check: an item assembles from a synthetic source, the recorded
-    datum offset round-trips, an antimeridian-wrapped bounds row is represented (west > east),
-    a comment-only source_datum mention doesn't trip the sidecar invariant (the real noaa_s102
-    Justfile is the regression case), and the two hard-error paths (missing metadata.json, a
-    recipe that ran source_datum with no sidecar) both fail registration."""
+    datum offset round-trips (sidecar → negate publishes False), a sidecar-less source takes
+    negate from metadata (the mirrored model), an antimeridian-wrapped bounds row is
+    represented (west > east), and missing metadata.json fails registration."""
     import shutil
     import tempfile
 
     d = tempfile.mkdtemp()
     cwd, saved_sources_dir = os.getcwd(), config.SOURCES_DIR
-    # The real repo sources dir, resolved before the chdir — the noaa_s102 case below reads
-    # its actual Justfile (offline file read; its header comment mentions source_datum).
-    real_sources = os.path.abspath(saved_sources_dir)
     try:
         os.chdir(d)
         config.SOURCES_DIR = "sources"
@@ -202,6 +204,14 @@ def _check():
             f.write("filename,left,bottom,right,top,width,height\n"
                     "a.tif,0.0,0.0,111319.49,111325.14,10,10\n"
                     "b.tif,111319.49,0.0,222638.98,55787.5,10,10\n")
+
+        # recipe_hash(): deterministic, and sensitive to both content and filename
+        h1 = recipe_hash(sid)
+        assert h1 == recipe_hash(sid)
+        with open(f"sources/{sid}/file_list.txt", "w") as f:
+            f.write("https://x/a.tif\n")
+        h2 = recipe_hash(sid)
+        assert h1 != h2, "recipe hash must change when a recipe file changes"
 
         item = build_item(sid, recipe_hash="abc123")
         p = item["properties"]
@@ -238,31 +248,11 @@ def _check():
         assert abs(w2 - 175.0) < 0.01 and abs(e2 - -150.0) < 0.01, (w2, e2)
         assert s2 < n2, (s2, n2)
 
-        # A Justfile whose COMMENT mentions source_datum but never invokes it must not trip
-        # the sidecar invariant (sid2 has no sidecar and no datum need)…
-        with open(f"sources/{sid2}/Justfile", "w") as f:
-            f.write("# mirrored sources skip source_datum — see the module docstring\n"
-                    "default:\n    uv run python source_mirror.py x\n")
-        assert build_item(sid2)["properties"]["seascape:negate"] is False
-        # …and the real noaa_s102 recipe (header comment mentions it, never runs it) is the
-        # live regression: _datum must fall through to metadata (negate=true, no offset).
-        assert os.path.isfile(f"{real_sources}/noaa_s102/Justfile"), \
-            f"run --check from pipelines/ ({real_sources}/noaa_s102/Justfile not found)"
-        config.SOURCES_DIR = real_sources
-        try:
-            assert _datum("noaa_s102") == (True, 0.0, False)
-        finally:
-            config.SOURCES_DIR = "sources"
-
-        # missing datum sidecar for a recipe that runs source_datum → hard error
-        with open(f"sources/{sid}/Justfile", "w") as f:
-            f.write("default:\n    uv run python source_datum.py x --negate\n")
-        os.remove(f"store/source/{sid}/datum.json")
-        try:
-            build_item(sid)
-            assert False, "expected a missing datum sidecar to fail"
-        except SystemExit as ex:
-            assert "datum.json is missing" in str(ex), ex
+        # No sidecar = the mirrored model: negate comes from metadata (a prepped source
+        # always has a sidecar — source_prep writes one even for a no-op transform).
+        with open(f"sources/{sid2}/metadata.json", "w") as f:
+            json.dump({"name": "Wrap Source", "negate": True, "volatile": True}, f)
+        assert build_item(sid2)["properties"]["seascape:negate"] is True
 
         # missing metadata.json → hard error
         shutil.rmtree(f"sources/{sid}")

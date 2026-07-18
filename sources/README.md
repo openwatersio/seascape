@@ -93,14 +93,10 @@ Two coverage notes that look like gaps but aren't: EMODnet's 58 tiles are the fu
 
 Check the catalog above first — the candidate may already be cataloged (with verified license/datum/access notes in its `source` issue) or ruled out.
 
-1. Create `sources/<id>/`:
-   - `metadata.json` — `name`, `producer`, `website`, `license`, and an optional `max_zoom` cap (omit to use the source's native resolution; cap it for high-res lidar like CUDEM). Flags as needed: `priority` (outrank a finer source, e.g. datum-authoritative), `mixed_crs`, `band`, `land_clamp` (coarse sources with no land/water concept), `volatile` (mirrored sources whose upstream catalog drifts — re-registered on every scheduled sources run).
-   - `file_list.txt` — source URL(s): `https://…`, `s3://…` (read via `/vsis3/`), an ERDDAP `…/griddap/…` base, a `.zip`, or a local path.
-   - `Justfile` — compose the shared `pipelines/source_*.py` steps the source needs. Copy an existing recipe and adjust:
-     - http GeoTIFF → `source_download`; volatile public tile collections → `source_mirror` (a bucket-prefix listing like S-102 or a flat urllist like CUDEM — registers relative `objects/<key>` rows + a mirror manifest; the sources workflow copies the bytes, builds never touch the upstream); zip → `source_download` + `source_unzip`. Oddball fetches (ERDDAP griddap, portal APIs) get their own `source_download_<id>.py` — copy one.
-     - positive-down depths or a datum offset → `source_datum --negate --offset N`.
-     - always: `source_normalize --crs EPSG:… [--nodata N]` → `source_bounds` → `source_polygonize <id> 8` → `source_create_tarball`.
-2. `just source <id>` (verify it lands in `pipelines/store/source/<id>/`).
+1. Create `sources/<id>/` — two files, no recipe (the Snakemake lane discovers the directory and routes it by metadata):
+   - `metadata.json` — `name`, `producer`, `website`, `license`, and an optional `max_zoom` cap (omit to use the source's native resolution; cap it for high-res lidar like CUDEM). Prep knobs as needed: `crs` (assigned at normalize), `nodata`, `negate` (positive-down depths), `datum_offset_m`, `clamp_positive` (drop a lake DEM's land fringe), `archive_members` (fnmatch glob selecting archive members, e.g. `"*_lld.tif"`). Build flags as needed: `priority` (outrank a finer source, e.g. datum-authoritative), `mixed_crs`, `band`, `land_clamp` (coarse sources with no land/water concept), `volatile` (mirrored public tile collections whose upstream catalog drifts — a bucket-prefix listing like S-102 or a flat urllist like CUDEM; registered from header reads on every scheduled sources run, bytes mirrored, builds never touch the upstream).
+   - `file_list.txt` — one upstream URL per line. Formats are detected from the bytes (zip / 7z / gzip / tar / ARC-INFO e00 / netCDF / ESRI ASCII mosaic / GeoTIFF) — no per-format wiring. A source whose URL list comes from an API/index gets a `harvest.py` that regenerates `file_list.txt` (human-run, committed — see batnas, uk_surfzone).
+2. `just source <id>` — runs the lane for that source (verify it lands in `pipelines/store/source/<id>/`); equivalently `uv run snakemake sources --config source=<id>` from the repo root.
 3. `just planet` — its tiles fold into the grid-cell overlays + manifest automatically (priority is derived from `(maxzoom, id)`). `just preview` over its bbox to eyeball depths and seams.
 4. Nothing to wire in CI — the sources workflow discovers `sources/<id>/` directories automatically; dispatch it (optionally filtered to the new source), then dispatch a build.
 

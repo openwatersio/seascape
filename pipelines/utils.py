@@ -184,6 +184,27 @@ def create_folder(path):
     Path(path).mkdir(parents=True, exist_ok=True)
 
 
+def write_if_changed(path, content):
+    """Write path only when its content differs — mtimes don't churn on a no-op rewrite,
+    so engine provenance sees an unchanged artifact as unchanged (a code-mtime re-prep
+    with identical output stops cascading downstream). Temp + rename so a crash never
+    leaves a half-written file at the declared path."""
+    if os.path.isfile(path):
+        with open(path) as f:
+            if f.read() == content:
+                return False
+    with open(path + ".tmp", "w") as f:
+        f.write(content)
+    os.replace(path + ".tmp", path)
+    return True
+
+
+# Identifying User-Agent for every upstream request (requests here, GDAL /vsicurl via
+# GDAL_HTTP_USERAGENT in the Dockerfile): gives data providers something to allowlist
+# instead of the default python-requests fingerprint their WAFs throttle.
+USER_AGENT = "seascape/1.0 (+https://openwaters.io/charts/seascape)"
+
+
 def http_download(url, dest, chunk=1 << 20, retries=5):
     '''Stream a URL to dest with requests (handles query-string URLs; no shell).
     Retries with backoff on transient network errors — the public data servers
@@ -192,11 +213,19 @@ def http_download(url, dest, chunk=1 << 20, retries=5):
     import requests
     for attempt in range(retries):
         try:
-            with requests.get(url, stream=True, timeout=120) as r:
+            with requests.get(url, stream=True, timeout=120,
+                              headers={'User-Agent': USER_AGENT}) as r:
                 r.raise_for_status()
+                written = 0
                 with open(dest, 'wb') as f:
                     for part in r.iter_content(chunk):
-                        f.write(part)
+                        written += f.write(part)
+                # a truncated body can still look like success (a cut zip keeps its PK magic)
+                expected = r.headers.get('Content-Length', '')
+                if expected.isdigit() and r.headers.get('Content-Encoding', 'identity') == 'identity' \
+                        and written != int(expected):
+                    raise requests.exceptions.RequestException(
+                        f"truncated body: {written} of {expected} bytes")
             return
         except requests.exceptions.RequestException as e:
             if attempt == retries - 1:

@@ -1,0 +1,8 @@
+# Workflow profile, auto-loaded by snakemake (relative to the Snakefile).
+# Bare `snakemake <target>` uses every core; -j/--cores still overrides.
+cores: all
+# Every job reserves memory for scheduler accounting (rules override where they hold
+# more); the global budget comes from the caller's --resources mem_gb=N (unlimited
+# when unset, e.g. a laptop dry run).
+default-resources:
+  mem_gb: 2

@@ -4,5 +4,8 @@
     "website": "https://www.ncei.noaa.gov/products/great-lakes-bathymetry",
     "license": "public domain (U.S. Government work)",
     "max_zoom": 10,
-    "datum": "Low Water Datum (LWD) per lake — a low-water / chart-datum analog"
+    "datum": "Low Water Datum (LWD) per lake — a low-water / chart-datum analog",
+    "clamp_positive": true,
+    "crs": "EPSG:4269",
+    "archive_members": "*_lld.tif"
 }

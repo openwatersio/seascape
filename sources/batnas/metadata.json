@@ -4,5 +4,6 @@
     "website": "https://tanahair.indonesia.go.id/",
     "license": "BIG Ina-Geoportal terms (open, attribution; no resale)",
     "max_zoom": 10,
-    "datum": "MSL"
+    "datum": "MSL",
+    "crs": "EPSG:4326"
 }

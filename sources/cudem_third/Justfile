@@ -1,8 +1,0 @@
-# NOAA CUDEM 1/3 arc-sec (offshore band + Alaska). Run from pipelines/:  just ../sources/cudem_third/
-# Mirrored model: register every manifest tile as a relative objects/<key> row (header
-# reads only for newly-listed tiles; the bytes are copied into the store's object mirror).
-# ~10 m, NAVD88 / NAD83; already COGs → no normalize/datum/tarball.
-# Priority derives from (maxzoom, id): cudem (z13) wins over cudem_third (z12) over gebco.
-[no-cd]
-default:
-    uv run python source_mirror.py cudem_third

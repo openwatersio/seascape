@@ -5,13 +5,10 @@
 
 set working-directory := 'pipelines'
 
-# Prepare one source: fetch -> datum -> normalize -> bounds -> polygon -> tarball, then
-# assemble catalog.json. The catalog step is the shared tail, so every source (prepared or
-# mirrored) gets a generated catalog item without editing each recipe. RECIPE_HASH (the
-# source's recipe content hash, supplied by the caller; empty locally) rides into the item.
+# Prepare one source through the Snakemake lane: fetch -> stage -> datum -> normalize ->
+# bounds -> polygon -> catalog.json. Per-source knobs live in sources/<id>/metadata.json.
 source id:
-    just ../sources/{{id}}/
-    uv run python source_catalog.py {{id}}
+    uv run snakemake -s ../Snakefile sources --config source={{id}}
 
 # Prepare the OSM land mask once (download -> unzip -> EPSG:3857 FlatGeobuf at
 # store/landmask/land.fgb). Flagged coarse sources (GEBCO/EMODnet) clamp negative
@@ -26,14 +23,9 @@ landmask:
 watermask:
     uv run python landmask.py prep-water
 
-# Prepare every source under sources/.
+# Prepare every source under sources/ (the Snakemake lane; sources are discovered).
 sources:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    for id in $(uv run python -c "import config; print('\n'.join(config.sources()))"); do
-        echo "── source: $id ──"
-        just ../sources/"$id"/
-    done
+    uv run snakemake -s ../Snakefile sources
 
 # Planet build: cover -> aggregate -> mosaic-index -> terrain -> bundle -> vector layers (BBOX="W,S,E,N"
 # for a region). Soundings + depare bundle BEFORE contours: the contours tile-join folds their
@@ -242,13 +234,17 @@ test: test-sources test-engine test-workflows
 
 # Offline self-checks (synthetic data, no network).
 test-sources:
-    uv run python test_source_stage.py
     uv run python source_mirror.py --check
     uv run python source_catalog.py --check
     uv run python source_remote.py
+    uv run python source_fetch.py --check
+    uv run python source_prep.py --check
+    uv run python source_check.py --check
+    uv run snakemake -s ../Snakefile -n sources > /dev/null
 test-engine:
     uv run python test_engine.py
     uv run python aggregation_reproject.py --check
+    uv run python aggregation_covering.py --check
     uv run python keys.py --check
     uv run python mosaic.py --check
     uv run python terrain.py --check

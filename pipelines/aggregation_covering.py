@@ -193,9 +193,9 @@ def get_aggregation_tiles(macrotile_map):
     return tiles
 
 
-def write_aggregation_items(macrotile_map, aggregation_tiles, aggregation_id):
-    folder = f"store/aggregation/{aggregation_id}"
-    utils.create_folder(folder)
+def aggregation_items(macrotile_map, aggregation_tiles):
+    """{csv filename: csv content} for the covering — the write-mode-independent core."""
+    items = {}
     for aggregation_tile in aggregation_tiles:
         rows = set()
         child_z = 0
@@ -203,30 +203,128 @@ def write_aggregation_items(macrotile_map, aggregation_tiles, aggregation_id):
             cell = macrotile_map.get((macrotile.x, macrotile.y))
             if cell is None:
                 continue
-            for source, items in cell["sources"].items():
-                for item in items:
+            for source, source_items in cell["sources"].items():
+                for item in source_items:
                     rows.add((source, item["filename"], str(item["maxzoom"])))
                     child_z = max(child_z, item["maxzoom"])
         if not rows:
             continue
         lines = ["source,filename,maxzoom\n"] + [",".join(r) + "\n" for r in sorted(rows)]
         name = f"{aggregation_tile.z}-{aggregation_tile.x}-{aggregation_tile.y}-{child_z}-aggregation.csv"
+        items[name] = "".join(lines)
+    return items
+
+
+def write_aggregation_items(macrotile_map, aggregation_tiles, aggregation_id):
+    folder = f"store/aggregation/{aggregation_id}"
+    utils.create_folder(folder)
+    for name, content in aggregation_items(macrotile_map, aggregation_tiles).items():
         with open(f"{folder}/{name}", "w") as f:
-            f.writelines(lines)
+            f.write(content)
 
 
-def main():
+# Shared write-if-changed (utils): mtimes don't churn on a no-op re-cover, so engine
+# provenance sees an unchanged covering as unchanged.
+write_if_changed = utils.write_if_changed
+
+
+def write_stable(macrotile_map, aggregation_tiles):
+    """The Snakemake-lane covering: per-tile CSVs at stable paths directly under
+    store/aggregation/ (no ULID run directories), write-if-changed, stale tiles pruned,
+    plus store/aggregation/covering.txt — the stem list the planet/preview invocation
+    parses its DAG from. Under BBOX only intersecting tiles are computed, so pruning
+    keeps out-of-window tiles: a bbox covering refreshes its window without erasing the
+    planet's. Legacy ULID directories (subdirectories) are untouched."""
+    folder = "store/aggregation"
+    utils.create_folder(folder)
+    items = aggregation_items(macrotile_map, aggregation_tiles)
+    written = sum(write_if_changed(f"{folder}/{name}", content)
+                  for name, content in items.items())
+    clip = bbox_3857()
+    pruned = 0
+    for path in glob(f"{folder}/*-aggregation.csv"):
+        name = path.rsplit("/", 1)[-1]
+        if name in items:
+            continue
+        z, x, y, _ = (int(a) for a in name.removesuffix("-aggregation.csv").split("-"))
+        tile_bounds = mercantile.xy_bounds(mercantile.Tile(x=x, y=y, z=z))
+        if clip is not None and not bounds_intersect(tuple(tile_bounds), clip):
+            continue  # outside this bbox run's window — not ours to judge
+        os.remove(path)
+        pruned += 1
+    stems = sorted(p.rsplit("/", 1)[-1].removesuffix("-aggregation.csv")
+                   for p in glob(f"{folder}/*-aggregation.csv"))
+    write_if_changed(f"{folder}/covering.txt", "".join(s + "\n" for s in stems))
+    print(f"stable covering: {len(items)} tile(s), {written} changed, {pruned} pruned, "
+          f"{len(stems)} total in covering.txt")
+
+
+def main(stable=False):
     print("get_macrotile_map...")
     macrotile_map = get_macrotile_map()
     print("add group ids...")
     add_group_ids(macrotile_map)
     print("get aggregation tiles...")
     aggregation_tiles = get_aggregation_tiles(macrotile_map)
+    if stable:
+        write_stable(macrotile_map, aggregation_tiles)
+        return
     aggregation_id = str(ULID())
     utils.create_folder(f"store/aggregation/{aggregation_id}")
     print(f"write {len(aggregation_tiles)} aggregation items to {aggregation_id}...")
     write_aggregation_items(macrotile_map, aggregation_tiles, aggregation_id)
 
 
+def _check():
+    """Offline: write_if_changed leaves mtimes alone on identical content, and the
+    stable covering prunes a stale in-window tile while keeping an out-of-window one."""
+    import shutil
+    import tempfile
+    import time
+
+    d = tempfile.mkdtemp()
+    cwd = os.getcwd()
+    try:
+        os.chdir(d)
+        utils.create_folder("store/aggregation")
+        path = "store/aggregation/8-1-1-9-aggregation.csv"
+        assert write_if_changed(path, "a,b\n1,2\n") is True
+        before = os.stat(path).st_mtime_ns
+        time.sleep(0.01)
+        assert write_if_changed(path, "a,b\n1,2\n") is False
+        assert os.stat(path).st_mtime_ns == before, "unchanged content must not touch mtime"
+        assert write_if_changed(path, "a,b\n1,3\n") is True
+        assert os.stat(path).st_mtime_ns != before
+
+        # stale prune honors the bbox window: with BBOX over NY harbor, a stale csv
+        # on the covering tile there is pruned, one on the other side of the planet
+        # is kept, and covering.txt lists exactly what remains on disk.
+        t = mercantile.tile(-74.0, 40.6, utils.macrotile_z)
+        inside = f"{t.z}-{t.x}-{t.y}-13-aggregation.csv"
+        for name in (inside, "8-200-100-9-aggregation.csv"):
+            with open(f"store/aggregation/{name}", "w") as f:
+                f.write("source,filename,maxzoom\nx,y.tif,9\n")
+        os.environ["BBOX"] = "-74.30,40.40,-73.75,40.80"
+        try:
+            write_stable({}, [])  # empty covering: everything in-window is stale
+        finally:
+            del os.environ["BBOX"]
+        assert not os.path.exists(f"store/aggregation/{inside}"), \
+            "stale in-window tile must be pruned"
+        assert os.path.exists("store/aggregation/8-200-100-9-aggregation.csv"), \
+            "out-of-window tile must survive a bbox run"
+        with open("store/aggregation/covering.txt") as f:
+            stems = f.read().split()
+        assert stems == ["8-1-1-9", "8-200-100-9"], stems
+        print("aggregation_covering.py self-check ok")
+    finally:
+        os.chdir(cwd)
+        shutil.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+    if sys.argv[1:2] == ["--check"]:
+        _check()
+    else:
+        main(stable="--stable" in sys.argv[1:])

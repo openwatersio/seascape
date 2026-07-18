@@ -4,4 +4,11 @@
 # 115 m and the same survey lineage. Both INFOMAR sources set priority:1 to outrank EMODnet
 # regardless of any zoom tie; max_zoom stays the honest native (z11 for 25 m, z13 for the 10 m
 # sibling), so the 10 m wins inshore by finer max_zoom within the tier. 100 m offshore omitted.
-https://gsi.geodata.gov.ie/downloads/Marine/Data/Downloads/LatestEntireAreaMerge/IE_GSI_MI_Bathymetry_25m_IE_Waters_WGS84_LAT_TIFF.zip
+# MIRRORED: GSI's CDN blocks/throttles datacenter IPs (build-box fetches time out on
+# every attempt while residential fetches succeed; an identifying User-Agent didn't
+# help), so the zip is fetched by hand and served from our public bucket. Refresh when
+# GSI ships a new vintage:
+#   curl -C - -o IE_GSI_MI_Bathymetry_25m_IE_Waters_WGS84_LAT_TIFF.zip \
+#     https://gsi.geodata.gov.ie/downloads/Marine/Data/Downloads/LatestEntireAreaMerge/IE_GSI_MI_Bathymetry_25m_IE_Waters_WGS84_LAT_TIFF.zip
+#   rclone copyto IE_GSI_MI_Bathymetry_25m_IE_Waters_WGS84_LAT_TIFF.zip r2:data/bathymetry/raw/infomar_25m/IE_GSI_MI_Bathymetry_25m_IE_Waters_WGS84_LAT_TIFF.zip
+https://data.openwaters.io/bathymetry/raw/infomar_25m/IE_GSI_MI_Bathymetry_25m_IE_Waters_WGS84_LAT_TIFF.zip

@@ -3,5 +3,6 @@
     "producer": "EMODnet Bathymetry Consortium",
     "website": "https://emodnet.ec.europa.eu/en/bathymetry",
     "license": "CC-BY 4.0",
-    "land_clamp": true
+    "land_clamp": true,
+    "crs": "EPSG:4326"
 }

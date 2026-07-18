@@ -6,5 +6,6 @@
     "max_zoom": 13,
     "datum": "depth below lake surface (per-lake sounding datum, EGM2008/WGS84) — depth, so negate; no offset",
     "negate": true,
-    "mixed_crs": true
+    "mixed_crs": true,
+    "archive_members": "*_Analytical_ras.tif"
 }

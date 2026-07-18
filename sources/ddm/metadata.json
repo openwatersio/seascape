@@ -2,5 +2,7 @@
     "name": "Danmarks Dybdemodel (DDM) 50 m",
     "producer": "SDFI / Dataforsyningen",
     "website": "https://dataforsyningen.dk/data/4707",
-    "license": "see SDFI / Dataforsyningen terms"
+    "license": "see SDFI / Dataforsyningen terms",
+    "negate": true,
+    "crs": "EPSG:3034"
 }
