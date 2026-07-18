@@ -99,7 +99,11 @@ rule mirror_source:
         bucket="store/source/{source}/mirror-bucket.txt",
     wildcard_constraints:
         source=pat(LOCAL_MIRRORED)
-    priority: 5000  # long serial job with thousands of network header reads; start early
+    # Priority BANDS, separated by orders of magnitude so no byte-weighted prep (raw MB,
+    # realistically <1,000,000) can cross into a higher band, and so the values dominate
+    # the scheduler's packing objective (the planet run showed small priorities losing to
+    # count-maximizing selection): masks 10M > mirrors 5M > preps (raw MB).
+    priority: 5_000_000  # long serial job with thousands of network header reads; start early
     retries: 2
     resources:
         mem_gb=2  # header reads + list bookkeeping, no raster in memory
@@ -156,7 +160,7 @@ rule fetch_catalog:
 rule landmask:
     output:
         "store/landmask/land.fgb"
-    priority: 10000  # long single-threaded jobs, ready at t=0: overlap, don't tail
+    priority: 10_000_000  # top band (see mirror_source): long single-threaded, ready at t=0 — overlap, don't tail
     retries: 2
     resources:
         mem_gb=4
@@ -169,7 +173,7 @@ rule landmask:
 rule watermask:
     output:
         "store/landmask/water.fgb"
-    priority: 10000  # see landmask
+    priority: 10_000_000  # see landmask
     retries: 2
     resources:
         mem_gb=8  # the planet Overture-water reproject; refine from the benchmark
