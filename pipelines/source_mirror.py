@@ -287,7 +287,7 @@ def register(source, keys, header):
             sys.exit(f"{msg} — upstream looks broken/half-published; refusing to publish "
                      f"over the previous registration (MIRROR_ALLOW_SHRINK=1 to override)")
 
-    rows, todo = [], []
+    rows, todo, read_ok = [], [], 0
     healthy = set(keys)  # keys whose objects the copier may chase; broken ones leave
     for key in keys:
         rel = f"objects/{key}"
@@ -324,6 +324,7 @@ def register(source, keys, header):
             for i, row_or_key, err in pool.map(read_one, todo):
                 if err is None:
                     rows[i] = row_or_key
+                    read_ok += 1
                 else:
                     broken.append((i, row_or_key, err))
 
@@ -354,7 +355,9 @@ def register(source, keys, header):
     with open(f"store/source/{source}/mirror.txt", "w") as f:
         f.writelines(key + "\n" for key in sorted(healthy))
     write_bounds(source, rows)
-    print(f"{source}: {len(rows) - len(todo)} carried forward, {len(todo)} newly read, "
+    kept = len(keys) - len(todo)
+    n_broken = len(todo) - read_ok if todo else 0
+    print(f"{source}: {kept} carried forward, {read_ok} newly read, {n_broken} broken, "
           f"{len(removed)} removed")
 
 

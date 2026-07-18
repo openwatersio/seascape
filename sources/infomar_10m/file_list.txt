@@ -4,4 +4,11 @@
 # Values are elevation (seafloor negative, like GEBCO) → no negate. NoData 3.4e38.
 # The 25 m shelf grid is a SEPARATE source (sources/infomar_25m), mirroring cudem/cudem_third.
 # Both set priority:1 to outrank EMODnet; the 10 m wins inshore by finer max_zoom (z13 > z11).
-https://gsi.geodata.gov.ie/downloads/Marine/Data/Downloads/LatestEntireAreaMerge/IE_GSI_MI_Bathymetry_10m_Inshore_IE_WGS84_LAT_TIFF.zip
+# MIRRORED: GSI's CDN blocks/throttles datacenter IPs (build-box fetches time out on
+# every attempt while residential fetches succeed; an identifying User-Agent didn't
+# help), so the zip is fetched by hand and served from our public bucket. Refresh when
+# GSI ships a new vintage:
+#   curl -C - -o IE_GSI_MI_Bathymetry_10m_Inshore_IE_WGS84_LAT_TIFF.zip \
+#     https://gsi.geodata.gov.ie/downloads/Marine/Data/Downloads/LatestEntireAreaMerge/IE_GSI_MI_Bathymetry_10m_Inshore_IE_WGS84_LAT_TIFF.zip
+#   rclone copyto IE_GSI_MI_Bathymetry_10m_Inshore_IE_WGS84_LAT_TIFF.zip r2:data/bathymetry/raw/infomar_10m/IE_GSI_MI_Bathymetry_10m_Inshore_IE_WGS84_LAT_TIFF.zip
+https://data.openwaters.io/bathymetry/raw/infomar_10m/IE_GSI_MI_Bathymetry_10m_Inshore_IE_WGS84_LAT_TIFF.zip
