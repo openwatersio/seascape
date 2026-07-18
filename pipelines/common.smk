@@ -21,11 +21,6 @@ def pat(ids):
     return "|".join(ids) or "^\\b$"
 
 
-def code(*names):
-    """A rule's code inputs: the named modules + the shared config/utils, absolute."""
-    return [str(SCRIPTS / n) for n in (*names, "config.py", "utils.py")]
-
-
 def raw_assets(wc):
     """One raw/<index> input per file_list.txt entry."""
     return [f"store/source/{wc.source}/raw/{i}"

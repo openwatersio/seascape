@@ -121,10 +121,8 @@ rule catalog_item:
         "{PY}/source_catalog.py {wildcards.source} --hash-recipe"
 
 
-# The masks rebuild only on a landmask.py change (pinned snapshot/release ⇒ no data drift).
+# Masks rebuild only when forced (-R landmask): pinned snapshot/release ⇒ no data drift.
 rule landmask:
-    input:
-        code=code("landmask.py"),
     output:
         "store/landmask/land.fgb"
     priority: 10000  # long single-threaded jobs, ready at t=0: overlap, don't tail
@@ -138,8 +136,6 @@ rule landmask:
 
 
 rule watermask:
-    input:
-        code=code("landmask.py"),
     output:
         "store/landmask/water.fgb"
     priority: 10000  # see landmask
@@ -157,7 +153,6 @@ rule cover:
     input:
         expand("store/source/{source}/bounds.csv", source=PREPPED + MIRRORED),
         expand("store/source/{source}/catalog.json", source=PREPPED + MIRRORED),
-        code=code("aggregation_covering.py"),
     output:
         "store/aggregation/covering.txt"
     shell:
@@ -171,7 +166,6 @@ rule coverage:
         expand("store/source/{source}/bounds.csv", source=PREPPED + MIRRORED),
         expand("store/source/{source}/catalog.json", source=PREPPED + MIRRORED),
         "store/aggregation/covering.txt",  # sequencing only; coverage reads footprints + bounds
-        code=code("contour_run.py", "aggregation_covering.py", "cache_versions.py"),
     output:
         "store/bundle/coverage.pmtiles"
     shell:
