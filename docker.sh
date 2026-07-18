@@ -22,7 +22,11 @@ image="${IMAGE:-seascape-build}"
 # CI's env carries the repo image and its deps tag separately — compose the ref here.
 if [ -n "${IMAGE_TAG:-}" ]; then image="$image:$IMAGE_TAG"; fi
 if [ "$image" = seascape-build ]; then
-  docker build -t seascape-build .
+  # Tag on the deps files (CI's IMAGE_TAG keying) so an unchanged image skips the
+  # docker build round-trip entirely; code is mounted, so nothing else can stale it.
+  deps=$(cat Dockerfile pyproject.toml uv.lock | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-12)
+  image="seascape-build:deps-$deps"
+  docker image inspect "$image" >/dev/null 2>&1 || docker build -t "$image" .
 else
   docker image inspect "$image" >/dev/null 2>&1 || docker pull "$image"
 fi
@@ -36,7 +40,9 @@ state=""; if [ -n "${STATE:-}" ]; then state="-v $STATE:/app/state"; fi
 export TOOLCHAIN="${TOOLCHAIN:-$(docker image inspect -f '{{.Id}}' "$image")}"
 # node_modules is shadowed by a named volume: the host's install is
 # platform-specific (darwin vs linux binaries), so the container keeps its own.
-exec docker run --rm $tty $ports $state \
+# nofile: ~96 concurrent snakemake jobs' pipes + per-job benchmark /proc reads exhaust
+# the default soft limit in the parent (observed at planet width: Errno 24 at 82%).
+exec docker run --rm $tty $ports $state --ulimit nofile=65536:65536 \
   -e TOOLCHAIN \
   -e BBOX -e SOURCE_VSI_BASE -e BOUNDS_BASE -e LANDMASK -e WATERMASK -e FORCE_REBUILD \
   -e MACROTILE_Z -e OVERLAY_SPLIT_Z -e NUM_OVERVIEWS -e AGG_PROCESSES -e BUNDLE_PROCESSES -e GDAL_CACHEMAX \
