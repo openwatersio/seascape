@@ -330,6 +330,35 @@ def _artifact(stem):
     return f"{utils.get_pmtiles_folder(x, y, z)}/{stem}.pmtiles"
 
 
+def render_stems(covering_stems):
+    """The engine-lane port of cover()'s marker cascade, PURE: native render stems are the
+    covering stems; overview parents coalesce per child zoom cascading to z0 (a parent added
+    at one zoom is an extent the next-coarser pass reads, exactly like the markers). Parse-time
+    cheap: mercantile only, no store reads."""
+    out = set(covering_stems)
+    for child_zoom in reversed(range(1, 32)):
+        extents = []
+        for s in out:
+            z, x, y, cz = (int(a) for a in s.split("-"))
+            if cz == child_zoom:
+                extents.append(mercantile.Tile(x=x, y=y, z=z))
+        if not extents:
+            continue
+        for simplified in _simplified(extents, child_zoom):
+            out.add(f"{simplified.z}-{simplified.x}-{simplified.y}-{child_zoom - 1}")
+    return sorted(out)
+
+
+def render(stem):
+    """The stage-3 Snakemake job: render one stem from the mosaic (via the local GTI the
+    mosaic_index rule wrote) to the PLAIN flat name — engine freshness, no keys, no markers.
+    Flat store/pmtiles/<stem>.pmtiles: the engine lane doesn't shard (bundling globs it)."""
+    out = f"store/pmtiles/{stem}.pmtiles"
+    os.makedirs("store/pmtiles", exist_ok=True)
+    _render(stem, out)
+    print(f"terrain render {stem}: {out}", flush=True)
+
+
 def _render_stems(aid):
     """Every render stem in the covering: native (aggregation) + overview (terrain markers)."""
     stems = set()
@@ -547,10 +576,12 @@ def main(argv):
         cover()
     elif argv == ["run"]:
         run()
+    elif argv[:1] == ["render"] and len(argv) == 2:
+        render(argv[1])
     elif argv[:1] == ["--check"]:
         _check()
     else:
-        sys.exit("usage: terrain.py <cover | run | --check>")
+        sys.exit("usage: terrain.py <cover | run | render <stem> | --check>")
 
 
 if __name__ == "__main__":

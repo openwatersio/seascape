@@ -138,3 +138,128 @@ rule mosaic_index:
 rule mosaic:
     input:
         rules.mosaic_index.output
+
+
+# ── stage 3: every consumer reads mosaic windows (5c re-pointed) ──────────────────────
+
+import contour_run
+import depare_run
+import smooth
+import soundings_run
+import terrain as terrain_mod
+
+RENDER_STEMS = terrain_mod.render_stems(STEMS)
+DEPARE_STEMS = [] if os.environ.get("SKIP_DEPARE") else STEMS
+
+# The one shared f(depth, zoom) — a knob change reruns stage 3 only, never a merge.
+SMOOTH_CFG = json.dumps({} if os.environ.get("SKIP_SMOOTH") else {
+    "sigma": smooth.DEM_SIGMA, "sigma_deep": smooth.DEM_SIGMA_DEEP,
+    "mask_sigma": smooth.MASK_SIGMA, "slope_low": smooth.SLOPE_LOW,
+    "slope_high": smooth.SLOPE_HIGH, "depth_full": smooth.DEPTH_FULL,
+    "depth_smooth": smooth.DEPTH_SMOOTH, "block": smooth.BLOCK}, sort_keys=True)
+
+
+def fork_inputs(wc):
+    """A vector fork's inputs: the intersecting mosaic tiles (the buffered window's sources)
+    — never the global index, so fork jobs run the moment their neighborhood of merges lands."""
+    return [f"store/mosaic/tiles/{s}.tif" for s in mosaic_mod.intersecting_tiles(wc.stem)]
+
+
+rule contour_tile:
+    input:
+        fork_inputs
+    output:
+        "store/contour/{stem}.fgb"
+    params:
+        levels=json.dumps({"m": pipeline_config.CONTOUR_LEVELS, "ft": pipeline_config.CONTOUR_LEVELS_FT}),
+        nav=contour_run.NAV_SMOOTH_MAX_M, deep=contour_run.DEEP_CUTOFF_M,
+        ring=contour_run.MIN_RING_AREA_M2, smooth=SMOOTH_CFG,
+    resources:
+        mem_gb=2  # a windowed read + line smoothing, not a source-stack merge
+    benchmark:
+        "store/bench/contour/{stem}.tsv"
+    shell:
+        "{PY}/contour_run.py tile {wildcards.stem}"
+
+
+rule soundings_tile:
+    input:
+        fork_inputs
+    output:
+        "store/soundings/{stem}.geojson"
+    params:
+        cell=soundings_run.SOUND_CELL_PX, min_depth=soundings_run.SOUND_MIN_DEPTH_M,
+        smooth=SMOOTH_CFG,
+    resources:
+        mem_gb=2
+    benchmark:
+        "store/bench/soundings/{stem}.tsv"
+    shell:
+        "{PY}/soundings_run.py tile {wildcards.stem}"
+
+
+# Behind SKIP_DEPARE until the perf backlog's bounding work: the dense-tile GEOS tail is
+# unbounded (~65 min single-core measured on the densest stem).
+rule depare_tile:
+    input:
+        fork_inputs,
+        masks=MASKS,
+    output:
+        "store/depare/{stem}.fgb"
+    params:
+        levels=json.dumps({"m": pipeline_config.DEPARE_LEVELS, "ft": pipeline_config.DEPARE_LEVELS_FT}),
+        drying=pipeline_config.DRYING_CAP, sliver=depare_run.SLIVER_MIN_PX, smooth=SMOOTH_CFG,
+    resources:
+        mem_gb=3
+    benchmark:
+        "store/bench/depare/{stem}.tsv"
+    shell:
+        "{PY}/depare_run.py tile {wildcards.stem}"
+
+
+# Terrain reads windows through the LOCAL GTI, so it gates on mosaic_index (named upgrade:
+# per-stem VRTs would restore stage-2/3 pipelining for native stems). Weight like the merge:
+# a native z14 window is the same array size; overview stems are tiny.
+rule terrain_render:
+    input:
+        rules.mosaic_index.output
+    output:
+        "store/pmtiles/{stem}.pmtiles"
+    params:
+        cfg=json.dumps(terrain_mod._config(), sort_keys=True),
+    resources:
+        mem_gb=lambda wc, attempt: scheduler.weight(wc.stem, factor=MERGE_FACTOR) * attempt
+    benchmark:
+        "store/bench/terrain/{stem}.tsv"
+    shell:
+        "{PY}/terrain.py render {wildcards.stem}"
+
+
+# Product-inventory aggregates: each family buildable alone against a warm mosaic.
+rule contours:
+    input:
+        expand("store/contour/{stem}.fgb", stem=STEMS)
+
+
+rule soundings:
+    input:
+        expand("store/soundings/{stem}.geojson", stem=STEMS)
+
+
+rule depare:
+    input:
+        expand("store/depare/{stem}.fgb", stem=DEPARE_STEMS)
+
+
+rule terrain:
+    input:
+        expand("store/pmtiles/{stem}.pmtiles", stem=RENDER_STEMS)
+
+
+# Everything cartographic (bundles + publish arrive next; DEPARE rides only when enabled).
+rule tiles:
+    input:
+        rules.contours.input,
+        rules.soundings.input,
+        rules.depare.input,
+        rules.terrain.input,
