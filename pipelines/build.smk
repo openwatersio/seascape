@@ -80,11 +80,11 @@ MERGE_CFG = json.dumps({
 }, sort_keys=True)
 
 
-# factor 0.75, not scheduler.DEFAULT_FACTOR (4): the legacy factor priced the pool job
-# with forks riding in it. The merge-only job with the windowed negate measures 1.74 GB
-# peak on the densest S-102 stem (52 products) → z14 reserves 4 GB (~2.3x margin);
-# retries escalate. Re-fit from store/bench/mosaic/ when planet data lands.
-MERGE_FACTOR = 0.75
+# factor 1.5, not scheduler.DEFAULT_FACTOR (4): the legacy factor priced the pool job
+# with forks riding in it. The merge-only job with the windowed negate measures 3.9 GB
+# max RSS on the densest S-102 stem (52 products) on the box → z14 reserves 7 GB
+# (~1.8x margin); retries escalate. Re-fit from store/bench/mosaic/ when planet lands.
+MERGE_FACTOR = 1.5
 
 
 def tile_weight(wc, input=None, attempt=None):
