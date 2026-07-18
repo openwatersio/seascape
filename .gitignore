@@ -12,3 +12,4 @@ __pycache__
 pipelines/store
 pipelines/.snakemake/
 .snakemake
+.codegraph
