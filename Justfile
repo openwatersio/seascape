@@ -247,6 +247,7 @@ test-engine:
     uv run python aggregation_covering.py --check
     uv run python keys.py --check
     uv run python mosaic.py --check
+    uv run python test_build.py
     uv run python terrain.py --check
     uv run python scheduler.py --check
     uv run python store_manifest.py --check

@@ -38,19 +38,33 @@ R2-agnostic like the rest of pipelines/: the writer writes the LOCAL store; the 
 base comes from MOSAIC_VSI_BASE (CI: a /vsicurl bucket URL) and falls back to the tiles dir's local
 abspath, mirroring config.source_path's SOURCE_VSI_BASE resolution — no bucket name here.
 
-  python mosaic.py index     build the index + planet z8 COG + mosaic.gti for the current covering
-  python mosaic.py --check    self-check
+The KEYED lane above (aggregation_run → produce / build_index) is the legacy build's and is
+DELETED in this branch once the stage-3 rules replace its consumers. The SNAKEMAKE lane —
+``mosaic.py tile <csv>`` + ``mosaic.py index --stable`` — is what remains: one engine job per
+covering tile off the ``--stable`` covering:
+freshness is ENGINE provenance (the rule's inputs + params), so artifacts take PLAIN stable names
+(``tiles/<stem>.tif``, ``index/covering.parquet``, ``planet-z8.tif``, no key column) and
+content-addressing happens only at R2 publish time by hashing the finished COG's bytes — the
+atomic-publish contract for concurrent readers, unchanged.
+
+  python mosaic.py tile <covering-csv>   one tile: reproject + merge + persist, merge ONLY
+                                         (no smoothing, no vector forks — stage 3 reads windows)
+  python mosaic.py index [--stable]      build the index + planet z8 COG + mosaic.gti
+                                         (--stable: the Snakemake lane's covering + plain names)
+  python mosaic.py --check               self-check
 """
 
 import glob
 import json
 import os
+import shutil
 import sys
 from glob import glob as _glob
 
 import mercantile
 import rasterio
 
+import aggregation_merge
 import aggregation_reproject
 import cache_versions
 import config
@@ -167,19 +181,13 @@ def _merged_dem(tmp_folder):
     return f"{tmp_folder}/{n - 1}-3857.tiff"
 
 
-def produce(filepath, tmp_folder, key=None):
-    """Persist one aggregation tile's merged DEM as its content-addressed mosaic COG. Called from
-    aggregation_run.run AFTER merge and BEFORE smooth (unsmoothed truth), only when stale. Crops the
-    halo (buffer_pixels) off every side so the tile carries EXACTLY its mercantile bounds — the
-    non-overlapping partition GTI needs and the buffer/restrict discipline. Float32, nodata = -9999,
-    ZSTD, nodata-aware `average` overviews (COG driver, native -> the 512 block = z8-equivalent).
-    Published with an atomic rename so the content name only ever appears complete."""
+def _translate(filepath, tmp_folder):
+    """Crop the halo off the tile's merged DEM and write the mosaic COG to a transient path inside
+    tmp_folder — the write shared by both freshness lanes. Crops buffer_pixels off every side so
+    the tile carries EXACTLY its mercantile bounds (the non-overlapping partition GTI needs and the
+    buffer/restrict discipline). Float32, nodata = -9999, ZSTD, nodata-aware `average` overviews
+    (COG driver, native -> the 512 block = z8-equivalent)."""
     stem = _stem(filepath)
-    key = key or mosaic_key(filepath)
-    art = tile_artifact(stem)
-    if keys.fork_fresh(art, key):
-        return keys.content_path(art, key)
-
     with open(f"{tmp_folder}/reprojection.json") as f:
         buffer_pixels = json.load(f)["buffer_pixels"]
     merged = _merged_dem(tmp_folder)
@@ -192,7 +200,6 @@ def produce(filepath, tmp_folder, key=None):
     if w <= 0 or h <= 0 or w % 512 or h % 512:
         raise ValueError(f"mosaic {stem}: de-buffered size {w}x{h} is not a positive multiple of 512")
 
-    os.makedirs(tiles_dir(), exist_ok=True)
     tmp_cog = f"{tmp_folder}/mosaic.tif"
     # -b 1: drop any alpha band; -a_nodata -9999 + -ot Float32: one uniform sentinel + dtype across
     # every tile (GEBCO-only tiles are Int16 upstream). -srcwin adjusts the geotransform, so the
@@ -204,10 +211,46 @@ def produce(filepath, tmp_folder, key=None):
         "-co COMPRESS=ZSTD -co PREDICTOR=3 -co BLOCKSIZE=512 "
         "-co RESAMPLING=AVERAGE -co OVERVIEW_RESAMPLING=AVERAGE -co NUM_THREADS=ALL_CPUS "
         f"{merged} {tmp_cog}")
+    return tmp_cog
+
+
+def produce(filepath, tmp_folder, key=None):
+    """Persist one aggregation tile's merged DEM as its content-addressed mosaic COG — the KEYED
+    lane. Called from aggregation_run.run AFTER merge and BEFORE smooth (unsmoothed truth), only
+    when stale. Published with an atomic rename so the content name only ever appears complete."""
+    stem = _stem(filepath)
+    key = key or mosaic_key(filepath)
+    art = tile_artifact(stem)
+    if keys.fork_fresh(art, key):
+        return keys.content_path(art, key)
+    tmp_cog = _translate(filepath, tmp_folder)
+    os.makedirs(tiles_dir(), exist_ok=True)
     keys.supersede(art)            # clear last build's key before the atomic publish
     cpath = keys.content_path(art, key)
     keys.publish(tmp_cog, cpath)
     return cpath
+
+
+def tile(filepath):
+    """One covering tile's merge, alone — the Snakemake stage-2 job body. Reproject each
+    intersecting source, feather-merge, persist the unsmoothed COG at its PLAIN stable name;
+    no smoothing, no vector forks (stage 3 reads this tile back through windowed VRTs).
+    Freshness is the ENGINE's (the rule's inputs + params) — no keys, no staleness check here:
+    when this runs, it rebuilds. The tmp folder is cleared first so a retried job never reuses
+    a half-written reproject (the modules' resume markers are the legacy pool's affordance)."""
+    stem = _stem(filepath)
+    tmp_folder = filepath.replace("-aggregation.csv", "-tmp")
+    shutil.rmtree(tmp_folder, ignore_errors=True)
+    aggregation_reproject.reproject(filepath)
+    aggregation_merge.merge(filepath)
+    tmp_cog = _translate(filepath, tmp_folder)
+    os.makedirs(tiles_dir(), exist_ok=True)
+    out = tile_artifact(stem)
+    os.replace(tmp_cog, out)       # atomic: the stable name only ever appears complete
+    if not os.environ.get("KEEP_TMP"):  # KEEP_TMP=1 preserves the merged DEM for debugging
+        shutil.rmtree(tmp_folder)
+    print(f"mosaic tile {stem}: {out}", flush=True)
+    return out
 
 
 # ── the covering-level index / planet-z8 / pointer (mosaic.py index) ──────────────────────────────
@@ -224,23 +267,15 @@ def _datum_name(source):
     return config.load_metadata(source).get("datum")
 
 
-def _tile_row(filepath):
-    """One index row for a covering tile: the geometry (exact 3857 tile bounds — a non-overlapping
-    partition, so GTI needs no z-order), location, resx/resy, and the seascape: provenance columns
-    composited from the tile's catalog items. Raises if the tile COG is missing under its key — the
-    index asserts completeness (a half-built mosaic can't get a manifest that vouches for it)."""
+def _feature(filepath, cpath, location, extra_props=None):
+    """One index row: geometry (exact 3857 tile bounds — a non-overlapping partition, so GTI needs
+    no z-order), location, resx/resy, and the seascape: provenance columns composited from the
+    tile's catalog items. Geometry + resolution come from the produced COG's OWN georeferencing,
+    not recomputed from mercantile: the two agree to the metre, but a float-epsilon disagreement
+    makes GTI ceil the virtual extent to a 1-pixel overhang (the exact-grid-registration
+    invariant). Reading the COG makes the index describe the raster exactly."""
     stem = _stem(filepath)
-    key = mosaic_key(filepath)
-    cpath = keys.content_path(tile_artifact(stem), key)
-    if not os.path.isfile(cpath):
-        raise SystemExit(
-            f"mosaic index incomplete: tile {stem} has no COG under key {key} — run the aggregate "
-            f"first (a failed/interrupted build); refusing to publish an index")
-    z, x, y, child_z = (int(a) for a in stem.split("-"))
-    # Geometry + resolution come from the produced COG's OWN georeferencing, not recomputed from
-    # mercantile: the two agree to the metre, but a float-epsilon disagreement makes GTI ceil the
-    # virtual extent to a 1-pixel overhang (the exact-grid-registration invariant). Reading the COG
-    # makes the index describe the raster exactly.
+    child_z = int(stem.split("-")[3])
     with rasterio.open(cpath) as src:
         t = src.transform
         res = t.a
@@ -249,10 +284,10 @@ def _tile_row(filepath):
 
     sources = _tile_sources(filepath)
     props = {
-        "location": location_for(stem, key),
+        "location": location,
         "resx": res,
         "resy": res,
-        "seascape:key": key,
+        **(extra_props or {}),
         "seascape:sources": ",".join(sources),
         "seascape:priority": max((int(config.source_property(s, "priority", 0) or 0) for s in sources), default=0),
         "seascape:maxzoom": child_z,
@@ -261,7 +296,32 @@ def _tile_row(filepath):
     }
     geom = {"type": "Polygon", "coordinates": [[
         [left, bottom], [right, bottom], [right, top], [left, top], [left, bottom]]]}
-    return key, {"type": "Feature", "properties": props, "geometry": geom}
+    return {"type": "Feature", "properties": props, "geometry": geom}
+
+
+def _tile_row(filepath):
+    """The KEYED lane's index row. Raises if the tile COG is missing under its key — the index
+    asserts completeness (a half-built mosaic can't get a manifest that vouches for it)."""
+    stem = _stem(filepath)
+    key = mosaic_key(filepath)
+    cpath = keys.content_path(tile_artifact(stem), key)
+    if not os.path.isfile(cpath):
+        raise SystemExit(
+            f"mosaic index incomplete: tile {stem} has no COG under key {key} — run the aggregate "
+            f"first (a failed/interrupted build); refusing to publish an index")
+    return key, _feature(filepath, cpath, location_for(stem, key), {"seascape:key": key})
+
+
+def _tile_row_plain(filepath):
+    """The Snakemake lane's index row: the PLAIN-named tile COG, no key column — freshness is the
+    engine's, and hash-at-publish stamps keys onto the R2 copies at publish time. The completeness
+    refusal survives: an index must never vouch for a half-built mosaic."""
+    stem = _stem(filepath)
+    cpath = tile_artifact(stem)
+    if not os.path.isfile(cpath):
+        raise SystemExit(f"mosaic index incomplete: missing {cpath} — the mosaic_tile rules "
+                         f"produce it; refusing to publish an index")
+    return _feature(filepath, cpath, f"{vsi_base()}/{stem}.tif")
 
 
 def _write_index(filepath_out, features):
@@ -289,24 +349,28 @@ def _planet_key(tile_keys):
                           {"product": "planet-z8", "macrotile_z": utils.macrotile_z})
 
 
+def _warp_planet(index_path, out_tmp):
+    """Decimate the whole mosaic (via the index-as-GTI, so the warp picks each tile's own
+    `average` overviews — never a full-res read) to the GEBCO-native z8 base."""
+    res8 = aggregation_reproject.get_resolution(utils.macrotile_z)
+    if os.path.exists(out_tmp):
+        os.remove(out_tmp)
+    utils.run_command(
+        f"GDAL_CACHEMAX=512 gdalwarp -q -overwrite -r average -tr {res8} {res8} "
+        f"-dstnodata {NODATA} -of COG -co COMPRESS=ZSTD -co PREDICTOR=3 -co BLOCKSIZE=512 "
+        f"-co OVERVIEW_RESAMPLING=AVERAGE -co NUM_THREADS=ALL_CPUS "
+        f"GTI:{index_path} {out_tmp}")
+
+
 def _build_planet_z8(index_path, tile_keys):
-    """Decimate the whole mosaic to the GEBCO-native z8 base and write it as a content-addressed
-    COG. Reads the index-as-GTI so the decimation picks each tile's own `average` overviews (never a
-    full-res read). Content-addressed, so an unchanged mosaic reuses it."""
+    """The KEYED lane's planet z8 COG — content-addressed, so an unchanged mosaic reuses it."""
     key = _planet_key(tile_keys)
     logical = planet_artifact()
     cpath = keys.content_path(logical, key)
     if keys.fork_fresh(logical, key):
         return cpath, key
-    res8 = aggregation_reproject.get_resolution(utils.macrotile_z)
     tmp = "store/mosaic/planet-z8.tmp.tif"
-    if os.path.exists(tmp):
-        os.remove(tmp)
-    utils.run_command(
-        f"GDAL_CACHEMAX=512 gdalwarp -q -overwrite -r average -tr {res8} {res8} "
-        f"-dstnodata {NODATA} -of COG -co COMPRESS=ZSTD -co PREDICTOR=3 -co BLOCKSIZE=512 "
-        f"-co OVERVIEW_RESAMPLING=AVERAGE -co NUM_THREADS=ALL_CPUS "
-        f"GTI:{index_path} {tmp}")
+    _warp_planet(index_path, tmp)
     keys.supersede(logical)
     keys.publish(tmp, cpath)
     return cpath, key
@@ -362,6 +426,32 @@ def build_index():
     _write_index(index_path, features)
     planet_path, _pk = _build_planet_z8(index_path, tile_keys)
     child_z = max(int(_stem(fp).split("-")[3]) for fp in csvs)
+    resolution = aggregation_reproject.get_resolution(child_z)
+    _write_gti(index_path, planet_path, resolution)  # pointer LAST
+    print(f"mosaic index: {len(features)} tile(s) -> {index_path}; planet z8 {planet_path}; "
+          f"pointer {gti_path()} at z{child_z} ({resolution} m)")
+
+
+def build_index_stable():
+    """The Snakemake lane's index + planet z8 + pointer, off the --stable covering: plain names
+    throughout, freshness owned by the engine (this runs only when a tile changed). Same
+    artifacts-before-pointer discipline — the .gti is written last."""
+    try:
+        with open("store/aggregation/covering.txt") as f:
+            stems = sorted(f.read().split())
+    except FileNotFoundError:
+        sys.exit("mosaic index: no covering — run `snakemake catalogs` first")
+    if not stems:
+        sys.exit("mosaic index: empty covering — run `snakemake catalogs` first")
+    csvs = [f"store/aggregation/{s}-aggregation.csv" for s in stems]
+    features = [_tile_row_plain(fp) for fp in csvs]
+    index_path = f"{index_dir()}/covering.parquet"
+    _write_index(index_path, features)
+    planet_path = planet_artifact()
+    tmp = planet_path + ".tmp"
+    _warp_planet(index_path, tmp)
+    os.replace(tmp, planet_path)
+    child_z = max(int(s.split("-")[3]) for s in stems)
     resolution = aggregation_reproject.get_resolution(child_z)
     _write_gti(index_path, planet_path, resolution)  # pointer LAST
     print(f"mosaic index: {len(features)} tile(s) -> {index_path}; planet z8 {planet_path}; "
@@ -490,6 +580,26 @@ def _check():
             assert col in out, f"index missing column {col}"
         assert "gebco,reef" in out, "seascape:sources must list the tile's sources"
         assert '"reef": "MLLW"' in out or 'reef\\":\\"MLLW' in out or "MLLW" in out, "datum must be composited"
+
+        # ── the Snakemake lane: plain names off the --stable covering, engine freshness ──
+        # tile()'s reproject/merge needs real sources, so exercise its persist half directly
+        # (_translate + atomic replace — exactly tile()'s tail) and then the stable index.
+        stable_fp = f"store/aggregation/{stem}-aggregation.csv"
+        shutil.copy(fp, stable_fp)
+        with open("store/aggregation/covering.txt", "w") as f:
+            f.write(stem + "\n")
+        os.replace(_translate(stable_fp, tmp_folder), tile_artifact(stem))
+        build_index_stable()
+        assert os.path.isfile(tile_artifact(stem)), "the plain-named tile COG must exist"
+        assert os.path.isfile(planet_artifact()), "the plain-named planet z8 must exist"
+        assert os.path.isfile(f"{index_dir()}/covering.parquet")
+        info, _ = utils.run_command(f"gdalinfo {os.path.abspath(gti_path())}")
+        assert "Driver: GTI/GDAL Raster Tile Index" in info and f"Size is {core}, {core}" in info, \
+            info[:400]
+        assert "Overviews:" in info, "the plain planet z8 must register as the mosaic overview"
+        out, _ = utils.run_command(f"ogrinfo -q -al {index_dir()}/covering.parquet")
+        assert "seascape:key" not in out, "the engine lane's index carries no key column"
+        assert "gebco,reef" in out, "provenance columns must survive in the stable index"
         print("mosaic.py self-check ok")
     finally:
         config.SOURCES_DIR = saved_dir
@@ -504,10 +614,14 @@ def _check():
 def main(argv):
     if argv == ["index"]:
         build_index()
+    elif argv == ["index", "--stable"]:
+        build_index_stable()
+    elif argv[:1] == ["tile"] and len(argv) == 2:
+        tile(argv[1])
     elif argv[:1] == ["--check"]:
         _check()
     else:
-        sys.exit("usage: mosaic.py index | --check")
+        sys.exit("usage: mosaic.py tile <covering-csv> | index [--stable] | --check")
 
 
 if __name__ == "__main__":

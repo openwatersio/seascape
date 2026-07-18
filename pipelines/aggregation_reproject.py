@@ -189,11 +189,12 @@ def contains_nodata_pixels(filepath):
 
 
 def reproject(filepath):
-    aggregation_id, filename = filepath.split("/")[-2:]
+    filename = filepath.split("/")[-1]
     z, x, y, child_z = (int(a) for a in filename.replace("-aggregation.csv", "").split("-"))
     aggregation_tile = mercantile.Tile(x=x, y=y, z=z)
 
-    tmp_folder = f"store/aggregation/{aggregation_id}/{z}-{x}-{y}-{child_z}-tmp"
+    # Beside the CSV — identical for the legacy ULID layout and the --stable flat layout.
+    tmp_folder = filepath.replace("-aggregation.csv", "-tmp")
     utils.create_folder(tmp_folder)
     metadata_filepath = f"{tmp_folder}/reprojection.json"
     if os.path.isfile(metadata_filepath):

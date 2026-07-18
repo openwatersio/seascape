@@ -25,9 +25,9 @@ NODATA = -9999
 
 
 def merge(filepath):
-    aggregation_id, filename = filepath.split("/")[-2:]
+    filename = filepath.split("/")[-1]
     z, x, y, child_z = (int(a) for a in filename.replace("-aggregation.csv", "").split("-"))
-    tmp_folder = f"store/aggregation/{aggregation_id}/{z}-{x}-{y}-{child_z}-tmp"
+    tmp_folder = filepath.replace("-aggregation.csv", "-tmp")  # beside the CSV — ULID or stable layout alike
 
     done_filepath = f"{tmp_folder}/merge-done"
     if os.path.isfile(done_filepath):
