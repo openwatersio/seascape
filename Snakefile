@@ -15,6 +15,19 @@ ALL_SOURCES = pipeline_config.sources()
 MIRRORED = [s for s in ALL_SOURCES if pipeline_config.load_metadata(s).get("volatile")]
 PREPPED = [s for s in ALL_SOURCES if s not in MIRRORED]
 
+# ── streaming ("source access resolves per source, local wins") ──────────────────────
+# --config stream=1 (laptop preview): a source with no local prep evidence
+# (store/source/<id>/raw/) fetches its published registration (bounds.csv +
+# catalog.json) from R2 instead of prepping, and its COGs stream via SOURCE_VSI_BASE.
+# A locally-prepped source keeps its prep rules — local wins. Off (the box, the
+# sources workflow): STREAMED is empty and nothing changes.
+STREAM_BASE = config.get("stream_base", "https://data.openwaters.io/bathymetry/source")
+_wd = Path(config.get("workdir", str(SCRIPTS)))
+STREAMED = ([s for s in ALL_SOURCES if not (_wd / "store/source" / s / "raw").is_dir()]
+            if config.get("stream") else [])
+LOCAL_PREPPED = [s for s in PREPPED if s not in STREAMED]
+LOCAL_MIRRORED = [s for s in MIRRORED if s not in STREAMED]
+
 ONLY = config.get("source")
 if ONLY and ONLY not in PREPPED + MIRRORED:
     raise WorkflowError(f"unknown source {ONLY!r} — known: {PREPPED + MIRRORED}")
@@ -54,7 +67,7 @@ rule prep_source:
         # staged tif names aren't knowable at parse; bounds.csv is the declared artifact
         "store/source/{source}/bounds.csv"
     wildcard_constraints:
-        source=pat(PREPPED)
+        source=pat(LOCAL_PREPPED)
     priority: source_priority
     resources:
         mem_gb=8  # asc-mosaic / archive-extract jobs hold whole rasters in flight
@@ -85,7 +98,7 @@ rule mirror_source:
         mirror="store/source/{source}/mirror.txt",
         bucket="store/source/{source}/mirror-bucket.txt",
     wildcard_constraints:
-        source=pat(MIRRORED)
+        source=pat(LOCAL_MIRRORED)
     priority: 5000  # long serial job with thousands of network header reads; start early
     retries: 2
     resources:
@@ -102,7 +115,7 @@ rule polygon:
     output:
         "store/polygon/{source}.gpkg"
     wildcard_constraints:
-        source=pat(PREPPED)
+        source=pat(LOCAL_PREPPED)
     threads: 4
     shell:
         "{PY}/source_polygonize.py {wildcards.source} {threads}"
@@ -116,9 +129,27 @@ rule catalog_item:
     output:
         "store/source/{source}/catalog.json"
     wildcard_constraints:
-        source=pat(PREPPED + MIRRORED)
+        source=pat(LOCAL_PREPPED + LOCAL_MIRRORED)
     shell:
         "{PY}/source_catalog.py {wildcards.source} --hash-recipe"
+
+
+# The streamed half of the catalogs invocation (--config stream=1): fetch a not-locally-
+# prepped source's published registration. Absent-only like the legacy preview's fetch
+# (engine: outputs exist ⇒ done); -R fetch_catalog refreshes. tmp+mv so a 404 never
+# leaves a truncated file.
+rule fetch_catalog:
+    output:
+        bounds="store/source/{source}/bounds.csv",
+        catalog="store/source/{source}/catalog.json",
+    wildcard_constraints:
+        source=pat(STREAMED)
+    retries: 2
+    shell:
+        "curl -fsS {STREAM_BASE}/{wildcards.source}/bounds.csv -o {output.bounds}.tmp && "
+        "mv {output.bounds}.tmp {output.bounds} && "
+        "curl -fsS {STREAM_BASE}/{wildcards.source}/catalog.json -o {output.catalog}.tmp && "
+        "mv {output.catalog}.tmp {output.catalog}"
 
 
 # Masks rebuild only when forced (-R landmask): pinned snapshot/release ⇒ no data drift.
@@ -148,13 +179,16 @@ rule watermask:
         "{PY}/landmask.py prep-water"
 
 
-# The covering — stage 1's downstream interface.
+# The covering — stage 1's downstream interface. BBOX rides as a param so a changed
+# window reruns it (write-if-changed prunes in-window stale tiles, keeps out-of-window).
 rule cover:
     input:
         expand("store/source/{source}/bounds.csv", source=PREPPED + MIRRORED),
         expand("store/source/{source}/catalog.json", source=PREPPED + MIRRORED),
     output:
         "store/aggregation/covering.txt"
+    params:
+        bbox=os.environ.get("BBOX", "")
     shell:
         "{PY}/aggregation_covering.py --stable"
 
