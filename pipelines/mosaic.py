@@ -495,7 +495,7 @@ def _stage_publish():
         name = f"{stem}-{h}.tif"
         tile_files.append(name)
         os.link(cpath, f"{tiles_stage}/{name}")
-        features.append(_feature(fp, cpath, f"{public_base()}/mosaic/tiles/{name}"))
+        features.append(_feature(fp, cpath, f"/vsicurl/{public_base()}/mosaic/tiles/{name}"))
 
     planet = planet_artifact()
     if not os.path.isfile(planet):
@@ -510,8 +510,10 @@ def _stage_publish():
 
     gti_name = f"mosaic-candidate-{idxhash}.gti"
     assert gti_name != SERVING_GTI_NAME, "the candidate GTI must never be the serving pointer"
-    index_ref = f"{public_base()}/mosaic/index/{index_name}"
-    planet_ref = f"{public_base()}/mosaic/{planet_name}"
+    # /vsicurl/ prefix: a bare https URL makes GDAL fetch whole objects instead of
+    # range-reading — an open would download entire tile COGs.
+    index_ref = f"/vsicurl/{public_base()}/mosaic/index/{index_name}"
+    planet_ref = f"/vsicurl/{public_base()}/mosaic/{planet_name}"
     child_z = max(int(s.split("-")[3]) for s in stems)
     resolution = aggregation_reproject.get_resolution(child_z)
     gti_stage = f"{pubdir}/{gti_name}"
@@ -812,12 +814,12 @@ def _check():
         assert os.path.isfile(staged_planet), staged_planet
         assert os.stat(staged_planet).st_ino == os.stat(planet_artifact()).st_ino, "planet must be a hardlink"
         # the candidate index locations carry PUBLIC_BASE + the hashed tile name
-        assert [f["properties"]["location"] for f in feats] == [f"{pub_base}/mosaic/tiles/{stem}-{thash}.tif"], \
+        assert [f["properties"]["location"] for f in feats] == [f"/vsicurl/{pub_base}/mosaic/tiles/{stem}-{thash}.tif"], \
             [f["properties"]["location"] for f in feats]
         # the candidate GTI references the PUBLIC index + planet URLs (absolute), not a local path
         gti_xml = open(names["gti_path"]).read()
-        assert f"<IndexDataset>{pub_base}/mosaic/index/{names['index']}</IndexDataset>" in gti_xml, gti_xml
-        assert f"<Dataset>{pub_base}/mosaic/planet-z8-{phash}.tif</Dataset>" in gti_xml, gti_xml
+        assert f"<IndexDataset>/vsicurl/{pub_base}/mosaic/index/{names['index']}</IndexDataset>" in gti_xml, gti_xml
+        assert f"<Dataset>/vsicurl/{pub_base}/mosaic/planet-z8-{phash}.tif</Dataset>" in gti_xml, gti_xml
         # the index name is content-addressed by the sorted tile hashes
         assert names["index"] == hashlib.sha256(thash.encode()).hexdigest()[:12] + ".parquet", names["index"]
         # the serving pointer name is unreachable from this path — nowhere in the staged outputs
