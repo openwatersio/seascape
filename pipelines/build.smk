@@ -172,6 +172,19 @@ SMOOTH_CFG = json.dumps({} if os.environ.get("SKIP_SMOOTH") else {
     "depth_smooth": smooth.DEPTH_SMOOTH, "block": smooth.BLOCK}, sort_keys=True)
 
 
+# Fork reservations, fitted from the first planet run's benchmark rows (max RSS by
+# child_z; the flat 2 GB guess under-priced dense z14 tiles at 5-9.5 GB and ~84 wide
+# OOM-killed the box). Step tables carry ~40% margin over the measured maxima;
+# retries escalate. Re-fit from store/bench/ as the corpus grows.
+CONTOUR_GB = {14: 13, 13: 5}
+SOUND_GB = {14: 8, 13: 3}
+DEPARE_GB = {14: 8, 13: 4}
+
+
+def _fork_gb(table, default):
+    return lambda wc, attempt: table.get(int(wc.stem.split("-")[3]), default) * attempt
+
+
 def fork_inputs(wc):
     """A vector fork's inputs: the intersecting mosaic tiles (the buffered window's sources)
     — never the global index, so fork jobs run the moment their neighborhood of merges lands."""
@@ -188,7 +201,7 @@ rule contour_tile:
         nav=contour_run.NAV_SMOOTH_MAX_M, deep=contour_run.DEEP_CUTOFF_M,
         ring=contour_run.MIN_RING_AREA_M2, smooth=SMOOTH_CFG,
     resources:
-        mem_gb=2  # a windowed read + line smoothing, not a source-stack merge
+        mem_gb=_fork_gb(CONTOUR_GB, 3)
     benchmark:
         "store/bench/contour/{stem}.tsv"
     shell:
@@ -204,7 +217,7 @@ rule soundings_tile:
         cell=soundings_run.SOUND_CELL_PX, min_depth=soundings_run.SOUND_MIN_DEPTH_M,
         smooth=SMOOTH_CFG,
     resources:
-        mem_gb=2
+        mem_gb=_fork_gb(SOUND_GB, 2)
     benchmark:
         "store/bench/soundings/{stem}.tsv"
     shell:
@@ -223,7 +236,7 @@ rule depare_tile:
         levels=json.dumps({"m": pipeline_config.DEPARE_LEVELS, "ft": pipeline_config.DEPARE_LEVELS_FT}),
         drying=pipeline_config.DRYING_CAP, sliver=depare_run.SLIVER_MIN_PX, smooth=SMOOTH_CFG,
     resources:
-        mem_gb=3
+        mem_gb=_fork_gb(DEPARE_GB, 3)
     benchmark:
         "store/bench/depare/{stem}.tsv"
     shell:
