@@ -166,19 +166,6 @@ jobs:
           [ -d "$STATE/store/source" ] || { echo "volume has no store/source — run sources.yml first (a build assumes a warm volume)" >&2; exit 1; }
           [ -f "$STATE/store/aggregation/covering.txt" ] || { echo "volume has no covering — run sources.yml first (the covering is a stage-1 product; builds consume it read-only)" >&2; exit 1; }
           echo "STATE=$STATE" >> "$GITHUB_ENV"
-      # One-time-per-content retirement of legacy derived state (idempotent; delete this
-      # step when the legacy lane is deleted). Production serves from R2, so local legacy build products
-      # have no resume value; stage-1 products (sources, masks, footprints, the stable
-      # covering + CSVs) and this lane's store/mosaic + bench stay.
-      - name: Retire legacy derived state
-        run: |
-          set -euo pipefail
-          STORE=$STATE/store
-          find "$STORE/aggregation" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} +
-          rm -rf "$STORE"/{contour,soundings,depare,terrain-tmp,pmtiles,bundle,meta,tar,download,manifests,profile}
-          find "$STORE/mosaic/tiles" -name '*-????????????.tif' -delete 2>/dev/null || true
-          rm -f "$STORE"/mosaic/planet-z8-*.tif "$STORE/source-manifest.txt"
-          df -h "$STATE" | tail -1
       - uses: ./.github/actions/ghcr-login
       # A SIGKILLed previous run leaves .snakemake locks on the volume; safe to clear here —
       # the r2-store concurrency group guarantees no other lane run holds the store. One
