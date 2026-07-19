@@ -220,10 +220,12 @@ jobs:
           # Extra args reach the command as separate words; reject anything shell-active.
           case "$INPUT_ARGS" in *[!-A-Za-z0-9_=\ .]*) echo "invalid snakemake_args" >&2; exit 1 ;; esac
           read -r -a extra <<<"$INPUT_ARGS"
-          ./docker.sh snakemake -s pipelines/build.smk bundles publish \
+          # extra/force ride BEFORE --config: a bare extra target after it is swallowed
+          # as a config pair.
+          ./docker.sh snakemake -s pipelines/build.smk bundles publish "${extra[@]}" "${force[@]}" \
             --keep-going --rerun-incomplete \
             --cores "$cores" --resources mem_gb="$budget_gb" \
-            --config workdir=/app/state "${force[@]}" "${extra[@]}"
+            --config workdir=/app/state
       # Per-job wall/CPU/max-RSS — the measurement this lane exists to produce.
       - name: Upload snakemake benchmarks
         if: always()
