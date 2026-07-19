@@ -59,6 +59,9 @@ env:
   # with these public URLs (mosaic.public_base); the serving pointer is never written from here.
   DATA_BUCKET: data
   PUBLIC_BASE: https://data.openwaters.io/bathymetry
+  # DEPARE stays out of builds until its dense-tile GEOS tail is bounded (the reason
+  # production disabled it); docs/perf/optimization-backlog.md owns the re-enable work.
+  SKIP_DEPARE: "1"
 
 # One store-mutating workflow at a time, globally: builds, sources runs, and GC share this
 # group. NOTE: a second queued dispatch EVICTS the first (observed) — one dispatch at a time.
