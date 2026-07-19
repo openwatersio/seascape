@@ -1,7 +1,7 @@
-# Bathymetry tiling pipeline. The build itself is one Snakemake DAG (pipelines/Snakefile for
-# sources, pipelines/build.smk for the planet/preview) — run via `snakemake` / `./docker.sh
-# snakemake`, not this file. What remains here is the test suite, the dev servers, and the
-# one-time mask prep. See CONTRIBUTING.md.
+# Bathymetry tiling pipeline. The build itself is one Snakemake DAG in one entry file (the
+# repo-root Snakefile; `pipelines/build.smk` is included from it, gated on the `cover`
+# checkpoint) — run via `snakemake` / `./docker.sh snakemake`, not this file. What remains here
+# is the test suite, the dev servers, and the one-time mask prep. See CONTRIBUTING.md.
 
 set working-directory := 'pipelines'
 
@@ -29,8 +29,9 @@ preview bbox="-74.30,40.40,-73.75,40.80":
     export LANDMASK="${LANDMASK:-/vsicurl/https://data.openwaters.io/bathymetry/landmask/land.fgb}"
     export WATERMASK="${WATERMASK:-/vsicurl/https://data.openwaters.io/bathymetry/landmask/water.fgb}"
     export SKIP_DEPARE="${SKIP_DEPARE-1}"
-    uv run snakemake -s ../Snakefile cover --config stream=1 --cores 8
-    uv run snakemake -s build.smk bundles --cores 4
+    # One invocation: the `cover` checkpoint runs inside the bundles build (streamed sources),
+    # then the DAG re-evaluates into the per-stem mosaic/fork/terrain jobs.
+    uv run snakemake -s ../Snakefile bundles --config stream=1 --cores 8
     ../worker/seed.sh
 
 # Run both dev servers in one terminal: tile Worker on :8787 + Vite viewer on :5173
@@ -65,8 +66,8 @@ test-sources:
     uv run python source_check.py --check
     uv run snakemake -s ../Snakefile -n sources > /dev/null
 
-# Build self-checks: the e2e (real stage-1 CLIs + the build.smk DAG), the build.smk parse
-# seam, and each module's --check.
+# Build self-checks: the e2e (real stage-1 CLIs + the unified DAG), the `cover` checkpoint
+# seam (test_build), and each module's --check.
 test-engine:
     uv run python test_engine.py
     uv run python aggregation_reproject.py --check
