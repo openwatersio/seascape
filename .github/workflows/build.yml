@@ -243,7 +243,7 @@ jobs:
           hb=$!
           trap 'kill "$hb" 2>/dev/null || true' EXIT
           ./docker.sh snakemake -s pipelines/build.smk bundles publish "${extra[@]}" "${force[@]}" \
-            --keep-going --rerun-incomplete \
+            --keep-going --rerun-incomplete --scheduler greedy \
             --cores "$cores" --resources mem_gb="$budget_gb" \
             --config workdir=/app/state tmp=/app/tmp 2>&1 | tee "$buildlog"
       # Per-job wall/CPU/max-RSS from the benchmark: directives, plus per-job stderr logs —
