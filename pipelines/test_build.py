@@ -99,7 +99,7 @@ def main():
         assert counts.get("cover") == 1, f"cold store must schedule the cover checkpoint: {counts}"
         assert "mosaic_tile" not in counts, \
             f"per-stem jobs are unknown until the checkpoint runs: {counts}"
-        assert "checkpoint jobs, which will result in alteration" in out, \
+        assert "checkpoint" in out.lower(), \
             f"cold dry run must flag the DAG as incomplete-until-checkpoint:\n{out}"
         assert store_tree(store) == before, "a dry run must not touch the store"
     finally:

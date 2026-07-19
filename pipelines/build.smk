@@ -67,8 +67,16 @@ def depare_stems(wc=None):
     return covering_stems() if DEPARE else []
 
 
+_RENDER_STEMS = {}
+
+
 def render_stems(wc=None):
-    return terrain_mod.render_stems(covering_stems())
+    # Memoized like covering_stems: several input functions call this per DAG evaluation,
+    # and the cascade over a planet covering is minutes of pure Python if recomputed.
+    _, key = _covering_key()
+    if key not in _RENDER_STEMS:
+        _RENDER_STEMS[key] = terrain_mod.render_stems(covering_stems())
+    return _RENDER_STEMS[key]
 
 
 def cell_stems():
