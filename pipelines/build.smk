@@ -108,8 +108,10 @@ rule mosaic_tile:
         mem_gb=lambda wc, attempt: utils.weight(wc.stem, factor=MERGE_FACTOR) * attempt,
     benchmark:
         "store/bench/mosaic/{stem}.tsv"
+    log:
+        "store/logs/mosaic/{stem}.log"
     shell:
-        "{PY}/mosaic.py tile store/aggregation/{wildcards.stem}-aggregation.csv"
+        "{PY}/mosaic.py tile store/aggregation/{wildcards.stem}-aggregation.csv 2> {log}"
 
 
 # The GTI + planet z8 + pointer — the interface for publish and streamed preview ONLY:
@@ -125,8 +127,10 @@ rule mosaic_index:
         gti="store/mosaic/mosaic.gti",
     benchmark:
         "store/bench/mosaic-index.tsv"
+    log:
+        "store/logs/mosaic-index.log"
     shell:
-        "{PY}/mosaic.py index --stable"
+        "{PY}/mosaic.py index --stable 2> {log}"
 
 
 # The product-inventory target: the mosaic, buildable alone.
@@ -144,8 +148,10 @@ rule publish:
         rules.mosaic_index.output
     benchmark:
         "store/bench/mosaic-publish.tsv"
+    log:
+        "store/logs/mosaic-publish.log"
     shell:
-        "{PY}/mosaic.py publish"
+        "{PY}/mosaic.py publish 2> {log}"
 
 
 # ── stage 3 (cartographic products): every consumer reads windows of the persisted ──
@@ -199,8 +205,10 @@ rule contour_tile:
         mem_gb=_fork_gb(CONTOUR_GB, 3)
     benchmark:
         "store/bench/contour/{stem}.tsv"
+    log:
+        "store/logs/contour/{stem}.log"
     shell:
-        "{PY}/contour_run.py tile {wildcards.stem}"
+        "{PY}/contour_run.py tile {wildcards.stem} 2> {log}"
 
 
 rule soundings_tile:
@@ -215,8 +223,10 @@ rule soundings_tile:
         mem_gb=_fork_gb(SOUND_GB, 2)
     benchmark:
         "store/bench/soundings/{stem}.tsv"
+    log:
+        "store/logs/soundings/{stem}.log"
     shell:
-        "{PY}/soundings_run.py tile {wildcards.stem}"
+        "{PY}/soundings_run.py tile {wildcards.stem} 2> {log}"
 
 
 # Behind SKIP_DEPARE until the perf backlog's bounding work: the dense-tile GEOS tail is
@@ -234,8 +244,10 @@ rule depare_tile:
         mem_gb=_fork_gb(DEPARE_GB, 3)
     benchmark:
         "store/bench/depare/{stem}.tsv"
+    log:
+        "store/logs/depare/{stem}.log"
     shell:
-        "{PY}/depare_run.py tile {wildcards.stem}"
+        "{PY}/depare_run.py tile {wildcards.stem} 2> {log}"
 
 
 # Terrain reads windows through the LOCAL GTI, so it gates on mosaic_index (a per-stem VRT
@@ -252,8 +264,10 @@ rule terrain_render:
         mem_gb=lambda wc, attempt: utils.weight(wc.stem, factor=MERGE_FACTOR) * attempt
     benchmark:
         "store/bench/terrain/{stem}.tsv"
+    log:
+        "store/logs/terrain/{stem}.log"
     shell:
-        "{PY}/terrain.py render {wildcards.stem}"
+        "{PY}/terrain.py render {wildcards.stem} 2> {log}"
 
 
 # Product-inventory aggregates: each family buildable alone against a warm mosaic.
@@ -298,8 +312,10 @@ rule soundings_bundle:
         "store/bundle/soundings.pmtiles"
     benchmark:
         "store/bench/soundings-bundle.tsv"
+    log:
+        "store/logs/soundings-bundle.log"
     shell:
-        "{PY}/soundings_run.py bundle --stable"
+        "{PY}/soundings_run.py bundle --stable 2> {log}"
 
 
 # Guarded out entirely when DEPARE_STEMS is empty (SKIP_DEPARE): the input list would be empty.
@@ -311,8 +327,10 @@ if DEPARE_STEMS:
             "store/bundle/depare.pmtiles"
         benchmark:
             "store/bench/depare-bundle.tsv"
+        log:
+            "store/logs/depare-bundle.log"
         shell:
-            "{PY}/depare_run.py bundle --stable"
+            "{PY}/depare_run.py bundle --stable 2> {log}"
 
 
 # The contour tippecanoe + the single tile-join that folds soundings (+ depare when enabled)
@@ -328,8 +346,10 @@ rule vector_bundle:
         "store/bundle/vector.pmtiles"
     benchmark:
         "store/bench/vector-bundle.tsv"
+    log:
+        "store/logs/vector-bundle.log"
     shell:
-        "{PY}/contour_run.py bundle --stable"
+        "{PY}/contour_run.py bundle --stable 2> {log}"
 
 
 # ── terrain (raster) bundles — the planet base archive + one overlay per populated ──
@@ -344,8 +364,10 @@ rule terrain_planet_bundle:
         "store/bundle/planet.pmtiles"
     benchmark:
         "store/bench/planet-bundle.tsv"
+    log:
+        "store/logs/planet-bundle.log"
     shell:
-        "{PY}/bundle.py planet --stable"
+        "{PY}/bundle.py planet --stable 2> {log}"
 
 
 wildcard_constraints:
@@ -367,8 +389,10 @@ rule overlay_bundle:
         "store/bundle/overlay-{cell}.pmtiles"
     benchmark:
         "store/bench/overlay-{cell}.tsv"
+    log:
+        "store/logs/overlay-{cell}.log"
     shell:
-        "{PY}/bundle.py cell {wildcards.cell} --stable"
+        "{PY}/bundle.py cell {wildcards.cell} --stable 2> {log}"
 
 
 # The bundle-inventory target: the vector layers + the raster planet/overlay archives,
@@ -392,5 +416,7 @@ rule stage_build:
         rules.bundles.input
     benchmark:
         "store/bench/stage-build.tsv"
+    log:
+        "store/logs/stage-build.log"
     shell:
-        "{PY}/bundle.py stage-build --stable"
+        "{PY}/bundle.py stage-build --stable 2> {log}"

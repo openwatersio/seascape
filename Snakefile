@@ -54,8 +54,12 @@ rule fetch_asset:
     retries: 2
     benchmark:
         "store/bench/fetch/{source}-{index}.tsv"
+    # stderr per job for forensics (a failed job's diagnostics stay isolated in its own log);
+    # stdout keeps flowing to the run log so monitors and Actions heartbeats parse progress.
+    log:
+        "store/logs/fetch/{source}-{index}.log"
     shell:
-        "{PY}/source_fetch.py {wildcards.source} {wildcards.index}"
+        "{PY}/source_fetch.py {wildcards.source} {wildcards.index} 2> {log}"
 
 
 # Stage → datum → normalize → bounds, one job per source.
@@ -73,8 +77,10 @@ rule prep_source:
         mem_gb=8  # asc-mosaic / archive-extract jobs hold whole rasters in flight
     benchmark:
         "store/bench/prep/{source}.tsv"
+    log:
+        "store/logs/prep/{source}.log"
     shell:
-        "{PY}/source_prep.py {wildcards.source} && {PY}/source_bounds.py {wildcards.source}"
+        "( {PY}/source_prep.py {wildcards.source} && {PY}/source_bounds.py {wildcards.source} ) 2> {log}"
 
 
 # The weekly forced source refresh — run as its OWN invocation before catalogs/publish:
@@ -109,8 +115,10 @@ rule mirror_source:
         mem_gb=2  # header reads + list bookkeeping, no raster in memory
     benchmark:
         "store/bench/mirror/{source}.tsv"
+    log:
+        "store/logs/mirror/{source}.log"
     shell:
-        "{PY}/source_mirror.py {wildcards.source}"
+        "{PY}/source_mirror.py {wildcards.source} 2> {log}"
 
 
 rule polygon:
@@ -121,8 +129,10 @@ rule polygon:
     wildcard_constraints:
         source=pat(LOCAL_PREPPED)
     threads: 4
+    log:
+        "store/logs/polygon/{source}.log"
     shell:
-        "{PY}/source_polygonize.py {wildcards.source} {threads}"
+        "{PY}/source_polygonize.py {wildcards.source} {threads} 2> {log}"
 
 
 # catalog.json: the per-source currency signal, last in every source's chain.
@@ -134,8 +144,10 @@ rule catalog_item:
         "store/source/{source}/catalog.json"
     wildcard_constraints:
         source=pat(LOCAL_PREPPED + LOCAL_MIRRORED)
+    log:
+        "store/logs/catalog_item/{source}.log"
     shell:
-        "{PY}/source_catalog.py {wildcards.source} --hash-recipe"
+        "{PY}/source_catalog.py {wildcards.source} --hash-recipe 2> {log}"
 
 
 # The streamed half of the catalogs invocation (--config stream=1): fetch a not-locally-
@@ -148,12 +160,14 @@ rule fetch_catalog:
     wildcard_constraints:
         source=pat(STREAMED)
     retries: 2
+    log:
+        "store/logs/fetch_catalog/{source}.log"
     shell:
-        "(curl -fsS {STREAM_BASE}/{wildcards.source}/bounds.csv -o {output.bounds}.tmp && "
+        "((curl -fsS {STREAM_BASE}/{wildcards.source}/bounds.csv -o {output.bounds}.tmp && "
         "mv {output.bounds}.tmp {output.bounds} && "
         "curl -fsS {STREAM_BASE}/{wildcards.source}/catalog.json -o {output.catalog}.tmp && "
         "mv {output.catalog}.tmp {output.catalog}) || "
-        "{{ rm -f {output.bounds}.tmp {output.catalog}.tmp; exit 1; }}"
+        "{{ rm -f {output.bounds}.tmp {output.catalog}.tmp; exit 1; }}) 2> {log}"
 
 
 # Masks rebuild only when forced (-R landmask): pinned snapshot/release ⇒ no data drift.
@@ -166,8 +180,10 @@ rule landmask:
         mem_gb=4
     benchmark:
         "store/bench/landmask.tsv"
+    log:
+        "store/logs/landmask.log"
     shell:
-        "{PY}/landmask.py prep"
+        "{PY}/landmask.py prep 2> {log}"
 
 
 rule watermask:
@@ -179,8 +195,10 @@ rule watermask:
         mem_gb=8  # the planet Overture-water reproject; refine from the benchmark
     benchmark:
         "store/bench/watermask.tsv"
+    log:
+        "store/logs/watermask.log"
     shell:
-        "{PY}/landmask.py prep-water"
+        "{PY}/landmask.py prep-water 2> {log}"
 
 
 # The covering — stage 1's downstream interface. BBOX rides as a param so a changed
@@ -193,8 +211,10 @@ rule cover:
         "store/aggregation/covering.txt"
     params:
         bbox=os.environ.get("BBOX", "")
+    log:
+        "store/logs/cover.log"
     shell:
-        "{PY}/aggregation_covering.py --stable"
+        "{PY}/aggregation_covering.py --stable 2> {log}"
 
 
 # Source-coverage provenance tileset.
@@ -206,8 +226,10 @@ rule coverage:
         "store/aggregation/covering.txt",  # sequencing only; coverage reads footprints + bounds
     output:
         "store/bundle/coverage.pmtiles"
+    log:
+        "store/logs/coverage.log"
     shell:
-        "{PY}/contour_run.py coverage"
+        "{PY}/contour_run.py coverage 2> {log}"
 
 
 # The complete stage-1 product set (what the stage-2/3 invocation parses from).
@@ -232,5 +254,7 @@ rule check:
         check_input,
     params:
         source=lambda wc: ONLY,
+    log:
+        "store/logs/check.log"
     shell:
-        "{PY}/source_check.py {params.source}"
+        "{PY}/source_check.py {params.source} 2> {log}"
