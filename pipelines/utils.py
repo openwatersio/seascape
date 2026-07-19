@@ -1,7 +1,6 @@
 """Shared helpers: PMTiles archive writing, the aggregation covering store, the
 z7-sharded pmtiles layout, terrarium tile encode, priority-grouped source items,
 the merge-weight estimate, and the publish-time file hash / toolchain identity.
-Incrementality is engine provenance (Snakemake inputs + params) now, not a covering diff.
 
 Vendored from mapterhorn (BSD-3, (c) 2025 mapterhorn; see LICENSE.mapterhorn).
 """
@@ -349,9 +348,9 @@ def get_grouped_source_items(filepath):
 
 
 # ── merge-weight estimate (the mosaic_tile reservation seed) ─────────────────────────────────
-# Moved here from the retired scheduler.py: build.smk's mosaic_tile / terrain_render rules read
-# `weight(stem)` to seed each job's mem_gb reservation. A deterministic estimate from the tile
-# geometry — it only needs to ORDER and BOUND tiles, not be exact; the benchmarks re-fit it.
+# build.smk's mosaic_tile / terrain_render rules read `weight(stem)` to seed each job's mem_gb
+# reservation. A deterministic estimate from the tile geometry — it only needs to ORDER and BOUND
+# tiles, not be exact; the benchmarks re-fit it.
 
 # The halo (buffer) each read carries for smoothing continuity is a small additive px term next to
 # the 2**(child_z-macrotile_z)*512 core; one constant is close enough for the merge and terrain
@@ -359,8 +358,8 @@ def get_grouped_source_items(filepath):
 HALO_PX = 64
 
 # Peak-over-rest multiplier: a merge holds roughly the merged array + reprojected sources + masks
-# at once. Env-tunable (AGG_MEM_FACTOR); build.smk passes a lower factor now the vector forks no
-# longer ride inside the merge job.
+# at once. Env-tunable (AGG_MEM_FACTOR); build.smk passes a lower factor for the merge job (the
+# vector forks are separate jobs, not held in the merge's memory).
 DEFAULT_FACTOR = float(os.environ.get("AGG_MEM_FACTOR", "4"))
 
 
@@ -380,10 +379,9 @@ def weight(stem, budget_gb=0, factor=DEFAULT_FACTOR):
     return w
 
 
-# ── publish-time file hash + toolchain identity (moved from the retired keys.py) ─────────────────
-# The mosaic engine-lane publish content-addresses the finished plain COGs by hashing their bytes;
-# build.smk's mosaic_tile carries the toolchain tag as a rerun param. Both are R2-agnostic — no
-# bucket names here.
+# ── publish-time file hash + toolchain identity ──────────────────────────────────────────────────
+# The mosaic publish content-addresses the finished plain COGs by hashing their bytes; build.smk's
+# mosaic_tile carries the toolchain tag as a rerun param. Both are R2-agnostic — no bucket names here.
 
 @lru_cache(maxsize=1)
 def toolchain():

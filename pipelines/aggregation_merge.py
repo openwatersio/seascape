@@ -6,9 +6,8 @@ best source, fill remaining nodata from lower-priority sources, then feather onl
 across the valid/invalid boundary so source seams don't show as elevation steps.
 Interiors are untouched. A final guard restores any pixel the feather flips from
 >= 0 to < 0 back to its pre-blend value, so seam smoothing can never manufacture
-water on land — the stage invariant that lets the source-blind post-merge land
-re-clamp be dropped. This reconciles nothing vertically — datum handling is
-upstream in source_datum.
+water on land. This reconciles nothing vertically — datum handling is upstream in
+source_datum.
 """
 
 import json
@@ -27,7 +26,7 @@ NODATA = -9999
 def merge(filepath):
     filename = filepath.split("/")[-1]
     z, x, y, child_z = (int(a) for a in filename.replace("-aggregation.csv", "").split("-"))
-    tmp_folder = filepath.replace("-aggregation.csv", "-tmp")  # beside the CSV — ULID or stable layout alike
+    tmp_folder = filepath.replace("-aggregation.csv", "-tmp")  # beside the CSV
 
     done_filepath = f"{tmp_folder}/merge-done"
     if os.path.isfile(done_filepath):
@@ -101,11 +100,9 @@ def merge(filepath):
                             merged_tile = bb * blurred + (1 - bb) * merged_tile
                             # Stage rule: the seam feather may not manufacture water. Wherever the
                             # blend pulled a pixel that entered >= 0 (clamped land, real land topo,
-                            # or a filled hole) below 0, restore its pre-feather value. This makes
-                            # the feather guarantee its own sign invariant, which is what lets the
-                            # source-blind post-merge land re-clamp be deleted: no downstream fork
-                            # sees a false negative rim where clamped land abuts water, and trusted
-                            # land keeps its true elevation instead of being re-flattened to 0.
+                            # or a filled hole) below 0, restore its pre-feather value — so no
+                            # downstream fork sees a false negative rim where clamped land abuts
+                            # water, and trusted land keeps its true elevation.
                             flipped = (pre_feather >= 0) & (merged_tile < 0)
                             merged_tile = np.where(flipped, pre_feather, merged_tile)
 

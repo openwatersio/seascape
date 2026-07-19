@@ -50,8 +50,8 @@ test-sources:
     uv run python source_check.py --check
     uv run snakemake -s ../Snakefile -n sources > /dev/null
 
-# Engine-lane self-checks: the e2e (real stage-1 CLIs + the build.smk DAG), the build.smk
-# parse seam, and every remaining module's --check.
+# Build self-checks: the e2e (real stage-1 CLIs + the build.smk DAG), the build.smk parse
+# seam, and each module's --check.
 test-engine:
     uv run python test_engine.py
     uv run python aggregation_reproject.py --check

@@ -258,10 +258,10 @@ def _depare_dem(dem, tile_obj, tmp, label):
 
 
 def tile(stem):
-    """The per-stem Snakemake job — reads the PERSISTED mosaic instead of the transient merge: partition one stem from a BUFFERED mosaic
-    window, smoothed at read with the one shared f(depth, zoom), output at the PLAIN stable
-    name (depare also reads the land + water masks). A waterless tile writes a 0-byte
-    sentinel; bundling filters empties by size."""
+    """The per-stem Snakemake job: partition one stem from a BUFFERED mosaic window, smoothed at
+    read with the one shared f(depth, zoom), output at store/depare/<stem>.fgb (depare also reads
+    the land + water masks). A waterless tile writes a 0-byte sentinel; bundling filters empties by
+    size."""
     import shutil
 
     import mosaic
@@ -307,10 +307,10 @@ def _tippecanoe(fgbs, maxz, out):
 
 
 def bundle_stable():
-    """Engine-lane depare bundle: tippecanoe the PLAIN per-stem FGBs for the covering into
-    store/bundle/depare.pmtiles. A 0-byte per-tile file is a legitimately waterless tile (filtered
-    by size); a MISSING one is an incomplete build (require_stable_complete). Snakemake decides when
-    to invoke, so this always rebuilds — no key, no sidecar, no fresh-skip."""
+    """Depare bundle: tippecanoe the per-stem FGBs for the covering into store/bundle/depare.pmtiles.
+    A 0-byte per-tile file is a legitimately waterless tile (filtered by size); a MISSING one is an
+    incomplete build (require_stable_complete). Snakemake decides when to invoke, so this always
+    rebuilds."""
     import mosaic
     stems = mosaic.covering_stems()
     files = [f"store/depare/{s}.fgb" for s in stems]

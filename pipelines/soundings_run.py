@@ -1,7 +1,7 @@
 """Static soundings: shoalest-per-cell point depths off each aggregation tile's merged DEM.
 
-A second consumer of the same merged, smoothed DEM the aggregation stage builds — the one
-contour_run.py forks off. On a real chart, point soundings are the primary depth cue.
+A second consumer of the same smoothed mosaic window contour_run.py reads. On a real chart,
+point soundings are the primary depth cue.
 
 A client-side plugin (maplibre-contour's spot-soundings fork) point-samples one jittered
 DEM pixel per grid node, which can miss a shoal between nodes. We own the whole DEM at build
@@ -170,9 +170,9 @@ def _sound_dem(dem, tile_obj, z, child_z, tmp, label):
 
 
 def tile(stem):
-    """The per-stem Snakemake job — reads the PERSISTED mosaic instead of the transient merge: sound one stem from a BUFFERED mosaic window,
-    smoothed at read with the one shared f(depth, zoom), output at the PLAIN stable name. A dry
-    tile writes a 0-byte sentinel; bundling filters empties by size."""
+    """The per-stem Snakemake job: sound one stem from a BUFFERED mosaic window, smoothed at read
+    with the one shared f(depth, zoom), output at store/soundings/<stem>.geojson. A dry tile writes
+    a 0-byte sentinel; bundling filters empties by size."""
     import shutil
 
     import mosaic
@@ -209,10 +209,10 @@ def _tippecanoe(gj, maxz, out):
 
 
 def bundle_stable():
-    """Engine-lane soundings bundle: tippecanoe the PLAIN per-stem geojsons for the covering into
+    """Soundings bundle: tippecanoe the per-stem geojsons for the covering into
     store/bundle/soundings.pmtiles. A 0-byte per-tile file is a legitimately dry tile (filtered by
     size); a MISSING one is an incomplete build (require_stable_complete). Snakemake decides when to
-    invoke, so this always rebuilds — no key, no sidecar, no fresh-skip."""
+    invoke, so this always rebuilds."""
     import mosaic
     stems = mosaic.covering_stems()
     files = [f"store/soundings/{s}.geojson" for s in stems]

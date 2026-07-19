@@ -101,8 +101,8 @@ rule mirror_source:
         source=pat(LOCAL_MIRRORED)
     # Priority BANDS, separated by orders of magnitude so no byte-weighted prep (raw MB,
     # realistically <1,000,000) can cross into a higher band, and so the values dominate
-    # the scheduler's packing objective (the planet run showed small priorities losing to
-    # count-maximizing selection): masks 10M > mirrors 5M > preps (raw MB).
+    # the scheduler's packing objective (which otherwise favors count-maximizing selection of
+    # light jobs): masks 10M > mirrors 5M > preps (raw MB).
     priority: 5_000_000  # long serial job with thousands of network header reads; start early
     retries: 2
     resources:
@@ -139,9 +139,8 @@ rule catalog_item:
 
 
 # The streamed half of the catalogs invocation (--config stream=1): fetch a not-locally-
-# prepped source's published registration. Absent-only like the legacy preview's fetch
-# (engine: outputs exist ⇒ done); -R fetch_catalog refreshes. tmp+mv so a 404 never
-# leaves a truncated file.
+# prepped source's published registration. Absent-only (engine: outputs exist ⇒ done);
+# -R fetch_catalog refreshes. tmp+mv so a 404 never leaves a truncated file.
 rule fetch_catalog:
     output:
         bounds="store/source/{source}/bounds.csv",

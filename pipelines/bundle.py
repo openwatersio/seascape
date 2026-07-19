@@ -89,8 +89,7 @@ def create_archive(filepaths, name, stem_of):
     """Concat the single-zoom pmtiles into store/bundle/<archive_filename(name)>.
     For an overlay cell, tiles outside the cell (a coarse parent spanning cells)
     are left to the sibling cells' archives. ``stem_of`` parses a member's logical
-    {z}-{x}-{y}-{child_z} — ``_plain_stem`` in the engine lane, where the flat basename
-    IS the stem."""
+    {z}-{x}-{y}-{child_z} — ``_plain_stem``, where the flat basename IS the stem."""
     utils.create_folder("store/bundle")
     out_filepath = f"store/bundle/{archive_filename(name)}"
     min_z, max_z = math.inf, 0
@@ -153,23 +152,21 @@ def bundle_group(name, filepaths, stem_of):
     return create_archive(filepaths, name, stem_of)
 
 
-# ── engine lane (--stable) ─────────────────────────────────────────────────────
-# Plain flat inventory (store/pmtiles/<stem>.pmtiles), one archive per invocation.
-# Snakemake owns freshness, so no keys, no sidecar, no fresh-skip, no manifest, and no
-# internal cell pool — the engine schedules the cells as jobs. Same grid partition
-# (stem_groups / cell_of) as the legacy bundle, so the archives are byte-identical.
+# ── the --stable inventory ─────────────────────────────────────────────────────
+# Plain flat inventory (store/pmtiles/<stem>.pmtiles), one archive per invocation. Snakemake
+# owns freshness, so no manifest and no internal cell pool — the engine schedules the cells as
+# jobs. Same grid partition (stem_groups / cell_of) for every archive.
 
 
 def _plain_stem(path):
-    """The logical stem of an engine-lane plain name (store/pmtiles/<stem>.pmtiles): the basename
-    minus extension IS the stem (no content-address key to strip)."""
+    """The logical stem of a plain name (store/pmtiles/<stem>.pmtiles): the basename minus
+    extension IS the stem."""
     return os.path.splitext(os.path.basename(path))[0]
 
 
 def _stable_inventory():
     """{stem: plain path} over every render stem of the BBOX-scoped covering
-    (terrain.render_stems of mosaic.covering_stems). The render-stem set IS the inventory — no
-    content-name filter, no orphan sweep (the engine keeps the store consistent)."""
+    (terrain.render_stems of mosaic.covering_stems). The render-stem set IS the inventory."""
     import mosaic
     import terrain
     stems = terrain.render_stems(mosaic.covering_stems())
@@ -178,8 +175,8 @@ def _stable_inventory():
 
 def overlay_cells(stems):
     """The populated overlay cell ids for a render-stem list — every non-planet group stem_groups
-    routes a stem into, grouped exactly as the legacy bundle. build.smk derives the per-cell
-    overlay outputs (and each cell's member stems) from this."""
+    routes a stem into. build.smk derives the per-cell overlay outputs (and each cell's member
+    stems) from this."""
     cells = set()
     for stem in stems:
         cells.update(n for n in stem_groups(stem) if n != "planet")
@@ -189,7 +186,7 @@ def overlay_cells(stems):
 def bundle_planet_stable():
     """Build store/bundle/planet.pmtiles (z0..PLANET_MAX_ZOOM) from the plain inventory — the base
     stems (stem_groups == ['planet']). Asserts every render stem's pmtiles is on disk first (a
-    MISSING one is an interrupted build), the only bundle-time gate the stable path keeps."""
+    MISSING one is an interrupted build) — the only bundle-time gate."""
     inv = _stable_inventory()
     stems = sorted(inv)
     contour_run.require_stable_complete("terrain", stems, [inv[s] for s in stems])
@@ -211,7 +208,7 @@ def bundle_cell_stable(cell):
     print(f"overlay bundle (stable): store/bundle/{archive_filename(cell)} ({len(filepaths)} pmtiles)")
 
 
-# ── engine lane: the per-commit release bundle (build/<sha>/) ───────────────────
+# ── the per-commit release bundle (build/<sha>/) ────────────────────────────────
 # The finished archives the serving Worker fetches (planet + overlays + vector, plus
 # coverage when the catalogs invocation left it) and a manifest.json it reads: planet
 # BundleMeta, the overlay grid, source_ids, attribution — the Worker's Manifest shape and

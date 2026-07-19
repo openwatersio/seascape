@@ -110,7 +110,7 @@ def warp_mixed(inputs, out_tif, zoom, aggregation_tile, buffer):
     """gdalwarp several heterogeneous-CRS inputs into one 3857 GTiff mosaic. A warped
     VRT can't span source CRSs (it has one), so warp straight to a raster — each input
     is reprojected from its own UTM zone, so a zone-crossing tile keeps every source.
-    No value transform: streamed sources skip source_datum, MLLW->MSL is the Phase 5
+    No value transform: streamed sources skip source_datum, MLLW->MSL is a future
     VDatum job; nan source-nodata maps to NODATA via -dstnodata."""
     left, bottom, right, top = buffered_bounds(aggregation_tile, buffer)
     res = get_resolution(zoom)
@@ -197,7 +197,7 @@ def reproject(filepath):
     z, x, y, child_z = (int(a) for a in filename.replace("-aggregation.csv", "").split("-"))
     aggregation_tile = mercantile.Tile(x=x, y=y, z=z)
 
-    # Beside the CSV — identical for the legacy ULID layout and the --stable flat layout.
+    # Beside the CSV.
     tmp_folder = filepath.replace("-aggregation.csv", "-tmp")
     utils.create_folder(tmp_folder)
     metadata_filepath = f"{tmp_folder}/reprojection.json"

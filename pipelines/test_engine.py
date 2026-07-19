@@ -40,12 +40,11 @@ PIPE = os.path.dirname(os.path.abspath(__file__))
 # Small macrotile_z / num_overviews keep the synthetic rasters tiny. SKIP_SMOOTH: the raster
 # priority test needs no smoothing (one fewer moving part in the dry-run rerun table). The source
 # values sit just off the contour levels (-101/-51) so gdal_contour sees clean crossings only at
-# the feathered seam. FORCE_REBUILD/CONTOUR_LEVELS are stripped so a dev shell can't poison the
-# provenance assertions.
+# the feathered seam. CONTOUR_LEVELS is stripped so a dev shell can't poison the provenance
+# assertions.
 def _base_env(tmp, extra=None):
     env = {**os.environ, "SOURCES_DIR": os.path.join(tmp, "sources"),
            "MACROTILE_Z": "10", "NUM_OVERVIEWS": "2", "SKIP_SMOOTH": "1"}
-    env.pop("FORCE_REBUILD", None)
     env.pop("CONTOUR_LEVELS", None)
     env.pop("BBOX", None)
     env.update(extra or {})

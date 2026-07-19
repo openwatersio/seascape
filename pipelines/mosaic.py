@@ -1,48 +1,38 @@
-"""Stage 2 — persist the merged Float32 DEM as the durable, content-addressed MOSAIC product.
+"""Stage 2 — persist each aggregation tile's merged Float32 DEM as the durable MOSAIC product.
 
-The aggregate already computes a priority-resolved, seam-feathered, datum-offset, land-clamped
-merged DEM transiently inside every tile's tmp folder (aggregation_reproject + aggregation_merge),
-then throws it away after the cartographic forks read it. This module PERSISTS that exact array —
-unsmoothed, unencoded — as the survey-faithful TRUTH layer:
+The aggregate computes a priority-resolved, seam-feathered, datum-offset, land-clamped merged DEM
+transiently inside every tile's tmp folder (aggregation_reproject + aggregation_merge). This module
+persists that exact array — unsmoothed, unencoded — as the survey-faithful truth layer stage 3 reads:
 
   store/mosaic/
-    tiles/<stem>-<key12>.tif   one immutable content-addressed Float32 COG per aggregation tile:
-                               the merged DEM cropped to the tile's EXACT bounds (the halo removed
-                               so the tiles partition the plane with no overlap — a GTI requirement
-                               and the buffer/restrict discipline), nodata = -9999 (the same numeric
-                               sentinel the merge's hole detection uses), with nodata-aware `average`
-                               internal overviews native -> z8-equivalent (the COG driver stops at
-                               the 512 block = one z8 tile, so a z8 covering tile yields exactly
-                               child_z - 8 levels; never `nearest` — decimation is the anti-alias
-                               prefilter, and never below z8, where the planet z8 COG takes over).
-    index/<covering-ulid>.parquet   a GeoParquet TILE INDEX doubling as the MANIFEST: rows are the
-                               tile COGs with ABSOLUTE `location`s (+ per-tile resx/resy) the GTI
-                               driver reads, plus `seascape:`-prefixed columns it ignores (key,
-                               sources, datum, offset, priority, maxzoom) — one file is both the
-                               GDAL-openable planet mosaic and the DuckDB-queryable provenance.
-    planet-z8-<key>.tif        the whole mosaic decimated to the GEBCO-native z8 base, registered as
-                               the mosaic's overview (GTI <Overview>) so a z0-z4 open reads it, not
-                               thousands of tile-COG top overviews.
-    mosaic.gti                 the pointer — a small XML naming the current index + the z8 overview;
-                               GDAL opens the planet mosaic straight from it. Written LAST.
+    tiles/<stem>.tif          one Float32 COG per aggregation tile: the merged DEM cropped to the
+                              tile's EXACT bounds (halo removed so the tiles partition the plane with
+                              no overlap — a GTI requirement), nodata = -9999 (the sentinel the
+                              merge's hole detection uses), nodata-aware `average` internal overviews
+                              native -> z8 (the COG driver stops at the 512 block = one z8 tile).
+                              `average`, never `nearest`: decimation is the anti-alias prefilter.
+    index/covering.parquet    a GeoParquet tile index doubling as the manifest: rows are the tile
+                              COGs with ABSOLUTE `location`s (+ per-tile resx/resy) the GTI driver
+                              reads, plus `seascape:`-prefixed provenance columns it ignores (sources,
+                              datum, offset, priority, maxzoom).
+    planet-z8.tif             the whole mosaic decimated to the GEBCO-native z8 base, registered as
+                              the mosaic's overview (GTI <Overview>) so a z0-z4 open reads it, not
+                              thousands of tile-COG top overviews.
+    mosaic.gti                the pointer — a small XML naming the index + the z8 overview; GDAL opens
+                              the planet mosaic straight from it. Written LAST.
 
-NO smoothing, NO encoding: that is stage-3 display generalization. The mosaic is the layer you QA,
+No smoothing, no encoding: that is stage-3 display generalization. The mosaic is the layer to QA,
 diff between builds, and could publish as an open dataset.
 
-R2-agnostic like the rest of pipelines/: the writer writes the LOCAL store; the GTI `location`
-base comes from MOSAIC_VSI_BASE (CI: a /vsicurl bucket URL) and falls back to the tiles dir's local
-abspath, mirroring config.source_path's SOURCE_VSI_BASE resolution — no bucket name here.
+R2-agnostic like the rest of pipelines/: the writer writes the LOCAL store; the GTI `location` base
+comes from MOSAIC_VSI_BASE (CI: a /vsicurl bucket URL), else the tiles dir's local abspath.
 
-The SNAKEMAKE (engine) lane — ``mosaic.py tile <csv>`` + ``mosaic.py index --stable`` — is one
-engine job per covering tile off the ``--stable`` covering: freshness is ENGINE provenance (the
-rule's inputs + params), so artifacts take PLAIN stable names (``tiles/<stem>.tif``,
-``index/covering.parquet``, ``planet-z8.tif``, no key column) and content-addressing happens only
-at R2 publish time by hashing the finished COG's bytes — the atomic-publish contract for concurrent
-readers.
+Artifacts take plain stable names; the publish command content-addresses the finished COGs by
+hashing their bytes at R2-publish time, so a name's presence on R2 proves its content.
 
   python mosaic.py tile <covering-csv>   one tile: reproject + merge + persist, merge ONLY
                                          (no smoothing, no vector forks — stage 3 reads windows)
-  python mosaic.py index --stable        build the index + planet z8 COG + mosaic.gti (plain names)
+  python mosaic.py index --stable        build the index + planet z8 COG + mosaic.gti
   python mosaic.py publish               content-address the plain COGs to R2 + a CANDIDATE
                                          pointer; the serving pointer mosaic.gti is never touched
   python mosaic.py --check               self-check
@@ -88,14 +78,13 @@ def _stem(filepath):
 
 
 def tile_artifact(stem):
-    """The plain, stable tile-COG path ({stem}.tif) — the engine owns freshness (no key in the
-    name); publish content-addresses the R2 copy by hashing its bytes."""
+    """The tile-COG path for a stem. Plain, stable name; publish content-addresses the R2 copy by
+    hashing its bytes."""
     return f"{tiles_dir()}/{stem}.tif"
 
 
 def planet_artifact():
-    """The plain, stable planet-z8 overview COG path — like the tiles, content-addressing happens
-    only at R2 publish time."""
+    """The planet-z8 overview COG path. Content-addressed only in the R2 copy, at publish time."""
     return "store/mosaic/planet-z8.tif"
 
 
@@ -115,20 +104,17 @@ def _tile_sources(filepath):
 
 
 def _merged_dem(tmp_folder):
-    """The merged DEM the aggregate just produced: the highest-index N-3857.tiff (the merge output
-    for a multi-source tile, or the lone reprojected source for a single-source one). Same rule
-    smooth.smooth_merged / aggregation_tile.main use, so the mosaic persists exactly what the forks
-    read — before smoothing."""
+    """The merged DEM the aggregate produced: the highest-index N-3857.tiff (the merge output for a
+    multi-source tile, or the lone reprojected source for a single-source one)."""
     n = len(glob.glob(f"{tmp_folder}/*.tiff"))
     return f"{tmp_folder}/{n - 1}-3857.tiff"
 
 
 def _translate(filepath, tmp_folder):
     """Crop the halo off the tile's merged DEM and write the mosaic COG to a transient path inside
-    tmp_folder — the write shared by both freshness lanes. Crops buffer_pixels off every side so
-    the tile carries EXACTLY its mercantile bounds (the non-overlapping partition GTI needs and the
-    buffer/restrict discipline). Float32, nodata = -9999, ZSTD, nodata-aware `average` overviews
-    (COG driver, native -> the 512 block = z8-equivalent)."""
+    tmp_folder. Crops buffer_pixels off every side so the tile carries EXACTLY its mercantile bounds
+    (the non-overlapping partition GTI needs). Float32, nodata = -9999, ZSTD, nodata-aware `average`
+    overviews (COG driver, native -> the 512 block = z8)."""
     stem = _stem(filepath)
     with open(f"{tmp_folder}/reprojection.json") as f:
         buffer_pixels = json.load(f)["buffer_pixels"]
@@ -157,12 +143,10 @@ def _translate(filepath, tmp_folder):
 
 
 def tile(filepath):
-    """One covering tile's merge, alone — the Snakemake stage-2 job body. Reproject each
-    intersecting source, feather-merge, persist the unsmoothed COG at its PLAIN stable name;
-    no smoothing, no vector forks (stage 3 reads this tile back through windowed VRTs).
-    Freshness is the ENGINE's (the rule's inputs + params) — no keys, no staleness check here:
-    when this runs, it rebuilds. The tmp folder is cleared first so a retried job never reuses
-    a half-written reproject (the modules' resume markers are the legacy pool's affordance)."""
+    """One covering tile's merge: reproject each intersecting source, feather-merge, persist the
+    unsmoothed COG at store/mosaic/tiles/<stem>.tif. No smoothing, no vector forks (stage 3 reads
+    this tile back through windowed VRTs). The tmp folder is cleared first so a retried job never
+    reuses a half-written reproject."""
     stem = _stem(filepath)
     tmp_folder = filepath.replace("-aggregation.csv", "-tmp")
     shutil.rmtree(tmp_folder, ignore_errors=True)
@@ -225,9 +209,8 @@ def _feature(filepath, cpath, location, extra_props=None):
 
 
 def _tile_row_plain(filepath):
-    """The Snakemake lane's index row: the PLAIN-named tile COG, no key column — freshness is the
-    engine's, and hash-at-publish stamps keys onto the R2 copies at publish time. The completeness
-    refusal survives: an index must never vouch for a half-built mosaic."""
+    """One index row for a stem's tile COG. Refuses a missing tile — an index must never vouch for
+    a half-built mosaic."""
     stem = _stem(filepath)
     cpath = tile_artifact(stem)
     if not os.path.isfile(cpath):
@@ -269,7 +252,7 @@ def _warp_planet(index_path, out_tmp):
 def _gti_xml(index_ref, planet_ref, resolution):
     """The GTI pointer XML naming an index + z8 overview. index_ref / planet_ref are written
     verbatim: RELATIVE paths for the local serving pointer (portable across store prefixes),
-    ABSOLUTE public URLs for the engine-lane candidate pointer (resolves off the bucket)."""
+    ABSOLUTE public URLs for the publish command's candidate pointer (resolves off the bucket)."""
     return (
         "<GDALTileIndexDataset>\n"
         f"  <IndexDataset>{index_ref}</IndexDataset>\n"
@@ -290,9 +273,9 @@ def _write_gti(index_path, planet_path, resolution):
     (rclone carries it as-is); GDAL opens the planet mosaic straight from this file. One atomic
     rename, so the pointer only ever names a complete world.
 
-    5b / workflow: the R2 push publishes the mosaic/ prefix (tiles, index, planet-z8) BEFORE this
-    pointer — same artifacts-before-pointer discipline as bounds.csv-last — then PUTs mosaic.gti
-    last. This module only writes it locally."""
+    The R2 push publishes the mosaic/ prefix (tiles, index, planet-z8) BEFORE this pointer — same
+    artifacts-before-pointer discipline as bounds.csv-last — then PUTs mosaic.gti last. This module
+    only writes it locally."""
     rel_index = os.path.relpath(index_path, os.path.dirname(gti_path()))
     rel_planet = os.path.relpath(planet_path, os.path.dirname(gti_path()))
     xml = _gti_xml(rel_index, rel_planet, resolution)
@@ -302,7 +285,7 @@ def _write_gti(index_path, planet_path, resolution):
     os.replace(tmp, gti_path())
 
 
-# ── the engine-lane content-addressed R2 publish (mosaic.py publish) ──────────────────────────────
+# ── the content-addressed R2 publish (mosaic.py publish) ──────────────────────────────────────────
 #
 # Hash the finished plain COGs, hardlink them under content names, and push only what R2 lacks
 # (content-addressing makes existence == correctness). The parquet + GTI it uploads are a CANDIDATE
@@ -364,7 +347,7 @@ def _stage_publish():
 
     # Hash the pointer's SEMANTIC content (locations + refs), not just the tile hashes: a
     # location-format fix must mint a NEW candidate name, or --ignore-existing keeps serving
-    # the defective object under the unchanged name (observed).
+    # the defective object under the unchanged name.
     locations = sorted(f["properties"]["location"] for f in features)
     idxhash = hashlib.sha256("\n".join(locations + [public_base()]).encode()).hexdigest()[:12]
     index_name = f"{idxhash}.parquet"
@@ -464,10 +447,9 @@ def intersecting_tiles(stem):
 
 def window_dem(stem, out_tif):
     """Materialize the stem's BUFFERED window from the plain mosaic tiles — the stage-3 read
-    primitive (the 5c re-pointing): a throwaway VRT over the intersecting tiles, translated
-    to one bounded raster at the stem's native resolution. A coarser neighbor's halo pixels
-    upsample bilinearly (the named equivalent-not-equal behavior change; the seam check in
-    Validation gates it)."""
+    primitive: a throwaway VRT over the intersecting tiles, translated to one bounded raster at the
+    stem's native resolution. A coarser neighbor's halo pixels upsample bilinearly (seam_check gates
+    the continuity this can perturb)."""
     z, x, y, child_z = (int(a) for a in stem.split("-"))
     l, b, r, t = aggregation_reproject.buffered_bounds(
         mercantile.Tile(x=x, y=y, z=z), utils.macrotile_buffer_3857)
@@ -484,8 +466,8 @@ def window_dem(stem, out_tif):
 
 
 def _stable_stems():
-    """The --stable covering scoped to the BBOX env — the stem set the engine-lane index and
-    publish both walk. Refuses (naming the catalogs invocation) rather than build nothing."""
+    """The --stable covering scoped to the BBOX env — the stem set index and publish both walk.
+    Refuses (naming the catalogs invocation) rather than build nothing."""
     try:
         stems = covering_stems()
     except FileNotFoundError:
@@ -496,10 +478,9 @@ def _stable_stems():
 
 
 def build_index_stable():
-    """The Snakemake lane's index + planet z8 + pointer, off the --stable covering (BBOX-scoped
-    like the build invocation): plain names throughout, freshness owned by the engine (this runs
-    only when a tile changed). Same artifacts-before-pointer discipline — the .gti is written
-    last."""
+    """The index + planet z8 + pointer, off the --stable covering (BBOX-scoped like the build
+    invocation): plain names throughout. Same artifacts-before-pointer discipline — the .gti is
+    written last."""
     stems = _stable_stems()
     csvs = [f"store/aggregation/{s}-aggregation.csv" for s in stems]
     features = [_tile_row_plain(fp) for fp in csvs]
@@ -517,8 +498,8 @@ def build_index_stable():
 
 
 def _check():
-    """One synthetic aggregation tile, engine lane only: persist its merged DEM to the PLAIN tile
-    COG (Float32, nodata -9999, nodata-aware average overviews down to the 512 block), build the
+    """One synthetic aggregation tile: persist its merged DEM to the plain tile COG (Float32,
+    nodata -9999, nodata-aware average overviews down to the 512 block), build the
     --stable index + planet z8 + .gti, confirm the .gti opens as one raster with the z8 overview
     and the parquet carries the seascape: provenance columns (no key column), then stage the
     content-addressed publish set and assert its names/refs never touch the serving pointer."""
@@ -530,7 +511,7 @@ def _check():
 
     saved_dir, cwd = config.SOURCES_DIR, os.getcwd()
     saved_env = {k: os.environ.pop(k, None) for k in
-                 ("LANDMASK", "WATERMASK", "MOSAIC_VSI_BASE", "FORCE_REBUILD", "SOURCE_VSI_BASE", "BBOX")}
+                 ("LANDMASK", "WATERMASK", "MOSAIC_VSI_BASE", "SOURCE_VSI_BASE", "BBOX")}
     d = tempfile.mkdtemp()
     try:
         os.chdir(d)
@@ -582,7 +563,6 @@ def _check():
                            tiled=True, blockxsize=512, blockysize=512) as dst:
             dst.write(arr, 1)
 
-        # ── the engine lane: plain names off the --stable covering, engine freshness ──
         # tile()'s reproject/merge needs real sources, so exercise its persist half directly
         # (_translate + atomic replace — exactly tile()'s tail) and then the stable index.
         os.makedirs(tiles_dir(), exist_ok=True)
@@ -615,14 +595,14 @@ def _check():
         assert "Type=Float32" in info and f"NoData Value={NODATA}" in info, info[:400]
         assert "Overviews:" in info, "the plain planet z8 must register as the mosaic overview"
         out, _ = utils.run_command(f"ogrinfo -q -al {index_dir()}/covering.parquet")
-        assert "seascape:key" not in out, "the engine lane's index carries no key column"
+        assert "seascape:key" not in out, "the index carries no key column"
         for col in ("seascape:sources", "seascape:priority", "seascape:maxzoom",
                     "seascape:datum", "seascape:offset"):
             assert col in out, f"index missing column {col}"
         assert "gebco,reef" in out, "provenance columns must survive in the stable index"
         assert '"reef": "MLLW"' in out or 'reef\\":\\"MLLW' in out or "MLLW" in out, "datum must be composited"
 
-        # ── the engine-lane publish: stage content-addressed names LOCALLY, assert names + refs, no
+        # ── publish: stage content-addressed names LOCALLY, assert names + refs, no
         # network (rclone is never called from _stage_publish; the serving pointer is unreachable) ──
         pub_base = "https://data.example/bathymetry"
         os.environ["PUBLIC_BASE"] = pub_base

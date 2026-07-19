@@ -1,8 +1,8 @@
 """Contours as a fork off each aggregation tile's merged DEM.
 
-Reuses the best-available merged DEM the aggregation stage builds (already
-slope-smoothed by smooth.py), so contours come from one continuous surface. GDAL
-runs as a subprocess; geopandas/shapely do the Chaikin smoothing.
+Reads a window of the persisted mosaic (smoothed at read by smooth.py), so contours
+come from one continuous surface. GDAL runs as a subprocess; geopandas/shapely do the
+Chaikin smoothing.
 
 Each aggregation tile contours its full-res merged DEM, so every source shows at
 all zooms (coarse GEBCO is overzoomed by the renderer above its native z9; CUDEM
@@ -143,10 +143,10 @@ def smooth_and_enrich(sources, out_fgb, tol):
 
 
 def tile(stem):
-    """The per-stem Snakemake job — reads the PERSISTED mosaic instead of the transient merge: contour one stem from a BUFFERED mosaic
-    window, smoothed at read with the one shared f(depth, zoom), output at the PLAIN stable
-    name. A featureless tile writes a 0-byte sentinel so the engine sees a complete output;
-    bundling filters empties by size."""
+    """The per-stem Snakemake job: contour one stem from a BUFFERED mosaic window, smoothed at read
+    with the one shared f(depth, zoom), output at store/contour/<stem>.fgb. A featureless tile
+    writes a 0-byte sentinel so the engine sees a complete output; bundling filters empties by
+    size."""
     import mosaic
     import smooth
     z, x, y, child_z = (int(a) for a in stem.split("-"))
@@ -265,8 +265,8 @@ def _stems_maxz(stems):
 def bundle_maxz_stable(own_max):
     """The shared tileset maxzoom every vector layer bundles to (contours/soundings/depare
     tile-join into one vector.pmtiles): the covering's max child_z (so they tile to the same depth and
-    tile-join cleanly), else the caller's own files' max. The covering is always present in the
-    engine lane (Snakemake refuses to run without it), so there is no None fallback."""
+    tile-join cleanly), else the caller's own files' max. The covering is always present
+    (Snakemake refuses to run without it), so there is no None fallback."""
     import mosaic
     return max(own_max, _stems_maxz(mosaic.covering_stems()))
 
@@ -359,8 +359,8 @@ def _finalize_contours(archives, out):
     archive, so folding each sparse layer in afterwards re-paid the planet-wide join
     per layer (~90 min each). -pk keeps every feature of every layer; a layer
     whose pmtiles isn't present locally is simply not joined. Coverage is its own
-    tileset (coverage_bundle), not a layer here. Drying is no longer its own layer —
-    it folds into `depare` (a DEPARE band with negative drval1)."""
+    tileset (coverage_bundle), not a layer here. Drying is not its own layer; it folds
+    into `depare` (a DEPARE band with negative drval1)."""
     layers = [p for p in ["store/bundle/soundings.pmtiles",
                           "store/bundle/depare.pmtiles"]
               if os.path.isfile(p)]
@@ -371,10 +371,9 @@ def _finalize_contours(archives, out):
 
 
 def require_stable_complete(layer, stems, files):
-    """The engine-lane no-holes gate: every covering stem must have its PLAIN per-stem file on
-    disk — a 0-byte file is a legitimately empty tile, a
-    MISSING one is an incomplete build. Snakemake owns freshness, so this completeness assert is the
-    only bundle-time gate the stable path keeps (no keys, no markers)."""
+    """The no-holes gate: every covering stem must have its per-stem file on disk — a 0-byte file
+    is a legitimately empty tile, a MISSING one is an incomplete build. The only bundle-time gate;
+    Snakemake owns freshness."""
     missing = [s for s, f in zip(stems, files) if not os.path.exists(f)]
     if missing:
         raise SystemExit(
@@ -384,12 +383,11 @@ def require_stable_complete(layer, stems, files):
 
 
 def bundle_stable():
-    """Engine-lane vector bundle: tippecanoe the PLAIN per-stem contour FGBs for the covering into
-    contour lines, then tile-join the already-bundled soundings/depare pmtiles → vector.pmtiles.
-    A 0-byte per-tile file is a legitimately empty tile (filtered by size); a MISSING one is an
-    incomplete build (require_stable_complete). Snakemake decides when to invoke, so this always
-    rebuilds — no key, no sidecar, no fresh-skip. A missing depare.pmtiles (SKIP_DEPARE) is simply
-    not joined, exactly as the legacy _finalize_contours tolerates it (an isfile check)."""
+    """Vector bundle: tippecanoe the per-stem contour FGBs for the covering into contour lines,
+    then tile-join the already-bundled soundings/depare pmtiles → vector.pmtiles. A 0-byte per-tile
+    file is a legitimately empty tile (filtered by size); a MISSING one is an incomplete build
+    (require_stable_complete). Snakemake decides when to invoke, so this always rebuilds. A missing
+    depare.pmtiles (SKIP_DEPARE) is simply not joined (_finalize_contours' isfile check)."""
     import mosaic
     stems = mosaic.covering_stems()
     files = [f"store/contour/{s}.fgb" for s in stems]

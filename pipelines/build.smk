@@ -7,7 +7,7 @@
 #
 # Freshness here is ENGINE provenance (inputs + params). CODE is deliberately not an
 # input (force-only: `-R mosaic_tile`) — an innocuous merge-module edit must not
-# re-merge the planet by default (docs/plans/2026-07-14-snakemake-build.md, Identity).
+# re-merge the planet by default.
 
 include: "common.smk"
 
@@ -53,23 +53,23 @@ def tile_sources(stem):
 def merge_inputs(wc):
     """A tile's staleness inputs: its covering CSV, each intersecting source's catalog item
     (the registration marker — a re-prepped or re-mirrored source restamps it, so exactly the
-    intersecting tiles re-merge), and the masks (their content enters every merged tile, as in
-    the legacy keys). All LEAF files here — their producing rules live only in the Snakefile."""
+    intersecting tiles re-merge), and the masks (their content enters every merged tile). All LEAF
+    files here — their producing rules live only in the Snakefile."""
     return ([f"store/aggregation/{wc.stem}-aggregation.csv"]
             + [f"store/source/{s}/catalog.json" for s in tile_sources(wc.stem)]
             + MASKS)
 
 
 def source_props(stem):
-    """The resolved per-source build props the reproject/merge read — the same set the legacy
-    mosaic key hashed (mosaic._PROPS), as a sorted-JSON param so any change reruns the tile."""
+    """The resolved per-source build props the reproject/merge read (mosaic._PROPS), as a
+    sorted-JSON param so any change reruns the tile."""
     return json.dumps(
         {s: {k: pipeline_config.source_property(s, k) for k in mosaic_mod._PROPS}
          for s in tile_sources(stem)}, sort_keys=True)
 
 
-# The resolved merge config — _inputs_config's cfg minus the recipe hashes (those enter as
-# the catalog INPUTS above).
+# The resolved merge config as a rerun param; the recipe hashes ride in the catalog INPUTS
+# above, not here.
 MERGE_CFG = json.dumps({
     "resample": aggregation_reproject.RESAMPLE,
     "macrotile_z": utils.macrotile_z,
@@ -78,24 +78,21 @@ MERGE_CFG = json.dumps({
 }, sort_keys=True)
 
 
-# factor 2.0, not utils.DEFAULT_FACTOR (4): the legacy factor priced the pool job
-# with forks riding in it. Fresh planet benchmarks with the windowed negate: z13 peaks
-# 2.31 GB (reserve 3), z14 typically 4-6 GB (reserve 9; 22 concurrent still fit 168).
-# Re-fit from store/bench/mosaic/ — FRESH rows only; the dir accrues stale runs.
+# factor 2.0, not utils.DEFAULT_FACTOR (4): the merge job holds only the merged array +
+# reprojected sources, not the vector forks. z13 peaks ~2.3 GB, z14 ~4-6 GB. Re-fit from
+# store/bench/mosaic/.
 MERGE_FACTOR = 2.0
 
 
 def tile_weight(wc, input=None, attempt=None):
-    # x1000: the planet run showed small priorities losing to count-maximizing packing —
-    # 22 ready z14 heavies were admitted one at a time over 32 min while ~96 lights
-    # front-loaded, re-creating the straggler tail. Make priority dominate any objective.
+    # x1000: make tile weight dominate the scheduler's packing objective, so heavy tiles aren't
+    # starved by count-maximizing selection of light ones (which re-creates the straggler tail).
     return utils.weight(wc.stem, factor=MERGE_FACTOR) * 1000
 
 
 # One covering tile's merge, alone — the planet's memory hot spot, isolated in its own job.
-# utils.weight seeds the reservation (the geometric estimate the first planet run's
-# benchmarks will re-fit); retries escalate it. The kernel cgroup cap (docker run --memory)
-# arrives with the box workflow — on a laptop the reservation is scheduling only.
+# utils.weight seeds the reservation (a geometric estimate the benchmarks re-fit); retries
+# escalate it. On a laptop the reservation is scheduling only (no kernel cap).
 rule mosaic_tile:
     input:
         merge_inputs
@@ -152,7 +149,7 @@ rule publish:
 
 
 # ── stage 3 (cartographic products): every consumer reads windows of the persisted ──
-# ── mosaic, instead of riding inside the merge job as the legacy forks do            ──
+# ── mosaic, as a separate job rather than riding inside the merge                    ──
 
 import bundle
 import contour_run
@@ -172,10 +169,8 @@ SMOOTH_CFG = json.dumps({} if os.environ.get("SKIP_SMOOTH") else {
     "depth_smooth": smooth.DEPTH_SMOOTH, "block": smooth.BLOCK}, sort_keys=True)
 
 
-# Fork reservations, fitted from the first planet run's benchmark rows (max RSS by
-# child_z; the flat 2 GB guess under-priced dense z14 tiles at 5-9.5 GB and ~84 wide
-# OOM-killed the box). Step tables carry ~40% margin over the measured maxima;
-# retries escalate. Re-fit from store/bench/ as the corpus grows.
+# Fork reservations by child_z, fitted from benchmark max-RSS with ~40% margin (dense z14
+# tiles peak ~5-9.5 GB); retries escalate. Re-fit from store/bench/ as the corpus grows.
 CONTOUR_GB = {14: 13, 13: 5}
 SOUND_GB = {14: 8, 13: 3}
 DEPARE_GB = {14: 8, 13: 4}
@@ -243,8 +238,8 @@ rule depare_tile:
         "{PY}/depare_run.py tile {wildcards.stem}"
 
 
-# Terrain reads windows through the LOCAL GTI, so it gates on mosaic_index (named upgrade:
-# per-stem VRTs would restore stage-2/3 pipelining for native stems). Weight like the merge:
+# Terrain reads windows through the LOCAL GTI, so it gates on mosaic_index (a per-stem VRT
+# would restore stage-2/3 pipelining for native stems). Weight like the merge:
 # a native z14 window is the same array size; overview stems are tiny.
 rule terrain_render:
     input:
@@ -293,8 +288,8 @@ rule tiles:
 
 # ── bundles — the three vector layers tile-join into one vector.pmtiles ──
 # Each bundler consumes the PLAIN per-stem outputs (0-byte = an empty tile, kept by size),
-# asserts the covering is hole-free, and always rebuilds — Snakemake owns freshness, so the
-# `--stable` CLIs carry no key/sidecar. depare rides only when SKIP_DEPARE is unset (DEPARE_STEMS).
+# asserts the covering is hole-free, and always rebuilds — Snakemake owns freshness. depare
+# rides only when SKIP_DEPARE is unset (DEPARE_STEMS).
 
 rule soundings_bundle:
     input:
@@ -340,8 +335,7 @@ rule vector_bundle:
 # ── terrain (raster) bundles — the planet base archive + one overlay per populated ──
 # OVERLAY_SPLIT_Z grid cell, concatenated from the PLAIN per-stem terrain pmtiles. The
 # planet holds z0..PLANET_MAX_ZOOM; each overlay cell holds its deeper tiles. Snakemake owns
-# freshness, so the `--stable` CLIs carry no key/sidecar; one cell per invocation (no internal
-# pool — the engine schedules the cells).
+# freshness; one cell per invocation (the engine schedules the cells).
 
 rule terrain_planet_bundle:
     input:

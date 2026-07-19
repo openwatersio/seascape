@@ -1,29 +1,20 @@
 name: Build
 
-# The Snakemake build lane, REPLACING the legacy stage choreography at this path: the same
-# infrastructure as sources.yml (image, Hetzner runner, persistent store volume, teardown,
-# leak checks) but the per-stage docker runs collapse to TWO chained Snakemake invocations —
-# the catalogs invocation (covering from the volume's canonical sources), then the build
-# invocation (pipelines/build.smk), which parses purely from disk and structurally contains
-# no fetch rule. On this branch `gh workflow run build.yml --ref <branch>` runs THIS file
-# while main's legacy copy keeps planet production — merging the branch makes this
-# the production build (docs/plans/2026-07-14-snakemake-build.md, phases 8-11).
+# Runs the planet build on ONE ephemeral Hetzner box against the persistent store volume, in
+# TWO chained Snakemake invocations — the catalogs invocation (covering from the volume's
+# canonical sources), then the build invocation (pipelines/build.smk bundles + publish), which
+# parses purely from disk and structurally contains no fetch rule, so a build can never contact
+# upstream.
 #
-# Scope today: stage 2 (the mosaic) only — the first dispatch is the MEASUREMENT run the
-# memory plan calls for. Every mosaic_tile job runs isolated with a benchmark: directive, so
-# per-tile max-RSS data lands in store/bench/ and survives even if the run dies. Tiles are
-# plain-named on the volume; the publish rule content-addresses them to R2 under hashed names
-# with a CANDIDATE pointer (index + gti) — the serving pointer mosaic.gti is never written
-# from here, so serving state is structurally untouchable.
+# Every job runs isolated with a benchmark: directive, so per-tile max-RSS lands in store/bench/
+# and survives even if the run dies. Tiles are plain-named on the volume; the publish rule
+# content-addresses them to R2 under hashed names with a CANDIDATE pointer (index + gti) — the
+# serving pointer mosaic.gti is never written from here, so serving state is structurally
+# untouchable.
 #
-# Named follow-ups, deliberately not in this revision:
-#   - per-job kernel memory caps (cgroup / docker run --memory per job): added once the
-#     measurement run's benchmarks give real reservations to enforce; until then the global
-#     --resources budget + per-job process isolation + retries bound the blast radius.
-#   - planet-mosaic sizing vs the volume: check before the first FULL planet
-#     dispatch; a bbox smoke first is the intended path.
-#   - a warm volume is assumed: if a source's registration is missing, the cover invocation
-#     can reach stage-1 prep rules (it is the catalogs invocation) — run sources.yml first.
+# A warm volume is assumed: if a source's registration is missing, the cover invocation can reach
+# stage-1 prep rules (it is the catalogs invocation) — run sources.yml first. A bbox smoke before
+# the first full planet dispatch is the intended path.
 
 on:
   workflow_dispatch:
@@ -50,8 +41,8 @@ env:
   SERVER_TYPE: ${{ github.event.inputs.server_type }}
   SERVER_IMAGE: ubuntu-24.04
   SERVER_LOCATION: fsn1
-  # The persistent store volume — see main's legacy build.yml for its full story; this lane
-  # reads the same canonical stage-1 store and adds store/mosaic/ + store/bench/.
+  # The persistent store volume: reads the canonical stage-1 store and adds store/mosaic/ +
+  # store/bench/.
   STORE_VOLUME: seascape-store
   STORE_VOLUME_GB: "750"
   NAME: seascape-build-${{ github.run_id }}
@@ -59,12 +50,12 @@ env:
   # with these public URLs (mosaic.public_base); the serving pointer is never written from here.
   DATA_BUCKET: data
   PUBLIC_BASE: https://data.openwaters.io/bathymetry
-  # DEPARE stays out of builds until its dense-tile GEOS tail is bounded (the reason
-  # production disabled it); docs/perf/optimization-backlog.md owns the re-enable work.
+  # DEPARE stays out of builds until its dense-tile GEOS tail is bounded;
+  # docs/perf/optimization-backlog.md owns the re-enable work.
   SKIP_DEPARE: "1"
 
 # One store-mutating workflow at a time, globally: builds, sources runs, and GC share this
-# group. NOTE: a second queued dispatch EVICTS the first (observed) — one dispatch at a time.
+# group. NOTE: a second queued dispatch EVICTS the first — one dispatch at a time.
 concurrency:
   group: r2-store
   cancel-in-progress: false
@@ -116,9 +107,9 @@ jobs:
           location: ${{ env.SERVER_LOCATION }}
           image: ${{ env.SERVER_IMAGE }}
           volume: "null"
-      # The store volume holds the canonical stage-1 sources this lane builds FROM — attached
-      # for bbox smokes too (unlike the legacy NVMe-scratch bbox path): the mosaic lane always
-      # reads the volume's catalogs and writes plain-named tiles beside them.
+      # The store volume holds the canonical stage-1 sources the build reads FROM — attached
+      # for bbox smokes too: the build always reads the volume's catalogs and writes plain-named
+      # tiles beside them.
       - name: Attach persistent store volume
         env:
           HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
@@ -132,15 +123,15 @@ jobs:
           hcloud volume attach "$STORE_VOLUME" --server "$SERVER_ID"
           echo "volume $STORE_VOLUME attached to server $SERVER_ID"
 
-  # The build: covering (catalogs invocation) then the mosaic (build invocation), natively on
-  # the box. timeout-minutes REQUIRED even self-hosted (default per-job timeout is 360 min).
+  # The build: covering (catalogs invocation) then bundles + publish (build invocation), natively
+  # on the box. timeout-minutes REQUIRED even self-hosted (default per-job timeout is 360 min).
   build:
     needs: [image, create-runner]
     runs-on: ${{ needs.create-runner.outputs.label }}
     timeout-minutes: 2880
     permissions: { contents: read, packages: read }
     # R2 via rclone's env-var remote (remote "r2" exists ambiently in every rclone call) —
-    # scoped to this job, the only one that publishes. Copied from sources.yml.
+    # scoped to this job, the only one that publishes.
     env:
       RCLONE_CONFIG_R2_TYPE: s3
       RCLONE_CONFIG_R2_PROVIDER: Cloudflare
@@ -189,8 +180,8 @@ jobs:
           INPUT_FORCE: ${{ github.event.inputs.force }}
           INPUT_ARGS: ${{ github.event.inputs.snakemake_args }}
           # Mirrored sources (CUDEM/S-102) stream from the public mirror; prepped sources
-          # read the volume (source_path: a local file wins per file). Curl caches sized as
-          # in the legacy build; both fit inside the global reserve below.
+          # read the volume (source_path: a local file wins per file). Curl caches sized to
+          # fit inside the global reserve below.
           SOURCE_VSI_BASE: /vsicurl/https://data.openwaters.io/bathymetry/source
           CPL_VSIL_CURL_CHUNK_SIZE: "5242880"
           CPL_VSIL_CURL_CACHE_SIZE: "268435456"
@@ -199,8 +190,8 @@ jobs:
         run: |
           set -euo pipefail
           # Disk headroom: the mosaic tiles live permanently on the volume (~360 G), so
-          # planet runs are incremental — 100 G covers the index/planet-z8/scratch churn
-          # (the legacy build's proven floor). Refuse early rather than fill mid-run.
+          # planet runs are incremental — 100 G covers the index/planet-z8/scratch churn.
+          # Refuse early rather than fill mid-run.
           need_gb=100; [ -n "$BBOX" ] && need_gb=50
           free_gb=$(df -BG --output=avail "$STATE" | tail -1 | tr -dc '0-9')
           [ "$free_gb" -ge "$need_gb" ] || { echo "only ${free_gb}G free on the store volume (need ${need_gb}G) — GC or resize first" >&2; exit 1; }
@@ -208,7 +199,7 @@ jobs:
           # page-cache headroom) that SCALES with the box — an eighth of RAM, floor 4 GB:
           # ccx33 -> 28 GB budget (sources.yml's proven number), ccx63 -> 168 GB. A flat
           # big-box reserve on a small box starves merge concurrency for no protection.
-          # Scheduling only — the per-job kernel cap is the named follow-up in the header.
+          # Scheduling only — no per-job kernel cap.
           total_gb=$(awk '/MemTotal/ {print int($2/1024/1024)}' /proc/meminfo)
           reserve_gb=$((total_gb / 8)); [ "$reserve_gb" -ge 4 ] || reserve_gb=4
           budget_gb=$((total_gb - reserve_gb))
@@ -229,7 +220,7 @@ jobs:
             --keep-going --rerun-incomplete \
             --cores "$cores" --resources mem_gb="$budget_gb" \
             --config workdir=/app/state
-      # Per-job wall/CPU/max-RSS — the measurement this lane exists to produce.
+      # Per-job wall/CPU/max-RSS from the benchmark: directives.
       - name: Upload snakemake benchmarks
         if: always()
         uses: actions/upload-artifact@v7

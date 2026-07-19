@@ -1,11 +1,10 @@
 """Decoded A/B gate between two builds' published artifacts.
 
-Compares what a *renderer* would see, not the archive bytes: the new Snakemake lane's
-``build/<sha>/`` against the legacy baseline ``build/<sha>/`` (both live at
-``https://data.openwaters.io/bathymetry/build/<sha>/`` or a local dir). Byte-diffing the
-pmtiles is useless here — the two lanes are designed to produce byte-identical archives,
-and when they don't the question is whether the *decoded* elevation / vector content drifted,
-not whether two equivalent encodings differ.
+Compares what a *renderer* would see, not the archive bytes: build A's ``build/<sha>/`` against
+build B's ``build/<sha>/`` (both live at ``https://data.openwaters.io/bathymetry/build/<sha>/`` or a
+local dir). Byte-diffing the pmtiles is useless here — two equivalent encodings can differ in bytes,
+so the question is whether the *decoded* elevation / vector content drifted, not whether the
+encodings differ.
 
 Two gates, each over a seeded, stratified sample of tile addresses:
 

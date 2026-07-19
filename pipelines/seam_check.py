@@ -19,14 +19,14 @@ FGBs are 4326):
     the same span; the symmetric-difference length must be under a pixel-scaled tolerance.
 
 Tolerance is derived from the tile pixel size in degrees (via mercantile), using the COARSER of the
-two neighbours (a coarse tile's halo upsamples into its finer neighbour — the named
-equivalent-not-equal behaviour of window_dem). Handled: 0-byte sentinel files (an empty tile — a
+two neighbours (a coarse tile's halo upsamples into its finer neighbour — the equivalent-not-equal
+behaviour of window_dem). Handled: 0-byte sentinel files (an empty tile — a
 pair where one side is empty and the other still crosses the seam is a FAIL), antimeridian pairs
 (the ±180 seam, skipped with a note — their coordinates don't touch numerically), and neighbours
 with differing child_z (coarser wins the tolerance).
 
 Decoupled by construction: reads store paths directly and shells out to ogr2ogr; imports no pipeline
-module, so the concurrent stage-3 refactor can't break it.
+module, so a change to the stage-3 code it validates can't break the gate.
 
 CLI:
   seam_check.py contours <stemA> <stemB>   # two ADJACENT covering tiles (z-x-y-cz)

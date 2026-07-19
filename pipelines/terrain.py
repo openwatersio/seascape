@@ -1,22 +1,17 @@
 """Stage 3 — per-zoom Terrarium terrain render from the MOSAIC.
 
-Replaces BOTH the aggregate's native-zoom terrain fork (old aggregation_tile call) AND the
-2x2-average overview pyramid (old downsampling.py). The model the production-build plan mandates:
-
-  each output zoom renders by reading the MOSAIC at that zoom's resolution
+Each output zoom renders by reading the MOSAIC at that zoom's resolution
   -> depth/zoom-gated smooth AT THAT RESOLUTION (smooth.smooth_array — the ONE smoothing
      function the contour fork also calls, so isobaths agree with the shading)
   -> Terrarium encode (encode.py's conservative, bias-shallow quantization)
-  -> single-zoom pmtiles bundle.py already understands (store/pmtiles/<stem>-<key12>.pmtiles).
+  -> single-zoom pmtiles bundle.py concatenates (store/pmtiles/<stem>.pmtiles).
 
-Why this replaces the 2x2 average: the old path smoothed ONCE at native res then box-averaged the
-ENCODED tiles down, so a sigma had no defined ground size at coarse zoom. Reading the mosaic's
-nodata-aware `average` overviews at each zoom and smoothing there gives f(depth, zoom) a real
-metre meaning at every level (the zoom-tier contour design assumes this). Accepted consequence
-(plan): coarse zooms are no longer a strict decimation of fine zooms, so features may shift
-slightly between levels — invisible in shading, already intended for contours.
+Reading the mosaic's nodata-aware `average` overviews at each zoom and smoothing there gives
+f(depth, zoom) a real metre meaning at every level (the zoom-tier contour design assumes this).
+Consequence: coarse zooms are not a strict decimation of fine zooms, so features may shift slightly
+between levels — invisible in shading, intended for contours.
 
-The two pyramids (5a): the mosaic COGs' internal overviews are the *access* pyramid (unsmoothed
+Two pyramids: the mosaic COGs' internal overviews are the *access* pyramid (unsmoothed
 truth, `average`-resampled) — a decimated GTI read picks each tile's overview automatically, so the
 rule here is ALWAYS read at target resolution, never full-res-then-decimate. This module builds the
 *served* pyramid: smoothed, encoded, display-conditioned. z0-~z4 read the mosaic's own GTI-
@@ -24,14 +19,14 @@ registered planet z8 COG (the <Overview> in mosaic.gti), not thousands of tile-C
 that fallthrough is automatic in the GTI decimated read too.
 
 Reads the mosaic by ABSOLUTE path through the SYSTEM gdal (the toolchain the pipeline shells to),
-not rasterio's bundled GDAL — 5a found the GTI's RELATIVE IndexDataset/Overview refs resolve
+not rasterio's bundled GDAL — the GTI's RELATIVE IndexDataset/Overview refs resolve
 differently across GDAL versions, so a windowed read must go through the same gdal that wrote the
 .gti. MOSAIC_VSI_BASE points the tile `location`s at a bucket in CI; unset = local abspath, which
 is what a laptop / this render uses. The mosaic MUST already be built + indexed
 (mosaic.py index --stable) before this runs — the terrain_render rule gates on mosaic_index.
 
-The engine lane: build.smk derives the render stems (render_stems) at parse time and schedules one
-`terrain.py render <stem>` job per stem, writing the PLAIN store/pmtiles/<stem>.pmtiles.
+build.smk derives the render stems (render_stems) at parse time and schedules one
+`terrain.py render <stem>` job per stem, writing store/pmtiles/<stem>.pmtiles.
 
   python terrain.py render <stem>   render one stem from the mosaic to the plain flat name
   python terrain.py --check         self-check (renders a synthetic mosaic tile, asserts the pyramid)
@@ -81,16 +76,12 @@ def _halo_px():
 def _read_window(anchor, cz, halo, out_tif):
     """Warp a buffered window of the mosaic — the anchor tile's 3857 bounds expanded by `halo`
     px on every side — to `out_tif` at zoom `cz` resolution, through the SYSTEM gdal. `-r average`
-    (the plan's default, and the anti-alias prefilter decimation needs): a decimated read picks
+    (the anti-alias prefilter decimation needs): a decimated read picks
     each mosaic tile's own `average` overview, and z<=8 falls through to the planet z8 COG the .gti
     registers — never a full-res-then-decimate. Exact grid registration: -te/-tr snap the window to
-    the global 3857 grid so the interior origin is EXACTLY the anchor's mercantile bounds (5a's
-    ceil-overhang trap). -dstnodata fills the beyond-extent halo with the one sentinel.
-
-    Shallow-bias option (plan, deferred): `average` moves an isolated shoal deeper. If the shading
-    itself should bias shallow in the navigable band (<=~30 m), a shallowest-in-window reducer
-    there (average standing in deep water) is the tool — a cartographic call beyond this pass; the
-    conservative signal at coarse zoom is carried by soundings/depare meanwhile."""
+    the global 3857 grid so the interior origin is EXACTLY the anchor's mercantile bounds (a slip
+    ceils the virtual extent to a 1-px overhang). -dstnodata fills the beyond-extent halo with the
+    one sentinel."""
     res = aggregation_reproject.get_resolution(cz)
     span = 2 ** (cz - anchor.z)
     core = span * 512
@@ -134,7 +125,7 @@ def _encode_tile(i, j, src_path, halo, out_webp, cz):
 
 
 def _render(stem, out_pmtiles):
-    """Render one stem `z-x-y-cz` from the mosaic into `out_pmtiles` (the caller's content name):
+    """Render one stem `z-x-y-cz` from the mosaic into `out_pmtiles`:
     read the buffered window at cz res -> smooth per-zoom -> cut the interior into the span*span
     512-tiles -> encode -> pack. Published atomically."""
     z, x, y, cz = (int(a) for a in stem.split("-"))
@@ -173,7 +164,7 @@ def _render(stem, out_pmtiles):
 # ── the render covering: native aggregation stems + coalesced overview parents ──────────────────
 # Enumerates the multi-zoom stem set bundle.py groups (native + overviews); every stem RENDERS from
 # the mosaic. _simplified bounds a stem's pixel span to 2**num_overviews*512 so no render window is
-# unbounded; render_stems is the pure, parse-time cascade the engine lane derives its outputs from.
+# unbounded; render_stems is the pure, parse-time cascade build.smk derives its outputs from.
 
 def _simplified(extents, zoom):
     simplified = []
@@ -226,9 +217,8 @@ def render_stems(covering_stems):
 
 
 def render(stem):
-    """The stage-3 Snakemake job: render one stem from the mosaic (via the local GTI the
-    mosaic_index rule wrote) to the PLAIN flat name — engine freshness, no keys, no markers.
-    Flat store/pmtiles/<stem>.pmtiles: the engine lane doesn't shard (bundling globs it)."""
+    """The stage-3 Snakemake job: render one stem from the mosaic (via the local GTI mosaic_index
+    wrote) to store/pmtiles/<stem>.pmtiles — a flat name, not sharded (bundling globs it)."""
     out = f"store/pmtiles/{stem}.pmtiles"
     os.makedirs("store/pmtiles", exist_ok=True)
     _render(stem, out)
@@ -236,8 +226,8 @@ def render(stem):
 
 
 def _check():
-    """The engine lane: derive the render stems from a one-tile covering (native + overview
-    cascade), render a synthetic single-tile mosaic at two zooms, and assert exact grid
+    """Derive the render stems from a one-tile covering (native + overview cascade), render a
+    synthetic single-tile mosaic at two zooms, and assert exact grid
     registration (served tiles match the mercantile grid), the served pyramid decodes to the
     mosaic's depth, and the mosaic's nodata hole resolves to a served value (no transparency)."""
     import json
