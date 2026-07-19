@@ -368,3 +368,17 @@ rule bundles:
         rules.vector_bundle.output,
         rules.terrain_planet_bundle.output,
         expand("store/bundle/overlay-{cell}.pmtiles", cell=bundle.overlay_cells(RENDER_STEMS)),
+
+
+# Upload the finished archives + manifest.json to bathymetry/build/<sha>/ (manifest LAST,
+# marking a complete build; release.yml promotes it). Publishing is remote, so there is no
+# on-disk output — a plain always-runnable target gated on the finished bundles. coverage.pmtiles
+# rides from disk when the catalogs invocation left it; the graph never writes it. Dispatch-only
+# (SHA from the env) — deliberately absent from the workflow's default target list.
+rule stage_build:
+    input:
+        rules.bundles.input
+    benchmark:
+        "store/bench/stage-build.tsv"
+    shell:
+        "{PY}/bundle.py stage-build --stable"

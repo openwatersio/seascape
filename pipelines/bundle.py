@@ -25,6 +25,7 @@ Usage (from pipelines/):  bundle.py
 import json
 import math
 import os
+import shutil
 import sys
 from glob import glob
 from multiprocessing import get_context
@@ -302,6 +303,162 @@ def bundle_cell_stable(cell):
     print(f"overlay bundle (stable): store/bundle/{archive_filename(cell)} ({len(filepaths)} pmtiles)")
 
 
+# ── engine lane: the per-commit release bundle (build/<sha>/) ───────────────────
+# The finished archives the serving Worker fetches (planet + overlays + vector, plus
+# coverage when the catalogs invocation left it) and a manifest.json it reads: planet
+# BundleMeta, the overlay grid, source_ids, attribution — the Worker's Manifest shape and
+# no more (worker/src/index.ts). Uploaded to bathymetry/build/<sha>/ with manifest.json
+# LAST: its presence marks a complete build (release.yml refuses a sha without one).
+
+_BUILD_DEST = "r2:$DATA_BUCKET/bathymetry/build"  # $DATA_BUCKET + $SHA stay shell env vars
+
+
+def _archive_meta(path):
+    """One archive's Worker BundleMeta {file, min_zoom, max_zoom, bbox}, read from its pmtiles
+    header (bbox from the e7 bounds create_archive wrote)."""
+    with open(path, "rb") as f:
+        h = Reader(MmapSource(f)).header()
+    return {"file": os.path.basename(path), "min_zoom": h["min_zoom"], "max_zoom": h["max_zoom"],
+            "bbox": [h["min_lon_e7"] / 1e7, h["min_lat_e7"] / 1e7,
+                     h["max_lon_e7"] / 1e7, h["max_lat_e7"] / 1e7]}
+
+
+def stage_build(bundle_dir="store/bundle"):
+    """Assemble build/<sha>/ LOCALLY — no network, so the test drives it directly. Reads the
+    finished archives, writes manifest.json from their headers (planet BundleMeta + overlay
+    {split_z, cells} + source_ids + attribution), and returns (upload_files, manifest_path) with
+    manifest.json deliberately ABSENT from upload_files — the publisher sends it LAST.
+
+    planet + vector are REQUIRED (a missing one is an interrupted build). Overlay cells ride
+    when populated. soundings/depare are NOT shipped — they tile-join INTO vector.pmtiles, the
+    only vector archive the Worker fetches. coverage.pmtiles is a catalogs product (this graph
+    never writes it); it ships when the warm volume has it, and the Worker tolerates its absence."""
+    planet = f"{bundle_dir}/planet.pmtiles"
+    vector = f"{bundle_dir}/vector.pmtiles"
+    for req in (planet, vector):
+        if not os.path.isfile(req):
+            sys.exit(f"stage-build: missing {req} — run the bundles first")
+    overlays = sorted(glob(f"{bundle_dir}/overlay-*.pmtiles"))
+    manifest = {
+        "planet": _archive_meta(planet),
+        "overlay": {"split_z": SPLIT_Z, "cells": {
+            os.path.basename(o)[len("overlay-"):-len(".pmtiles")]: _archive_meta(o)["max_zoom"]
+            for o in overlays}},
+        "source_ids": config.sources(),  # the viewer's provenance palette
+        "attribution": attribution(),
+    }
+    uploads = [planet, vector, *overlays]
+    coverage = f"{bundle_dir}/coverage.pmtiles"
+    if os.path.isfile(coverage):
+        uploads.append(coverage)
+    else:
+        print("stage-build: no coverage.pmtiles — shipping without the provenance layer "
+              "(the catalogs invocation produces it)")
+    manifest_path = f"{bundle_dir}/manifest.json"
+    tmp = manifest_path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(manifest, f, indent=2)
+    os.replace(tmp, manifest_path)  # only ever appears complete
+    return uploads, manifest_path
+
+
+def _stage_build_guard():
+    """SHA + rclone/R2 creds are required — stage-build publishes from the box only."""
+    if not os.environ.get("SHA"):
+        sys.exit("stage-build: SHA unset — the build/<sha>/ prefix is github.sha")
+    if shutil.which("rclone") is None:
+        sys.exit("stage-build: rclone not found — publishing runs on the box only")
+    if not os.environ.get("RCLONE_CONFIG_R2_TYPE"):
+        sys.exit("stage-build: RCLONE_CONFIG_R2_TYPE unset (no R2 creds) — runs on the box only")
+
+
+def stage_build_publish():
+    """Upload build/<sha>/: every archive, then manifest.json LAST. One `rclone copyto` per file;
+    $DATA_BUCKET + $SHA stay shell env vars (rclone's env-var remote is `r2`)."""
+    _stage_build_guard()
+    uploads, manifest_path = stage_build()
+    dest = f"{_BUILD_DEST}/$SHA"
+    for fp in uploads:
+        utils.run_command(f"rclone copyto {fp} {dest}/{os.path.basename(fp)} "
+                          "--retries 5 --stats 30s --stats-one-line", silent=False)
+    utils.run_command(f"rclone copyto {manifest_path} {dest}/manifest.json --retries 5", silent=False)
+    print(f"stage-build: {len(uploads)} archive(s) + manifest.json → {dest}", flush=True)
+
+
+def _check():
+    """Pure stage_build over a synthetic bundle dir — file set, manifest shape, manifest-last.
+    No network (stage_build never touches R2). Builds real 1-tile pmtiles so the header read is
+    exercised end to end."""
+    import tempfile
+
+    saved_dir, cwd = config.SOURCES_DIR, os.getcwd()
+    d = tempfile.mkdtemp()
+
+    def synth(path, min_zoom, max_zoom, bounds):
+        w, s, e, n = bounds
+        with open(path, "wb") as f:
+            wr = Writer(f)
+            # Writer derives min/max_zoom from the written tiles — anchor both ends of the range.
+            for z in {min_zoom, max_zoom}:
+                wr.write_tile(zxy_to_tileid(z, 0, 0), b"webp")
+            wr.finalize(
+                {"tile_type": TileType.WEBP, "tile_compression": Compression.NONE,
+                 "min_zoom": min_zoom, "max_zoom": max_zoom,
+                 "min_lon_e7": int(w * 1e7), "min_lat_e7": int(s * 1e7),
+                 "max_lon_e7": int(e * 1e7), "max_lat_e7": int(n * 1e7),
+                 "center_zoom": min_zoom, "center_lon_e7": 0, "center_lat_e7": 0},
+                {"attribution": utils.ATTRIBUTION})
+    try:
+        os.chdir(d)
+        config.SOURCES_DIR = "sources"
+        os.makedirs("sources/src")
+        with open("sources/src/metadata.json", "w") as f:
+            json.dump({"name": "src", "max_zoom": 12}, f)
+        os.makedirs("store/bundle")
+        synth("store/bundle/planet.pmtiles", 0, 8, [-180, -85, 180, 85])
+        synth("store/bundle/overlay-5-1-1.pmtiles", 9, 14, [-10, -10, 10, 10])
+        synth("store/bundle/vector.pmtiles", 0, 14, [-180, -85, 180, 85])
+        synth("store/bundle/coverage.pmtiles", 0, 14, [-180, -85, 180, 85])
+        # soundings/depare exist on disk but must NEVER ship — they fold into vector.pmtiles.
+        synth("store/bundle/soundings.pmtiles", 0, 14, [-180, -85, 180, 85])
+        synth("store/bundle/depare.pmtiles", 0, 14, [-180, -85, 180, 85])
+
+        uploads, manifest_path = stage_build()
+        names = {os.path.basename(u) for u in uploads}
+        assert names == {"planet.pmtiles", "vector.pmtiles", "overlay-5-1-1.pmtiles",
+                         "coverage.pmtiles"}, f"upload set {names}"
+        assert not any("soundings" in n or "depare" in n for n in names), \
+            "soundings/depare tile-join into vector.pmtiles — never shipped separately"
+        assert "manifest.json" not in names and manifest_path.endswith("/manifest.json"), \
+            "manifest.json is returned separately so the publisher sends it LAST"
+
+        m = json.load(open(manifest_path))
+        assert set(m["planet"]) == {"file", "min_zoom", "max_zoom", "bbox"}, \
+            f"planet is the Worker BundleMeta, no more: {sorted(m['planet'])}"
+        assert m["planet"]["file"] == "planet.pmtiles" and m["planet"]["max_zoom"] == 8
+        assert m["planet"]["bbox"] == [-180.0, -85.0, 180.0, 85.0], m["planet"]["bbox"]
+        assert m["overlay"] == {"split_z": SPLIT_Z, "cells": {"5-1-1": 14}}, m["overlay"]
+        assert m["source_ids"] == ["src"] and m["attribution"] == utils.ATTRIBUTION
+        assert json.load(open(stage_build()[1])) == m, "manifest not deterministic across a re-walk"
+
+        # coverage rides only when present; planet/vector are required.
+        os.remove("store/bundle/coverage.pmtiles")
+        assert not any("coverage" in os.path.basename(u) for u in stage_build()[0]), \
+            "coverage must drop out of the upload set when absent"
+        os.remove("store/bundle/planet.pmtiles")
+        try:
+            stage_build()
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("a missing planet.pmtiles must fail stage-build")
+        print("bundle stage-build self-check ok")
+    finally:
+        config.SOURCES_DIR = saved_dir
+        os.chdir(cwd)
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     """Bundle every group (planet base + one overlay per populated grid cell) and write
     manifest.json. Groups are independent — the overlay cells share no tiles and the planet
@@ -357,6 +514,10 @@ if __name__ == "__main__":
         bundle_planet_stable()
     elif a[:1] == ["cell"] and len(a) == 3 and a[2] == "--stable":
         bundle_cell_stable(a[1])
+    elif a == ["stage-build", "--stable"]:
+        stage_build_publish()
+    elif a == ["--check"]:
+        _check()
     else:
         sys.exit("usage: bundle.py  (legacy: planet + overlays + manifest.json)  |  "
-                 "planet --stable  |  cell <cell> --stable")
+                 "planet --stable  |  cell <cell> --stable  |  stage-build --stable  |  --check")

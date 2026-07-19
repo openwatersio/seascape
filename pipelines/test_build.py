@@ -92,6 +92,13 @@ def main():
         p = snakemake(d, sources_dir, "-n", "mosaic", bbox="10.0,-40.0,11.0,-39.0")
         assert p.returncode != 0 and "no tiles in BBOX" in p.stderr + p.stdout
 
+        # stage_build (build/<sha>/ publish) schedules — dispatch-only, so not a default target,
+        # but its DAG must resolve to exactly one job over the finished bundles.
+        p = snakemake(d, sources_dir, "-n", "stage_build")
+        assert p.returncode == 0, p.stderr
+        assert re.search(r"stage_build\s+1", p.stdout), f"expected 1 stage_build job:\n{p.stdout}"
+        assert store_tree(store) == before, "a dry run must not touch the store"
+
         print("test_build.py ok")
     finally:
         shutil.rmtree(d, ignore_errors=True)

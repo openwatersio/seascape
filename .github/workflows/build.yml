@@ -145,6 +145,8 @@ jobs:
       RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
+      # The build/<sha>/ release prefix (stage_build); dispatch-only, so unset elsewhere.
+      SHA: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v6
       # Idempotent box setup — docker + the store volume mount. STATE is the volume root
