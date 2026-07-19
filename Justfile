@@ -18,6 +18,21 @@ landmask:
 watermask:
     uv run python landmask.py prep-water
 
+# Regional preview: sources streamed from R2 (a locally-prepped source wins), the whole
+# cartographic chain into store/bundle, then seed the local Worker. Depth areas are skipped
+# by default (their dense-tile tail is unbounded); SKIP_DEPARE= re-enables them.
+preview bbox="-74.30,40.40,-73.75,40.80":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export BBOX="{{bbox}}"
+    export SOURCE_VSI_BASE="${SOURCE_VSI_BASE:-/vsicurl/https://data.openwaters.io/bathymetry/source}"
+    export LANDMASK="${LANDMASK:-/vsicurl/https://data.openwaters.io/bathymetry/landmask/land.fgb}"
+    export WATERMASK="${WATERMASK:-/vsicurl/https://data.openwaters.io/bathymetry/landmask/water.fgb}"
+    export SKIP_DEPARE="${SKIP_DEPARE-1}"
+    uv run snakemake -s ../Snakefile cover --config stream=1 --cores 8
+    uv run snakemake -s build.smk bundles --cores 4
+    ../worker/seed.sh
+
 # Run both dev servers in one terminal: tile Worker on :8787 + Vite viewer on :5173
 # (the viewer defaults to localhost:8787, so no VITE_TILES_BASE needed). Ctrl-C stops both.
 # Works in the container too (`./docker.sh dev`): there the servers bind 0.0.0.0 so the

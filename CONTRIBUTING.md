@@ -35,7 +35,7 @@ The toolchain is heavy native tooling. There are two routes to get it running:
 
 ### Commands
 
-The build itself is one Snakemake DAG — `snakemake sources` (weekly source refresh), `snakemake preview --config bbox=…` (a regional slice, sources streamed from R2), `snakemake planet` (the full build). Run via `./docker.sh snakemake <target>`. What stays in the `just` file is testing, the dev servers, and one-time mask prep:
+The build itself is one Snakemake DAG in two entry files: `snakemake sources` (the weekly source refresh; root `Snakefile`) and `snakemake -s pipelines/build.smk bundles publish` (the build; runs on the box via build.yml — dispatch it for a planet or bbox build). Locally, `just preview [bbox]` (or `./docker.sh preview`) runs a regional slice with sources streamed from R2 and seeds the dev Worker. What stays in the `just` file is testing, the dev servers, and one-time mask prep:
 
 - `dev` - run both dev servers (tile Worker on :8787 + viewer on :5173, installing npm deps on first run), then open <http://localhost:5173/#12/40.55/-73.96>
 - `landmask` / `watermask` - prepare the OSM land / inland-water mask once (coarse sources clamp land negatives to them)
