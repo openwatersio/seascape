@@ -128,7 +128,7 @@ jobs:
     needs: [image, create-runner]
     runs-on: ${{ needs.create-runner.outputs.label }}
     timeout-minutes: 2880
-    permissions: { contents: read, packages: read }
+    permissions: { contents: read, packages: read, statuses: write }
     # R2 via rclone's env-var remote (remote "r2" exists ambiently in every rclone call) —
     # scoped to this job, the only one that publishes.
     env:
@@ -184,6 +184,7 @@ jobs:
           BBOX: ${{ github.event.inputs.bbox }}
           INPUT_FORCE: ${{ github.event.inputs.force }}
           INPUT_ARGS: ${{ github.event.inputs.snakemake_args }}
+          GH_TOKEN: ${{ github.token }} # the progress-heartbeat gh api calls
           # Mirrored sources (CUDEM/S-102) stream from the public mirror; prepped sources
           # read the volume (source_path: a local file wins per file). Curl caches sized to
           # fit inside the global reserve below.
@@ -226,10 +227,25 @@ jobs:
           read -r -a extra <<<"$INPUT_ARGS"
           # extra/force ride BEFORE --config: a bare extra target after it is swallowed
           # as a config pair.
+          # Progress heartbeat: the run log at planet scale exceeds what the GitHub UI
+          # serves, so the step-counter also goes out as a commit status every minute.
+          buildlog=/var/tmp/build-progress.log
+          : > "$buildlog"
+          ( while sleep 60; do
+              p=$(grep -oE "[0-9]+ of [0-9]+ steps" "$buildlog" | tail -1)
+              [ -n "$p" ] || continue
+              n=${p%% *}; m=${p##*of }; m=${m%% *}
+              gh api "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" -f state=pending \
+                -f context=build/progress -f description="$p ($((n * 100 / m))%)" \
+                -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+                >/dev/null 2>&1 || true
+            done ) &
+          hb=$!
+          trap 'kill "$hb" 2>/dev/null || true' EXIT
           ./docker.sh snakemake -s pipelines/build.smk bundles publish "${extra[@]}" "${force[@]}" \
             --keep-going --rerun-incomplete \
             --cores "$cores" --resources mem_gb="$budget_gb" \
-            --config workdir=/app/state tmp=/app/tmp
+            --config workdir=/app/state tmp=/app/tmp 2>&1 | tee "$buildlog"
       # Per-job wall/CPU/max-RSS from the benchmark: directives, plus per-job stderr logs —
       # both live in the box's local-disk scratch (TMP), the durable home is this artifact.
       - name: Upload snakemake benchmarks + logs
