@@ -352,10 +352,17 @@ wildcard_constraints:
     cell=r"\d+-\d+-\d+"
 
 
+# One cell -> stems map, built once: deriving it inside the input function costs
+# O(cells x render_stems) at DAG build, minutes at planet scale.
+_CELL_STEMS = {}
+for _s in RENDER_STEMS:
+    for _c in bundle.overlay_cells([_s]):
+        _CELL_STEMS.setdefault(_c, []).append(_s)
+
+
 rule overlay_bundle:
     input:
-        lambda wc: [f"store/pmtiles/{s}.pmtiles"
-                    for s in RENDER_STEMS if wc.cell in bundle.overlay_cells([s])]
+        lambda wc: [f"store/pmtiles/{s}.pmtiles" for s in _CELL_STEMS.get(wc.cell, [])]
     output:
         "store/bundle/overlay-{cell}.pmtiles"
     benchmark:

@@ -149,10 +149,11 @@ rule fetch_catalog:
         source=pat(STREAMED)
     retries: 2
     shell:
-        "curl -fsS {STREAM_BASE}/{wildcards.source}/bounds.csv -o {output.bounds}.tmp && "
+        "(curl -fsS {STREAM_BASE}/{wildcards.source}/bounds.csv -o {output.bounds}.tmp && "
         "mv {output.bounds}.tmp {output.bounds} && "
         "curl -fsS {STREAM_BASE}/{wildcards.source}/catalog.json -o {output.catalog}.tmp && "
-        "mv {output.catalog}.tmp {output.catalog}"
+        "mv {output.catalog}.tmp {output.catalog}) || "
+        "{{ rm -f {output.bounds}.tmp {output.catalog}.tmp; exit 1; }}"
 
 
 # Masks rebuild only when forced (-R landmask): pinned snapshot/release ⇒ no data drift.

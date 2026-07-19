@@ -355,8 +355,9 @@ def auto():
         raise SystemExit(f"seam_check auto: no covering at {COVERING}")
     with open(COVERING) as f:
         stems = f.read().split()
-    built = [s for s in stems
-             if os.path.exists(f"store/contour/{s}.fgb") and os.path.getsize(f"store/contour/{s}.fgb") > 0]
+    # A 0-byte sentinel counts as built-and-empty: an empty tile beside a neighbor whose
+    # features cross their shared edge is exactly the discontinuity this gate exists to catch.
+    built = [s for s in stems if os.path.exists(f"store/contour/{s}.fgb")]
     index = {}
     for s in built:
         z, x, y, _cz = parse_stem(s)
