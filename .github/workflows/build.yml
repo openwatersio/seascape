@@ -40,6 +40,10 @@ on:
         description: "Hetzner type — ccx63 (48 vCPU/192 GB) for planet; ccx33 (8/32) for a bbox smoke"
         required: false
         default: ccx63
+      snakemake_args:
+        description: "Extra snakemake args, e.g. -R publish (code changes are force-only)"
+        required: false
+        default: ""
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
@@ -178,6 +182,7 @@ jobs:
           # Dispatch inputs reach the shell as env vars, never interpolated into a shell line.
           BBOX: ${{ github.event.inputs.bbox }}
           INPUT_FORCE: ${{ github.event.inputs.force }}
+          INPUT_ARGS: ${{ github.event.inputs.snakemake_args }}
           # Mirrored sources (CUDEM/S-102) stream from the public mirror; prepped sources
           # read the volume (source_path: a local file wins per file). Curl caches sized as
           # in the legacy build; both fit inside the global reserve below.
@@ -210,10 +215,13 @@ jobs:
           echo "box: ${total_gb} GB RAM, --cores ${cores} -> budget ${budget_gb} GB (reserve ${reserve_gb} GB)"
           force=()
           if [ "$INPUT_FORCE" = "true" ]; then force=(-F); fi
+          # Extra args reach the command as separate words; reject anything shell-active.
+          case "$INPUT_ARGS" in *[!-A-Za-z0-9_=\ .]*) echo "invalid snakemake_args" >&2; exit 1 ;; esac
+          read -r -a extra <<<"$INPUT_ARGS"
           ./docker.sh snakemake -s pipelines/build.smk bundles publish \
             --keep-going --rerun-incomplete \
             --cores "$cores" --resources mem_gb="$budget_gb" \
-            --config workdir=/app/state "${force[@]}"
+            --config workdir=/app/state "${force[@]}" "${extra[@]}"
       # Per-job wall/CPU/max-RSS — the measurement this lane exists to produce.
       - name: Upload snakemake benchmarks
         if: always()
