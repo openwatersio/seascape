@@ -17,9 +17,12 @@ owning cell is computed from the tile address (no footprint search).
 ``manifest.json`` records planet metadata + ``overlay`` ({split_z, cells: {cell:
 max_zoom}}) + the configured source ids (the viewer's provenance palette).
 
-Pure concat in tile-id order. Bundling everything (incremental rebuild is Phase E3).
+Pure concat in tile-id order. The engine schedules one job per archive; Snakemake owns freshness.
 
-Usage (from pipelines/):  bundle.py
+Usage (from pipelines/):
+  bundle.py planet --stable        the planet base archive (z0..PLANET_MAX_ZOOM)
+  bundle.py cell <cell> --stable   one overlay grid cell's deeper tiles
+  bundle.py stage-build --stable   assemble + publish build/<sha>/ (manifest.json last)
 """
 
 import json
@@ -28,7 +31,6 @@ import os
 import shutil
 import sys
 from glob import glob
-from multiprocessing import get_context
 
 import mercantile
 from pmtiles.tile import zxy_to_tileid, TileType, Compression
@@ -36,9 +38,7 @@ from pmtiles.reader import Reader, MmapSource, all_tiles
 from pmtiles.writer import Writer
 
 import config
-import cache_versions
 import contour_run
-import keys
 import utils
 
 # Base cap = the GEBCO-native zoom (the planet is complete + overzoomable below it).
@@ -76,37 +76,6 @@ def archive_filename(name):
     return f"{name}.pmtiles" if name == "planet" else f"overlay-{name}.pmtiles"
 
 
-def covering_stems(aggregation_id):
-    """{z}-{x}-{y}-{child_z} of every terrain tile the current covering builds (native +
-    per-zoom overview renders). The only pmtiles that belong in a bundle. A source's
-    footprint/maxzoom shift re-tiles its area to new stems, but the R2 sync has no --delete and the
-    dirty-diff only adds work, so the superseded pmtiles lingers; bundling it draws a
-    stale tile over the live tiling. Filter every glob/listing through this. The render stems are
-    the native aggregation stems plus the coalesced overview markers terrain.cover wrote."""
-    return {
-        c.split("/")[-1].replace("-aggregation.csv", "").replace("-terrain.csv", "")
-        for c in glob(f"store/aggregation/{aggregation_id}/*-aggregation.csv")
-        + glob(f"store/aggregation/{aggregation_id}/*-terrain.csv")
-    }
-
-
-def group_filepaths(aggregation_id):
-    """{'planet': [...], '<z>-<x>-<y>': [...]} — the grid partition of every
-    single-zoom pmtiles in the local store. Content-addressed names carry the key; the sweep leaves
-    one file per logical stem, so grouping by the parsed stem never doubles a tile."""
-    stems = covering_stems(aggregation_id)
-    groups = {}
-    for fp in sorted(glob("store/pmtiles/*.pmtiles") + glob("store/pmtiles/*/*.pmtiles")):
-        if not keys.is_content_name(fp):  # legacy mutable name / torn logical write — skip
-            continue
-        stem = keys.stem_of(fp)
-        if stem not in stems:  # orphan from a re-tiled covering (see covering_stems)
-            continue
-        for name in stem_groups(stem):
-            groups.setdefault(name, []).append(fp)
-    return groups
-
-
 def read_full_archive(filepath):
     out = {}
     with open(filepath, "r+b") as f:
@@ -116,12 +85,12 @@ def read_full_archive(filepath):
     return out
 
 
-def create_archive(filepaths, name, stem_of=keys.stem_of):
+def create_archive(filepaths, name, stem_of):
     """Concat the single-zoom pmtiles into store/bundle/<archive_filename(name)>.
     For an overlay cell, tiles outside the cell (a coarse parent spanning cells)
     are left to the sibling cells' archives. ``stem_of`` parses a member's logical
-    {z}-{x}-{y}-{child_z} — the legacy content name by default, ``_plain_stem`` in the
-    engine lane where the flat basename IS the stem."""
+    {z}-{x}-{y}-{child_z} — ``_plain_stem`` in the engine lane, where the flat basename
+    IS the stem."""
     utils.create_folder("store/bundle")
     out_filepath = f"store/bundle/{archive_filename(name)}"
     min_z, max_z = math.inf, 0
@@ -179,70 +148,9 @@ def attribution():
     return utils.ATTRIBUTION
 
 
-def bundle_group(name, filepaths, stem_of=keys.stem_of):
+def bundle_group(name, filepaths, stem_of):
     print(f"bundling {archive_filename(name)} ({len(filepaths)} pmtiles)...")
     return create_archive(filepaths, name, stem_of)
-
-
-def verify_complete(aggregation_id):
-    """Every covering must have produced a pmtiles, or the pyramid has a silent hole.
-    terrain.run emits one pmtiles per render stem, so a covering stem with no pmtiles means a
-    failed/interrupted render — the Worker overzooms GEBCO into that hole, so it renders as missing
-    high-zoom terrain. Fail rather than publish it."""
-    coverings = covering_stems(aggregation_id)
-    have = {keys.stem_of(fp)
-            for fp in glob("store/pmtiles/*.pmtiles") + glob("store/pmtiles/*/*.pmtiles")
-            if keys.is_content_name(fp)}
-    missing = sorted(coverings - have)
-    if missing:
-        raise SystemExit(
-            f"pyramid incomplete: {len(missing)} of {len(coverings)} coverings have no pmtiles "
-            f"(a failed/interrupted terrain render) — e.g. "
-            f"{', '.join(missing[:15])}{' …' if len(missing) > 15 else ''}")
-
-
-def _fragment(name, meta):
-    """One per-group manifest fragment (a picklable Pool worker return). Planet keeps its full
-    metadata; an overlay cell only needs its max_zoom (the Worker computes the cell from the
-    tile address — no bbox search)."""
-    if name == "planet":
-        return {"kind": "planet", **meta}
-    return {"kind": "cell", "cell": name, "max_zoom": meta["max_zoom"]}
-
-
-def _manifest_from_fragments(frags):
-    manifest = {"planet": None, "overlay": {"split_z": SPLIT_Z, "cells": {}}}
-    for frag in frags:
-        if frag["kind"] == "planet":
-            manifest["planet"] = {k: v for k, v in frag.items() if k != "kind"}
-        else:
-            manifest["overlay"]["cells"][frag["cell"]] = frag["max_zoom"]
-    manifest["source_ids"] = config.sources()  # the viewer's provenance palette
-    manifest["attribution"] = attribution()
-    return manifest
-
-
-def _bundle_one(item):
-    """One (name, filepaths) → its manifest fragment. Top-level so a spawn Pool can pickle it."""
-    name, filepaths = item
-    return _fragment(name, bundle_group(name, filepaths))
-
-
-# The terrain bundle depends only on its member pmtiles' keys (+ the grid geometry), so a change
-# that leaves every member's key untouched — a contour-config edit re-merging tiles but not
-# rewriting their pmtiles — leaves this key unchanged and the whole bundle skips. config.sources()
-# rides in because it becomes the manifest's source_ids.
-def _bundle_key(groups):
-    inputs = []
-    for name in sorted(groups):
-        for fp in sorted(groups[name]):
-            # The member's key rides in its content filename, so the basename IS its identity —
-            # a re-keyed member (a re-merged tile) enters under a new name and moves this key.
-            inputs.append(f"{name}/{os.path.basename(fp)}")
-    inputs += [f"source:{s}" for s in config.sources()]
-    cfg = {"planet_max_zoom": PLANET_MAX_ZOOM, "split_z": SPLIT_Z,
-           "macrotile_z": utils.macrotile_z, "num_overviews": utils.num_overviews}
-    return keys.stage_key(inputs, [cache_versions.TERRAIN_BUNDLE], cfg)
 
 
 # ── engine lane (--stable) ─────────────────────────────────────────────────────
@@ -459,58 +367,9 @@ def _check():
         shutil.rmtree(d, ignore_errors=True)
 
 
-def main():
-    """Bundle every group (planet base + one overlay per populated grid cell) and write
-    manifest.json. Groups are independent — the overlay cells share no tiles and the planet
-    base is one unit — so they fan out across a process Pool.
-
-    Skips wholesale when every member pmtiles' key is unchanged and the manifest is already on
-    disk (the key sidecar next to it matches) — but only after verify_complete, so a missing
-    pmtiles fails loudly rather than skipping. manifest.json is written whole whenever anything
-    changed (it is per-sha).
-
-    SPAWN, not fork: bundle imports rasterio (via utils), which inits GDAL at module load, and
-    GDAL is not fork-safe (see terrain.run)."""
-    aggregation_id = utils.get_aggregation_ids()[-1]
-    verify_complete(aggregation_id)
-    groups = group_filepaths(aggregation_id)
-    manifest_path = "store/bundle/manifest.json"
-    bkey = _bundle_key(groups)
-    if keys.is_fresh(manifest_path, bkey):
-        print(f"bundle: {len(groups)} group(s) unchanged — skip")
-        return
-    utils.create_folder("store/bundle")
-    # Invalidate before writing (the crash rule every keyed writer follows): the manifest's
-    # sidecar vouches for EVERY group archive, so it must go before the first group is
-    # rewritten — under FORCE the key is unchanged, and a crash mid-bundle would otherwise
-    # skip over torn planet/overlay pmtiles as fresh forever.
-    sc = keys.sidecar(manifest_path)
-    if os.path.isfile(sc):
-        os.remove(sc)
-    items = sorted(groups.items(), key=lambda kv: -len(kv[1]))  # biggest first → no straggler tail
-    # Each worker reads whole input pmtiles into RAM and the writer spools ~2x its group on
-    # disk, so peak ≈ workers × the biggest group (the planet base). Cap workers via
-    # BUNDLE_PROCESSES to stay under the machine's RAM (the build box sizes it from RAM);
-    # unset/0 = all cores (local builds) — same convention as AGG_PROCESSES.
-    procs = int(os.environ.get("BUNDLE_PROCESSES", "0")) or None
-    with get_context("spawn").Pool(procs) as pool:
-        frags = pool.map(_bundle_one, items)
-    manifest = _manifest_from_fragments(frags)
-    # Atomic: manifest.json doubles as the fresh-bundle artifact (is_fresh reads its presence)
-    # and the workflow's completeness marker — it must never exist truncated at its final path.
-    tmp_path = manifest_path + ".tmp"
-    with open(tmp_path, "w") as f:
-        json.dump(manifest, f, indent=2)
-    os.replace(tmp_path, manifest_path)
-    keys.write_key(manifest_path, bkey)
-    print(f"created {len(groups)} bundle(s): {', '.join(sorted(groups))} + manifest.json")
-
-
 if __name__ == "__main__":
     a = sys.argv[1:]
-    if not a:
-        main()
-    elif a == ["planet", "--stable"]:
+    if a == ["planet", "--stable"]:
         bundle_planet_stable()
     elif a[:1] == ["cell"] and len(a) == 3 and a[2] == "--stable":
         bundle_cell_stable(a[1])
@@ -519,5 +378,5 @@ if __name__ == "__main__":
     elif a == ["--check"]:
         _check()
     else:
-        sys.exit("usage: bundle.py  (legacy: planet + overlays + manifest.json)  |  "
-                 "planet --stable  |  cell <cell> --stable  |  stage-build --stable  |  --check")
+        sys.exit("usage: bundle.py  planet --stable  |  cell <cell> --stable  |  "
+                 "stage-build --stable  |  --check")

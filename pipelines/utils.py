@@ -1,14 +1,17 @@
 """Shared helpers: PMTiles archive writing, the aggregation covering store, the
-z7-sharded pmtiles layout, terrarium tile encode, and priority-grouped source items.
-Incrementality is content-hash keys now (keys.py), not a covering diff.
+z7-sharded pmtiles layout, terrarium tile encode, priority-grouped source items,
+the merge-weight estimate, and the publish-time file hash / toolchain identity.
+Incrementality is engine provenance (Snakemake inputs + params) now, not a covering diff.
 
 Vendored from mapterhorn (BSD-3, (c) 2025 mapterhorn; see LICENSE.mapterhorn).
 """
 
 import subprocess
 from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path
 from glob import glob
+import errno
 import gzip
 import math
 import os
@@ -343,6 +346,96 @@ def get_grouped_source_items(filepath):
         })
     grouped_source_items.append(current_group)
     return grouped_source_items
+
+
+# ── merge-weight estimate (the mosaic_tile reservation seed) ─────────────────────────────────
+# Moved here from the retired scheduler.py: build.smk's mosaic_tile / terrain_render rules read
+# `weight(stem)` to seed each job's mem_gb reservation. A deterministic estimate from the tile
+# geometry — it only needs to ORDER and BOUND tiles, not be exact; the benchmarks re-fit it.
+
+# The halo (buffer) each read carries for smoothing continuity is a small additive px term next to
+# the 2**(child_z-macrotile_z)*512 core; one constant is close enough for the merge and terrain
+# reads alike.
+HALO_PX = 64
+
+# Peak-over-rest multiplier: a merge holds roughly the merged array + reprojected sources + masks
+# at once. Env-tunable (AGG_MEM_FACTOR); build.smk passes a lower factor now the vector forks no
+# longer ride inside the merge job.
+DEFAULT_FACTOR = float(os.environ.get("AGG_MEM_FACTOR", "4"))
+
+
+def weight(stem, budget_gb=0, factor=DEFAULT_FACTOR):
+    """Estimated peak GB for a tile `z-x-y-cz` (z = macrotile_z, cz = child_z), rounded up to a
+    whole GB and floored at 1. Monotonic in child_z (each level quadruples the pixel area). When a
+    budget is given, the weight is CLAMPED to it (with a warning): a tile heavier than the whole
+    budget must still be admittable alone."""
+    z, _x, _y, cz = (int(a) for a in stem.split("-"))
+    side_px = (2 ** (cz - z)) * 512 + 2 * HALO_PX
+    base_gb = side_px * side_px * 4 / 1e9
+    w = max(1, math.ceil(base_gb * factor))
+    if budget_gb and w > budget_gb:
+        print(f"weight: tile {stem} weight {w} GB exceeds budget {budget_gb} GB — clamping to "
+              f"{budget_gb} (runs alone; better one-at-a-time than deadlock)", flush=True)
+        w = budget_gb
+    return w
+
+
+# ── publish-time file hash + toolchain identity (moved from the retired keys.py) ─────────────────
+# The mosaic engine-lane publish content-addresses the finished plain COGs by hashing their bytes;
+# build.smk's mosaic_tile carries the toolchain tag as a rerun param. Both are R2-agnostic — no
+# bucket names here.
+
+@lru_cache(maxsize=1)
+def toolchain():
+    """The toolchain identity: TOOLCHAIN (the workflow passes the GHCR image tag, which pins one
+    GDAL/tippecanoe) when set, else the local GDAL version so a laptop stays honest about GDAL
+    skew. A GDAL bump correctly invalidates the world."""
+    t = os.environ.get("TOOLCHAIN")
+    if t:
+        return t
+    for cmd in (["gdal-config", "--version"], ["gdalinfo", "--version"]):
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True)
+        except (FileNotFoundError, OSError):
+            continue
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip().splitlines()[0]
+    return "no-toolchain"
+
+
+@lru_cache(maxsize=None)
+def _file_hash_cached(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()[:16]
+
+
+def file_hash(path):
+    """A content hash of a local file (its bytes) — the publish-time R2 name discriminator. None
+    for a missing or /vsi (remote) path. Cached per absolute path — inputs don't change under a
+    running build."""
+    if path is None or path.startswith("/vsi") or not os.path.isfile(path):
+        return None
+    return _file_hash_cached(os.path.abspath(path))
+
+
+def publish(tmp_path, final_path):
+    """Publish a fully-written temp file atomically, including across filesystems (NVMe scratch and
+    the persistent store are separate mounts in production). os.replace is the fast path; on EXDEV,
+    copy to a temp beside the final path first, then rename there — the final name only ever appears
+    complete, and a crash leaves a temp no freshness check considers."""
+    os.makedirs(os.path.dirname(final_path), exist_ok=True)
+    try:
+        os.replace(tmp_path, final_path)
+    except OSError as error:
+        if error.errno != errno.EXDEV:
+            raise
+        destination_tmp = final_path + ".tmp"
+        shutil.copyfile(tmp_path, destination_tmp)
+        os.replace(destination_tmp, final_path)
+        os.remove(tmp_path)
 
 
 class HashWriter:

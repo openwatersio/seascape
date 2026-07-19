@@ -35,17 +35,13 @@ The toolchain is heavy native tooling. There are two routes to get it running:
 
 ### Commands
 
-Depending on your setup, run either `./docker.sh <cmd>` or `just <cmd>`:
+The build itself is one Snakemake DAG — `snakemake sources` (weekly source refresh), `snakemake preview --config bbox=…` (a regional slice, sources streamed from R2), `snakemake planet` (the full build). Run via `./docker.sh snakemake <target>`. What stays in the `just` file is testing, the dev servers, and one-time mask prep:
 
-- `preview` - build a real multi-source harbor mosaic and seed the local Worker R2, range-reading sources straight from R2 — **no dataset download**. The fastest feedback loop: run it whenever you make a visual change. (`preview-local` builds the same demo from already-prepared sources in `pipelines/store/source/`, fully offline.)
 - `dev` - run both dev servers (tile Worker on :8787 + viewer on :5173, installing npm deps on first run), then open <http://localhost:5173/#12/40.55/-73.96>
-- `source <id>` - prepare one source (fetch → datum → normalize → bounds → polygon → tarball)
-- `sources` - prepare every source under `sources/`
-- `landmask` - prepare the OSM land mask once (coarse sources clamp land negatives to it)
-- `planet` - cover → aggregate → downsample → bundle → contours → soundings (set `BBOX="W,S,E,N"` for a region)
+- `landmask` / `watermask` - prepare the OSM land / inland-water mask once (coarse sources clamp land negatives to them)
 - `test` - the whole suite: the three below
 - `test-sources` - offline source-stage self-check (synthetic, no network)
-- `test-engine` - offline aggregation/bundle self-check (priority, zoom cap, pyramid)
+- `test-engine` - engine-lane e2e (real stage-1 CLIs + the `build.smk` DAG) + module self-checks
 - `test-workflows` - [actionlint](https://github.com/rhysd/actionlint) (+shellcheck) over `.github/workflows/`
 
 ### Configuration
@@ -57,7 +53,7 @@ Key knobs (env vars, read by `pipelines/utils.py` / `bundle.py`):
 - `OVERLAY_SPLIT_Z` - overlay grid cell zoom (default 5 — raise it if a cell's bundle ever outgrows a CI runner)
 - `NUM_OVERVIEWS` - overview pyramid levels below each source's native maxzoom
 - `SMOOTH_DEM_SIGMA` / `SMOOTH_SLOPE_LOW` / `SMOOTH_SLOPE_HIGH` - slope-adaptive DEM smoothing (Gaussian sigma + the slope band it fades across)
-- `SKIP_SMOOTH`, `SKIP_CONTOURS`, `SKIP_SOUNDINGS`, `SKIP_DEPARE` - skip that step
+- `SKIP_SMOOTH`, `SKIP_DEPARE` - skip that step
 - `CONTOUR_NAV_SMOOTH_MAX` - navigable-band contour-smoothing gate (replaces the retired `SKIP_CONTOUR_SMOOTH`)
 - `SOUND_CELL_PX` / `SOUND_MIN_DEPTH_M` - sounding spacing / min charted depth
 - `DRYING_CAP` - max elevation (m) tinted as drying foreshore
@@ -94,7 +90,7 @@ Four stages — `source → aggregation → downsampling → bundle` — all wri
 - **source** (the Snakemake lane: repo-root `Snakefile` + `pipelines/source_*.py`): per-asset fetch → content-keyed staging (archives/formats detected from bytes) → datum → normalize to a COG → `bounds.csv` → coverage polygon → a generated `catalog.json` (the machine-facing item the build reads for priority/max_zoom/land_clamp/offset + the recipe hash the tile keys consume; `metadata.json` stays the hand-edited input and fallback, and carries each source's prep knobs). Priority derives from `(maxzoom, id)` — GEBCO loses (smallest maxzoom), so regional sources win in overlap.
 - **aggregation** (`aggregation_*.py`): `cover` slices the planet into source-aware aggregation tiles (one CSV each); `run` reprojects each source by priority into a merged Float32 DEM (Gaussian seam feather), slope-smooths it (`smooth.py`), encodes Terrarium raster tiles, and forks contours (`contour_run.py`) and soundings (`soundings_run.py`) off the same merged DEM — each fork independently keyed, so e.g. a contour-levels change re-runs the contour fork without rewriting terrain pmtiles. Sources flagged `land_clamp` (GEBCO/EMODnet — coarse, no land/water concept) get their negative land pixels clamped to 0 against the OSM land mask (`landmask.py`, prep once with `just landmask`) right after warp, so shoreline cells don't paint false water/contours/soundings over land. A `depare_run.py` fork buckets the same merged DEM into depth-area partitions (ENC DEPARE: water between charted isobaths, `drval1`/`drval2` depth bounds) — the vector twin of the raster depth shading — and folds two more kinds into the one `depare` layer off the same `gdal_contour -p` pass and the OSM land + inland-water masks: green drying foreshore (the `[0, DRYING_CAP]` bucket seaward of the land line but kept inside mapped inland water, negative `drval1`) and unknown-depth water (`nodata`, no `drval1`).
 - **downsampling**: 2×2-average overview pyramid below each source's native maxzoom; an overview's key hashes its children's keys, so child changes cascade up the pyramid by construction.
-- **bundle** (`bundle.py`): concat single-zoom pmtiles into `planet.pmtiles` + one overlay archive per populated grid cell + `manifest.json`; contours, soundings, and depare layers bundle into `vector.pmtiles` via tippecanoe; the per-source coverage footprints bundle standalone into `coverage.pmtiles` (`just coverage`). Bundles key off their members' keys and skip when nothing changed.
+- **bundle** (`bundle.py`): concat single-zoom pmtiles into `planet.pmtiles` + one overlay archive per populated grid cell + `manifest.json`; contours, soundings, and depare layers bundle into `vector.pmtiles` via tippecanoe; the per-source coverage footprints bundle standalone into `coverage.pmtiles` (the `coverage` rule). Snakemake owns bundle freshness — a bundle rebuilds when a member tile changed.
 
 A full build (`planet`) lands in `pipelines/store/bundle/`:
 

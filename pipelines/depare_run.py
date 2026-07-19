@@ -54,15 +54,12 @@ a `depare` layer pmtiles; the contours tile-join folds it into vector.pmtiles li
 import os
 import subprocess
 import sys
-from glob import glob
 
 import mercantile
 import rasterio
 
 import config
-import cache_versions
 import contour_run
-import keys
 import utils
 
 # The bands' zoom floor (matches the style's depth-areas/contour-lines minzoom):
@@ -260,26 +257,6 @@ def _depare_dem(dem, tile_obj, tmp, label):
     return final, len(rows)
 
 
-def generate(filepath, out):
-    """Partition one aggregation tile's merged DEM into depth-area / drying / nodata polygons at
-    ``out`` (the caller's content-addressed FGB name). Writes ``out`` atomically only when there
-    ARE rows — an all-ocean-deep / all-land tile returns having written nothing, and the caller
-    records the empty marker. The caller superseded this stem's old-key siblings before calling,
-    so a crash here leaves the fork reading stale."""
-    agg_id, filename = filepath.split("/")[-2:]
-    z, x, y, child_z = (int(a) for a in filename.replace("-aggregation.csv", "").split("-"))
-    tmp = f"store/aggregation/{agg_id}/{z}-{x}-{y}-{child_z}-tmp"
-    dem = f"{tmp}/{len(glob(f'{tmp}/*.tiff')) - 1}-3857.tiff"
-    if not os.path.exists(dem):
-        print(f"depare: no merged DEM for {filename}")
-        return
-    res = _depare_dem(dem, mercantile.Tile(x=x, y=y, z=z), tmp, filename)
-    if res:
-        final, n = res
-        keys.publish(final, out)
-        print(f"depare: {filename} -> {n} polygons")
-
-
 def tile(stem):
     """The per-stem Snakemake job — reads the PERSISTED mosaic instead of the transient merge: partition one stem from a BUFFERED mosaic
     window, smoothed at read with the one shared f(depth, zoom), output at the PLAIN stable
@@ -327,54 +304,6 @@ def _tippecanoe(fgbs, maxz, out):
          "-y", "drval1", "-y", "drval2", "-y", "sys", "-y", "kind", "-y", "rank",
          "-T", "rank:int", *fgbs],
         check=True)
-
-
-def bundle():
-    """tippecanoe the per-tile depare FGBs into store/bundle/depare.pmtiles (layer `depare`,
-    folded into vector.pmtiles by the contours tile-join, same as soundings), z
-    MIN_ZOOM..shared maxz (see contour_run.bundle_maxz). --detect-shared-borders keeps shared
-    partition edges identical through per-zoom simplification (no cracks between bands);
-    --coalesce-smallest-as-needed, never --drop-densest: a dropped partition is a tint hole, a
-    coalesced one mis-tints a sub-pixel blob. Orphan filter as contours.
-
-    Attributes: drval1/drval2 (Real -> numeric MVT; absent on nodata features, which is the
-    fill's switch key), sys (bands only), kind (nodata only), rank (all — sort key). rank is
-    FlatGeobuf Integer64, so -T rank:int keeps it numeric in the MVT (else it lands as a string,
-    like the contour depth ints)."""
-    fgbs = contour_run._live_fgbs(sorted(glob("store/depare/*.fgb")), contour_run._current_stems())
-    contour_run.verify_vector_complete("depare", fgbs)  # self-enforcing, before the fresh-skip
-    out = "store/bundle/depare.pmtiles"
-    if not fgbs:
-        # Empty input is a real state, not a no-op: a previously-built archive (and the sidecar
-        # vouching for it) must not survive — _finalize_contours folds this file into
-        # vector.pmtiles whenever it exists on disk, so a stale layer would ship as current.
-        # The invalidate discipline, extended to "the current state is nothing".
-        for stale in (out, keys.sidecar(out)):
-            if os.path.isfile(stale):
-                os.remove(stale)
-        print("depare bundle: no depare FGBs")
-        return
-    maxz = contour_run.bundle_maxz(max(int(keys.stem_of(f).split("-")[3]) for f in fgbs))
-    # Skip when every member tile's key is unchanged and the pmtiles is on disk (the local
-    # iterative loop; the box's store/bundle is never hydrated, so a box build always rebuilds).
-    # The key rides in each member's content name.
-    dkey = keys.stage_key([os.path.basename(f) for f in fgbs],
-                          [cache_versions.DEPARE_BUNDLE],
-                          {"maxz": maxz, "min_zoom": MIN_ZOOM,
-                           "simplification": os.environ.get("DEPARE_SIMPLIFICATION", "8")})
-    if keys.is_fresh(out, dkey):
-        print("depare bundle: inputs unchanged — skip")
-        return
-    utils.create_folder("store/bundle")
-    # Invalidate before writing (the crash rule every keyed writer follows): under FORCE the
-    # key is unchanged, so a crash mid-tippecanoe would otherwise leave the old sidecar reading
-    # a torn archive as fresh forever.
-    for stale in (out, keys.sidecar(out)):
-        if os.path.isfile(stale):
-            os.remove(stale)
-    _tippecanoe(fgbs, maxz, out)
-    keys.write_key(out, dkey)
-    print(f"depare bundle: {out} (z{MIN_ZOOM}-{maxz}, {len(fgbs)} FGBs)")
 
 
 def bundle_stable():
@@ -504,9 +433,9 @@ if __name__ == "__main__":
     a = sys.argv[1:]
     if a[:1] == ["tile"] and len(a) == 2:
         tile(a[1])
-    elif a[:1] == ["bundle"]:
-        bundle_stable() if a[1:] == ["--stable"] else bundle()
+    elif a == ["bundle", "--stable"]:
+        bundle_stable()
     elif a[:1] == ["check"]:
         _check()
     else:
-        sys.exit("usage: depare_run.py tile <stem> | bundle [--stable] | check")
+        sys.exit("usage: depare_run.py tile <stem> | bundle --stable | check")

@@ -29,9 +29,7 @@ from glob import glob
 import mercantile
 
 import aggregation_covering
-import cache_versions
 import config
-import keys
 import utils
 from aggregation_reproject import get_resolution
 
@@ -142,25 +140,6 @@ def smooth_and_enrich(sources, out_fgb, tol):
                                      for g in gdf.loc[deep, "geometry"]]
         gdf = gdf[gdf.geometry.notna() & ~gdf.geometry.is_empty]
     gdf.to_file(out_fgb, driver="FlatGeobuf")
-
-
-def generate(filepath, out):
-    """Contour one aggregation tile's merged DEM into ``out`` (the caller's content-addressed FGB
-    name). Writes ``out`` atomically only when there ARE features — an all-land / all-deep tile
-    returns having written nothing, and the caller records the empty marker. The caller superseded
-    this stem's old-key siblings before calling, so a crash here leaves the fork reading stale."""
-    agg_id, filename = filepath.split("/")[-2:]
-    z, x, y, child_z = (int(a) for a in filename.replace("-aggregation.csv", "").split("-"))
-    tile_obj = mercantile.Tile(x=x, y=y, z=z)
-    tmp = f"store/aggregation/{agg_id}/{z}-{x}-{y}-{child_z}-tmp"
-    dem = f"{tmp}/{len(glob(f'{tmp}/*.tiff')) - 1}-3857.tiff"
-    if not os.path.exists(dem):
-        print(f"contour: no merged DEM for {filename}")
-        return
-    final = _contour_dem(dem, tile_obj, child_z, tmp, filename)
-    if final:
-        keys.publish(final, out)
-        print(f"contour: {filename} -> {feature_count(out)} features")
 
 
 def tile(stem):
@@ -278,32 +257,14 @@ def _tippecanoe(fgbs, minz, maxz, out):
             "contour tippecanoe", out)
 
 
-def _global_maxz(fgbs):
-    return max(int(keys.stem_of(f).split("-")[3]) for f in fgbs)
-
-
 def _stems_maxz(stems):
     """Max child_z across covering stems ({z}-{x}-{y}-{child_z})."""
     return max(int(s.rsplit("-", 1)[1]) for s in stems)
 
 
-def bundle_maxz(own_max):
-    """The tileset maxzoom EVERY vector layer bundles to (contours, soundings,
-    depare). They tile-join into one vector.pmtiles, whose maxzoom is the max
-    across layers — a layer bundled only to its own regional max silently
-    vanishes from deeper tiles (the drying flats, folded into depare, once stopped
-    at z11 while contours ran to z14 and rendered as bare land above z11). Use the current
-    covering's max child_z (so every layer tiles to the same depth and tile-joins cleanly),
-    else the caller's own files' max."""
-    stems = _current_stems()
-    if stems:
-        return max(own_max, _stems_maxz(stems))
-    return own_max
-
-
 def bundle_maxz_stable(own_max):
-    """The engine-lane twin of bundle_maxz: the shared tileset maxzoom every vector layer bundles
-    to, from the covering's max child_z (so contours/soundings/depare tile to the same depth and
+    """The shared tileset maxzoom every vector layer bundles to (contours/soundings/depare
+    tile-join into one vector.pmtiles): the covering's max child_z (so they tile to the same depth and
     tile-join cleanly), else the caller's own files' max. The covering is always present in the
     engine lane (Snakemake refuses to run without it), so there is no None fallback."""
     import mosaic
@@ -409,55 +370,9 @@ def _finalize_contours(archives, out):
                             out)
 
 
-def _current_stems():
-    """{z}-{x}-{y}-{child_z} of every tile in the newest covering — the only contour
-    FGBs that belong in the bundle. None when no covering is present locally, so the
-    caller falls back to every FGB it has."""
-    ids = utils.get_aggregation_ids()
-    if not ids:
-        return None
-    csvs = glob(f"store/aggregation/{ids[-1]}/*-aggregation.csv")
-    return {c.split("/")[-1].replace("-aggregation.csv", "") for c in csvs} or None
-
-
-def _live_fgbs(fgbs, stems):
-    """Drop FGBs orphaned by a covering re-tiling. A source's footprint/maxzoom shift re-tiles its
-    area (different z/x/y/child_z), but the store keeps no --delete, so the superseded FGB lingers;
-    bundling it alongside the new tiling draws two overlapping contour sets. Keep only
-    current-covering stems (parsed off the content-addressed name); keep all when stems is None.
-    Non-content-addressed debris (a torn logical write) is dropped either way."""
-    live = [f for f in fgbs if keys.is_content_name(f)]
-    if stems is None:
-        return live
-    return [f for f in live if keys.stem_of(f) in stems]
-
-
-def verify_vector_complete(layer, paths):
-    """Every stem in the current covering must carry this fork's artifact OR its .empty marker, or
-    the layer has a silent hole — the vector twin of bundle.verify_complete (a tile whose fork
-    never completed would simply vanish from vector.pmtiles). build.yml enforces the same invariant
-    via the store manifest's hard-fail, which happens to run before the vector bundlers — but that
-    is step ORDER; this gate makes each bundler SELF-enforcing, so a reordered workflow or a local
-    run fails loudly instead of publishing a hole. Runs before each bundler's fresh-skip, so a
-    fresh key can't paper over a gap. No covering locally (ad-hoc bundling of whatever exists)
-    skips the gate; a fork hard-skipped at aggregate time (SKIP_CONTOURS et al.) left no markers,
-    so bundling it fails here — correct: you asked to bundle a fork you never built."""
-    stems = _current_stems()
-    if stems is None:
-        return
-    have = {keys.stem_of(p) for p in paths}
-    have |= {keys.stem_of(p) for p in glob(f"store/{layer}/*.empty") if keys.is_content_name(p)}
-    missing = sorted(stems - have)
-    if missing:
-        raise SystemExit(
-            f"{layer} incomplete: {len(missing)} of {len(stems)} covering tiles have neither an "
-            f"artifact nor an empty marker (a failed/interrupted aggregate run) — e.g. "
-            f"{', '.join(missing[:15])}{' …' if len(missing) > 15 else ''}")
-
-
 def require_stable_complete(layer, stems, files):
-    """The engine-lane no-holes gate (the --stable twin of verify_vector_complete): every covering
-    stem must have its PLAIN per-stem file on disk — a 0-byte file is a legitimately empty tile, a
+    """The engine-lane no-holes gate: every covering stem must have its PLAIN per-stem file on
+    disk — a 0-byte file is a legitimately empty tile, a
     MISSING one is an incomplete build. Snakemake owns freshness, so this completeness assert is the
     only bundle-time gate the stable path keeps (no keys, no markers)."""
     missing = [s for s, f in zip(stems, files) if not os.path.exists(f)]
@@ -466,75 +381,6 @@ def require_stable_complete(layer, stems, files):
             f"{layer} incomplete: {len(missing)} of {len(stems)} covering tiles have no per-tile "
             f"file (an interrupted build) — e.g. {', '.join(missing[:5])}"
             f"{' …' if len(missing) > 5 else ''}")
-
-
-# vector.pmtiles depends on every per-tile contour/sounding/depare artifact's key + the three
-# layers' modules (the tippecanoe filter + flags live in them) + the env-tunable simplifications.
-# A per-tile fork whose key changed (a contour-levels edit) moves this key; an unchanged set skips
-# the whole tippecanoe + planet-wide tile-join.
-def _vector_key(maxz):
-    stems = _current_stems()
-    inputs = []
-    for folder, ext in (("contour", "fgb"), ("soundings", "geojson"), ("depare", "fgb")):
-        for path in sorted(glob(f"store/{folder}/*.{ext}")):
-            if not keys.is_content_name(path):  # legacy/torn debris — never a bundle input
-                continue
-            stem = keys.stem_of(path)
-            if stems is not None and stem not in stems:  # orphan from a re-tiled covering
-                continue
-            # The key rides in the filename now (empty forks carry only a .empty marker, which
-            # this *.fgb / *.geojson glob skips — an empty->non-empty transition adds a content
-            # file and moves the key, the meaningful change). Layer folder included: contour and
-            # depare are both .fgb, so the folder keeps each input's identity unambiguous.
-            inputs.append(os.path.relpath(path, "store"))
-    cfg = {"maxz": maxz,
-           "contour_simplification": os.environ.get("CONTOUR_SIMPLIFICATION", "8"),
-           "depare_simplification": os.environ.get("DEPARE_SIMPLIFICATION", "8")}
-    return keys.stage_key(inputs, [cache_versions.VECTOR_BUNDLE], cfg)
-
-
-def bundle():
-    """tippecanoe every contour FGB into contour lines, then tile-join in the already-bundled
-    soundings/depare layers → store/bundle/vector.pmtiles (one global tippecanoe + one join;
-    maxz is the covering's shared max child_z so every layer tiles to the same depth). Soundings
-    and depare must bundle before this — the single tile-join folds their pmtiles in. Skips when
-    every per-tile vector artifact's key is unchanged and vector.pmtiles is already on disk (the
-    local iterative loop; the box's store/bundle is never hydrated, so a box build always runs)."""
-    fgbs = _live_fgbs(sorted(glob("store/contour/*.fgb")), _current_stems())
-    verify_vector_complete("contour", fgbs)  # self-enforcing, before the fresh-skip (see the gate)
-    vec = "store/bundle/vector.pmtiles"
-    if not fgbs:
-        # Empty input is a real state, not a no-op: a previously-built vector.pmtiles (and the
-        # sidecar vouching for it) must not survive to be pushed as this build's current vector
-        # layer. The invalidate discipline, extended to "the current state is nothing".
-        for stale in (vec, keys.sidecar(vec)):
-            if os.path.isfile(stale):
-                os.remove(stale)
-        print("contour bundle: no contour FGBs")
-        return
-    maxz = bundle_maxz(_global_maxz(fgbs))
-    vkey = _vector_key(maxz)
-    if keys.is_fresh(vec, vkey):
-        print("contour bundle: vector inputs unchanged — skip")
-        return
-    utils.create_folder("store/bundle")
-    # Invalidate before writing (the crash rule every keyed writer follows): under FORCE the
-    # key is unchanged, so a crash mid-tippecanoe/tile-join would otherwise leave the old
-    # sidecar reading a torn vector.pmtiles as fresh forever.
-    for stale in (vec, keys.sidecar(vec)):
-        if os.path.isfile(stale):
-            os.remove(stale)
-    lines = utils.vector_scratch("contours-lines.pmtiles")
-    vector_tmp = utils.vector_scratch("vector.pmtiles")
-    for path in (lines, vector_tmp):
-        if os.path.exists(path):
-            os.remove(path)
-    _tippecanoe(fgbs, 0, maxz, lines)
-    _finalize_contours([lines], vector_tmp)
-    os.remove(lines)
-    keys.publish(vector_tmp, vec)
-    keys.write_key(vec, vkey)
-    print(f"contour bundle: {vec} (z0-{maxz}, {len(fgbs)} FGBs)")
 
 
 def bundle_stable():
@@ -573,12 +419,6 @@ def _check():
     assert _drop_small_rings(ring(100), MIN_RING_AREA_M2) is None        # ~0.03 km² → drop
     assert _drop_small_rings(ring(3000), MIN_RING_AREA_M2) is not None   # ~28 km²  → keep
     assert _drop_small_rings(LineString([(0, 0), (5e3, 0), (1e4, 5e3)]), MIN_RING_AREA_M2) is not None  # open line kept
-    # orphan-FGB filter (content-addressed names): keep only current-covering stems; passthrough
-    # when stems is None; a non-content name (legacy/torn) is dropped either way.
-    fgbs = ["store/contour/4-5-6-8-aaaaaaaaaaaa.fgb", "store/contour/11-300-400-13-bbbbbbbbbbbb.fgb"]
-    assert _live_fgbs(fgbs, {"11-300-400-13"}) == ["store/contour/11-300-400-13-bbbbbbbbbbbb.fgb"]
-    assert _live_fgbs(fgbs, None) == fgbs
-    assert _live_fgbs(["store/contour/9-1-1-9.fgb"], None) == [], "a legacy logical name is dropped"
     # the shared bundle maxzoom reads child_z off covering stems
     assert _stems_maxz({"4-5-6-8", "11-300-400-13"}) == 13
     # navigable-band contours skip Chaikin (never bow a shoal deeper); deeper ones smooth
@@ -590,18 +430,18 @@ def _check():
     assert "depth_abs_m" not in PER_ZOOM_FILTER
     # every tier level must exist in the generated contour set (else it filters to nothing)
     assert all(d in config.CONTOUR_LEVELS for _, depths in CONTOUR_TIERS for d in depths)
-    print("contour_run ring-drop + orphan-filter self-check ok")
+    print("contour_run ring-drop self-check ok")
 
 
 if __name__ == "__main__":
     a = sys.argv[1:]
     if a[:1] == ["tile"] and len(a) == 2:
         tile(a[1])
-    elif a[:1] == ["bundle"]:
-        bundle_stable() if a[1:] == ["--stable"] else bundle()
+    elif a == ["bundle", "--stable"]:
+        bundle_stable()
     elif a[:1] == ["coverage"]:
         coverage_bundle()
     elif a[:1] == ["check"]:
         _check()
     else:
-        sys.exit("usage: contour_run.py tile <stem> | bundle [--stable] | coverage | check")
+        sys.exit("usage: contour_run.py tile <stem> | bundle --stable | coverage | check")
