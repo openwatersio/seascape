@@ -53,11 +53,11 @@ rule fetch_asset:
         source=pat(PREPPED), index=r"\d+"
     retries: 2
     benchmark:
-        "store/bench/fetch/{source}-{index}.tsv"
+        f"{TMP}/bench/fetch/{{source}}-{{index}}.tsv"
     # stderr per job for forensics (a failed job's diagnostics stay isolated in its own log);
     # stdout keeps flowing to the run log so monitors and Actions heartbeats parse progress.
     log:
-        "store/logs/fetch/{source}-{index}.log"
+        f"{TMP}/logs/fetch/{{source}}-{{index}}.log"
     shell:
         "{PY}/source_fetch.py {wildcards.source} {wildcards.index} 2> {log}"
 
@@ -76,9 +76,9 @@ rule prep_source:
     resources:
         mem_gb=8  # asc-mosaic / archive-extract jobs hold whole rasters in flight
     benchmark:
-        "store/bench/prep/{source}.tsv"
+        f"{TMP}/bench/prep/{{source}}.tsv"
     log:
-        "store/logs/prep/{source}.log"
+        f"{TMP}/logs/prep/{{source}}.log"
     shell:
         "( {PY}/source_prep.py {wildcards.source} && {PY}/source_bounds.py {wildcards.source} ) 2> {log}"
 
@@ -114,9 +114,9 @@ rule mirror_source:
     resources:
         mem_gb=2  # header reads + list bookkeeping, no raster in memory
     benchmark:
-        "store/bench/mirror/{source}.tsv"
+        f"{TMP}/bench/mirror/{{source}}.tsv"
     log:
-        "store/logs/mirror/{source}.log"
+        f"{TMP}/logs/mirror/{{source}}.log"
     shell:
         "{PY}/source_mirror.py {wildcards.source} 2> {log}"
 
@@ -130,7 +130,7 @@ rule polygon:
         source=pat(LOCAL_PREPPED)
     threads: 4
     log:
-        "store/logs/polygon/{source}.log"
+        f"{TMP}/logs/polygon/{{source}}.log"
     shell:
         "{PY}/source_polygonize.py {wildcards.source} {threads} 2> {log}"
 
@@ -145,7 +145,7 @@ rule catalog_item:
     wildcard_constraints:
         source=pat(LOCAL_PREPPED + LOCAL_MIRRORED)
     log:
-        "store/logs/catalog_item/{source}.log"
+        f"{TMP}/logs/catalog_item/{{source}}.log"
     shell:
         "{PY}/source_catalog.py {wildcards.source} --hash-recipe 2> {log}"
 
@@ -161,7 +161,7 @@ rule fetch_catalog:
         source=pat(STREAMED)
     retries: 2
     log:
-        "store/logs/fetch_catalog/{source}.log"
+        f"{TMP}/logs/fetch_catalog/{{source}}.log"
     shell:
         "((curl -fsS {STREAM_BASE}/{wildcards.source}/bounds.csv -o {output.bounds}.tmp && "
         "mv {output.bounds}.tmp {output.bounds} && "
@@ -179,9 +179,9 @@ rule landmask:
     resources:
         mem_gb=4
     benchmark:
-        "store/bench/landmask.tsv"
+        f"{TMP}/bench/landmask.tsv"
     log:
-        "store/logs/landmask.log"
+        f"{TMP}/logs/landmask.log"
     shell:
         "{PY}/landmask.py prep 2> {log}"
 
@@ -194,9 +194,9 @@ rule watermask:
     resources:
         mem_gb=8  # the planet Overture-water reproject; refine from the benchmark
     benchmark:
-        "store/bench/watermask.tsv"
+        f"{TMP}/bench/watermask.tsv"
     log:
-        "store/logs/watermask.log"
+        f"{TMP}/logs/watermask.log"
     shell:
         "{PY}/landmask.py prep-water 2> {log}"
 
@@ -212,7 +212,7 @@ rule cover:
     params:
         bbox=os.environ.get("BBOX", "")
     log:
-        "store/logs/cover.log"
+        f"{TMP}/logs/cover.log"
     shell:
         "{PY}/aggregation_covering.py --stable 2> {log}"
 
@@ -227,7 +227,7 @@ rule coverage:
     output:
         "store/bundle/coverage.pmtiles"
     log:
-        "store/logs/coverage.log"
+        f"{TMP}/logs/coverage.log"
     shell:
         "{PY}/contour_run.py coverage 2> {log}"
 
@@ -255,6 +255,6 @@ rule check:
     params:
         source=lambda wc: ONLY,
     log:
-        "store/logs/check.log"
+        f"{TMP}/logs/check.log"
     shell:
         "{PY}/source_check.py {params.source} 2> {log}"

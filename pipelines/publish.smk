@@ -35,7 +35,7 @@ rule mirror_objects:
         source=pat(MIRRORED)
     priority: 5000  # ~190 GB when it runs; start first
     log:
-        "store/logs/mirror_objects/{source}.log"
+        f"{TMP}/logs/mirror_objects/{{source}}.log"
     shell:
         "( " + PUBLISH_GUARD +
         'printf "[upstream]\\ntype = s3\\nprovider = AWS\\nregion = us-east-1\\n" > /tmp/upstream-{wildcards.source}.conf; '
@@ -60,7 +60,7 @@ rule publish_source:
     wildcard_constraints:
         source=pat(PREPPED + MIRRORED)
     log:
-        "store/logs/publish_source/{source}.log"
+        f"{TMP}/logs/publish_source/{{source}}.log"
     shell:
         "( " + PUBLISH_GUARD +
         'src="store/source/{wildcards.source}"; dest="{DEST}/source/{wildcards.source}"; '
@@ -82,7 +82,7 @@ rule publish_coverage:
     output:
         touch("store/meta/publish/coverage")
     log:
-        "store/logs/publish_coverage.log"
+        f"{TMP}/logs/publish_coverage.log"
     shell:
         "( " + PUBLISH_GUARD +
         'rclone copyto "store/bundle/coverage.pmtiles" '
@@ -97,7 +97,7 @@ rule publish_masks:
     output:
         touch("store/meta/publish/landmask")
     log:
-        "store/logs/publish_masks.log"
+        f"{TMP}/logs/publish_masks.log"
     shell:
         "( " + PUBLISH_GUARD +
         'rclone copyto "{input.land}" "{DEST}/landmask/land.fgb" --retries 5; '

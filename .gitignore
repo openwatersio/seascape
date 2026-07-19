@@ -4,6 +4,8 @@ output/
 dist/
 # pipeline stages + bundle output all write under pipelines/store/
 pipelines/store/
+# per-run scratch (logs + benchmarks) defaults to pipelines/tmp/
+pipelines/tmp/
 .venv/
 node_modules
 .envrc

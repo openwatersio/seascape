@@ -80,7 +80,7 @@ MERGE_CFG = json.dumps({
 
 # factor 2.0, not utils.DEFAULT_FACTOR (4): the merge job holds only the merged array +
 # reprojected sources, not the vector forks. z13 peaks ~2.3 GB, z14 ~4-6 GB. Re-fit from
-# store/bench/mosaic/.
+# the scratch bench/mosaic/ (the benchmark artifact).
 MERGE_FACTOR = 2.0
 
 
@@ -107,9 +107,9 @@ rule mosaic_tile:
     resources:
         mem_gb=lambda wc, attempt: utils.weight(wc.stem, factor=MERGE_FACTOR) * attempt,
     benchmark:
-        "store/bench/mosaic/{stem}.tsv"
+        f"{TMP}/bench/mosaic/{{stem}}.tsv"
     log:
-        "store/logs/mosaic/{stem}.log"
+        f"{TMP}/logs/mosaic/{{stem}}.log"
     shell:
         "{PY}/mosaic.py tile store/aggregation/{wildcards.stem}-aggregation.csv 2> {log}"
 
@@ -126,9 +126,9 @@ rule mosaic_index:
         planet="store/mosaic/planet-z8.tif",
         gti="store/mosaic/mosaic.gti",
     benchmark:
-        "store/bench/mosaic-index.tsv"
+        f"{TMP}/bench/mosaic-index.tsv"
     log:
-        "store/logs/mosaic-index.log"
+        f"{TMP}/logs/mosaic-index.log"
     shell:
         "{PY}/mosaic.py index --stable 2> {log}"
 
@@ -147,9 +147,9 @@ rule publish:
     input:
         rules.mosaic_index.output
     benchmark:
-        "store/bench/mosaic-publish.tsv"
+        f"{TMP}/bench/mosaic-publish.tsv"
     log:
-        "store/logs/mosaic-publish.log"
+        f"{TMP}/logs/mosaic-publish.log"
     shell:
         "{PY}/mosaic.py publish 2> {log}"
 
@@ -176,7 +176,7 @@ SMOOTH_CFG = json.dumps({} if os.environ.get("SKIP_SMOOTH") else {
 
 
 # Fork reservations by child_z, fitted from benchmark max-RSS with ~40% margin (dense z14
-# tiles peak ~5-9.5 GB); retries escalate. Re-fit from store/bench/ as the corpus grows.
+# tiles peak ~5-9.5 GB); retries escalate. Re-fit from the scratch bench/ as the corpus grows.
 CONTOUR_GB = {14: 13, 13: 5}
 SOUND_GB = {14: 8, 13: 3}
 DEPARE_GB = {14: 8, 13: 4}
@@ -204,9 +204,9 @@ rule contour_tile:
     resources:
         mem_gb=_fork_gb(CONTOUR_GB, 3)
     benchmark:
-        "store/bench/contour/{stem}.tsv"
+        f"{TMP}/bench/contour/{{stem}}.tsv"
     log:
-        "store/logs/contour/{stem}.log"
+        f"{TMP}/logs/contour/{{stem}}.log"
     shell:
         "{PY}/contour_run.py tile {wildcards.stem} 2> {log}"
 
@@ -222,9 +222,9 @@ rule soundings_tile:
     resources:
         mem_gb=_fork_gb(SOUND_GB, 2)
     benchmark:
-        "store/bench/soundings/{stem}.tsv"
+        f"{TMP}/bench/soundings/{{stem}}.tsv"
     log:
-        "store/logs/soundings/{stem}.log"
+        f"{TMP}/logs/soundings/{{stem}}.log"
     shell:
         "{PY}/soundings_run.py tile {wildcards.stem} 2> {log}"
 
@@ -243,9 +243,9 @@ rule depare_tile:
     resources:
         mem_gb=_fork_gb(DEPARE_GB, 3)
     benchmark:
-        "store/bench/depare/{stem}.tsv"
+        f"{TMP}/bench/depare/{{stem}}.tsv"
     log:
-        "store/logs/depare/{stem}.log"
+        f"{TMP}/logs/depare/{{stem}}.log"
     shell:
         "{PY}/depare_run.py tile {wildcards.stem} 2> {log}"
 
@@ -263,9 +263,9 @@ rule terrain_render:
     resources:
         mem_gb=lambda wc, attempt: utils.weight(wc.stem, factor=MERGE_FACTOR) * attempt
     benchmark:
-        "store/bench/terrain/{stem}.tsv"
+        f"{TMP}/bench/terrain/{{stem}}.tsv"
     log:
-        "store/logs/terrain/{stem}.log"
+        f"{TMP}/logs/terrain/{{stem}}.log"
     shell:
         "{PY}/terrain.py render {wildcards.stem} 2> {log}"
 
@@ -311,9 +311,9 @@ rule soundings_bundle:
     output:
         "store/bundle/soundings.pmtiles"
     benchmark:
-        "store/bench/soundings-bundle.tsv"
+        f"{TMP}/bench/soundings-bundle.tsv"
     log:
-        "store/logs/soundings-bundle.log"
+        f"{TMP}/logs/soundings-bundle.log"
     shell:
         "{PY}/soundings_run.py bundle --stable 2> {log}"
 
@@ -326,9 +326,9 @@ if DEPARE_STEMS:
         output:
             "store/bundle/depare.pmtiles"
         benchmark:
-            "store/bench/depare-bundle.tsv"
+            f"{TMP}/bench/depare-bundle.tsv"
         log:
-            "store/logs/depare-bundle.log"
+            f"{TMP}/logs/depare-bundle.log"
         shell:
             "{PY}/depare_run.py bundle --stable 2> {log}"
 
@@ -345,9 +345,9 @@ rule vector_bundle:
     output:
         "store/bundle/vector.pmtiles"
     benchmark:
-        "store/bench/vector-bundle.tsv"
+        f"{TMP}/bench/vector-bundle.tsv"
     log:
-        "store/logs/vector-bundle.log"
+        f"{TMP}/logs/vector-bundle.log"
     shell:
         "{PY}/contour_run.py bundle --stable 2> {log}"
 
@@ -363,9 +363,9 @@ rule terrain_planet_bundle:
     output:
         "store/bundle/planet.pmtiles"
     benchmark:
-        "store/bench/planet-bundle.tsv"
+        f"{TMP}/bench/planet-bundle.tsv"
     log:
-        "store/logs/planet-bundle.log"
+        f"{TMP}/logs/planet-bundle.log"
     shell:
         "{PY}/bundle.py planet --stable 2> {log}"
 
@@ -388,9 +388,9 @@ rule overlay_bundle:
     output:
         "store/bundle/overlay-{cell}.pmtiles"
     benchmark:
-        "store/bench/overlay-{cell}.tsv"
+        f"{TMP}/bench/overlay-{{cell}}.tsv"
     log:
-        "store/logs/overlay-{cell}.log"
+        f"{TMP}/logs/overlay-{{cell}}.log"
     shell:
         "{PY}/bundle.py cell {wildcards.cell} --stable 2> {log}"
 
@@ -415,8 +415,8 @@ rule stage_build:
     input:
         rules.bundles.input
     benchmark:
-        "store/bench/stage-build.tsv"
+        f"{TMP}/bench/stage-build.tsv"
     log:
-        "store/logs/stage-build.log"
+        f"{TMP}/logs/stage-build.log"
     shell:
         "{PY}/bundle.py stage-build --stable 2> {log}"

@@ -6,8 +6,8 @@ name: Build
 # parses purely from disk and structurally contains no fetch rule, so a build can never contact
 # upstream.
 #
-# Every job runs isolated with a benchmark: directive, so per-tile max-RSS lands in store/bench/
-# and survives even if the run dies. Tiles are plain-named on the volume; the publish rule
+# Every job runs isolated with a benchmark: directive, so per-tile max-RSS lands in the box's
+# local-disk scratch (TMP) and ships as an artifact. Tiles are plain-named on the volume; the publish rule
 # content-addresses them to R2 under hashed names with a CANDIDATE pointer (index + gti) — the
 # serving pointer mosaic.gti is never written from here, so serving state is structurally
 # untouchable.
@@ -41,8 +41,7 @@ env:
   SERVER_TYPE: ${{ github.event.inputs.server_type }}
   SERVER_IMAGE: ubuntu-24.04
   SERVER_LOCATION: fsn1
-  # The persistent store volume: reads the canonical stage-1 store and adds store/mosaic/ +
-  # store/bench/.
+  # The persistent store volume: reads the canonical stage-1 store and adds store/mosaic/.
   STORE_VOLUME: seascape-store
   STORE_VOLUME_GB: "750"
   NAME: seascape-build-${{ github.run_id }}
@@ -171,8 +170,14 @@ jobs:
       # the r2-store concurrency group guarantees no other lane run holds the store. One
       # unlock covers both invocations (same workdir, same lock directory).
       - name: Unlock a stale workflow lock (crash recovery)
+        # TMP is the box's LOCAL-disk per-run scratch (docker.sh mounts it at /app/tmp): logs +
+        # benchmarks land here, off the network store volume. Step-scoped, not job-wide — a
+        # job-wide TMP would silently redirect other steps' Python tempfile writes.
+        env:
+          TMP: /var/tmp/seascape-tmp
         run: |
-          ./docker.sh snakemake --unlock --config workdir=/app/state
+          mkdir -p "$TMP"  # first snakemake step; the mount source must exist before docker run
+          ./docker.sh snakemake --unlock --config workdir=/app/state tmp=/app/tmp
       - name: Build the mosaic (Snakemake)
         env:
           # Dispatch inputs reach the shell as env vars, never interpolated into a shell line.
@@ -187,8 +192,13 @@ jobs:
           CPL_VSIL_CURL_CACHE_SIZE: "268435456"
           VSI_CACHE: "TRUE"
           VSI_CACHE_SIZE: "33554432"
+          # LOCAL-disk per-run scratch (docker.sh mounts it at /app/tmp): logs + benchmarks land
+          # here, off the network store volume. Step-scoped to avoid redirecting other steps'
+          # Python tempfile writes.
+          TMP: /var/tmp/seascape-tmp
         run: |
           set -euo pipefail
+          mkdir -p "$TMP"
           # Disk headroom: the mosaic tiles live permanently on the volume (~360 G), so
           # planet runs are incremental — 100 G covers the index/planet-z8/scratch churn.
           # Refuse early rather than fill mid-run.
@@ -219,14 +229,17 @@ jobs:
           ./docker.sh snakemake -s pipelines/build.smk bundles publish "${extra[@]}" "${force[@]}" \
             --keep-going --rerun-incomplete \
             --cores "$cores" --resources mem_gb="$budget_gb" \
-            --config workdir=/app/state
-      # Per-job wall/CPU/max-RSS from the benchmark: directives.
-      - name: Upload snakemake benchmarks
+            --config workdir=/app/state tmp=/app/tmp
+      # Per-job wall/CPU/max-RSS from the benchmark: directives, plus per-job stderr logs —
+      # both live in the box's local-disk scratch (TMP), the durable home is this artifact.
+      - name: Upload snakemake benchmarks + logs
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: snakemake-bench-${{ github.run_id }}
-          path: ${{ env.STATE }}/store/bench/
+          path: |
+            /var/tmp/seascape-tmp/bench/
+            /var/tmp/seascape-tmp/logs/
           if-no-files-found: ignore
           retention-days: 90
 

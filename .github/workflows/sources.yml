@@ -150,17 +150,28 @@ jobs:
       # markers ON THE VOLUME, wedging every later run at startup. Unlock is safe here:
       # the r2-store concurrency group guarantees no other lane run holds the store.
       - name: Unlock a stale workflow lock (crash recovery)
+        # TMP is the box's LOCAL-disk per-run scratch (docker.sh mounts it at /app/tmp): logs +
+        # benchmarks land here, off the network store volume. Step-scoped, not job-wide — a
+        # job-wide TMP would silently redirect other steps' Python tempfile writes.
+        env:
+          TMP: /var/tmp/seascape-tmp
         run: |
-          ./docker.sh snakemake --unlock --config workdir=/app/state
+          mkdir -p "$TMP"  # first snakemake step; the mount source must exist before docker run
+          ./docker.sh snakemake --unlock --config workdir=/app/state tmp=/app/tmp
       - name: Run the sources lane (Snakemake) and publish
         env:
           INPUT_SOURCE: ${{ github.event.inputs.source }}
           INPUT_FORCE: ${{ github.event.inputs.force }}
+          # LOCAL-disk per-run scratch (docker.sh mounts it at /app/tmp): logs + benchmarks land
+          # here, off the network store volume. Step-scoped to avoid redirecting other steps'
+          # Python tempfile writes.
+          TMP: /var/tmp/seascape-tmp
         run: |
           set -euo pipefail
+          mkdir -p "$TMP"
           # Optional target args, collected into an array so an empty one contributes nothing
           # (no unquoted word-splitting) and a source id can't smuggle extra tokens.
-          extra=(--config workdir=/app/state)
+          extra=(--config workdir=/app/state tmp=/app/tmp)
           if [ -n "$INPUT_SOURCE" ]; then
             # source ids are directory names ([a-z0-9_]); reject anything else before it
             # reaches the docker/snakemake command line.
@@ -182,14 +193,16 @@ jobs:
           ./docker.sh snakemake catalogs publish --keep-going --rerun-incomplete \
             --cores 16 --resources mem_gb=28 "${extra[@]}" || rc=$?
           exit "$rc"
-      # Per-job wall/CPU/max-RSS from the benchmark: directives (this job runs on the box,
-      # so the volume path is directly readable).
-      - name: Upload snakemake benchmarks
+      # Per-job wall/CPU/max-RSS from the benchmark: directives, plus per-job stderr logs —
+      # both live in the box's local-disk scratch (TMP), the durable home is this artifact.
+      - name: Upload snakemake benchmarks + logs
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: snakemake-bench-${{ github.run_id }}
-          path: ${{ env.STATE }}/store/bench/
+          path: |
+            /var/tmp/seascape-tmp/bench/
+            /var/tmp/seascape-tmp/logs/
           if-no-files-found: ignore
           retention-days: 90
 

@@ -35,6 +35,9 @@ tty=""; if [ -t 0 ]; then tty="-it"; fi
 ports=""; if [ "${1:-}" = "dev" ]; then ports="-p 5173:5173 -p 8787:8787"; fi
 # CI mounts the persistent store volume at /app/state.
 state=""; if [ -n "${STATE:-}" ]; then state="-v $STATE:/app/state"; fi
+# CI points TMP (per-run logs/benchmarks) at local disk, off the network volume — forwarded
+# only as the mount SOURCE, never into the container env (keeps container tempfile at /tmp).
+tmp=""; if [ -n "${TMP:-}" ]; then tmp="-v $TMP:/app/tmp"; fi
 # Toolchain identity (utils.toolchain): the image ID pins the exact GDAL/tippecanoe
 # build, like the GHCR image tag does on the build box.
 export TOOLCHAIN="${TOOLCHAIN:-$(docker image inspect -f '{{.Id}}' "$image")}"
@@ -42,7 +45,7 @@ export TOOLCHAIN="${TOOLCHAIN:-$(docker image inspect -f '{{.Id}}' "$image")}"
 # platform-specific (darwin vs linux binaries), so the container keeps its own.
 # nofile: ~96 concurrent snakemake jobs' pipes + per-job benchmark /proc reads exhaust
 # the default soft limit in the parent.
-exec docker run --rm $tty $ports $state --ulimit nofile=65536:65536 \
+exec docker run --rm $tty $ports $state $tmp --ulimit nofile=65536:65536 \
   -e TOOLCHAIN \
   -e BBOX -e SOURCE_VSI_BASE -e BOUNDS_BASE -e LANDMASK -e WATERMASK \
   -e MACROTILE_Z -e OVERLAY_SPLIT_Z -e NUM_OVERVIEWS -e AGG_PROCESSES -e BUNDLE_PROCESSES -e GDAL_CACHEMAX \
