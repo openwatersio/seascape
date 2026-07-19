@@ -503,7 +503,11 @@ def _stage_publish():
     planet_name = f"planet-z8-{_hash12(planet)}.tif"
     os.link(planet, f"{pubdir}/{planet_name}")
 
-    idxhash = hashlib.sha256("".join(sorted(tile_hashes)).encode()).hexdigest()[:12]
+    # Hash the pointer's SEMANTIC content (locations + refs), not just the tile hashes: a
+    # location-format fix must mint a NEW candidate name, or --ignore-existing keeps serving
+    # the defective object under the unchanged name (observed).
+    locations = sorted(f["properties"]["location"] for f in features)
+    idxhash = hashlib.sha256("\n".join(locations + [public_base()]).encode()).hexdigest()[:12]
     index_name = f"{idxhash}.parquet"
     index_stage = f"{pubdir}/index/{index_name}"
     _write_index(index_stage, features)
@@ -821,7 +825,9 @@ def _check():
         assert f"<IndexDataset>/vsicurl/{pub_base}/mosaic/index/{names['index']}</IndexDataset>" in gti_xml, gti_xml
         assert f"<Dataset>/vsicurl/{pub_base}/mosaic/planet-z8-{phash}.tif</Dataset>" in gti_xml, gti_xml
         # the index name is content-addressed by the sorted tile hashes
-        assert names["index"] == hashlib.sha256(thash.encode()).hexdigest()[:12] + ".parquet", names["index"]
+        exp_loc = f"/vsicurl/{pub_base}/mosaic/tiles/{stem}-{thash}.tif"
+        exp_hash = hashlib.sha256("\n".join([exp_loc, pub_base]).encode()).hexdigest()[:12]
+        assert names["index"] == exp_hash + ".parquet", names["index"]
         # the serving pointer name is unreachable from this path — nowhere in the staged outputs
         assert names["gti"] == f"mosaic-candidate-{names['idxhash']}.gti" and names["gti"] != SERVING_GTI_NAME
         for root, _dirs, sfiles in os.walk(pubdir):
