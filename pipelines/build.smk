@@ -104,6 +104,8 @@ rule mosaic_tile:
     retries: 2
     resources:
         mem_gb=lambda wc, attempt: utils.weight(wc.stem, factor=MERGE_FACTOR) * attempt,
+        # real scratch: the -tmp folder of per-source reprojected tiffs, ~tile-sized
+        disk_mb=lambda wc: utils.weight(wc.stem, factor=MERGE_FACTOR) * 1024,
     benchmark:
         f"{TMP}/bench/mosaic/{{stem}}.tsv"
     log:
