@@ -174,14 +174,13 @@ def tile(stem):
     with the one shared f(depth, zoom), output at store/soundings/<stem>.geojson. A dry tile writes
     a 0-byte sentinel; bundling filters empties by size."""
     import shutil
+    import tempfile
 
     import mosaic
     import smooth
     z, x, y, child_z = (int(a) for a in stem.split("-"))
     out = f"store/soundings/{stem}.geojson"
-    tmp = f"store/soundings/{stem}-tmp"
-    shutil.rmtree(tmp, ignore_errors=True)
-    os.makedirs(tmp)
+    tmp = tempfile.mkdtemp(prefix=f"soundings-{stem}-")  # local scratch; publish crosses to the store
     dem = mosaic.window_dem(stem, f"{tmp}/dem.tiff")
     if not os.environ.get("SKIP_SMOOTH"):
         smooth.smooth_tiff(dem)

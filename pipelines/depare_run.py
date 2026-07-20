@@ -263,14 +263,13 @@ def tile(stem):
     the land + water masks). A waterless tile writes a 0-byte sentinel; bundling filters empties by
     size."""
     import shutil
+    import tempfile
 
     import mosaic
     import smooth
     z, x, y, child_z = (int(a) for a in stem.split("-"))
     out = f"store/depare/{stem}.fgb"
-    tmp = f"store/depare/{stem}-tmp"
-    shutil.rmtree(tmp, ignore_errors=True)
-    os.makedirs(tmp)
+    tmp = tempfile.mkdtemp(prefix=f"depare-{stem}-")  # local scratch; publish crosses to the store
     dem = mosaic.window_dem(stem, f"{tmp}/dem.tiff")
     if not os.environ.get("SKIP_SMOOTH"):
         smooth.smooth_tiff(dem)

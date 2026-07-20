@@ -89,7 +89,7 @@ jobs:
   # Boot the Hetzner box, register it as a self-hosted runner, attach the store volume.
   create-runner:
     runs-on: ubuntu-latest
-    permissions: { contents: read }
+    permissions: { contents: read, statuses: write }
     outputs:
       label: ${{ steps.runner.outputs.label }}
       server_id: ${{ steps.runner.outputs.server_id }}
@@ -105,6 +105,9 @@ jobs:
           server_type: ${{ env.SERVER_TYPE }}
           location: ${{ env.SERVER_LOCATION }}
           image: ${{ env.SERVER_IMAGE }}
+          # Repo variable HCLOUD_SSH_KEY = an SSH key ID/name in the hcloud project; lets
+          # operators (and Claude, via the build/box status below) ssh root@<ip> for live diagnosis.
+          ssh_key: ${{ vars.HCLOUD_SSH_KEY }}
           volume: "null"
       # The store volume holds the canonical stage-1 sources the build reads FROM — attached
       # for bbox smokes too: the build always reads the volume's catalogs and writes plain-named
@@ -113,6 +116,7 @@ jobs:
         env:
           HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
           SERVER_ID: ${{ steps.runner.outputs.server_id }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           curl -fsSL -o /tmp/hcloud.tgz https://github.com/hetznercloud/cli/releases/download/v1.66.0/hcloud-linux-amd64.tar.gz
@@ -121,6 +125,12 @@ jobs:
           sudo mv /tmp/hcloud /usr/local/bin/
           hcloud volume attach "$STORE_VOLUME" --server "$SERVER_ID"
           echo "volume $STORE_VOLUME attached to server $SERVER_ID"
+          ip=$(hcloud server ip "$SERVER_ID")
+          curl -fsS -X POST -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -d "{\"state\":\"pending\",\"context\":\"build/box\",\"description\":\"root@$ip\",\"target_url\":\"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\"}" \
+            >/dev/null
 
   # The build: covering (catalogs invocation) then bundles + publish (build invocation), natively
   # on the box. timeout-minutes REQUIRED even self-hosted (default per-job timeout is 360 min).
@@ -252,21 +262,25 @@ jobs:
           # serves, so the step-counter also goes out as a commit status every minute.
           buildlog=/var/tmp/build-progress.log
           : > "$buildlog"
-          ( while sleep 60; do
+          # set +e: the step's set -e is inherited and the first no-match grep (during DAG
+          # build) would kill the loop — exactly how the heartbeat silently died before.
+          ( set +e
+            while sleep 60; do
               # memory/swap time series (Hetzner's metrics API has neither) — logs/ ships in the artifact
               mkdir -p "$TMP/logs"
               free -m | awk -v t="$(date -u +%FT%TZ)" 'NR==2{u=$3;a=$7} NR==3{print t" used_mb="u" avail_mb="a" swap_used_mb="$3}' \
-                >> "$TMP/logs/memory.log" || true
+                >> "$TMP/logs/memory.log"
               p=$(grep -oE "[0-9]+ of [0-9]+ steps" "$buildlog" | tail -1)
               [ -n "$p" ] || continue
               n=${p%% *}; m=${p##*of }; m=${m%% *}
+              run=$(( $(grep -cE "^(localrule|rule|checkpoint) " "$buildlog") - $(grep -c "^Finished jobid" "$buildlog") ))
               # curl, not gh: the self-hosted box has no gh CLI. Failures land in the
               # artifact via heartbeat.log instead of /dev/null.
               curl -fsS -X POST -H "Authorization: Bearer $GH_TOKEN" \
                 -H "Accept: application/vnd.github+json" \
                 "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
-                -d "{\"state\":\"pending\",\"context\":\"build/progress\",\"description\":\"$p ($((n * 100 / m))%)\",\"target_url\":\"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\"}" \
-                >/dev/null 2>>"$TMP/logs/heartbeat.log" || true
+                -d "{\"state\":\"pending\",\"context\":\"build/progress\",\"description\":\"$p ($((n * 100 / m))%), ~$run running\",\"target_url\":\"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\"}" \
+                >/dev/null 2>>"$TMP/logs/heartbeat.log"
             done ) &
           hb=$!
           trap 'kill "$hb" 2>/dev/null || true' EXIT

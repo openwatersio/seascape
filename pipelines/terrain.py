@@ -35,6 +35,7 @@ build.smk derives the render stems (render_stems) at parse time and schedules on
 import math
 import os
 import shutil
+import tempfile
 import sys
 
 import mercantile
@@ -140,8 +141,7 @@ def _render(stem, out_pmtiles):
     span = 2 ** (cz - z)
     halo = _halo_px()
 
-    tmp = f"store/terrain-tmp/{stem}"
-    utils.create_folder(tmp)
+    tmp = tempfile.mkdtemp(prefix=f"terrain-{stem}-")  # local scratch; publish crosses to the store
     window = f"{tmp}/window.tif"
     # cz>=8 reads a throwaway VRT of the halo-buffered tile set, so a render never waits on the
     # planet-wide GTI; cz<8 needs the GTI's planet-z8-COG fall-through. MOSAIC_GTI still wins.

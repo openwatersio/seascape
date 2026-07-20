@@ -22,6 +22,7 @@ real seam mitigation.)
 import json
 import os
 import shutil
+import tempfile
 import subprocess
 import sys
 from glob import glob
@@ -151,9 +152,7 @@ def tile(stem):
     import smooth
     z, x, y, child_z = (int(a) for a in stem.split("-"))
     out = f"store/contour/{stem}.fgb"
-    tmp = f"store/contour/{stem}-tmp"
-    shutil.rmtree(tmp, ignore_errors=True)
-    os.makedirs(tmp)
+    tmp = tempfile.mkdtemp(prefix=f"contour-{stem}-")  # local scratch; publish crosses to the store
     dem = mosaic.window_dem(stem, f"{tmp}/dem.tiff")
     if not os.environ.get("SKIP_SMOOTH"):
         smooth.smooth_tiff(dem)
