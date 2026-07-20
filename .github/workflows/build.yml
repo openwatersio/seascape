@@ -94,6 +94,20 @@ jobs:
       label: ${{ steps.runner.outputs.label }}
       server_id: ${{ steps.runner.outputs.server_id }}
     steps:
+      # The runner action takes a numeric SSH key ID only; resolve the friendlier key NAME
+      # in vars.HCLOUD_SSH_KEY (empty var -> "null" = no key).
+      - name: Resolve SSH key id
+        id: sshkey
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+          KEY_NAME: ${{ vars.HCLOUD_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          id=null
+          if [ -n "$KEY_NAME" ]; then
+            id=$(curl -fsS -H "Authorization: Bearer $HCLOUD_TOKEN"               "https://api.hetzner.cloud/v1/ssh_keys?name=$KEY_NAME" | jq -r '.ssh_keys[0].id // "null"')
+          fi
+          echo "id=$id" >> "$GITHUB_OUTPUT"
       - name: Create runner
         id: runner
         uses: Cyclenerd/hcloud-github-runner@v1.4.1
@@ -107,7 +121,7 @@ jobs:
           image: ${{ env.SERVER_IMAGE }}
           # Repo variable HCLOUD_SSH_KEY = an SSH key ID/name in the hcloud project; lets
           # operators (and Claude, via the build/box status below) ssh root@<ip> for live diagnosis.
-          ssh_key: ${{ vars.HCLOUD_SSH_KEY }}
+          ssh_key: ${{ steps.sshkey.outputs.id }}
           volume: "null"
       # The store volume holds the canonical stage-1 sources the build reads FROM — attached
       # for bbox smokes too: the build always reads the volume's catalogs and writes plain-named
