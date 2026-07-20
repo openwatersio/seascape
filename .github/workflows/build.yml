@@ -164,7 +164,7 @@ jobs:
           STATE=/mnt/seascape-store
           # Merge-job tmp dirs are transient (each job recreates its own); a killed run
           # strands them at planet width, which can fill the volume entirely.
-          rm -rf "$STATE"/store/aggregation/*-tmp
+          rm -rf "$STATE"/store/aggregation/*-tmp "$STATE"/store/mosaic/publish
           # Where the bytes live — first thing to read when the headroom guard trips.
           df -h "$STATE" | tail -1
           du -x -BG -d1 "$STATE/store" 2>/dev/null | sort -rn | head -12

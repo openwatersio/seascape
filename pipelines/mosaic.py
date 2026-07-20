@@ -403,6 +403,10 @@ def publish():
     utils.run_command(f"rclone copyto {pubdir}/{names['gti']} {dest}/{names['gti']} --retries 5",
                       silent=False)
 
+    # The staging dir pins the current tile inodes via hardlinks: left behind, a later
+    # re-merge strands whole superseded generations as sole-owner copies (~170 GB observed).
+    shutil.rmtree(pubdir, ignore_errors=True)
+
     print(f"mosaic publish: {len(features)} tiles staged, {len(new)} uploaded new, "
           f"{len(features) - len(new)} already present; candidate GTI "
           f"{public_base()}/mosaic/{names['gti']}", flush=True)
