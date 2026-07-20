@@ -6,3 +6,7 @@ cores: all
 # when unset, e.g. a laptop dry run).
 default-resources:
   mem_gb: 2
+# greedy over the default ILP selector: identical job ordering at our scales
+# (verified empirically), and the ILP's per-round solve melts down with ~10k ready
+# jobs (observed: 42 of 48 cores on the scheduler itself at planet scale).
+scheduler: greedy

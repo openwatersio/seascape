@@ -85,9 +85,7 @@ MERGE_FACTOR = 2.0
 
 
 def tile_weight(wc, input=None, attempt=None):
-    # x1000: make tile weight dominate the scheduler's packing objective, so heavy tiles aren't
-    # starved by count-maximizing selection of light ones (which re-creates the straggler tail).
-    return utils.weight(wc.stem, factor=MERGE_FACTOR) * 1000
+    return utils.weight(wc.stem, factor=MERGE_FACTOR)
 
 
 # One covering tile's merge, alone — the planet's memory hot spot, isolated in its own job.
