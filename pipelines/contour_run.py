@@ -159,7 +159,7 @@ def tile(stem):
     final = _contour_dem(dem, mercantile.Tile(x=x, y=y, z=z), child_z, tmp, stem)
     os.makedirs(os.path.dirname(out), exist_ok=True)
     if final:
-        os.replace(final, out)
+        utils.publish(final, out)  # scratch and store are separate filesystems
         print(f"contour tile {stem}: {feature_count(out)} features")
     else:
         open(out, "w").close()

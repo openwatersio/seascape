@@ -273,7 +273,7 @@ jobs:
               p=$(grep -oE "[0-9]+ of [0-9]+ steps" "$buildlog" | tail -1)
               [ -n "$p" ] || continue
               n=${p%% *}; m=${p##*of }; m=${m%% *}
-              run=$(( $(grep -cE "^(localrule|rule|checkpoint) " "$buildlog") - $(grep -c "^Finished jobid" "$buildlog") ))
+              run=$(( $(grep -oE "^    jobid: [0-9]+" "$buildlog" | sort -u | wc -l) - $(grep -oE "^Finished jobid: [0-9]+" "$buildlog" | sort -u | wc -l) ))
               # curl, not gh: the self-hosted box has no gh CLI. Failures land in the
               # artifact via heartbeat.log instead of /dev/null.
               curl -fsS -X POST -H "Authorization: Bearer $GH_TOKEN" \

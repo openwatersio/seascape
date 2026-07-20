@@ -188,7 +188,7 @@ def tile(stem):
     os.makedirs(os.path.dirname(out), exist_ok=True)
     if res:
         final, n = res
-        os.replace(final, out)
+        utils.publish(final, out)  # scratch and store are separate filesystems
         print(f"soundings tile {stem}: {n} points")
     else:
         open(out, "w").close()
