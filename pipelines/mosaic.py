@@ -433,13 +433,14 @@ def covering_stems(covering_path="store/aggregation/covering.txt"):
     return [s for s in stems if hits(s)]
 
 
-def intersecting_tiles(stem):
+def intersecting_tiles(stem, buffer_3857=None):
     """The covering stems whose tiles intersect this stem's BUFFERED bounds — the stage-3
     windowed-read input set. From the (BBOX-scoped) covering only, never the global GTI:
     a stem's tile jobs depend on their neighborhood, not on every tile."""
     z, x, y, _cz = (int(a) for a in stem.split("-"))
     l, b, r, t = aggregation_reproject.buffered_bounds(
-        mercantile.Tile(x=x, y=y, z=z), utils.macrotile_buffer_3857)
+        mercantile.Tile(x=x, y=y, z=z),
+        utils.macrotile_buffer_3857 if buffer_3857 is None else buffer_3857)
     out = []
     for s in covering_stems():
         sz, sx, sy, _scz = (int(a) for a in s.split("-"))

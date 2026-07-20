@@ -73,7 +73,14 @@ def _halo_px():
         smooth.DEM_SIGMA, smooth.DEM_SIGMA_DEEP, smooth.MASK_SIGMA))) + 1
 
 
-def _read_window(anchor, cz, halo, out_tif):
+def window_tiles(stem):
+    """The per-stem read set for cz>=8 renders: intersecting tiles buffered by the smooth halo
+    in meters at cz res — which outgrows the fixed macrotile buffer at coarse zooms."""
+    cz = int(stem.split("-")[3])
+    return mosaic.intersecting_tiles(stem, _halo_px() * aggregation_reproject.get_resolution(cz))
+
+
+def _read_window(anchor, cz, halo, out_tif, src=None):
     """Warp a buffered window of the mosaic — the anchor tile's 3857 bounds expanded by `halo`
     px on every side — to `out_tif` at zoom `cz` resolution, through the SYSTEM gdal. `-r average`
     (the anti-alias prefilter decimation needs): a decimated read picks
@@ -94,7 +101,7 @@ def _read_window(anchor, cz, halo, out_tif):
         f"GDAL_CACHEMAX=512 gdalwarp -q -overwrite -r average -t_srs EPSG:3857 "
         f"-tr {res} {res} -te {left} {bottom} {right} {top} -dstnodata {NODATA} "
         f"-of GTiff -co TILED=YES -co BLOCKXSIZE=512 -co BLOCKYSIZE=512 -co COMPRESS=ZSTD -co PREDICTOR=3 "
-        f"-co NUM_THREADS=ALL_CPUS {_q(gti_abspath())} {out_tif}",
+        f"-co NUM_THREADS=ALL_CPUS {_q(src or gti_abspath())} {out_tif}",
         f"terrain window {anchor.z}-{anchor.x}-{anchor.y}@z{cz}")
     return core, halo
 
@@ -136,10 +143,18 @@ def _render(stem, out_pmtiles):
     tmp = f"store/terrain-tmp/{stem}"
     utils.create_folder(tmp)
     window = f"{tmp}/window.tif"
+    # cz>=8 reads a throwaway VRT of the halo-buffered tile set, so a render never waits on the
+    # planet-wide GTI; cz<8 needs the GTI's planet-z8-COG fall-through. MOSAIC_GTI still wins.
+    src = None
+    if cz >= 8 and not os.environ.get("MOSAIC_GTI"):
+        src = f"{tmp}/window.vrt"
+        tiles = " ".join(mosaic.tile_artifact(s) for s in window_tiles(stem))
+        aggregation_reproject._run(f"gdalbuildvrt -q -overwrite -resolution highest {src} {tiles}",
+                                   f"terrain vrt {stem}")
     # The RAM peak the terrain_render rule reserves (build.smk mem_gb=weight) is here — the gdalwarp
     # window read + the smooth hold the multi-GB window array (a native macrotile window is 32768²
     # float32). The engine schedules one process per stem, so the cgroup cap bounds each in isolation.
-    core, halo = _read_window(anchor, cz, halo, window)
+    core, halo = _read_window(anchor, cz, halo, window, src)
     if not os.environ.get("SKIP_SMOOTH"):
         smooth.smooth_tiff(window)  # the ONE f(depth,zoom); halo makes interior identical to whole
 

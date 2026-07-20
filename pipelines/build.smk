@@ -78,10 +78,9 @@ MERGE_CFG = json.dumps({
 }, sort_keys=True)
 
 
-# factor 2.0, not utils.DEFAULT_FACTOR (4): the merge job holds only the merged array +
-# reprojected sources, not the vector forks. z13 peaks ~2.3 GB, z14 ~4-6 GB. Re-fit from
-# the scratch bench/mosaic/ (the benchmark artifact).
-MERGE_FACTOR = 2.0
+# The merge job holds only the merged array + reprojected sources, not the vector forks:
+# corpus max 6.5 GB on a 4.3 GB-weight z14, so 1.5x reserves 6.75 GB; retries escalate.
+MERGE_FACTOR = 1.5
 
 
 def tile_weight(wc, input=None, attempt=None):
@@ -175,11 +174,11 @@ SMOOTH_CFG = json.dumps({} if os.environ.get("SKIP_SMOOTH") else {
     "depth_smooth": smooth.DEPTH_SMOOTH, "block": smooth.BLOCK}, sort_keys=True)
 
 
-# Fork reservations by child_z, fitted from benchmark max-RSS with ~40% margin (dense z14
-# tiles peak ~5-9.5 GB); retries escalate. Re-fit from the scratch bench/ as the corpus grows.
-CONTOUR_GB = {14: 13, 13: 5}
-SOUND_GB = {14: 8, 13: 3}
-DEPARE_GB = {14: 8, 13: 4}
+# Fork reservations by child_z, fitted to the benchmark corpus (11k rows): footprints are
+# deterministic (p95 == max), so reserve measured max + ~10%; retries escalate via `attempt`.
+CONTOUR_GB = {14: 10, 13: 4}
+SOUND_GB = {14: 6, 13: 3}
+DEPARE_GB = {14: 6, 13: 4}
 
 
 def _fork_gb(table, default):
@@ -201,6 +200,8 @@ rule contour_tile:
         levels=json.dumps({"m": pipeline_config.CONTOUR_LEVELS, "ft": pipeline_config.CONTOUR_LEVELS_FT}),
         nav=contour_run.NAV_SMOOTH_MAX_M, deep=contour_run.DEEP_CUTOFF_M,
         ring=contour_run.MIN_RING_AREA_M2, smooth=SMOOTH_CFG,
+    priority: tile_weight  # heavy-first; greedy backfills lighter ready jobs into the rest of the budget
+    retries: 2
     resources:
         mem_gb=_fork_gb(CONTOUR_GB, 3)
     benchmark:
@@ -219,6 +220,8 @@ rule soundings_tile:
     params:
         cell=soundings_run.SOUND_CELL_PX, min_depth=soundings_run.SOUND_MIN_DEPTH_M,
         smooth=SMOOTH_CFG,
+    priority: tile_weight  # heavy-first; greedy backfills lighter ready jobs into the rest of the budget
+    retries: 2
     resources:
         mem_gb=_fork_gb(SOUND_GB, 2)
     benchmark:
@@ -240,6 +243,8 @@ rule depare_tile:
     params:
         levels=json.dumps({"m": pipeline_config.DEPARE_LEVELS, "ft": pipeline_config.DEPARE_LEVELS_FT}),
         drying=pipeline_config.DRYING_CAP, sliver=depare_run.SLIVER_MIN_PX, smooth=SMOOTH_CFG,
+    priority: tile_weight  # heavy-first; greedy backfills lighter ready jobs into the rest of the budget
+    retries: 2
     resources:
         mem_gb=_fork_gb(DEPARE_GB, 3)
     benchmark:
@@ -250,18 +255,29 @@ rule depare_tile:
         "{PY}/depare_run.py tile {wildcards.stem} 2> {log}"
 
 
-# Terrain reads windows through the LOCAL GTI, so it gates on mosaic_index (a per-stem VRT
-# would restore stage-2/3 pipelining for native stems). Weight like the merge:
-# a native z14 window is the same array size; overview stems are tiny.
+# Weight like the merge: a native z14 window is the same array size; overview stems are tiny.
+TERRAIN_FACTOR = 2.0  # native renders unproven at scale (corpus n=1); keep the wide margin
+
+
+def terrain_inputs(wc):
+    """cz>=8 renders read a per-stem VRT of their halo-buffered tile set, so they run the
+    moment their neighborhood merges; cz<8 needs the GTI's planet-z8-COG fall-through."""
+    if int(wc.stem.split("-")[3]) >= 8:
+        return [f"store/mosaic/tiles/{s}.tif" for s in terrain_mod.window_tiles(wc.stem)]
+    return rules.mosaic_index.output
+
+
 rule terrain_render:
     input:
-        rules.mosaic_index.output
+        terrain_inputs
     output:
         "store/pmtiles/{stem}.pmtiles"
+    priority: tile_weight  # heavy-first; greedy backfills lighter ready jobs into the rest of the budget
     params:
         cfg=json.dumps(terrain_mod._config(), sort_keys=True),
     resources:
-        mem_gb=lambda wc, attempt: utils.weight(wc.stem, factor=MERGE_FACTOR) * attempt
+        mem_gb=lambda wc, attempt: utils.weight(wc.stem, factor=TERRAIN_FACTOR) * attempt,
+        disk_mb=lambda wc: utils.weight(wc.stem, factor=TERRAIN_FACTOR) * 1024,
     benchmark:
         f"{TMP}/bench/terrain/{{stem}}.tsv"
     log:
