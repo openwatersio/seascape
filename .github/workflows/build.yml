@@ -213,6 +213,17 @@ jobs:
           need_gb=100; [ -n "$BBOX" ] && need_gb=50
           free_gb=$(df -BG --output=avail "$STATE" | tail -1 | tr -dc '0-9')
           [ "$free_gb" -ge "$need_gb" ] || { echo "only ${free_gb}G free on the store volume (need ${need_gb}G) — GC or resize first" >&2; exit 1; }
+          # Swap SAFETY NET on the LOCAL NVMe root disk (never the store volume) — insurance,
+          # not headroom: the mem_gb budget stays sized to physical RAM, and reservations sit
+          # ~10% over measured max, so this only turns a rare over-peak from an arbitrary
+          # OOM kill into a brief spill. swappiness=10 keeps the working set in RAM.
+          if [ ! -e /swapfile ]; then
+            fallocate -l 64G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=65536
+            chmod 600 /swapfile
+            mkswap /swapfile
+            swapon /swapfile
+            sysctl vm.swappiness=10
+          fi
           # Global budget: RAM minus a reserve (OS + Snakemake + curl/VSI caches +
           # page-cache headroom) that SCALES with the box — an eighth of RAM, floor 4 GB:
           # ccx33 -> 28 GB budget (sources.yml's proven number), ccx63 -> 168 GB. A flat
@@ -242,13 +253,20 @@ jobs:
           buildlog=/var/tmp/build-progress.log
           : > "$buildlog"
           ( while sleep 60; do
+              # memory/swap time series (Hetzner's metrics API has neither) — logs/ ships in the artifact
+              mkdir -p "$TMP/logs"
+              free -m | awk -v t="$(date -u +%FT%TZ)" 'NR==2{u=$3;a=$7} NR==3{print t" used_mb="u" avail_mb="a" swap_used_mb="$3}' \
+                >> "$TMP/logs/memory.log" || true
               p=$(grep -oE "[0-9]+ of [0-9]+ steps" "$buildlog" | tail -1)
               [ -n "$p" ] || continue
               n=${p%% *}; m=${p##*of }; m=${m%% *}
-              gh api "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" -f state=pending \
-                -f context=build/progress -f description="$p ($((n * 100 / m))%)" \
-                -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-                >/dev/null 2>&1 || true
+              # curl, not gh: the self-hosted box has no gh CLI. Failures land in the
+              # artifact via heartbeat.log instead of /dev/null.
+              curl -fsS -X POST -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+                -d "{\"state\":\"pending\",\"context\":\"build/progress\",\"description\":\"$p ($((n * 100 / m))%)\",\"target_url\":\"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\"}" \
+                >/dev/null 2>>"$TMP/logs/heartbeat.log" || true
             done ) &
           hb=$!
           trap 'kill "$hb" 2>/dev/null || true' EXIT
