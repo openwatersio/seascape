@@ -10,3 +10,6 @@ default-resources:
 # (verified empirically), and the ILP's per-round solve melts down with ~10k ready
 # jobs (observed: 42 of 48 cores on the scheduler itself at planet scale).
 scheduler: greedy
+# Engine triggers match the declared policy: code changes are force-only (-R/-F),
+# never auto-invalidation — a shell-string edit must not re-merge the planet.
+rerun-triggers: [mtime, params, input, software-env]

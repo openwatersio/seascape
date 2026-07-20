@@ -219,6 +219,9 @@ jobs:
           # so the extra width goes to light deep-ocean tiles backfilling blocked IO time.
           # Same knob sources.yml uses for its fetches (16 on 8 vCPUs).
           cores=$(( $(nproc) * 2 ))
+          # Jobs declare disk_mb for their tmp working set; budget it against the volume's
+          # real free space (80%) so concurrent merge tmps can't overflow the store.
+          disk_budget_mb=$(( $(df -BM --output=avail /mnt/seascape-store | tail -1 | tr -dc '0-9') * 8 / 10 ))
           echo "box: ${total_gb} GB RAM, --cores ${cores} -> budget ${budget_gb} GB (reserve ${reserve_gb} GB)"
           force=()
           if [ "$INPUT_FORCE" = "true" ]; then force=(-F); fi
@@ -244,7 +247,7 @@ jobs:
           trap 'kill "$hb" 2>/dev/null || true' EXIT
           ./docker.sh snakemake -s pipelines/build.smk bundles publish "${extra[@]}" "${force[@]}" \
             --keep-going --rerun-incomplete \
-            --cores "$cores" --resources mem_gb="$budget_gb" \
+            --cores "$cores" --resources mem_gb="$budget_gb" disk_mb="$disk_budget_mb" \
             --config workdir=/app/state tmp=/app/tmp 2>&1 | tee "$buildlog"
       # Per-job wall/CPU/max-RSS from the benchmark: directives, plus per-job stderr logs —
       # both live in the box's local-disk scratch (TMP), the durable home is this artifact.
