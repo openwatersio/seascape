@@ -276,6 +276,9 @@ def _check():
         utils.run_command(f"gdal_translate -q -of COG -a_nodata {NODATA} -co RESAMPLING=AVERAGE "
                           f"-co OVERVIEW_RESAMPLING=AVERAGE -co BLOCKSIZE=512 {raw} {cog}")
         os.remove(raw)
+        os.makedirs("store/aggregation")
+        with open("store/aggregation/covering.txt", "w") as f:
+            f.write(stem + "\n")  # window_tiles resolves the cz>=8 VRT read set from the covering
         # a minimal GTI over the one tile (absolute location; a real build's mosaic.py writes this)
         gj = {"type": "FeatureCollection", "features": [{"type": "Feature", "properties": {
             "location": os.path.abspath(cog), "resx": res, "resy": res},
