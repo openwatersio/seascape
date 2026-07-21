@@ -379,7 +379,10 @@ def clamp_positive_ocean(cog_path, mask_tif, water_tif=None):
     mask==0) AND outside mapped inland water, set it to 0. A coarse global source's shoreline cells
     read slightly positive just seaward of the land line (a ~460 m cell straddling the coast); left
     raw they fabricate drying foreshore in the depare/drying bucket, which reads the UNCLAMPED
-    mosaic in (0, DRYING_CAP]. Clamp to 0 (chart datum at the shoreline, NOT nodata — the ocean has
+    mosaic in (0, DRYING_CAP]. The one deliberate deep-ward move in the pipeline: it bets the true
+    seabed under a coarse coastal cell is subtidal, and where a flagged source is the sole coverage
+    of a macrotidal coast, genuine intertidal signal degrades to unknown-depth water (both read
+    non-safe-water). Clamp to 0 (chart datum at the shoreline, NOT nodata — the ocean has
     a real depth here, just not one a coarse land cell can assert), so the pixel drops out of the
     strictly-positive drying bucket. Keys on the combined land mask for 'not land'; the water-only
     mask (rasterize_water) excludes inland water, whose positive is the #24 case that

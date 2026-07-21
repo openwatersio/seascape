@@ -652,12 +652,14 @@ export function applyState(
 }
 
 // Chart-datum elevation at a point, in metres — a rendered DEM sample, not a
-// categorical classification. `v < 0` is depth (shallow-biased); `v > DRYING_CAP`
-// is land / out of scope (a zoom-varying sentinel, not a measured height); `v == 0`
-// is water of unknown depth (ENC UNSARE); `0 < v <= DRYING_CAP` needs the depare
-// layer to tell genuine drying foreshore from shoreline and interpolation samples —
-// consult depare before presenting a non-negative value as drying height. Returns
-// null if the tile is unavailable. Decodes the Terrarium DEM pixel directly, at
+// categorical classification. `v < 0` is depth (shallow-biased encoding; the datum
+// is per-source — ≈MSL sources read deep vs a low-water chart datum until datum
+// unification); `v > DRYING_CAP` is land / out of scope (a zoom-varying sentinel,
+// not a measured height); `v == 0` is water of unknown depth (ENC UNSARE);
+// `0 < v <= DRYING_CAP` needs the depare layer to tell genuine drying foreshore
+// from shoreline and interpolation samples — consult depare before presenting a
+// non-negative value as drying height. Returns null only on a fetch failure: the
+// Worker serves the land sentinel for missing tiles, so those read as land. Decodes the Terrarium DEM pixel directly, at
 // native resolution — unlike queryTerrainElevation, which needs 3D terrain enabled
 // and samples the coarse terrain mesh (it reads land over deep water near the
 // coast). Browser-only (createImageBitmap / OffscreenCanvas).

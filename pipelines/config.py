@@ -27,8 +27,10 @@ CONTOUR_LEVELS = [int(x) for x in os.environ.get("CONTOUR_LEVELS", _CONTOUR_LEVE
 
 # Drying areas (green foreshore): seabed above chart datum that covers/uncovers with the tide —
 # elevation in [0, DRYING_CAP] seaward of the OSM land line. The cap anchors to the global maximum
-# of HAT-LAT, the highest ground that still floods and dries (~17 m Bay of Fundy/Burntcoat Head;
-# Ungava ~16; Bristol Channel ~15). Two inherent biases: over-inclusion on low-MHW coasts (bluff
+# of HAT-LAT, the highest ground that still floods and dries (~16.3-17 m Bay of Fundy/Burntcoat
+# Head; Ungava ~16.8; Bristol Channel ~15). 16 is deliberately the round value just below that
+# extreme tail: genuine 16-17 m drying at the two or three most extreme sites classifies as land.
+# Two inherent biases: over-inclusion on low-MHW coasts (bluff
 # toes up to the cap tint as foreshore) and under-inclusion of the MHW-HAT band in mega-tidal
 # estuaries (it sits on OSM's land side). A spatially-varying HAT-LAT surface fixes the classifier;
 # the terrain sentinel only needs to exceed the planetary maximum, so it stays a global constant.

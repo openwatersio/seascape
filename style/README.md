@@ -63,9 +63,9 @@ builder if you manage the paint property yourself.
 
 ## Depth readout
 
-`readDepth(tilesBase, lngLat, zoom)` → the decoded Terrarium DEM sample in metres (`null` on a tile miss), read at native resolution. The published DEM is a depth product, not a topo map — decoded value `v`:
+`readDepth(tilesBase, lngLat, zoom)` → the decoded Terrarium DEM sample in metres (`null` only on a fetch failure — the Worker serves the land sentinel for missing tiles, so those read as land), read at native resolution. The published DEM is a depth product, not a topo map — decoded value `v` (thresholds are `DRYING_CAP`, currently 16):
 
-- `v < 0` — chart-datum elevation below datum; `-v` is shallow-biased charted depth on measured water.
+- `v < 0` — elevation below the winning source's datum; `-v` is charted depth on measured water. The encoding is shallow-biased; the datum is per-source (≈MSL sources read deep vs a low-water chart datum until datum unification).
 - `v == 0` — water present, **depth unknown** (ENC `UNSARE` analogue), not a measured depth of ~0.
 - `0 < v ≤ 16` — a non-submerged sample: genuine drying foreshore, or a transition value from smoothing/overzoom interpolation. Consult the `depare` layer before presenting it as drying height.
 - `v > 16` — **land / out of scope**: a synthetic sentinel (the pipeline clamps land to `DRYING_CAP + 1`; the Worker also serves it for missing tiles), not measured elevation.
