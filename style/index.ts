@@ -112,10 +112,13 @@ const DEFAULT_GLYPHS =
 // shallower than the safety depth is painted into the ramp itself.
 type RampStops = (number | string)[]; // alternating elevation, colour
 
-// Terrarium's vertical LSB. The encoder clamps water to <= -LSB and the terrain render nudges
-// land-side exact-0 pixels to +LSB, so decoded 0 is water of unknown depth (ENC UNSARE): the
-// shoal tint runs flat to -LSB, 0 is the unknown-water tint, and land starts at +LSB.
+// Terrarium's vertical LSB. The encoder clamps water to <= -LSB; the non-negative domain is
+// categorical (0 unknown-depth water, 1 drying foreshore, 2 land — flat codes, exact at every
+// zoom): the shoal tint runs flat to -LSB, then the code tints; fractional values between codes
+// are overzoom/interpolation transitions and blend smoothly.
 const LSB = 1 / 256;
+const DRYING_CODE = 1;
+const LAND_CODE = 2;
 
 // Width (metres) of the normal→hazard colour transition at the safety depth.
 const EDGE = 0.01;
@@ -125,7 +128,8 @@ const depthRamp = (flavor: Flavor, edges: number[]): RampStops => {
   edges.forEach((d, i) =>
     stops.push(-d - 0.1, flavor.bandColors[i], -d, flavor.bandColors[i + 1]),
   );
-  stops.push(-LSB, flavor.bandColors[5], 0, flavor.nodata, LSB, flavor.land);
+  stops.push(-LSB, flavor.bandColors[5], 0, flavor.nodata,
+             DRYING_CODE, flavor.drying, LAND_CODE, flavor.land);
   return stops;
 };
 
@@ -181,7 +185,9 @@ export function depthRelief(
       flavor.hazard,
       0,
       flavor.nodata,
-      LSB,
+      DRYING_CODE,
+      flavor.drying,
+      LAND_CODE,
       flavor.land,
     );
   return [
@@ -651,15 +657,14 @@ export function applyState(
   }
 }
 
-// Chart-datum elevation at a point, in metres — a rendered DEM sample, not a
-// categorical classification. `v < 0` is depth (shallow-biased encoding; the datum
-// is per-source — ≈MSL sources read deep vs a low-water chart datum until datum
-// unification); `v > DRYING_CAP` is land / out of scope (a zoom-varying sentinel,
-// not a measured height); `v == 0` is water of unknown depth (ENC UNSARE);
-// `0 < v <= DRYING_CAP` needs the depare layer to tell genuine drying foreshore
-// from shoreline and interpolation samples — consult depare before presenting a
-// non-negative value as drying height. Returns null only on a fetch failure: the
-// Worker serves the land sentinel for missing tiles, so those read as land. Decodes the Terrarium DEM pixel directly, at
+// Chart-datum elevation at a point, in metres. `v < 0` is depth (shallow-biased
+// encoding; the datum is per-source — ≈MSL sources read deep vs a low-water chart
+// datum until datum unification). The non-negative domain is categorical: 0 water
+// of unknown depth (ENC UNSARE), 1 drying foreshore (height not carried — depare
+// drval bands are the only drying-height source), 2 land. Fractions between codes
+// are overzoom/interpolation transitions — round to the nearest code or consult
+// depare. Returns null only on a fetch failure: the Worker serves the land code
+// for missing tiles, so those read as land. Decodes the Terrarium DEM pixel directly, at
 // native resolution — unlike queryTerrainElevation, which needs 3D terrain enabled
 // and samples the coarse terrain mesh (it reads land over deep water near the
 // coast). Browser-only (createImageBitmap / OffscreenCanvas).

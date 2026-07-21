@@ -238,19 +238,19 @@ async function landFallbackEtag(): Promise<string> {
   return landEtagCache;
 }
 
-// Missing-tile fill: the land sentinel, decoded v > DRYING_CAP ⇒ land. Must exceed
-// the pipeline's DRYING_CAP (16); 0 would read as unknown-depth WATER under the
-// published contract.
-const LAND_SENTINEL = 17;
+// Missing-tile fill: the land code (published raster codes: 0 unknown-depth water,
+// 1 drying, 2 land — pipelines/terrain.py). 0 would read as unknown-depth WATER
+// under the published contract.
+const LAND_SENTINEL = 2;
 
 let landFallbackCache: ArrayBuffer | undefined;
 async function _makeLandFallbackTile(): Promise<ArrayBuffer> {
-  // Terrarium +17 m — the land sentinel, which the depth ramp paints as the land
+  // Terrarium +2 m — the land code, which the depth ramp paints as the land
   // wash. A missing tile degrades to land rendering, never to phantom water
   // (Terrarium has no transparency to degrade to).
   await ensureCodec();
   const out = new Uint8ClampedArray(TILE * TILE * 4);
-  const packed = LAND_SENTINEL + 32768; // 32785 → R=128, G=17, B=0
+  const packed = LAND_SENTINEL + 32768; // 32770 → R=128, G=2, B=0
   for (let k = 0; k < TILE * TILE; k++) {
     out[k * 4] = packed >> 8;
     out[k * 4 + 1] = packed & 0xff;

@@ -102,14 +102,14 @@ A full build (`planet`) lands in `pipelines/store/bundle/`:
 
 ### The published-raster contract
 
-The Terrarium-decoded DEM (`readDepth` returns exactly this) is a continuous rendering surface, not a categorical classification. For decoded value `v` (metres):
+The Terrarium-decoded DEM (`readDepth` returns exactly this) carries depth in its negative domain and three flat category codes in its non-negative domain. For decoded value `v` (metres):
 
 - `v < 0` — elevation below the winning source's datum; on measured water pixels `-v` is the charted depth. The *encoding* is shallow-biased (quantize never deepens a value). The *datum* is per-source: LAT/MLLW where those sources win, but GEBCO/EMODnet are ≈MSL — which sits **above** any low-water datum — so their depths read **deep** vs a proper chart datum by the local MSL−LAT separation (0.1–0.5 m micro-tidal, 2–8 m macro-tidal) until datum unification.
-- `v > DRYING_CAP` — definitely **land / out of scope.** A sentinel the terrain render clamps land to (nominally `DRYING_CAP+1`, though the decoded value varies with zoom quantization — ceil rounding lifts +17 to +18 at coarse zooms), not measured elevation.
-- `v == 0` — water present, **depth unknown** (ENC `UNSARE` analogue), not a measured depth of approximately zero. The render nudges land-side exact-0 pixels to `+LSB`, so decoded 0 is unambiguously water.
-- `0 < v ≤ DRYING_CAP` — a non-submerged sample. The `depare` layer distinguishes genuine drying foreshore from shoreline and from values introduced by smoothing or overzoom interpolation.
+- `v == 0` — water present, **depth unknown** (ENC `UNSARE` analogue), not a measured depth of approximately zero.
+- `v == 1` — **drying foreshore** (seabed in `(0, DRYING_CAP]` seaward of the land line): covers and uncovers with the tide. The drying *height* is not carried — the `depare` layer's `drval` bands are the only drying-height source.
+- `v == 2` — **land / out of scope.** Not measured elevation; the terrain render classifies all land here (and the Worker serves it for missing tiles), so hillshade finds no slope on land — no fake topo relief, no halo ring at unknown-depth lakes.
 
-Raster values form a continuous rendering surface; `depare` supplies the categorical water/drying/unknown distinction — consult it before presenting a non-negative `v` as drying height.
+The codes are exact multiples of the quantize floor, so they decode exactly at every zoom. Values *between* codes are smoothing/overzoom interpolation transitions — round to the nearest code, or consult `depare` for the categorical truth.
 
 ### Why a planet cap + grid overlays
 

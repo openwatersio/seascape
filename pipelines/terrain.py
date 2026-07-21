@@ -43,7 +43,6 @@ import sys
 import mercantile
 import numpy as np
 import rasterio
-from scipy.ndimage import distance_transform_edt
 
 import aggregation_reproject
 import config
@@ -119,9 +118,11 @@ def _q(path):
 
 # ── render one stem ────────────────────────────────────────────────────────────────────────────
 
-FEATHER_PX = 4  # sentinel-edge ramp width (px): hillshade renders the 0->sentinel step at every
-                # 0-filled inland water polygon as a halo; ramping the plateau over a few px
-                # softens it. Touches ONLY plateau pixels — never water, never genuine low land.
+# The published raster carries depth only: `v < 0` is bathymetry, and the non-negative domain is
+# three flat codes — 0 unknown-depth water, 1 drying foreshore, 2 land. Flat codes have no slope,
+# so client hillshade shows nothing on land (no halo ring at 0-filled lakes, no fake topo relief);
+# all three are exact multiples of the 0.25 m quantize floor, so they decode exactly at every zoom.
+UNKNOWN, DRYING, LAND = 0.0, 1.0, 2.0
 
 
 def _encode_tile(i, j, src_path, halo, out_webp, cz, mask_path=None):
@@ -129,10 +130,9 @@ def _encode_tile(i, j, src_path, halo, out_webp, cz, mask_path=None):
     interior starts at `halo`; nodata (a build-edge hole the mosaic legitimately carries — GEBCO
     fills the ocean, so this is only the beyond-build fringe) resolves to 0 for the served render,
     which has no transparency."""
-    pad = min(FEATHER_PX, halo)  # padded read makes the feather seam-exact; the halo bounds it
-    col = i * 512 + halo - pad
-    row = j * 512 + halo - pad
-    win = rasterio.windows.Window(col, row, 512 + 2 * pad, 512 + 2 * pad)
+    col = i * 512 + halo
+    row = j * 512 + halo
+    win = rasterio.windows.Window(col, row, 512, 512)
     with rasterio.open(src_path) as src:
         data = src.read(1, window=win)
         dims = (src.height, src.width)
@@ -142,22 +142,22 @@ def _encode_tile(i, j, src_path, halo, out_webp, cz, mask_path=None):
     # value, and shoaling it is the conservative choice. (In practice this is only the beyond-build
     # fringe; true interior holes don't occur while GEBCO blankets the planet.)
     data[data == NODATA] = 0
+    pos = data > 0
     if mask_path is not None:
         with rasterio.open(mask_path) as m:
             if (m.height, m.width) != dims:  # same guard as the landmask clamps
                 raise ValueError(f"land mask {(m.height, m.width)} != window {dims} for {src_path}")
             land = m.read(1, window=win) == 1
-        data[(data == 0) & land] = encode.LSB  # land-side exact-0 -> land; 0 over water stays water
-    np.minimum(data, config.DRYING_CAP + 1, out=data)  # sentinel: decoded v > DRYING_CAP => land
-    plateau = data > config.DRYING_CAP
-    if plateau.any() and (data <= 0).any():
-        # Feather: ramp the plateau to 0 over FEATHER_PX px of distance to the nearest <=0 pixel.
-        # Ramp values land in (0, cap] — transition samples per the contract, depare authoritative.
-        dist = distance_transform_edt(data > 0)
-        np.minimum(data, dist * ((config.DRYING_CAP + 1) / FEATHER_PX),
-                   out=data, where=plateau)
-    if pad:
-        data = data[pad:-pad, pad:-pad]
+        # Water-side (0, cap] is genuine drying — the 4th-quadrant clamp zeroed coarse fakes at
+        # warp, so only trusted-source foreshore survives there. Everything else positive (land
+        # topo, land-side lowland, tall unmapped rock over water) is land, as is land-side exact-0
+        # (clamped polders); water-side exact-0 stays the unknown code.
+        drying = pos & ~land & (data <= config.DRYING_CAP)
+        data[pos] = LAND
+        data[drying] = DRYING
+        data[(data == 0) & land] = LAND
+    else:
+        data[pos] = LAND  # maskless (coarse stems / no feed): drying is sub-pixel there anyway
     utils.save_terrarium_tile(data, out_webp)  # utils parses zoom from the {cz}-{x}-{y}.webp name
 
 
@@ -374,13 +374,15 @@ def _check():
         assert len(wet) and abs(float(np.median(wet)) - (-30.0)) < 3.0, \
             f"overview served depth must track the mosaic (-30 m), median {np.median(wet):.1f}"
 
-        # _encode_tile's render-path steps (sentinel + land-0 nudge + edge feather). A one-tile
-        # window with a 20x20 land-topo block, a land-side 0, and a water-side 0, plus a matching
-        # land mask: interior land decodes sentinel > DRYING_CAP, the block's water-facing rim
-        # feathers into (0, DRYING_CAP], nudged land-0 stays strictly positive, water-0 exactly 0.
+        # _encode_tile's render-path classification. A window with a land-topo block, a land-side
+        # lowland, a land-side 0, a water-side drying height, and a water-side 0, plus a matching
+        # land mask: every non-negative pixel decodes to its exact code at this zoom — land topo,
+        # land lowland, and land-0 all 2; water-side (0, cap] exactly 1; water-side 0 exactly 0 —
+        # and measured depth passes through untouched.
         win = np.full((512, 512), -30.0, dtype="float32")
-        win[100:120, 100:120] = 5000.0  # land topo block; rim feathers, interior keeps the sentinel
-        win[0, 1], win[1, 0] = 0.0, 0.0  # land-side 0, water-side 0
+        win[100:120, 100:120] = 5000.0  # land topo block
+        win[0, 0], win[0, 1], win[1, 0] = 12.0, 0.0, 0.0  # land lowland, land-side 0, water-side 0
+        win[5, 5] = 4.0  # water-side drying height (trusted-source foreshore)
         wt, mkt = f"{d}/win.tif", f"{d}/winmask.tif"
         wtr = from_origin(b.left, b.top, res, res)
         with rasterio.open(wt, "w", driver="GTiff", height=512, width=512, count=1, dtype="float32",
@@ -388,19 +390,19 @@ def _check():
             dst.write(win, 1)
         mk = np.zeros((512, 512), dtype="uint8")
         mk[100:120, 100:120] = 1
-        mk[0, 1] = 1  # land at the topo block + land-side-0 pixel; water (0) everywhere else
+        mk[0, 0], mk[0, 1] = 1, 1  # land at the topo block + lowland + land-0; water elsewhere
         with rasterio.open(mkt, "w", driver="GTiff", height=512, width=512, count=1, dtype="uint8",
                            crs="EPSG:3857", transform=wtr) as dst:
             dst.write(mk, 1)
         _encode_tile(0, 0, wt, 0, f"{cz}-0-0.webp", cz, mkt)
         with open(f"{cz}-0-0.webp", "rb") as f:
             dec = encode.decode(imagecodecs.webp_decode(f.read()).astype("float32"))
-        assert dec[110, 110] > config.DRYING_CAP, \
-            ("interior sentinel land must decode > DRYING_CAP", dec[110, 110])
-        assert 0.0 < dec[100, 100] <= config.DRYING_CAP, \
-            ("water-facing rim must feather into (0, DRYING_CAP]", dec[100, 100])
-        assert dec[0, 1] > 0.0, ("land-side 0 must nudge strictly positive", dec[0, 1])
-        assert dec[1, 0] == 0.0, ("water-side 0 must stay exactly 0", dec[1, 0])
+        assert dec[110, 110] == LAND and dec[0, 0] == LAND and dec[0, 1] == LAND, \
+            ("land topo / lowland / land-0 must all decode the exact land code",
+             dec[110, 110], dec[0, 0], dec[0, 1])
+        assert dec[5, 5] == DRYING, ("water-side (0, cap] must decode the drying code", dec[5, 5])
+        assert dec[1, 0] == UNKNOWN, ("water-side 0 must stay exactly 0", dec[1, 0])
+        assert abs(dec[200, 200] - (-30.0)) < 0.5, ("measured depth must pass through", dec[200, 200])
         print("terrain.py self-check ok")
     finally:
         os.chdir(cwd)

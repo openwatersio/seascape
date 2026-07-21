@@ -32,8 +32,9 @@ CONTOUR_LEVELS = [int(x) for x in os.environ.get("CONTOUR_LEVELS", _CONTOUR_LEVE
 # extreme tail: genuine 16-17 m drying at the two or three most extreme sites classifies as land.
 # Two inherent biases: over-inclusion on low-MHW coasts (bluff
 # toes up to the cap tint as foreshore) and under-inclusion of the MHW-HAT band in mega-tidal
-# estuaries (it sits on OSM's land side). A spatially-varying HAT-LAT surface fixes the classifier;
-# the terrain sentinel only needs to exceed the planetary maximum, so it stays a global constant.
+# estuaries (it sits on OSM's land side). A spatially-varying HAT-LAT surface is the upgrade path.
+# Purely a classifier: it bounds the depare drying bucket and the terrain render's drying code —
+# the published raster carries category codes (0/1/2), never the cap itself.
 DRYING_CAP = float(os.environ.get("DRYING_CAP", "16"))
 
 # Feet/fathom isobaths: a second contour set at the classic fathom curves. Friendly feet depths
