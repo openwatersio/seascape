@@ -63,11 +63,14 @@ builder if you manage the paint property yourself.
 
 ## Depth readout
 
-`readDepth(tilesBase, lngLat, zoom)` → chart-datum elevation in metres
-(negative below datum, positive above; `null` on a tile miss), decoded from
-the Terrarium DEM tile pixel at native resolution. Use it instead of
-`queryTerrainElevation`, which needs 3D terrain enabled and samples a coarse
-mesh that reads land over deep water near coasts. Browser-only.
+`readDepth(tilesBase, lngLat, zoom)` → the decoded Terrarium DEM sample in metres (`null` on a tile miss), read at native resolution. The published DEM is a depth product, not a topo map — decoded value `v`:
+
+- `v < 0` — chart-datum elevation below datum; `-v` is shallow-biased charted depth on measured water.
+- `v == 0` — water present, **depth unknown** (ENC `UNSARE` analogue), not a measured depth of ~0.
+- `0 < v ≤ 16` — a non-submerged sample: genuine drying foreshore, or a transition value from smoothing/overzoom interpolation. Consult the `depare` layer before presenting it as drying height.
+- `v > 16` — **land / out of scope**: a synthetic sentinel (the pipeline clamps land to `DRYING_CAP + 1`; the Worker also serves it for missing tiles), not measured elevation.
+
+Use it instead of `queryTerrainElevation`, which needs 3D terrain enabled and samples a coarse mesh that reads land over deep water near coasts. Browser-only.
 
 ```js
 map.on("click", async (e) => {
