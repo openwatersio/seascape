@@ -73,6 +73,13 @@ jobs:
             --exclude 'contour-shards/**' --exclude 'bundle-frags/**' \
             --exclude 'manifest.json'
           rclone copyto "$src/manifest.json" "$dst/manifest.json"
+          # Promote the build's mosaic candidate to the serving pointer (the build never
+          # writes mosaic.gti). Older manifests lack the key — skip silently.
+          gti=$(rclone cat "$src/manifest.json" | jq -r '.mosaic_gti // empty')
+          if [ -n "$gti" ]; then
+            echo "promoting mosaic pointer: $gti → mosaic.gti"
+            rclone copyto "R2:$DATA_BUCKET/bathymetry/mosaic/$gti"               "R2:$DATA_BUCKET/bathymetry/mosaic/mosaic.gti"
+          fi
       - name: Prune old releases (keep newest 3)
         run: |
           # Count-based retention (current + 2 rollback targets), ordered by each

@@ -411,6 +411,19 @@ def _stage_publish():
     return pubdir, features, names
 
 
+def candidate_gti_name():
+    """The candidate GTI object name for the CURRENT local store, computed without staging:
+    the same location list + public-base hash _stage_publish mints. stage_build embeds this in
+    the release manifest so release.yml can promote the matching pointer to mosaic.gti."""
+    cache = _HashCache()
+    locations = sorted(
+        f"/vsicurl/{public_base()}/mosaic/tiles/{stem}-{cache.hash12(tile_artifact(stem))}.tif"
+        for stem in _stable_stems())
+    cache.save()
+    idxhash = hashlib.sha256("\n".join(locations + [public_base()]).encode()).hexdigest()[:12]
+    return f"mosaic-candidate-{idxhash}.gti"
+
+
 def _publish_guard():
     """rclone + R2 creds are required — publish runs on the box only."""
     if shutil.which("rclone") is None:

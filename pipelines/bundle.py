@@ -257,8 +257,15 @@ def stage_build(bundle_dir="store/bundle"):
     if stale:
         print(f"stage-build: ignoring {len(stale)} stale overlay file(s) not in the current "
               f"inventory, e.g. {[os.path.basename(s) for s in stale[:3]]}")
+    # release.yml promotes this candidate to the serving mosaic.gti after archive promotion
+    try:
+        mosaic_gti = mosaic.candidate_gti_name()
+    except (SystemExit, OSError):
+        mosaic_gti = None
+        print("stage-build: no complete local mosaic — manifest ships without mosaic_gti")
     manifest = {
         "planet": _archive_meta(planet),
+        **({"mosaic_gti": mosaic_gti} if mosaic_gti else {}),
         "overlay": {"split_z": SPLIT_Z, "cells": {
             os.path.basename(o)[len("overlay-"):-len(".pmtiles")]: _archive_meta(o)["max_zoom"]
             for o in overlays}},
