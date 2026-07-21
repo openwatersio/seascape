@@ -18,6 +18,8 @@ if [ $# -eq 0 ]; then set -- --list; fi
 # recipe — the same container, deps, and mounts either way.
 cmd=(just "$@")
 if [ "$1" = "snakemake" ]; then shift; cmd=(uv run snakemake "$@"); fi
+# `./docker.sh run <argv…>` executes argv verbatim in the container (no just routing).
+if [ "$1" = "run" ]; then shift; cmd=("$@"); fi
 image="${IMAGE:-seascape-build}"
 # CI's env carries the repo image and its deps tag separately — compose the ref here.
 if [ -n "${IMAGE_TAG:-}" ]; then image="$image:$IMAGE_TAG"; fi

@@ -301,7 +301,7 @@ jobs:
           # A hard teardown can strand unreadable tiles that look done (mtime valid, data lost);
           # drop them so the engine re-merges instead of poisoning downstream VRT reads.
           # cd /app/state: docker.sh starts in /app; only snakemake chdirs to the state mount
-          ./docker.sh sh -c "cd /app/state && uv run --project /app /app/pipelines/mosaic.py verify"
+          ./docker.sh run sh -c "cd /app/state && uv run --project /app /app/pipelines/mosaic.py verify"
           ./docker.sh snakemake -s pipelines/build.smk bundles publish "${extra[@]}" "${force[@]}" \
             --keep-going --rerun-incomplete \
             --cores "$cores" --resources mem_gb="$budget_gb" disk_mb="$disk_budget_mb" \
