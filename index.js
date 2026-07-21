@@ -68,6 +68,7 @@ const toggles = {
   "toggle-labels": ["contour-labels"],
   "toggle-soundings": ["soundings"],
   "toggle-osm": ["osm-base"],
+  "toggle-land": ["land-hillshade"],
   "toggle-sources": [
     "source-fill",
     "source-highlight",
@@ -77,6 +78,26 @@ const toggles = {
 };
 
 map.on("load", () => {
+  // Mapterhorn (mapterhorn.com): open global terrain DEM, far finer on land
+  // than the bathymetry mosaic. Ocean is flat 0 there, so a hillshade shades
+  // land only — attribution rides in via its TileJSON. Demo-only; the style
+  // package stays bathymetry.
+  map.addSource("mapterhorn", {
+    type: "raster-dem",
+    url: "https://tiles.mapterhorn.com/tilejson.json",
+    tileSize: 512,
+    encoding: "terrarium", // MapLibre doesn't read encoding from TileJSON
+  });
+  map.addLayer(
+    {
+      id: "land-hillshade",
+      type: "hillshade",
+      source: "mapterhorn",
+      paint: { "hillshade-exaggeration": 0.2 },
+    },
+    "contour-lines", // under the chart linework, over the land wash
+  );
+
   // Mariner settings — unit (m/ft/fm), safety depth (metres, 0 = off; drives the
   // hazard tint and black-sounding emphasis, S-52 style), and shading mode: relief
   // (raster ramp, continuous) vs bands (vector ENC depth areas — crisp isobath

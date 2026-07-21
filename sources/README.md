@@ -47,6 +47,7 @@ Every open candidate is a GitHub issue labeled [`source`](https://github.com/ope
 - [#36](https://github.com/openwatersio/seascape/issues/36) **Great Salt Lake** — the last unbuilt surveyed lake.
 - [#32](https://github.com/openwatersio/seascape/issues/32) **CUDEM territories** (HI/PR/USVI/Guam/AmSam/CNMI) — extend the existing streamed source.
 - [#38](https://github.com/openwatersio/seascape/issues/38) **IBCAO** — best Arctic resolution, blocked on a licence-ambiguity question, not build work.
+- [#86](https://github.com/openwatersio/seascape/issues/86) **Berlin Tiefenlinienkarte** + [#87](https://github.com/openwatersio/seascape/issues/87) **Brandenburg Seenvermessung** — the Berlin/Potsdam waterways (Müggelsee, Wannsee, Templiner See, 253 BB lakes); both vector isobaths, need a contour→grid step; low-water offsets per impoundment pool from PEGELONLINE/BWu (in the issues).
 
 ## Ruled out (don't re-research)
 
@@ -71,6 +72,9 @@ License is the real filter, not data existence — whole regions surveyed their 
 | HydroLAKES                                                                                                   | vector + scalar depth only — useful as a free lake mask, not bathymetry                               |
 | Caspian Sea                                                                                                  | already inside GEBCO                                                                                  |
 | Baikal, Tanganyika, Malawi, Great Bear/Slave, Titicaca, MN-DNR, Champlain, Salton, TWDB, Mekong/Yangtze      | NC / no-license / points-only / closed                                                                |
+| LUNG M-V Seenkataster Tiefenkarten (Mecklenburg lakes incl. Müritz)                                          | the data exists (~900 lakes, 1 m isobaths) but is private-use-only, no redistribution (INSPIRE Art. 13(1)(e)); a LUNG/ministry contract is the only path to Müritz depth |
+| German Inland ENCs (ELWIS IENC)                                                                              | open (GeoNutzV) but carry **no depth values** (DEPARE 0/0, no SOUNDG — verified on Potsdamer Havel cells); no cells at all for the Mecklenburg waterways |
+| WSV Peildaten / 3D-Datenarchiv BWaStr                                                                        | the real waterway-depth archive is intranet-only; public DGM-W Atom feed ([#53](https://github.com/openwatersio/seascape/issues/53)) has no Berlin/Mecklenburg tiles |
 
 Shelved with a revisit path (kept as issues, not re-research):
 

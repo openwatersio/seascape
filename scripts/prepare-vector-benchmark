@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source_store=${1:?usage: prepare-vector-benchmark SOURCE_STORE BENCH_STORE [COUNT]}
+bench_store=${2:?usage: prepare-vector-benchmark SOURCE_STORE BENCH_STORE [COUNT]}
+count=${3:-1000}
+
+mkdir -p "$bench_store/contour" "$bench_store/soundings" "$bench_store/bundle" \
+  "$bench_store/vector-tmp"
+mapfile -t contours < <(find "$source_store/contour" -maxdepth 1 -type f -name '*.fgb' | sort)
+((${#contours[@]})) || { echo "no contour inputs in $source_store" >&2; exit 1; }
+((count > 0)) || { echo "sample count must be positive" >&2; exit 1; }
+((count < ${#contours[@]})) || count=${#contours[@]}
+
+linked_soundings=0
+for ((i = 0; i < count; i++)); do
+  if ((count == 1)); then index=0; else index=$((i * (${#contours[@]} - 1) / (count - 1))); fi
+  contour=${contours[$index]}
+  base=${contour##*/}
+  stem=${base%-*}
+  ln -s "/planet-store/contour/$base" "$bench_store/contour/$base"
+  sounding=("$source_store/soundings/$stem-"*.geojson)
+  if [[ -f "${sounding[0]}" ]]; then
+    sbase=${sounding[0]##*/}
+    ln -s "/planet-store/soundings/$sbase" "$bench_store/soundings/$sbase"
+    ((linked_soundings += 1))
+  fi
+done
+
+echo "vector benchmark: $count/${#contours[@]} contour inputs, $linked_soundings matching soundings"
