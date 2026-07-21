@@ -32,6 +32,8 @@ preview bbox="-74.30,40.40,-73.75,40.80":
     # One invocation: the `cover` checkpoint runs inside the bundles build (streamed sources),
     # then the DAG re-evaluates into the per-stem mosaic/fork/terrain jobs.
     uv run snakemake -s ../Snakefile bundles --config stream=1 --cores 8
+    # seed.sh needs manifest.json; stage_build writes it locally (publish is a separate, box-only step)
+    uv run python -c "import bundle; bundle.stage_build()"
     ../worker/seed.sh
 
 # Run both dev servers in one terminal: tile Worker on :8787 + Vite viewer on :5173

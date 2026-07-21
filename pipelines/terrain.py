@@ -174,8 +174,11 @@ def _render(stem, out_pmtiles):
     # Rasterize the combined land mask on the window's exact grid so _encode_tile can nudge
     # land-side exact-0 pixels (clamped polders, beyond-build land fringe) to land, keeping decoded
     # 0 unambiguously water. Same #24 machinery, degrades to no-nudge when no mask is published.
+    # Regional windows only (cz>=8, the per-tile VRT path): a planet-scale window's -spat clip
+    # streams the entire vector mask (GBs) instead of an indexed subset. At z<=7 a land-side
+    # exact-0 area is a few pixels; a rasterized planet-z8 mask artifact is the upgrade path.
     mask = None
-    if landmask._present(landmask.path()):
+    if cz >= 8 and landmask._present(landmask.path()):
         mask = f"{tmp}/landmask.tif"
         with rasterio.open(window) as w:
             b, wres = w.bounds, w.res[0]
