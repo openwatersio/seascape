@@ -128,7 +128,10 @@ const depthRamp = (flavor: Flavor, edges: number[]): RampStops => {
   edges.forEach((d, i) =>
     stops.push(-d - 0.1, flavor.bandColors[i], -d, flavor.bandColors[i + 1]),
   );
-  stops.push(-LSB, flavor.bandColors[5], 0, flavor.nodata,
+  // The unknown tint is a knife-edge at exact 0 (native code pixels only): pinning drying
+  // green at +LSB keeps overzoom's wet/dry blend fractions out of the slate — otherwise the
+  // whole (0, 1) interval renders as a wide gray band along every foreshore seam.
+  stops.push(-LSB, flavor.bandColors[5], 0, flavor.nodata, LSB, flavor.drying,
              DRYING_CODE, flavor.drying, LAND_CODE, flavor.land);
   return stops;
 };
@@ -185,6 +188,8 @@ export function depthRelief(
       flavor.hazard,
       0,
       flavor.nodata,
+      LSB,
+      flavor.drying,
       DRYING_CODE,
       flavor.drying,
       LAND_CODE,

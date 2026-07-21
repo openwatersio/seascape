@@ -74,9 +74,12 @@ test("depthRelief folds a crisp hazard edge at the safety depth", () => {
   expect(hz).toBeGreaterThan(0);
   expect(on[hz - 1]).toBe(-2 + 0.01); // normal colour pinned just below…
   expect(on[hz + 1]).toBe(-1 / 256); // …hazard up to the encoder's water floor
-  // …then the category codes terminate the ramp: 0 unknown, 1 drying, 2 land.
-  expect(on[on.length - 6]).toBe(0);
-  expect(on[on.length - 5]).toBe(day.nodata);
+  // …then the category codes terminate the ramp: 0 unknown (knife-edge — drying
+  // pinned at +LSB keeps overzoom fractions out of the slate), 1 drying, 2 land.
+  expect(on[on.length - 8]).toBe(0);
+  expect(on[on.length - 7]).toBe(day.nodata);
+  expect(on[on.length - 6]).toBe(1 / 256);
+  expect(on[on.length - 5]).toBe(day.drying);
   expect(on[on.length - 4]).toBe(1);
   expect(on[on.length - 3]).toBe(day.drying);
   expect(on[on.length - 2]).toBe(2);
@@ -89,11 +92,13 @@ test("depthRelief renders the category codes: 0 unknown, 1 drying, 2 land", () =
   expect(zero).toBeGreaterThan(0);
   expect(ramp[zero - 2]).toBe(-1 / 256); // -LSB → shoalest band
   expect(ramp[zero - 1]).toBe(day.bandColors[5]);
-  expect(ramp[zero + 1]).toBe(day.nodata); // 0 → unknown-water tint
-  expect(ramp[zero + 2]).toBe(1); // 1 → drying foreshore green
-  expect(ramp[zero + 3]).toBe(day.drying);
-  expect(ramp[zero + 4]).toBe(2); // 2 → land wash
-  expect(ramp[zero + 5]).toBe(day.land);
+  expect(ramp[zero + 1]).toBe(day.nodata); // 0 → unknown-water tint (knife-edge)
+  expect(ramp[zero + 2]).toBe(1 / 256); // +LSB → drying green, so wet/dry
+  expect(ramp[zero + 3]).toBe(day.drying); // overzoom fractions skip the slate
+  expect(ramp[zero + 4]).toBe(1); // 1 → drying foreshore green
+  expect(ramp[zero + 5]).toBe(day.drying);
+  expect(ramp[zero + 6]).toBe(2); // 2 → land wash
+  expect(ramp[zero + 7]).toBe(day.land);
 });
 
 test("depthRelief stops stay strictly ascending for any safety depth", () => {
