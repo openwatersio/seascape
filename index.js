@@ -179,11 +179,13 @@ map.on("click", async (e) => {
   const lines = [];
   if (ele != null) {
     const depth = Math.round(-ele);
+    // Non-negative values are category codes (0 unknown water, 1 drying, 2 land);
+    // overzoom fractions between codes round to the nearest one.
     lines.push(
       `<strong>${
-        ele <= 0
+        ele < 0
           ? `${depth}m (${Math.round(depth * 3.28084)}ft)`
-          : `${Math.round(ele)}m elevation`
+          : ["unknown depth", "drying", "land"][Math.min(Math.round(ele), 2)]
       }</strong>`,
     );
   }
