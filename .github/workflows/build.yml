@@ -302,7 +302,9 @@ jobs:
           # drop them so the engine re-merges instead of poisoning downstream VRT reads.
           # cd /app/state: docker.sh starts in /app; only snakemake chdirs to the state mount
           ./docker.sh run sh -c "cd /app/state && uv run --project /app /app/pipelines/mosaic.py verify"
-          ./docker.sh snakemake -s pipelines/build.smk bundles publish "${extra[@]}" "${force[@]}" \
+          # stage_build only for planet runs: a bbox smoke must not stage regional archives
+          targets=(bundles publish); [ -z "$BBOX" ] && targets+=(stage_build)
+          ./docker.sh snakemake -s pipelines/build.smk "${targets[@]}" "${extra[@]}" "${force[@]}" \
             --keep-going --rerun-incomplete \
             --cores "$cores" --resources mem_gb="$budget_gb" disk_mb="$disk_budget_mb" \
             --config workdir=/app/state tmp=/app/tmp 2>&1 | tee "$buildlog"

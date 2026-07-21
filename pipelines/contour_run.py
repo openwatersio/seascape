@@ -356,13 +356,18 @@ def _finalize_contours(archives, out):
     """tile-join the contour lines pmtiles + the soundings/depare pmtiles (bundled first)
     into store/bundle/vector.pmtiles. ONE join: tile-join rewrites every tile of the whole
     archive, so folding each sparse layer in afterwards re-paid the planet-wide join
-    per layer (~90 min each). -pk keeps every feature of every layer; a layer
-    whose pmtiles isn't present locally is simply not joined. Coverage is its own
-    tileset (coverage_bundle), not a layer here. Drying is not its own layer; it folds
-    into `depare` (a DEPARE band with negative drval1)."""
-    layers = [p for p in ["store/bundle/soundings.pmtiles",
-                          "store/bundle/depare.pmtiles"]
-              if os.path.isfile(p)]
+    per layer (~90 min each). -pk keeps every feature of every layer. Layers join by
+    CONFIGURATION, never by disk state: soundings always, depare only when SKIP_DEPARE is
+    unset — a stale depare.pmtiles on the store can't leak into the product, and an enabled
+    layer whose bundle is missing fails loudly. Coverage is its own tileset (coverage_bundle),
+    not a layer here. Drying is not its own layer; it folds into `depare` (a DEPARE band with
+    negative drval1)."""
+    layers = ["store/bundle/soundings.pmtiles"]
+    if not os.environ.get("SKIP_DEPARE"):
+        layers.append("store/bundle/depare.pmtiles")
+    missing = [p for p in layers if not os.path.isfile(p)]
+    if missing:
+        raise SystemExit(f"vector join: required layer bundle(s) missing: {', '.join(missing)}")
     with utils.log_group(f"vector tile-join ({len(archives) + len(layers)} archives)"):
         utils.run_monitored(["tile-join", "-o", out, "-f", "-pk",
                              *archives, *layers], "vector tile-join",
@@ -385,8 +390,8 @@ def bundle_stable():
     """Vector bundle: tippecanoe the per-stem contour FGBs for the covering into contour lines,
     then tile-join the already-bundled soundings/depare pmtiles → vector.pmtiles. A 0-byte per-tile
     file is a legitimately empty tile (filtered by size); a MISSING one is an incomplete build
-    (require_stable_complete). Snakemake decides when to invoke, so this always rebuilds. A missing
-    depare.pmtiles (SKIP_DEPARE) is simply not joined (_finalize_contours' isfile check)."""
+    (require_stable_complete). Snakemake decides when to invoke, so this always rebuilds. Depare
+    joins only when SKIP_DEPARE is unset (_finalize_contours), regardless of disk state."""
     import mosaic
     stems = mosaic.covering_stems()
     files = [f"store/contour/{s}.fgb" for s in stems]

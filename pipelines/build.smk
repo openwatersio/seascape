@@ -120,6 +120,10 @@ rule mosaic_index:
     input:
         tiles=expand("store/mosaic/tiles/{stem}.tif", stem=STEMS),
         covering="store/aggregation/covering.txt",
+    params:
+        # scope stamp: a bbox build's regional artifact must not read as current in a later
+        # planet build — the params trigger re-runs every aggregate when the scope changes
+        bbox=os.environ.get("BBOX", ""),
     output:
         index="store/mosaic/index/covering.parquet",
         planet="store/mosaic/planet-z8.tif",
@@ -326,6 +330,8 @@ rule soundings_bundle:
         expand("store/soundings/{stem}.geojson", stem=STEMS)
     output:
         "store/bundle/soundings.pmtiles"
+    params:
+        bbox=os.environ.get("BBOX", ""),  # scope stamp — see mosaic_index
     benchmark:
         f"{TMP}/bench/soundings-bundle.tsv"
     log:
@@ -341,6 +347,8 @@ if DEPARE_STEMS:
             expand("store/depare/{stem}.fgb", stem=DEPARE_STEMS)
         output:
             "store/bundle/depare.pmtiles"
+        params:
+            bbox=os.environ.get("BBOX", ""),  # scope stamp — see mosaic_index
         benchmark:
             f"{TMP}/bench/depare-bundle.tsv"
         log:
@@ -360,6 +368,8 @@ rule vector_bundle:
         _VECTOR_DEPARE,
     output:
         "store/bundle/vector.pmtiles"
+    params:
+        bbox=os.environ.get("BBOX", ""),  # scope stamp — see mosaic_index
     benchmark:
         f"{TMP}/bench/vector-bundle.tsv"
     log:
@@ -378,6 +388,8 @@ rule terrain_planet_bundle:
         expand("store/pmtiles/{stem}.pmtiles", stem=RENDER_STEMS)
     output:
         "store/bundle/planet.pmtiles"
+    params:
+        bbox=os.environ.get("BBOX", ""),  # scope stamp — see mosaic_index
     benchmark:
         f"{TMP}/bench/planet-bundle.tsv"
     log:
@@ -403,6 +415,8 @@ rule overlay_bundle:
         lambda wc: [f"store/pmtiles/{s}.pmtiles" for s in _CELL_STEMS.get(wc.cell, [])]
     output:
         "store/bundle/overlay-{cell}.pmtiles"
+    params:
+        bbox=os.environ.get("BBOX", ""),  # scope stamp — see mosaic_index
     benchmark:
         f"{TMP}/bench/overlay-{{cell}}.tsv"
     log:

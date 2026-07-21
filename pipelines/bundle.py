@@ -243,7 +243,20 @@ def stage_build(bundle_dir="store/bundle"):
     for req in (planet, vector):
         if not os.path.isfile(req):
             sys.exit(f"stage-build: missing {req} — run the bundles first")
-    overlays = sorted(glob(f"{bundle_dir}/overlay-*.pmtiles"))
+    # The COMPUTED cell inventory, never a glob: the shared volume can hold overlay files from
+    # earlier coverings (shrunk coverage, bbox leftovers) that must not ship or be advertised.
+    import mosaic
+    import terrain
+    cells = overlay_cells(terrain.render_stems(mosaic.covering_stems()))
+    overlays = [f"{bundle_dir}/overlay-{c}.pmtiles" for c in cells]
+    missing = [o for o in overlays if not os.path.isfile(o)]
+    if missing:
+        sys.exit(f"stage-build: {len(missing)} overlay cell(s) missing, e.g. {missing[:3]} — "
+                 "run the bundles first")
+    stale = sorted(set(glob(f"{bundle_dir}/overlay-*.pmtiles")) - set(overlays))
+    if stale:
+        print(f"stage-build: ignoring {len(stale)} stale overlay file(s) not in the current "
+              f"inventory, e.g. {[os.path.basename(s) for s in stale[:3]]}")
     manifest = {
         "planet": _archive_meta(planet),
         "overlay": {"split_z": SPLIT_Z, "cells": {

@@ -16,6 +16,11 @@ z11 in metadata) inside it — registers them through the real stage-1 CLIs (bou
   - a CONTOUR_LEVELS change reruns contour_tile + the vector bundle but ZERO
     mosaic_tile and ZERO terrain_render (the stage split's payoff — no re-merge,
     no re-render — proven by a dry run's rerun table);
+  - scope transitions: a bbox build re-merges nothing, and the next planet build
+    heals the bbox-truncated forks (input-set trigger) and rebuilds every
+    scope-stamped aggregate (params trigger) — regional artifacts never survive;
+  - staging inventory: a stale overlay-*.pmtiles on disk is excluded from
+    stage_build's uploads and manifest;
   - the hole-free gate fires: a missing per-tile fork output makes the --stable
     bundle refuse rather than publish a hole.
 
@@ -262,6 +267,43 @@ def main():
         assert counts.get("vector_bundle", 0) == 1, f"the vector bundle must rerun: {counts}"
         print(f"stage-split ok — CONTOUR_LEVELS reruns {counts.get('contour_tile')} contour_tile "
               f"+ vector_bundle, 0 mosaic_tile, 0 terrain_render")
+
+        # ── scope transitions: a bbox build's regional aggregates must NOT read as current ──
+        # in a later planet build (the params scope stamp), and the planet build must rebuild
+        # ONLY aggregates — never re-merge or re-fork.
+        bbox = "-0.2,-0.2,0.2,0.2"  # the fine source's window: a strict stem subset
+        snake(tmp, "-c", "4", "bundles", env={"BBOX": bbox})   # real regional build
+        dry = snake(tmp, "-c", "4", "-n", "bundles").stdout    # then a planet dry-run
+        counts = _job_counts(dry)
+        assert counts.get("mosaic_tile", 0) == 0, f"scope change must never re-merge: {counts}"
+        # the bbox run re-forked its 4 in-window stems with TRUNCATED neighborhoods (their
+        # input set is bbox-scoped); the planet build must heal exactly those via the
+        # input-set trigger — and rebuild every scope-stamped aggregate.
+        assert counts.get("contour_tile", 0) == 4, f"planet must re-fork the 4 bbox-truncated stems: {counts}"
+        assert counts.get("soundings_tile", 0) == 4, f"soundings heal too: {counts}"
+        for agg in ("mosaic_index", "soundings_bundle", "vector_bundle", "terrain_planet_bundle"):
+            assert counts.get(agg, 0) == 1, f"{agg} must rebuild after a scope change: {counts}"
+        snake(tmp, "-c", "4", "bundles")  # restore planet-scoped products for the checks below
+        print("scope-transition ok — bbox->planet re-merges nothing, heals 4 truncated forks, "
+              "rebuilds every aggregate")
+
+        # ── staging inventory: a stale overlay file on disk must not ship or be advertised ──
+        real = sorted(glob(f"{tmp}/store/bundle/overlay-*.pmtiles"))[0]
+        stale_path = f"{tmp}/store/bundle/overlay-9-99-99.pmtiles"
+        shutil.copyfile(real, stale_path)
+        proc = subprocess.run(
+            [sys.executable, "-c",
+             f"import sys, json; sys.path.insert(0, {PIPE!r}); import bundle\n"
+             "up, mp = bundle.stage_build()\n"
+             "print(json.dumps({'uploads': up, 'cells': sorted(json.load(open(mp))['overlay']['cells'])}))"],
+            cwd=tmp, env=_base_env(tmp, {"SOURCES_DIR": "sources"}), capture_output=True, text=True)
+        assert proc.returncode == 0, f"stage_build failed:\n{proc.stdout}\n{proc.stderr}"
+        staged = json.loads(proc.stdout.splitlines()[-1])
+        assert "9-99-99" not in staged["cells"], f"stale cell advertised: {staged['cells']}"
+        assert not any("9-99-99" in u for u in staged["uploads"]), "stale overlay staged for upload"
+        assert "stale" in proc.stdout, "staging must report the ignored stale file"
+        os.remove(stale_path)
+        print("staging-inventory ok — stale overlay excluded from uploads + manifest")
 
         # ── the hole-free gate: a missing per-tile fork output makes --stable bundle refuse ──
         victim = sorted(glob(f"{tmp}/store/contour/*.fgb"))[0]
