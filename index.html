@@ -142,7 +142,9 @@
         <label>
           <input type="checkbox" id="toggle-soundings" checked /> Soundings
         </label>
-        <label title="Smooth raster relief, or vector ENC depth bands (crisp isobath edges, safety snapped to a charted level)">Shading
+        <!-- bands reads the DEPARE layer, absent from production builds while SKIP_DEPARE holds -->
+        <label id="shading-control" hidden
+          title="Smooth raster relief, or vector ENC depth bands (crisp isobath edges, safety snapped to a charted level)">Shading
           <select id="shading-select">
             <option value="relief">smooth</option>
             <option value="bands">bands</option>

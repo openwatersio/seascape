@@ -122,6 +122,8 @@ map.on("load", () => {
       map.setLayerZoomRange("depth-shading", 0, shading === "bands" ? 6 : 24);
   };
   apply();
+  // dev-only: bands needs the DEPARE layer, absent from production builds
+  if (import.meta.env.DEV) document.getElementById("shading-control").hidden = false;
   document.getElementById("safety-depth")?.addEventListener("input", apply);
   document.getElementById("unit-select")?.addEventListener("change", apply);
   document.getElementById("shading-select")?.addEventListener("change", apply);
