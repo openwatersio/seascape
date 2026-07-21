@@ -155,6 +155,8 @@ def tile(filepath):
     tmp_cog = _translate(filepath, tmp_folder)
     os.makedirs(tiles_dir(), exist_ok=True)
     out = tile_artifact(stem)
+    with open(tmp_cog, "rb") as f:
+        os.fsync(f.fileno())  # rename is metadata-only; a hard box teardown must not strand garbage
     os.replace(tmp_cog, out)       # atomic: the stable name only ever appears complete
     if not os.environ.get("KEEP_TMP"):  # KEEP_TMP=1 preserves the merged DEM for debugging
         shutil.rmtree(tmp_folder)
@@ -650,17 +652,34 @@ def _check():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def verify_tiles():
+    """Delete unreadable tile COGs (a hard box teardown can strand renamed files whose data
+    blocks never flushed); the engine re-merges anything missing. Run before an invocation."""
+    bad = 0
+    for path in sorted(glob.glob(f"{tiles_dir()}/*.tif")):
+        try:
+            with rasterio.open(path):
+                pass
+        except rasterio.errors.RasterioIOError:
+            print(f"mosaic verify: deleting unreadable {path}", flush=True)
+            os.remove(path)
+            bad += 1
+    print(f"mosaic verify: {bad} unreadable tile(s) removed", flush=True)
+
+
 def main(argv):
     if argv == ["index", "--stable"]:
         build_index_stable()
     elif argv == ["publish"]:
         publish()
+    elif argv == ["verify"]:
+        verify_tiles()
     elif argv[:1] == ["tile"] and len(argv) == 2:
         tile(argv[1])
     elif argv[:1] == ["--check"]:
         _check()
     else:
-        sys.exit("usage: mosaic.py tile <covering-csv> | index --stable | publish | --check")
+        sys.exit("usage: mosaic.py tile <covering-csv> | index --stable | publish | verify | --check")
 
 
 if __name__ == "__main__":
