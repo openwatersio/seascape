@@ -26,10 +26,12 @@ CONTOUR_LEVELS_DEFAULT = [int(x) for x in _CONTOUR_LEVELS_DEFAULT.split()]
 CONTOUR_LEVELS = [int(x) for x in os.environ.get("CONTOUR_LEVELS", _CONTOUR_LEVELS_DEFAULT).split()]
 
 # Drying areas (green foreshore): seabed above chart datum that covers/uncovers with the tide —
-# elevation in [0, DRYING_CAP] seaward of the OSM land line. The cap (metres, ~the Bay of Fundy
-# tidal range) keeps S-102's above-MHW shoreline topo (piers, bluff toes reach +20..+30 m) out of
-# the foreshore tint. Ceiling: a fixed global cap over-includes steep coastal topo just seaward of
-# the land line; upgrade path is a spatially-varying MHW surface (VDatum et al.).
+# elevation in [0, DRYING_CAP] seaward of the OSM land line. The cap anchors to the global maximum
+# of HAT-LAT, the highest ground that still floods and dries (~17 m Bay of Fundy/Burntcoat Head;
+# Ungava ~16; Bristol Channel ~15). Two inherent biases: over-inclusion on low-MHW coasts (bluff
+# toes up to the cap tint as foreshore) and under-inclusion of the MHW-HAT band in mega-tidal
+# estuaries (it sits on OSM's land side). A spatially-varying HAT-LAT surface fixes the classifier;
+# the terrain sentinel only needs to exceed the planetary maximum, so it stays a global constant.
 DRYING_CAP = float(os.environ.get("DRYING_CAP", "16"))
 
 # Feet/fathom isobaths: a second contour set at the classic fathom curves. Friendly feet depths

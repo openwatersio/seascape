@@ -258,12 +258,19 @@ def reproject(filepath):
             # 0 there, so it would hole the coastal ocean). Same buffered -te/-tr, cached per tile
             # across flagged sources. Skipped cleanly when no water feed is published — the mask
             # degrades to land-clamp-only (today's behavior), like rasterize's water subtraction.
+            water_tif = None
             if landmask._present(landmask.water_path()):
                 water_tif = f"{tmp_folder}/watermask.tif"
                 if not os.path.isfile(water_tif):
                     landmask.rasterize_water(buffered_bounds(aggregation_tile, buffer_3857_rounded),
                                              resolution, water_tif)
                 landmask.clamp_positive_water(out_tiff, water_tif)
+            # 4th-quadrant clamp: shoreline cells reading positive just SEAWARD of the land line
+            # (combined mask==0, outside inland water) are false drying — the depare/drying bucket
+            # reads this unclamped mosaic in (0, DRYING_CAP]. Clamp positive ocean to 0 so it can't.
+            # Deliberately discards coarse "drying": these flagged sources can't resolve the
+            # foreshore, and trusted topobathy sources are unflagged, so genuine drying survives.
+            landmask.clamp_positive_ocean(out_tiff, mask_tif, water_tif)
         if len(grouped) > 1 and not contains_nodata_pixels(out_tiff):
             break
 

@@ -100,6 +100,17 @@ A full build (`planet`) lands in `pipelines/store/bundle/`:
 - `coverage.pmtiles` — source-provenance footprints, its own tileset ending at z8 (MapLibre overzooms it independently; inside `vector.pmtiles` the sea-sized fills either minted millions of deep-ocean tiles or vanished above their zoom).
 - `manifest.json` — planet metadata + `overlay.cells` ({cell: max_zoom}) for the Worker.
 
+### The published-raster contract
+
+The Terrarium-decoded DEM (`readDepth` returns exactly this) is a continuous rendering surface, not a categorical classification. For decoded value `v` (metres):
+
+- `v < 0` — chart-datum elevation below datum. On measured water pixels, `-v` is the shallow-biased charted depth. Datum is the winning source's low-water datum (LAT / MLLW / ≈MSL for GEBCO) until datum unification.
+- `v > DRYING_CAP` — definitely **land / out of scope.** A sentinel the terrain render clamps land to (nominally `DRYING_CAP+1`, though the decoded value varies with zoom quantization — ceil rounding lifts +17 to +18 at coarse zooms), not measured elevation.
+- `v == 0` — water present, **depth unknown** (ENC `UNSARE` analogue), not a measured depth of approximately zero. The render nudges land-side exact-0 pixels to `+LSB`, so decoded 0 is unambiguously water.
+- `0 < v ≤ DRYING_CAP` — a non-submerged sample. The `depare` layer distinguishes genuine drying foreshore from shoreline and from values introduced by smoothing or overzoom interpolation.
+
+Raster values form a continuous rendering surface; `depare` supplies the categorical water/drying/unknown distinction — consult it before presenting a non-negative `v` as drying height.
+
 ### Why a planet cap + grid overlays
 
 GEBCO is ~z8 native; regional sources reach ~z14. Baking a full z0–14 pyramid would upsample GEBCO globally (hundreds of GB, no new data). Instead: the planet is capped at `macrotile_z` (complete, all-sources-merged base, ~1–2 GB) with fixed-grid overlay archives above it, each carrying the GEBCO-filled merged mosaic (Terrarium has no transparency, so an overlay must not punch holes). Overlays are grid cells rather than per-source archives on purpose: a cell is a fixed fraction of the globe, so a new source adds _cells_ instead of growing any single archive (a per-source overlay's size tracked its footprint and outgrew CI runner disks).
