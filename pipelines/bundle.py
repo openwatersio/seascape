@@ -333,6 +333,11 @@ def _check():
         with open("sources/src/metadata.json", "w") as f:
             json.dump({"name": "src", "max_zoom": 12}, f)
         os.makedirs("store/bundle")
+        # the staging inventory computes cells from the covering: one z14 native stem whose
+        # z5 ancestor is (1,1), so the computed cell set is exactly {5-1-1}
+        os.makedirs("store/aggregation")
+        with open("store/aggregation/covering.txt", "w") as f:
+            f.write("8-8-8-14\n")
         synth("store/bundle/planet.pmtiles", 0, 8, [-180, -85, 180, 85])
         synth("store/bundle/overlay-5-1-1.pmtiles", 9, 14, [-10, -10, 10, 10])
         synth("store/bundle/vector.pmtiles", 0, 14, [-180, -85, 180, 85])
