@@ -653,8 +653,9 @@ def _check():
 
 
 def verify_tiles():
-    """Delete unreadable tile COGs (a hard box teardown can strand renamed files whose data
-    blocks never flushed); the engine re-merges anything missing. Run before an invocation."""
+    """Delete unreadable tile COGs and empty render pmtiles (a hard box teardown can strand
+    renamed files whose data blocks never flushed); the engine rebuilds anything missing.
+    Empty contour/soundings outputs are legitimate dry-tile sentinels — never swept."""
     bad = 0
     for path in sorted(glob.glob(f"{tiles_dir()}/*.tif")):
         try:
@@ -664,7 +665,12 @@ def verify_tiles():
             print(f"mosaic verify: deleting unreadable {path}", flush=True)
             os.remove(path)
             bad += 1
-    print(f"mosaic verify: {bad} unreadable tile(s) removed", flush=True)
+    for path in sorted(glob.glob("store/pmtiles/*.pmtiles")):
+        if os.path.getsize(path) == 0:
+            print(f"mosaic verify: deleting empty {path}", flush=True)
+            os.remove(path)
+            bad += 1
+    print(f"mosaic verify: {bad} stranded artifact(s) removed", flush=True)
 
 
 def main(argv):
