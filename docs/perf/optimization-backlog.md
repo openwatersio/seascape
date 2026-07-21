@@ -19,11 +19,14 @@ cold costs are vector bundling and the pathological DEPARE tail.
 
 ### Bound DEPARE and re-enable it
 
-Still the worst pathological tail, now measured through the windowed-mosaic path: the densest NY
-z14 stem took **~65 minutes single-core** in `depare_run.py tile`. The stage-3 `depare` rule ships
-behind `SKIP_DEPARE` until the unbounded GEOS operation gets a spatial/window bound or a per-tile
-timeout with honest failure reporting. Success: every covering tile finishes DEPARE within an
-explicit bound; a planet build publishes a complete DEPARE bundle. Effort: medium. Risk: medium.
+Still the worst pathological tail, and the planet bench corpus relocated it: the worst stems are
+**coarse**, not the dense z14 coast — `6-21-22-9` (cz9) **32,126 s = 8.9 h** single-core, `6-19-18-9`
+5.2 h, `6-18-19-8` (cz8) 2.3 h; the densest NY z14 stem `8-75-96-14` measured 5,425 s (90 min) vs
+208 s through the legacy path. Low RSS (2–4.7 GB) at huge wall = GEOS grinding on continent-scale
+land/water unions in coarse windows. The stage-3 `depare` rule ships behind `SKIP_DEPARE` until the
+unbounded GEOS operation gets a spatial/window bound or a per-tile timeout with honest failure
+reporting. Success: every covering tile finishes DEPARE within an explicit bound; a planet build
+publishes a complete DEPARE bundle. Effort: medium. Risk: medium.
 Execution plan: [../plans/2026-07-21-depare-perf.md](../plans/2026-07-21-depare-perf.md).
 
 ### Vector bundling — the dominant cold cost
