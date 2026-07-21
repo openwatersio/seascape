@@ -82,10 +82,10 @@ export const day: Flavor = {
   // Drying areas (INT-1 foreshore green): seabed above chart datum that covers
   // and uncovers with the tide.
   drying: "#a8d5ba",
-  // Unknown-depth water (ENC DEPARE nodata): mapped water we hold no depth for. A flat,
-  // desaturated slate-blue — reads as water but distinct from the crisp surveyed depth
-  // bands, and deliberately provisional (S-52's NODATA fill is the eventual reference).
-  nodata: "#a9bccb",
+  // Unknown-depth water (ENC DEPARE nodata): mapped water we hold no depth for. Painted
+  // the hazard tint — unsurveyed water warrants the same caution as known-unsafe water
+  // (ECDIS treats it as unsafe for the safety check; S-52 hatching is the eventual upgrade).
+  nodata: "#1f86cb",
   contour: "#4a7a9c",
   label: "#036",
   labelHalo: "#fff",
@@ -132,7 +132,8 @@ const depthRamp = (flavor: Flavor, edges: number[]): RampStops => {
   // green at +LSB keeps overzoom's wet/dry blend fractions out of the slate — otherwise the
   // whole (0, 1) interval renders as a wide gray band along every foreshore seam.
   stops.push(-LSB, flavor.bandColors[5], 0, flavor.nodata, LSB, flavor.drying,
-             DRYING_CODE, flavor.drying, LAND_CODE, flavor.land);
+             DRYING_CODE, flavor.drying, LAND_CODE - LSB, flavor.drying,
+             LAND_CODE, flavor.land);
   return stops;
 };
 
@@ -191,6 +192,8 @@ export function depthRelief(
       LSB,
       flavor.drying,
       DRYING_CODE,
+      flavor.drying,
+      LAND_CODE - LSB,
       flavor.drying,
       LAND_CODE,
       flavor.land,
