@@ -30,9 +30,9 @@ on:
         type: boolean
         default: false
       server_type:
-        description: "Hetzner type — ccx63 (48 vCPU/192 GB) for planet; ccx33 (8/32) for a bbox smoke"
+        description: "Hetzner type — ccx33 (8/32) fits incremental/bundle-tail builds; pick ccx63 (48/192) for wide runs (cold builds, big invalidations)"
         required: false
-        default: ccx63
+        default: ccx33
       snakemake_args:
         description: "Extra snakemake args, e.g. -R publish (code changes are force-only)"
         required: false
