@@ -24,6 +24,7 @@ z14 stem took **~65 minutes single-core** in `depare_run.py tile`. The stage-3 `
 behind `SKIP_DEPARE` until the unbounded GEOS operation gets a spatial/window bound or a per-tile
 timeout with honest failure reporting. Success: every covering tile finishes DEPARE within an
 explicit bound; a planet build publishes a complete DEPARE bundle. Effort: medium. Risk: medium.
+Execution plan: [../plans/2026-07-21-depare-perf.md](../plans/2026-07-21-depare-perf.md).
 
 ### Vector bundling — the dominant cold cost
 
@@ -45,6 +46,14 @@ join folds the soundings layer in).
 Leads, roughly in order: per-layer archives (below) makes the bundles independent and
 parallel; `--read-parallel` on line-delimited input attacks the single-threaded read phase;
 sharding attacks the tiling phase.
+
+**Publish hash pass — resolved 2026-07-21:** the no-op publish re-hashed the whole tile store
+(~40 min); `_HashCache` (mtime_ns+size keyed, store/mosaic/hash-cache.json) now answers
+unchanged files instantly. **Coarse renders — mostly resolved by the per-stem VRT** (measured
+run 29795677492 vs the GTI-era corpus): cz9 731→164 s, cz10 592→45 s, cz13 132→16 s. Remaining:
+the cz<8 planet-COG readers (z5 anchors up to ~90 min) still read through the GTI, and cz8
+regressed 83→257 s (n=9; now decimating z14 tiles 64× through the VRT — check whether the
+GTI fall-through was the better path for cz8).
 
 Both may be mooted by the plan's **per-layer archives** direction (contours/depth-areas/soundings
 as independent pmtiles, first post-migration change): that deletes the tile-join entirely and lets

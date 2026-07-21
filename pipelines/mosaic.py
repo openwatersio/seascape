@@ -315,6 +315,41 @@ def _hash12(path):
     return h[:12]
 
 
+HASH_CACHE = "store/mosaic/hash-cache.json"
+
+
+class _HashCache:
+    """mtime_ns+size-keyed content-hash cache: a no-op publish re-hashed the whole ~360 GB tile
+    store (~40 min); unchanged files answer from here in microseconds. The mosaic writer fsyncs
+    before its rename, so a replaced tile always presents a new (mtime, size) identity."""
+
+    def __init__(self):
+        try:
+            with open(HASH_CACHE) as f:
+                self.entries = json.load(f)
+        except (OSError, ValueError):
+            self.entries = {}
+        self.dirty = False
+
+    def hash12(self, path):
+        st = os.stat(path)
+        cached = self.entries.get(path)
+        if cached and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+            return cached[2]
+        h = _hash12(path)
+        self.entries[path] = [st.st_mtime_ns, st.st_size, h]
+        self.dirty = True
+        return h
+
+    def save(self):
+        if not self.dirty:
+            return
+        tmp = HASH_CACHE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.entries, f)
+        os.replace(tmp, HASH_CACHE)
+
+
 def _stage_publish():
     """Stage the content-addressed publish set LOCALLY — no network, so the test drives it directly.
     Recreate publish/ each run; hardlink every covering tile COG to publish/tiles/<stem>-<hash12>.tif
@@ -328,13 +363,14 @@ def _stage_publish():
     shutil.rmtree(pubdir, ignore_errors=True)
     os.makedirs(tiles_stage)
 
+    cache = _HashCache()
     features, tile_files, tile_hashes = [], [], []
     for stem in stems:
         fp = f"store/aggregation/{stem}-aggregation.csv"
         cpath = tile_artifact(stem)
         if not os.path.isfile(cpath):
             sys.exit(f"mosaic publish: missing {cpath} — run `snakemake mosaic` first")
-        h = _hash12(cpath)
+        h = cache.hash12(cpath)
         tile_hashes.append(h)
         name = f"{stem}-{h}.tif"
         tile_files.append(name)
@@ -344,7 +380,8 @@ def _stage_publish():
     planet = planet_artifact()
     if not os.path.isfile(planet):
         sys.exit(f"mosaic publish: missing {planet} — run `snakemake mosaic` first")
-    planet_name = f"planet-z8-{_hash12(planet)}.tif"
+    planet_name = f"planet-z8-{cache.hash12(planet)}.tif"
+    cache.save()
     os.link(planet, f"{pubdir}/{planet_name}")
 
     # Hash the pointer's SEMANTIC content (locations + refs), not just the tile hashes: a
