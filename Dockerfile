@@ -66,6 +66,7 @@ COPY pyproject.toml uv.lock /app/
 RUN uv sync --frozen --no-install-project
 ENV PATH="/opt/venv/bin:${PATH}"
 
-# Recipes run from /app; the Justfile redirects into pipelines/ itself. e.g.
-# `docker run -v "$PWD:/app" img just planet` (set BBOX=… for a region).
+# The build is one Snakemake DAG (docker.sh fronts it). e.g.
+# `docker run -v "$PWD:/app" img snakemake planet` (BBOX=… scopes a region);
+# `just` still hosts the tests + dev servers.
 CMD ["just", "--list"]

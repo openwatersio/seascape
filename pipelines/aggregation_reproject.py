@@ -45,11 +45,15 @@ def negate_band1(filepath):
     nothing. read_masks honours alpha-or-nodata validity (don't compare to a NODATA value:
     ADD_ALPHA moves the mask off the data band). Drop this when the pipeline goes
     depth-canonical internally."""
+    # Per-block, not full-band: a whole z14 band is ~4.3 GB and its masks another ~2 GB —
+    # measured as the job's RSS peak (glibc retains the high-water for the process's life).
     with rasterio.open(filepath, "r+", IGNORE_COG_LAYOUT_BREAK="YES") as ds:
-        a = ds.read(1)
-        mask = ds.read_masks(1) != 0
-        a[mask] = -a[mask]
-        ds.write(a, 1)
+        for _, window in ds.block_windows(1):
+            mask = ds.read_masks(1, window=window) != 0
+            if mask.any():
+                a = ds.read(1, window=window)
+                a[mask] = -a[mask]
+                ds.write(a, 1, window=window)
 
 
 def band_select(source):
@@ -106,7 +110,7 @@ def warp_mixed(inputs, out_tif, zoom, aggregation_tile, buffer):
     """gdalwarp several heterogeneous-CRS inputs into one 3857 GTiff mosaic. A warped
     VRT can't span source CRSs (it has one), so warp straight to a raster — each input
     is reprojected from its own UTM zone, so a zone-crossing tile keeps every source.
-    No value transform: streamed sources skip source_datum, MLLW->MSL is the Phase 5
+    No value transform: streamed sources skip source_datum, MLLW->MSL is a future
     VDatum job; nan source-nodata maps to NODATA via -dstnodata."""
     left, bottom, right, top = buffered_bounds(aggregation_tile, buffer)
     res = get_resolution(zoom)
@@ -189,11 +193,12 @@ def contains_nodata_pixels(filepath):
 
 
 def reproject(filepath):
-    aggregation_id, filename = filepath.split("/")[-2:]
+    filename = filepath.split("/")[-1]
     z, x, y, child_z = (int(a) for a in filename.replace("-aggregation.csv", "").split("-"))
     aggregation_tile = mercantile.Tile(x=x, y=y, z=z)
 
-    tmp_folder = f"store/aggregation/{aggregation_id}/{z}-{x}-{y}-{child_z}-tmp"
+    # Beside the CSV.
+    tmp_folder = filepath.replace("-aggregation.csv", "-tmp")
     utils.create_folder(tmp_folder)
     metadata_filepath = f"{tmp_folder}/reprojection.json"
     if os.path.isfile(metadata_filepath):

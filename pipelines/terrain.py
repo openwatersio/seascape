@@ -1,71 +1,54 @@
 """Stage 3 — per-zoom Terrarium terrain render from the MOSAIC.
 
-Replaces BOTH the aggregate's native-zoom terrain fork (old aggregation_tile call) AND the
-2x2-average overview pyramid (old downsampling.py). The model the production-build plan mandates:
-
-  each output zoom renders by reading the MOSAIC at that zoom's resolution
+Each output zoom renders by reading the MOSAIC at that zoom's resolution
   -> depth/zoom-gated smooth AT THAT RESOLUTION (smooth.smooth_array — the ONE smoothing
      function the contour fork also calls, so isobaths agree with the shading)
   -> Terrarium encode (encode.py's conservative, bias-shallow quantization)
-  -> single-zoom pmtiles bundle.py already understands (store/pmtiles/<stem>-<key12>.pmtiles).
+  -> single-zoom pmtiles bundle.py concatenates (store/pmtiles/<stem>.pmtiles).
 
-Why this replaces the 2x2 average: the old path smoothed ONCE at native res then box-averaged the
-ENCODED tiles down, so a sigma had no defined ground size at coarse zoom. Reading the mosaic's
-nodata-aware `average` overviews at each zoom and smoothing there gives f(depth, zoom) a real
-metre meaning at every level (the zoom-tier contour design assumes this). Accepted consequence
-(plan): coarse zooms are no longer a strict decimation of fine zooms, so features may shift
-slightly between levels — invisible in shading, already intended for contours.
+Reading the mosaic's nodata-aware `average` overviews at each zoom and smoothing there gives
+f(depth, zoom) a real metre meaning at every level (the zoom-tier contour design assumes this).
+Consequence: coarse zooms are not a strict decimation of fine zooms, so features may shift slightly
+between levels — invisible in shading, intended for contours.
 
-The two pyramids (5a): the mosaic COGs' internal overviews are the *access* pyramid (unsmoothed
+Two pyramids: the mosaic COGs' internal overviews are the *access* pyramid (unsmoothed
 truth, `average`-resampled) — a decimated GTI read picks each tile's overview automatically, so the
 rule here is ALWAYS read at target resolution, never full-res-then-decimate. This module builds the
 *served* pyramid: smoothed, encoded, display-conditioned. z0-~z4 read the mosaic's own GTI-
 registered planet z8 COG (the <Overview> in mosaic.gti), not thousands of tile-COG top overviews —
 that fallthrough is automatic in the GTI decimated read too.
 
-Reads the mosaic by ABSOLUTE path through the SYSTEM gdal (the 3.13 toolchain the pipeline shells
-to), not rasterio's bundled 3.10 — 5a found the GTI's RELATIVE IndexDataset/Overview refs resolve
+Reads the mosaic by ABSOLUTE path through the SYSTEM gdal (the toolchain the pipeline shells to),
+not rasterio's bundled GDAL — the GTI's RELATIVE IndexDataset/Overview refs resolve
 differently across GDAL versions, so a windowed read must go through the same gdal that wrote the
-.gti (see mosaic._check). MOSAIC_VSI_BASE points the tile `location`s at a bucket in CI; unset =
-local abspath, which is what a laptop / this render uses. The mosaic MUST already be built +
-indexed (mosaic.py index) before this runs — the Justfile orders `aggregate -> mosaic-index ->
-terrain`.
+.gti. MOSAIC_VSI_BASE points the tile `location`s at a bucket in CI; unset = local abspath, which
+is what a laptop / this render uses. The mosaic MUST already be built + indexed
+(mosaic.py index --stable) before this runs — the terrain_render rule gates on mosaic_index.
 
-  python terrain.py cover     plan the render stems (native + coalesced overviews) for the covering
-  python terrain.py run       render every stale stem from the mosaic (one machine, a process pool)
-  python terrain.py --check    self-check (renders a synthetic mosaic tile, asserts the pyramid)
+build.smk derives the render stems (render_stems) at parse time and schedules one
+`terrain.py render <stem>` job per stem, writing store/pmtiles/<stem>.pmtiles.
+
+  python terrain.py render <stem>   render one stem from the mosaic to the plain flat name
+  python terrain.py --check         self-check (renders a synthetic mosaic tile, asserts the pyramid)
 """
 
-import hashlib
 import math
 import os
 import shutil
+import tempfile
 import sys
-import time
-from functools import lru_cache
-from glob import glob
-from multiprocessing import get_context
 
 import mercantile
 import numpy as np
 import rasterio
 
 import aggregation_reproject
-import cache_versions
 import encode
-import keys
 import mosaic
-import scheduler
 import smooth
 import utils
 
 NODATA = -9999
-
-# Code the served terrain render depends on: the smoothing (the ONE f(depth,zoom)), the encode
-# Explicit contracts for the index/GTI semantics and terrain renderer. Output-affecting changes
-# bump these versions; the mosaic tile keys enter separately as terrain inputs.
-TERRAIN_VERSIONS = [cache_versions.MOSAIC_INDEX, cache_versions.MOSAIC_GTI,
-                    cache_versions.SMOOTH, cache_versions.ENCODE, cache_versions.TERRAIN]
 
 
 # ── the mosaic GTI, read through the system gdal by absolute path ──────────────────────────────
@@ -73,7 +56,7 @@ TERRAIN_VERSIONS = [cache_versions.MOSAIC_INDEX, cache_versions.MOSAIC_GTI,
 def gti_abspath():
     """The absolute mosaic.gti path the system gdal opens. A regional/dev build streams the
     published planet GTI by setting MOSAIC_GTI to a /vsicurl URL; unset = the local store's
-    pointer (what `just planet` on a laptop and the build box both use — the box hydrates the
+    pointer (what a laptop `snakemake preview` and the build box both use — the box hydrates the
     mosaic/ prefix, so the .gti's RELATIVE index/overview refs resolve on local disk)."""
     env = os.environ.get("MOSAIC_GTI")
     if env:
@@ -91,19 +74,22 @@ def _halo_px():
         smooth.DEM_SIGMA, smooth.DEM_SIGMA_DEEP, smooth.MASK_SIGMA))) + 1
 
 
-def _read_window(anchor, cz, halo, out_tif):
+def window_tiles(stem):
+    """The per-stem read set for cz>=8 renders: intersecting tiles buffered by the smooth halo
+    in meters at cz res — which outgrows the fixed macrotile buffer at coarse zooms."""
+    cz = int(stem.split("-")[3])
+    return mosaic.intersecting_tiles(stem, _halo_px() * aggregation_reproject.get_resolution(cz))
+
+
+def _read_window(anchor, cz, halo, out_tif, src=None):
     """Warp a buffered window of the mosaic — the anchor tile's 3857 bounds expanded by `halo`
     px on every side — to `out_tif` at zoom `cz` resolution, through the SYSTEM gdal. `-r average`
-    (the plan's default, and the anti-alias prefilter decimation needs): a decimated read picks
+    (the anti-alias prefilter decimation needs): a decimated read picks
     each mosaic tile's own `average` overview, and z<=8 falls through to the planet z8 COG the .gti
     registers — never a full-res-then-decimate. Exact grid registration: -te/-tr snap the window to
-    the global 3857 grid so the interior origin is EXACTLY the anchor's mercantile bounds (5a's
-    ceil-overhang trap). -dstnodata fills the beyond-extent halo with the one sentinel.
-
-    Shallow-bias option (plan, deferred): `average` moves an isolated shoal deeper. If the shading
-    itself should bias shallow in the navigable band (<=~30 m), a shallowest-in-window reducer
-    there (average standing in deep water) is the tool — a cartographic call beyond this pass; the
-    conservative signal at coarse zoom is carried by soundings/depare meanwhile."""
+    the global 3857 grid so the interior origin is EXACTLY the anchor's mercantile bounds (a slip
+    ceils the virtual extent to a 1-px overhang). -dstnodata fills the beyond-extent halo with the
+    one sentinel."""
     res = aggregation_reproject.get_resolution(cz)
     span = 2 ** (cz - anchor.z)
     core = span * 512
@@ -116,7 +102,7 @@ def _read_window(anchor, cz, halo, out_tif):
         f"GDAL_CACHEMAX=512 gdalwarp -q -overwrite -r average -t_srs EPSG:3857 "
         f"-tr {res} {res} -te {left} {bottom} {right} {top} -dstnodata {NODATA} "
         f"-of GTiff -co TILED=YES -co BLOCKXSIZE=512 -co BLOCKYSIZE=512 -co COMPRESS=ZSTD -co PREDICTOR=3 "
-        f"-co NUM_THREADS=ALL_CPUS {_q(gti_abspath())} {out_tif}",
+        f"-co NUM_THREADS=ALL_CPUS {_q(src or gti_abspath())} {out_tif}",
         f"terrain window {anchor.z}-{anchor.x}-{anchor.y}@z{cz}")
     return core, halo
 
@@ -147,7 +133,7 @@ def _encode_tile(i, j, src_path, halo, out_webp, cz):
 
 
 def _render(stem, out_pmtiles):
-    """Render one stem `z-x-y-cz` from the mosaic into `out_pmtiles` (the caller's content name):
+    """Render one stem `z-x-y-cz` from the mosaic into `out_pmtiles`:
     read the buffered window at cz res -> smooth per-zoom -> cut the interior into the span*span
     512-tiles -> encode -> pack. Published atomically."""
     z, x, y, cz = (int(a) for a in stem.split("-"))
@@ -155,16 +141,20 @@ def _render(stem, out_pmtiles):
     span = 2 ** (cz - z)
     halo = _halo_px()
 
-    tmp = f"store/terrain-tmp/{stem}"
-    utils.create_folder(tmp)
+    tmp = tempfile.mkdtemp(prefix=f"terrain-{stem}-")  # local scratch; publish crosses to the store
     window = f"{tmp}/window.tif"
-    # This stem's memory weight was reserved in the PARENT before dispatch (scheduler.map_budgeted
-    # in run()); the RAM peak it prices is here — the gdalwarp window read + the smooth hold the
-    # multi-GB window array (a native macrotile window is 32768² float32), so a spawn Pool sized
-    # to cores can't OOM. The reservation now also spans the per-512-tile encode below (light,
-    # small on-disk windows) — released at task completion, a slightly longer hold traded for
-    # workers that never block.
-    core, halo = _read_window(anchor, cz, halo, window)
+    # cz>=8 reads a throwaway VRT of the halo-buffered tile set, so a render never waits on the
+    # planet-wide GTI; cz<8 needs the GTI's planet-z8-COG fall-through. MOSAIC_GTI still wins.
+    src = None
+    if cz >= 8 and not os.environ.get("MOSAIC_GTI"):
+        src = f"{tmp}/window.vrt"
+        tiles = " ".join(mosaic.tile_artifact(s) for s in window_tiles(stem))
+        aggregation_reproject._run(f"gdalbuildvrt -q -overwrite -resolution highest {src} {tiles}",
+                                   f"terrain vrt {stem}")
+    # The RAM peak the terrain_render rule reserves (build.smk mem_gb=weight) is here — the gdalwarp
+    # window read + the smooth hold the multi-GB window array (a native macrotile window is 32768²
+    # float32). The engine schedules one process per stem, so the cgroup cap bounds each in isolation.
+    core, halo = _read_window(anchor, cz, halo, window, src)
     if not os.environ.get("SKIP_SMOOTH"):
         smooth.smooth_tiff(window)  # the ONE f(depth,zoom); halo makes interior identical to whole
 
@@ -182,35 +172,14 @@ def _render(stem, out_pmtiles):
 
     tmp_archive = f"{tmp}/terrain.pmtiles"  # not *.webp, so create_archive's glob skips it
     utils.create_archive(tmp, tmp_archive)
-    keys.publish(tmp_archive, out_pmtiles)
+    utils.publish(tmp_archive, out_pmtiles)
     shutil.rmtree(tmp)
-    scheduler.log_peak(stem)  # whole-render peak RSS vs weight — factor-tuning data
 
 
 # ── the render covering: native aggregation stems + coalesced overview parents ──────────────────
-# Ported from the old downsampling `cover` cascade (which planned the overview parents by coalescing
-# aggregation extents). Here it enumerates the SAME multi-zoom stem set bundle.py groups (native +
-# overviews), but every stem RENDERS from the mosaic — there are no "children" to average, so the
-# marker CSV carries no filenames, only the stem's identity. get_simplified_extents bounds a stem's
-# pixel span to 2**num_overviews*512 so no render window is unbounded.
-
-def _covering_id():
-    ids = utils.get_aggregation_ids()
-    if not ids:
-        sys.exit("terrain: no covering — run `just cover` first")
-    return ids[-1]
-
-
-def _extents_at(aid, zoom):
-    """Every render extent already planned at `zoom` — the aggregation stems (native) and any
-    terrain markers written for that zoom (coarser parents the cascade already emitted)."""
-    out = []
-    for pattern in (f"*-*-*-{zoom}-aggregation.csv", f"*-*-*-{zoom}-terrain.csv"):
-        for fp in glob(f"store/aggregation/{aid}/{pattern}"):
-            z, x, yy = (int(a) for a in fp.split("/")[-1].split("-")[:3])
-            out.append(mercantile.Tile(x=x, y=yy, z=z))
-    return out
-
+# Enumerates the multi-zoom stem set bundle.py groups (native + overviews); every stem RENDERS from
+# the mosaic. _simplified bounds a stem's pixel span to 2**num_overviews*512 so no render window is
+# unbounded; render_stems is the pure, parse-time cascade build.smk derives its outputs from.
 
 def _simplified(extents, zoom):
     simplified = []
@@ -224,87 +193,10 @@ def _simplified(extents, zoom):
     return simplified
 
 
-def _marker(aid, stem):
-    return f"store/aggregation/{aid}/{stem}-terrain.csv"
-
-
-def cover():
-    """Plan the render stems. Native stems come straight from the aggregation CSVs (each renders at
-    its own child_z); overview parents are the coalesced cascade down to z0. Writes one
-    `<stem>-terrain.csv` marker per render stem — a work item for `run`, no children inside."""
-    aid = _covering_id()
-    utils.run_command(f"rm -f store/aggregation/{aid}/*-terrain.csv")
-    # native: one marker per aggregation stem (the finest render, at child_z).
-    for fp in glob(f"store/aggregation/{aid}/*-aggregation.csv"):
-        stem = fp.split("/")[-1].replace("-aggregation.csv", "")
-        with open(_marker(aid, stem), "w") as f:
-            f.write("# terrain render marker (native)\n")
-    # overviews: coalesce extents at each child_zoom into parents one zoom coarser, cascading down
-    # (a parent written here is itself an extent the next-coarser pass reads — the pyramid to z0).
-    for child_zoom in reversed(range(1, 32)):
-        extents = _extents_at(aid, child_zoom)
-        if not extents:
-            continue
-        seen = set()
-        for simplified in _simplified(extents, child_zoom):
-            pstem = f"{simplified.z}-{simplified.x}-{simplified.y}-{child_zoom - 1}"
-            if pstem in seen:
-                continue
-            seen.add(pstem)
-            with open(_marker(aid, pstem), "w") as f:
-                f.write("# terrain render marker (overview)\n")
-
-
-# ── keys, dirty, run ────────────────────────────────────────────────────────────────────────────
-
-def _aggregation_mosaic_keys(aid):
-    """{aggregation stem -> its mosaic tile key}. The mosaic tile a stem reads IS keyed by
-    mosaic.mosaic_key(csv); a re-merged/re-precedenced tile gets a new mosaic key here -> a new
-    terrain key -> a re-render. Cached per covering read isn't needed — one call per `run`."""
-    out = {}
-    for fp in glob(f"store/aggregation/{aid}/*-aggregation.csv"):
-        stem = fp.split("/")[-1].replace("-aggregation.csv", "")
-        out[stem] = mosaic.mosaic_key(fp)
-    return out
-
-
-@lru_cache(maxsize=None)
-def _tile_bounds(stem):
-    """mercantile lon/lat bounds of a 'z-x-y-cz' stem, memoised. `_intersecting_keys` runs once per
-    render stem over the SAME aggregation tiles, so without the cache a planet build recomputes each
-    tile's projected bounds thousands of times — the cost Copilot flagged. The cache makes the
-    expensive `mercantile.bounds` O(unique tiles); the per-stem loop is then only cheap float
-    compares. (A macrotile-grid spatial index would cut the loop to O(stems × 9) too, but the
-    compares are already sub-second at planet scale — deferred until measured to dominate.)"""
-    z, x, y, _cz = (int(a) for a in stem.split("-"))
-    return mercantile.bounds(mercantile.Tile(x=x, y=y, z=z))
-
-
-def _intersecting_keys(stem, agg_keys):
-    """The mosaic tile keys a render stem reads INTO — every aggregation tile whose mercantile tile
-    overlaps OR EDGE/CORNER-TOUCHES the stem's anchor. The touch case is load-bearing for chart
-    safety: _read_window buffers the anchor by a halo (smooth's truncation radius) and blends those
-    haloed pixels into the served EDGE band, so the immediate 8-neighbour tiles genuinely shape the
-    output — they must enter the key or a neighbour-only re-merge leaves a stale seam depth. Hence
-    INCLUSIVE bounds (<=/>=): adjacent tiles share exact grid coordinates (the east neighbour's west
-    == the anchor's east), and the halo (65 px) is far under the 512 px minimum tile width, so it
-    never reaches past the immediate neighbours — the touch test is both necessary and sufficient.
-    Sorted, so the terrain key is order-independent."""
-    ab = _tile_bounds(stem)
-    keyset = []
-    for astem, k in agg_keys.items():
-        bb = _tile_bounds(astem)
-        # lon/lat bbox overlap-or-touch (tiles share a global grid); >=/<= so an edge/corner
-        # neighbour the halo reads is included, not just a strictly-overlapping ancestor/descendant.
-        if bb.west <= ab.east and bb.east >= ab.west and bb.south <= ab.north and bb.north >= ab.south:
-            keyset.append(k)
-    return sorted(set(keyset))
-
-
 def _config():
-    """The served-render config in the key: the smoothing knobs (unless SKIP_SMOOTH) and the
-    encode's quantization constants + zoom-tiling floors. A SMOOTH_* / quantization change re-keys
-    every terrain stem and nothing upstream (the payoff)."""
+    """The served-render config the terrain_render rule carries as a param: the smoothing knobs
+    (unless SKIP_SMOOTH) and the encode's quantization constants + zoom-tiling floors. A SMOOTH_* /
+    quantization change reruns every terrain stem and nothing upstream (the payoff)."""
     cfg = {
         "quant_full_zoom": encode.FULL_RESOLUTION_ZOOM,
         "shallow_rel": encode.SHALLOW_REL, "shallow_min_step": encode.SHALLOW_MIN_STEP,
@@ -320,89 +212,39 @@ def _config():
     return cfg
 
 
-def terrain_key(stem, agg_keys):
-    return keys.stage_key(_intersecting_keys(stem, agg_keys), TERRAIN_VERSIONS,
-                          {**_config(), "product": "terrain"})
+def render_stems(covering_stems):
+    """The render-stem cascade, PURE: native render stems are the covering stems; overview parents
+    coalesce per child zoom cascading to z0 (a parent added at one zoom is an extent the next-coarser
+    pass reads). Parse-time cheap: mercantile only, no store reads — build.smk derives the
+    terrain_render outputs from this."""
+    out = set(covering_stems)
+    for child_zoom in reversed(range(1, 32)):
+        extents = []
+        for s in out:
+            z, x, y, cz = (int(a) for a in s.split("-"))
+            if cz == child_zoom:
+                extents.append(mercantile.Tile(x=x, y=y, z=z))
+        if not extents:
+            continue
+        for simplified in _simplified(extents, child_zoom):
+            out.add(f"{simplified.z}-{simplified.x}-{simplified.y}-{child_zoom - 1}")
+    return sorted(out)
 
 
-def _artifact(stem):
-    z, x, y, _cz = (int(a) for a in stem.split("-"))
-    return f"{utils.get_pmtiles_folder(x, y, z)}/{stem}.pmtiles"
-
-
-def _render_stems(aid):
-    """Every render stem in the covering: native (aggregation) + overview (terrain markers)."""
-    stems = set()
-    for fp in glob(f"store/aggregation/{aid}/*-aggregation.csv"):
-        stems.add(fp.split("/")[-1].replace("-aggregation.csv", ""))
-    for fp in glob(f"store/aggregation/{aid}/*-terrain.csv"):
-        stems.add(fp.split("/")[-1].replace("-terrain.csv", ""))
-    return stems
-
-
-def dirty_stems():
-    """Render stems whose content-addressed pmtiles is absent under its current key (self-heal, or
-    the mosaic tile(s) it reads / the smooth+encode config moved). FORCE_REBUILD makes every stem
-    stale. Deterministic pseudo-random order (stable hash of the stem): under the memory budget,
-    heaviest-first back-loads the queue with un-fittable heavies that starve the pool; a shuffle
-    interleaves cheap and heavy so the budget keeps every core busy. Order can't affect output."""
-    aid = _covering_id()
-    agg_keys = _aggregation_mosaic_keys(aid)
-    out = []
-    for stem in _render_stems(aid):
-        if not keys.fork_fresh(_artifact(stem), terrain_key(stem, agg_keys)):
-            out.append(stem)
-    return sorted(out, key=lambda s: hashlib.md5(s.encode()).hexdigest())
-
-
-def _run_one(stem_and_key):
-    stem, key = stem_and_key
-    art = _artifact(stem)
-    keys.supersede(art)  # clear last build's key before the atomic publish (crash -> reads stale)
-    _render(stem, keys.content_path(art, key))
-    return stem
-
-
-def run():
-    """Render every stale stem from the mosaic on one machine. SPAWN, not fork: this module inits
-    GDAL at import (rasterio), and GDAL is not fork-safe (same reason as the old downsampling pool).
-    Cap workers via TERRAIN_PROCESSES (each holds one window — a native macrotile is multi-GB); the
-    build box sizes it from RAM. unset/0 = all cores."""
-    aid = _covering_id()
-    agg_keys = _aggregation_mosaic_keys(aid)
-    stems = dirty_stems()
-    if not stems:
-        print("terrain: nothing to render")
-        return
-    work = [(s, terrain_key(s, agg_keys)) for s in stems]
-    # Pool size = cores (TERRAIN_PROCESSES, unset/0 = all cores); peak RAM is bounded separately
-    # by a shared GB budget (TERRAIN_MEM_BUDGET_GB), enforced in THIS process: map_budgeted
-    # dispatches a stem into the spawn pool only once its weight fits (heaviest admissible first),
-    # so the densest native windows can't all peak at once and a stem that doesn't fit waits here,
-    # never inside a worker. Budget unset/0 = plain pool.
-    procs = int(os.environ.get("TERRAIN_PROCESSES", "0")) or os.cpu_count()
-    budget = int(os.environ.get("TERRAIN_MEM_BUDGET_GB", "0"))
-    print(f"terrain: rendering {len(work)} stem(s) from the mosaic...")
-    done, last = 0, time.monotonic()
-
-    def _progress(_item):
-        nonlocal done, last
-        done += 1
-        if time.monotonic() - last > 30:
-            print(f"  {done}/{len(work)} stems rendered", flush=True)
-            last = time.monotonic()
-
-    with get_context("spawn").Pool(procs, **scheduler.pool_kwargs()) as pool:
-        scheduler.map_budgeted(pool, _run_one, work, budget, procs,
-                               stem_of=lambda w_: w_[0], on_done=_progress)
-    print(f"terrain: {done} stem(s) rendered")
+def render(stem):
+    """The stage-3 Snakemake job: render one stem from the mosaic (via the local GTI mosaic_index
+    wrote) to store/pmtiles/<stem>.pmtiles — a flat name, not sharded (bundling globs it)."""
+    out = f"store/pmtiles/{stem}.pmtiles"
+    os.makedirs("store/pmtiles", exist_ok=True)
+    _render(stem, out)
+    print(f"terrain render {stem}: {out}", flush=True)
 
 
 def _check():
-    """Render two zooms of a synthetic single-tile mosaic and assert: exact grid registration
-    (the served tiles match the mercantile grid), the served pyramid decodes to the mosaic's depth,
-    nodata resolves to a served value (no hole), and the terrain key is stable / moves on a mosaic-
-    tile-key change / a smooth-config change (the stage split's whole point)."""
+    """Derive the render stems from a one-tile covering (native + overview cascade), render a
+    synthetic single-tile mosaic at two zooms, and assert exact grid
+    registration (served tiles match the mercantile grid), the served pyramid decodes to the
+    mosaic's depth, and the mosaic's nodata hole resolves to a served value (no transparency)."""
     import json
     import tempfile
 
@@ -410,13 +252,13 @@ def _check():
     from pmtiles.reader import MmapSource, Reader, all_tiles
     from rasterio.transform import from_origin
 
-    saved_env = {k: os.environ.pop(k, None) for k in ("MOSAIC_GTI", "FORCE_REBUILD", "SKIP_SMOOTH")}
+    saved_env = {k: os.environ.pop(k, None) for k in ("MOSAIC_GTI", "SKIP_SMOOTH")}
     cwd = os.getcwd()
     d = tempfile.mkdtemp()
     try:
         os.chdir(d)
         # A z8 mosaic tile at child_z=10 (span 4 -> 2048 px native), constant -30 m with a nodata
-        # hole in one corner, built as a real COG with average overviews (mosaic.produce's shape).
+        # hole in one corner, built as a real COG with average overviews (mosaic.tile's shape).
         z, x, y, cz = 8, 75, 96, 10
         stem = f"{z}-{x}-{y}-{cz}"
         res = aggregation_reproject.get_resolution(cz)
@@ -430,10 +272,13 @@ def _check():
                            dtype="float32", nodata=NODATA, crs="EPSG:3857",
                            transform=from_origin(b.left, b.top, res, res)) as dst:
             dst.write(arr, 1)
-        cog = f"store/mosaic/tiles/{stem}-abc123abc123.tif"
+        cog = f"store/mosaic/tiles/{stem}.tif"
         utils.run_command(f"gdal_translate -q -of COG -a_nodata {NODATA} -co RESAMPLING=AVERAGE "
                           f"-co OVERVIEW_RESAMPLING=AVERAGE -co BLOCKSIZE=512 {raw} {cog}")
         os.remove(raw)
+        os.makedirs("store/aggregation")
+        with open("store/aggregation/covering.txt", "w") as f:
+            f.write(stem + "\n")  # window_tiles resolves the cz>=8 VRT read set from the covering
         # a minimal GTI over the one tile (absolute location; a real build's mosaic.py writes this)
         gj = {"type": "FeatureCollection", "features": [{"type": "Feature", "properties": {
             "location": os.path.abspath(cog), "resx": res, "resy": res},
@@ -447,33 +292,14 @@ def _check():
                     "  <LocationField>location</LocationField>\n  <SRS>EPSG:3857</SRS>\n"
                     f"  <NoDataValue>{NODATA}</NoDataValue>\n</GDALTileIndexDataset>\n")
 
-        # a covering with the one aggregation tile, so keys resolve the real mosaic key
-        import config
-        saved_dir = config.SOURCES_DIR
-        config.SOURCES_DIR = "sources"
-        config._catalog_cache.clear()
-        os.makedirs("sources/gebco")
-        with open("sources/gebco/metadata.json", "w") as f:
-            json.dump({"name": "gebco", "priority": 0, "max_zoom": 10}, f)
-        aid = "01TERRAINTERRAINTERRAINTE"
-        os.makedirs(f"store/aggregation/{aid}")
-        csv = f"store/aggregation/{aid}/{stem}-aggregation.csv"
-        with open(csv, "w") as f:
-            f.write("source,filename,maxzoom\ngebco,gebco_0.tif,10\n")
-
-        cover()
-        stems = _render_stems(aid)
+        # render_stems (pure): the native stem plus the coalesced overview parents down to z0.
+        stems = render_stems([stem])
         assert stem in stems, "native stem must be a render stem"
         assert any(s.endswith("-9") for s in stems), "an overview parent (z9) must be planned"
 
-        agg_keys = _aggregation_mosaic_keys(aid)
-        k = terrain_key(stem, agg_keys)
-        config._catalog_cache.clear()
-        assert terrain_key(stem, agg_keys) == k, "terrain key must be stable across a no-op recompute"
-
-        # render the native stem; assert the served tiles register on the mercantile grid and decode
-        cpath = keys.content_path(_artifact(stem), k)
-        _render(stem, cpath)
+        # render the native stem to its PLAIN name; assert the tiles register on the mercantile grid
+        render(stem)
+        cpath = f"store/pmtiles/{stem}.pmtiles"
         with open(cpath, "r+b") as f:
             tiles = dict(all_tiles(Reader(MmapSource(f)).get_bytes))
         span = 4
@@ -496,9 +322,8 @@ def _check():
 
         # render an overview stem too (reads the mosaic's average overview); it must decode to ~-30
         ostem = next(s for s in stems if s.endswith("-9"))
-        oc = keys.content_path(_artifact(ostem), terrain_key(ostem, agg_keys))
-        _render(ostem, oc)
-        with open(oc, "r+b") as f:
+        render(ostem)
+        with open(f"store/pmtiles/{ostem}.pmtiles", "r+b") as f:
             ot = dict(all_tiles(Reader(MmapSource(f)).get_bytes))
         assert ot, "overview render produced no tiles"
         allpx = np.concatenate([encode.decode(imagecodecs.webp_decode(v).astype("float32")).ravel()
@@ -506,33 +331,6 @@ def _check():
         wet = allpx[allpx < -1]  # the covered water (0 = beyond-build fill / nodata; ignore)
         assert len(wet) and abs(float(np.median(wet)) - (-30.0)) < 3.0, \
             f"overview served depth must track the mosaic (-30 m), median {np.median(wet):.1f}"
-
-        # key sensitivity: a mosaic-tile-key change re-keys terrain; a smooth-config change too
-        agg_keys2 = dict(agg_keys); agg_keys2[stem] = "deadbeefdead"
-        assert terrain_key(stem, agg_keys2) != k, "a mosaic tile key change must move the terrain key"
-
-        # TWO-TILE fixture (the single-tile store structurally can't cover this): the anchor's
-        # 65 px halo reads its EDGE NEIGHBOUR's mosaic tile and blends it into the served seam band,
-        # so a neighbour-only re-merge MUST move the anchor's terrain key (else a stale seam depth —
-        # a chart-safety bug). anchor 8-75-96-14 + east neighbour 8-76-96-14 (shares the anchor's
-        # east edge) + a far tile 8-200-96-14 that neither overlaps nor touches.
-        anc, nbr, far = "8-75-96-14", "8-76-96-14", "8-200-96-14"
-        two = {anc: "1111aaaa1111", nbr: "2222bbbb2222"}
-        base2 = terrain_key(anc, two)
-        assert two[nbr] in _intersecting_keys(anc, two), "the edge neighbour must be an intersecting tile"
-        bumped = {**two, nbr: "3333cccc3333"}  # the neighbour re-merged (new mosaic key)
-        assert terrain_key(anc, bumped) != base2, \
-            "a neighbour-only mosaic re-key must move the anchor's terrain key (the halo reads it)"
-        assert terrain_key(anc, {**two, far: "4444dddd4444"}) == base2, \
-            "a non-touching far tile must NOT enter the anchor's terrain key"
-
-        saved_sigma = smooth.DEM_SIGMA_DEEP
-        smooth.DEM_SIGMA_DEEP = saved_sigma + 1
-        try:
-            assert terrain_key(stem, agg_keys) != k, "a smooth-config change must move the terrain key"
-        finally:
-            smooth.DEM_SIGMA_DEEP = saved_sigma
-        config.SOURCES_DIR = saved_dir
         print("terrain.py self-check ok")
     finally:
         os.chdir(cwd)
@@ -543,14 +341,12 @@ def _check():
 
 
 def main(argv):
-    if argv == ["cover"]:
-        cover()
-    elif argv == ["run"]:
-        run()
+    if argv[:1] == ["render"] and len(argv) == 2:
+        render(argv[1])
     elif argv[:1] == ["--check"]:
         _check()
     else:
-        sys.exit("usage: terrain.py <cover | run | --check>")
+        sys.exit("usage: terrain.py <render <stem> | --check>")
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 """Static soundings: shoalest-per-cell point depths off each aggregation tile's merged DEM.
 
-A second consumer of the same merged, smoothed DEM the aggregation stage builds — the one
-contour_run.py forks off. On a real chart, point soundings are the primary depth cue.
+A second consumer of the same smoothed mosaic window contour_run.py reads. On a real chart,
+point soundings are the primary depth cue.
 
 A client-side plugin (maplibre-contour's spot-soundings fork) point-samples one jittered
 DEM pixel per grid node, which can miss a shoal between nodes. We own the whole DEM at build
@@ -27,13 +27,10 @@ import math
 import os
 import subprocess
 import sys
-from glob import glob
 
 import mercantile
 
 import contour_run
-import cache_versions
-import keys
 import utils
 
 NODATA = -9999
@@ -143,29 +140,18 @@ def _pyramid(src, nodata, bbox, min_depth, z, child_z):
     return pts
 
 
-def generate(filepath, out):
-    """Sound one aggregation tile's merged DEM into ``out`` (the caller's content-addressed
-    geojson name). Writes ``out`` atomically only when there ARE points — a dry / all-land tile
-    returns having written nothing, and the caller records the empty marker. The caller superseded
-    this stem's old-key siblings before calling, so a crash here leaves the fork reading stale."""
+def _sound_dem(dem, tile_obj, z, child_z, tmp, label):
+    """Sound any DEM covering the tile's extent: grid-decimated shoalest picks into a tmp
+    geojson. Returns (final_path, count), or None when dry / all-land."""
     import rasterio
     from pyproj import Transformer
-    agg_id, filename = filepath.split("/")[-2:]
-    z, x, y, child_z = (int(a) for a in filename.replace("-aggregation.csv", "").split("-"))
-    tile = mercantile.Tile(x=x, y=y, z=z)
-    tmp = f"store/aggregation/{agg_id}/{z}-{x}-{y}-{child_z}-tmp"
-    dem = f"{tmp}/{len(glob(f'{tmp}/*.tiff')) - 1}-3857.tiff"
-    if not os.path.exists(dem):
-        print(f"soundings: no merged DEM for {filename}")
-        return
-
-    bbox = mercantile.xy_bounds(tile)  # unbuffered, tile-aligned (EPSG:3857)
+    bbox = mercantile.xy_bounds(tile_obj)  # unbuffered, tile-aligned (EPSG:3857)
     with rasterio.open(dem) as src:
         nodata = src.nodata if src.nodata is not None else NODATA
         pts = _pyramid(src, nodata, bbox, SOUND_MIN_DEPTH_M, z, child_z)
     if not pts:
-        print(f"soundings: no wet cells for {filename}")
-        return
+        print(f"soundings: no wet cells for {label}")
+        return None
 
     to4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
     feats = []
@@ -177,72 +163,66 @@ def generate(filepath, out):
                       "properties": _depths(d),
                       "geometry": {"type": "Point", "coordinates": [round(lon, 6), round(lat, 6)]}})
 
-    # Write into the tmp folder, then atomically publish into the content name.
     final = f"{tmp}/soundings.geojson"
     with open(final, "w") as f:
         json.dump({"type": "FeatureCollection", "features": feats}, f)
-    keys.publish(final, out)
-    print(f"soundings: {filename} -> {len(feats)} points")
+    return final, len(feats)
 
 
-def _live(paths, stems):
-    """Drop soundings orphaned by a covering re-tiling (same class as contour's _live_fgbs: a
-    re-tiled source area leaves the old stem's file behind, sync has no --delete, and bundling it
-    alongside the new tiling doubles up). Keep only current-covering stems (parsed off the
-    content-addressed name); keep all when None; drop non-content debris either way."""
-    live = [p for p in paths if keys.is_content_name(p)]
-    if stems is None:
-        return live
-    return [p for p in live if keys.stem_of(p) in stems]
+def tile(stem):
+    """The per-stem Snakemake job: sound one stem from a BUFFERED mosaic window, smoothed at read
+    with the one shared f(depth, zoom), output at store/soundings/<stem>.geojson. A dry tile writes
+    a 0-byte sentinel; bundling filters empties by size."""
+    import shutil
+    import tempfile
+
+    import mosaic
+    import smooth
+    z, x, y, child_z = (int(a) for a in stem.split("-"))
+    out = f"store/soundings/{stem}.geojson"
+    tmp = tempfile.mkdtemp(prefix=f"soundings-{stem}-")  # local scratch; publish crosses to the store
+    dem = mosaic.window_dem(stem, f"{tmp}/dem.tiff")
+    if not os.environ.get("SKIP_SMOOTH"):
+        smooth.smooth_tiff(dem)
+    res = _sound_dem(dem, mercantile.Tile(x=x, y=y, z=z), z, child_z, tmp, stem)
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    if res:
+        final, n = res
+        utils.publish(final, out)  # scratch and store are separate filesystems
+        print(f"soundings tile {stem}: {n} points")
+    else:
+        open(out, "w").close()
+        print(f"soundings tile {stem}: empty")
+    shutil.rmtree(tmp)
 
 
-def bundle():
-    """tippecanoe the per-tile soundings into store/bundle/soundings.pmtiles (layer `soundings`).
-    Per-feature tippecanoe.minzoom places each point from the zoom the grid decimation assigned,
-    so no density dropping is needed (-r1 keeps every surviving point). Bundled before the
-    contour tile-join, which folds this layer into vector.pmtiles. Skips when every member
-    tile's key is unchanged and the pmtiles is already on disk (the local iterative loop; the
-    build box's store/bundle is never hydrated, so a box build always rebuilds it)."""
-    gj = _live(sorted(glob("store/soundings/*.geojson")), contour_run._current_stems())
-    contour_run.verify_vector_complete("soundings", gj)  # self-enforcing, before the fresh-skip
-    out = "store/bundle/soundings.pmtiles"
-    if not gj:
-        # Empty input is a real state, not a no-op: a previously-built archive (and the sidecar
-        # vouching for it) must not survive — _finalize_contours folds this file into
-        # vector.pmtiles whenever it exists on disk, so a stale layer would ship as current.
-        # The invalidate discipline, extended to "the current state is nothing".
-        for stale in (out, keys.sidecar(out)):
-            if os.path.isfile(stale):
-                os.remove(stale)
-        print("soundings bundle: no soundings")
-        return
-    # Shared tileset maxzoom (see contour_run.bundle_maxz): tiling only to this
-    # layer's own regional max would truncate it out of deeper joined tiles.
-    maxz = contour_run.bundle_maxz(max(int(keys.stem_of(g).split("-")[3]) for g in gj))
-    skey = keys.stage_key([os.path.basename(g) for g in gj],  # the key rides in each member's name
-                          [cache_versions.SOUNDINGS_BUNDLE], {"maxz": maxz})
-    if keys.is_fresh(out, skey):
-        print("soundings bundle: inputs unchanged — skip")
-        return
-    utils.create_folder("store/bundle")
-    # Invalidate before writing (the crash rule every keyed writer follows): under FORCE the
-    # key is unchanged, so a crash mid-tippecanoe would otherwise leave the old sidecar reading
-    # a torn archive as fresh forever.
-    for stale in (out, keys.sidecar(out)):
-        if os.path.isfile(stale):
-            os.remove(stale)
-    tmp_out = utils.vector_scratch("soundings.pmtiles")
-    if os.path.exists(tmp_out):
-        os.remove(tmp_out)
+def _tippecanoe(gj, maxz, out):
+    """tippecanoe the per-tile soundings geojsons into `out` (layer `soundings`, z0..maxz). -r1
+    keeps every point: per-feature tippecanoe.minzoom already did the density thinning by zoom."""
     with utils.log_group(f"soundings tippecanoe ({len(gj)} inputs, z0-{maxz})"):
         utils.run_monitored(
-            ["tippecanoe", "-o", tmp_out, "-f", "-l", "soundings",
+            ["tippecanoe", "-o", out, "-f", "-l", "soundings",
              "-n", "Bathymetric soundings", "-A", utils.ATTRIBUTION, "-Z", "0", "-z", str(maxz),
              "-P", "-q", "-r1", "-y", "depth_m", "-y", "depth_ft", "-y", "depth_fm",
-             *gj], "soundings tippecanoe", tmp_out)
-    keys.publish(tmp_out, out)
-    keys.write_key(out, skey)
-    print(f"soundings bundle: {out} (z0-{maxz}, {len(gj)} tiles)")
+             *gj], "soundings tippecanoe", out)
+
+
+def bundle_stable():
+    """Soundings bundle: tippecanoe the per-stem geojsons for the covering into
+    store/bundle/soundings.pmtiles. A 0-byte per-tile file is a legitimately dry tile (filtered by
+    size); a MISSING one is an incomplete build (require_stable_complete). Snakemake decides when to
+    invoke, so this always rebuilds."""
+    import mosaic
+    stems = mosaic.covering_stems()
+    files = [f"store/soundings/{s}.geojson" for s in stems]
+    contour_run.require_stable_complete("soundings", stems, files)
+    gj = [f for f in files if os.path.getsize(f) > 0]
+    out = "store/bundle/soundings.pmtiles"
+    utils.create_folder("store/bundle")
+    own_max = max((int(os.path.basename(g).split(".")[0].rsplit("-", 1)[1]) for g in gj), default=0)
+    maxz = contour_run.bundle_maxz_stable(own_max)
+    _tippecanoe(gj, maxz, out)
+    print(f"soundings bundle (stable): {out} (z0-{maxz}, {len(gj)} tiles)")
 
 
 def _check():
@@ -289,13 +269,6 @@ def _check():
     assert min(d for d, x, y, mz in pts if mz == 8) == 3.0      # block shoal survives to coarse zoom
     assert _jit(1, 1) == _jit(1, 1) and 0 <= _jit(3, 7) < 1     # jitter deterministic + in range
 
-    # orphan filter (content-addressed names): keep only current-covering stems; passthrough when
-    # stems is None; a non-content name (legacy/torn) is dropped either way.
-    paths = ["store/soundings/4-5-6-8-aaaaaaaaaaaa.geojson", "store/soundings/11-300-400-13-bbbbbbbbbbbb.geojson"]
-    assert _live(paths, {"11-300-400-13"}) == ["store/soundings/11-300-400-13-bbbbbbbbbbbb.geojson"]
-    assert _live(paths, None) == paths
-    assert _live(["store/soundings/9-1-1-9.geojson"], None) == [], "a legacy logical name is dropped"
-
     # zoom placement: coarser levels swap out at their own zoom; the finest level
     # (minz == child_z) is uncapped so it persists above the local source ceiling
     assert _tc(8, 10) == {"minzoom": 8, "maxzoom": 8}
@@ -305,9 +278,11 @@ def _check():
 
 if __name__ == "__main__":
     a = sys.argv[1:]
-    if a[:1] == ["bundle"]:
-        bundle()
+    if a[:1] == ["tile"] and len(a) == 2:
+        tile(a[1])
+    elif a == ["bundle", "--stable"]:
+        bundle_stable()
     elif a[:1] == ["check"]:
         _check()
     else:
-        sys.exit("usage: soundings_run.py bundle | check")
+        sys.exit("usage: soundings_run.py tile <stem> | bundle --stable | check")

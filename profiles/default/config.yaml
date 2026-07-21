@@ -6,3 +6,13 @@ cores: all
 # when unset, e.g. a laptop dry run).
 default-resources:
   mem_gb: 2
+  # Kill Snakemake's auto disk_mb (~2x input size): inputs are shared files already on
+  # disk, so those claims serialize the box against the --resources disk_mb budget.
+  disk_mb: 1000
+# greedy over the default ILP selector: identical job ordering at our scales
+# (verified empirically), and the ILP's per-round solve melts down with ~10k ready
+# jobs (observed: 42 of 48 cores on the scheduler itself at planet scale).
+scheduler: greedy
+# Engine triggers match the declared policy: code changes are force-only (-R/-F),
+# never auto-invalidation — a shell-string edit must not re-merge the planet.
+rerun-triggers: [mtime, params, input, software-env]

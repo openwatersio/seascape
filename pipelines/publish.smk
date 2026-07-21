@@ -34,8 +34,10 @@ rule mirror_objects:
     wildcard_constraints:
         source=pat(MIRRORED)
     priority: 5000  # ~190 GB when it runs; start first
+    log:
+        f"{TMP}/logs/mirror_objects/{{source}}.log"
     shell:
-        PUBLISH_GUARD +
+        "( " + PUBLISH_GUARD +
         'printf "[upstream]\\ntype = s3\\nprovider = AWS\\nregion = us-east-1\\n" > /tmp/upstream-{wildcards.source}.conf; '
         'bucket=$(cat {input.bucket}); '
         'rclone --config /tmp/upstream-{wildcards.source}.conf copy "upstream:$bucket" '
@@ -43,7 +45,7 @@ rule mirror_objects:
         '--transfers 16 --checkers 32 --retries 5 --stats 60s --stats-one-line; '
         'rclone copy "store/source/{wildcards.source}/objects" '
         '"{DEST}/source/{wildcards.source}/objects" --transfers 16 --checkers 32 --retries 5 '
-        '--stats 60s --stats-one-line'
+        '--stats 60s --stats-one-line ) 2> {log}'
 
 
 # Push one source, catalog.json last. Prepped: sync + footprint. Volatile: copy, never
@@ -57,8 +59,10 @@ rule publish_source:
         volatile=lambda wc: "true" if wc.source in MIRRORED else "false",
     wildcard_constraints:
         source=pat(PREPPED + MIRRORED)
+    log:
+        f"{TMP}/logs/publish_source/{{source}}.log"
     shell:
-        PUBLISH_GUARD +
+        "( " + PUBLISH_GUARD +
         'src="store/source/{wildcards.source}"; dest="{DEST}/source/{wildcards.source}"; '
         'if [ "{params.volatile}" = "true" ]; then '
         '  rclone copy "$src" "$dest" --exclude "bounds.csv" --exclude "catalog.json" --exclude "objects/**" --exclude "raw/**" --retries 5; '
@@ -69,7 +73,7 @@ rule publish_source:
         '  fi; '
         'fi; '
         'rclone copyto "$src/bounds.csv" "$dest/bounds.csv" --retries 5; '
-        'rclone copyto "$src/catalog.json" "$dest/catalog.json" --retries 5'
+        'rclone copyto "$src/catalog.json" "$dest/catalog.json" --retries 5 ) 2> {log}'
 
 
 rule publish_coverage:
@@ -77,10 +81,12 @@ rule publish_coverage:
         "store/bundle/coverage.pmtiles"
     output:
         touch("store/meta/publish/coverage")
+    log:
+        f"{TMP}/logs/publish_coverage.log"
     shell:
-        PUBLISH_GUARD +
+        "( " + PUBLISH_GUARD +
         'rclone copyto "store/bundle/coverage.pmtiles" '
-        '"{DEST}/coverage/coverage.pmtiles" --retries 5 --stats 30s --stats-one-line'
+        '"{DEST}/coverage/coverage.pmtiles" --retries 5 --stats 30s --stats-one-line ) 2> {log}'
 
 
 # One stamp for both masks: one module builds both, so they can't publish different snapshots.
@@ -90,10 +96,12 @@ rule publish_masks:
         water="store/landmask/water.fgb",
     output:
         touch("store/meta/publish/landmask")
+    log:
+        f"{TMP}/logs/publish_masks.log"
     shell:
-        PUBLISH_GUARD +
+        "( " + PUBLISH_GUARD +
         'rclone copyto "{input.land}" "{DEST}/landmask/land.fgb" --retries 5; '
-        'rclone copyto "{input.water}" "{DEST}/landmask/water.fgb" --retries 5'
+        'rclone copyto "{input.water}" "{DEST}/landmask/water.fgb" --retries 5 ) 2> {log}'
 
 
 # A single-source dispatch publishes only that source; full runs add coverage + masks.

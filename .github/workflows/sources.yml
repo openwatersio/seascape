@@ -1,25 +1,14 @@
 name: Sources
 
-# The Snakemake sources lane, REPLACING the legacy matrix workflow at this path: the same
-# infrastructure (image, Hetzner runner, persistent store volume, teardown, leak checks) but
-# the discovery/matrix/currentness/publish choreography collapses to ONE Snakemake invocation.
-# On this branch it shares main's registered workflow path, so `gh workflow run sources.yml
-# --ref <branch>` runs THIS file while main's legacy copy keeps the weekly schedule — merging
-# the branch is cutover A (docs/plans/2026-07-14-snakemake-build.md, phase 5); the cron below
-# is inert until then (schedules run only from the default branch).
-#
-# ONE store, ONE prefix — no shadow lane: the source contract is identical between the
-# lanes (verified byte-for-byte per source), so this writes the same
-# /mnt/seascape-store/store the legacy lane populated and publishes to the same
-# bathymetry/ prefix the builds read. Until merge, don't let both producers run: the
-# recipe-hash VALUES differ between the lanes (hashFiles vs self-computed), so alternating
-# producers restamp each other's catalogs and churn the build's tile keys. --keep-going
-# replaces the GH matrix's isolation: one red source fails its jobs, the rest complete,
-# the run goes red as the alert.
+# Runs the sources build — fetch/prep/catalog every source, mirror the volatile collections,
+# and publish — as ONE Snakemake invocation on an ephemeral Hetzner box against the persistent
+# store volume, publishing to the bathymetry/ prefix builds read. --keep-going gives per-source
+# isolation: one red source fails its own jobs, the rest complete, and the run goes red as the
+# alert.
 
 on:
   schedule:
-    - cron: "23 6 * * 1" # weekly, Monday 06:23 UTC — inert until this file reaches main
+    - cron: "23 6 * * 1" # weekly, Monday 06:23 UTC
   workflow_dispatch:
     inputs:
       source:
@@ -58,7 +47,7 @@ concurrency:
 
 jobs:
   # Ensure the deps-only toolchain image exists (keyed on IMAGE_TAG from ghcr-login; shared
-  # with ci.yml/build.yml/sources.yml, so a push-built image is reused). Copied from sources.yml.
+  # with ci.yml/build.yml, so a push-built image is reused).
   image:
     runs-on: ubuntu-latest
     permissions: { contents: read, packages: write }
@@ -84,7 +73,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # Boot the Hetzner box and attach the persistent store volume (same pattern as sources.yml).
+  # Boot the Hetzner box and attach the persistent store volume.
   create-runner:
     runs-on: ubuntu-latest
     permissions: { contents: read }
@@ -122,8 +111,8 @@ jobs:
           echo "volume $STORE_VOLUME attached to server $SERVER_ID"
 
   # The whole sources build in one job: fetch/prep/catalog every source and publish, keep-going,
-  # forcing a re-list of the volatile mirrors (-R mirror_source). Shares the legacy store on
-  # the volume and publishes to the production bathymetry/ prefix — one store, one mirror.
+  # forcing a re-list of the volatile mirrors (-R mirror_source). Shares the store on the
+  # volume and publishes to the production bathymetry/ prefix — one store, one mirror.
   sources:
     needs: [image, create-runner]
     runs-on: ${{ needs.create-runner.outputs.label }}
@@ -132,11 +121,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # Idempotent box setup — docker + the store volume mount (rclone lives in the
-      # toolchain image; every publish/mirror shell runs in-container). ONE store: the
-      # Snakemake lane reads and writes the same /mnt/seascape-store/store the legacy
-      # lane populated (the source contract is identical, verified byte-for-byte), and
-      # .snakemake/ provenance lives beside it at the volume root. STATE is the volume root
-      # (the dir that CONTAINS store/), mounted whole so both land on persistent disk.
+      # toolchain image; every publish/mirror shell runs in-container). ONE store: reads and
+      # writes /mnt/seascape-store/store, and .snakemake/ provenance lives beside it at the
+      # volume root. STATE is the volume root (the dir that CONTAINS store/), mounted whole so
+      # both land on persistent disk.
       - name: Set up box (docker + store volume)
         run: |
           set -euo pipefail
@@ -162,19 +150,28 @@ jobs:
       # markers ON THE VOLUME, wedging every later run at startup. Unlock is safe here:
       # the r2-store concurrency group guarantees no other lane run holds the store.
       - name: Unlock a stale workflow lock (crash recovery)
+        # TMP is the box's LOCAL-disk per-run scratch (docker.sh mounts it at /app/tmp): logs +
+        # benchmarks land here, off the network store volume. Step-scoped, not job-wide — a
+        # job-wide TMP would silently redirect other steps' Python tempfile writes.
+        env:
+          TMP: /var/tmp/seascape-tmp
         run: |
-          docker run --rm -v "$PWD:/app" -v "$STATE:/app/state" \
-            "$IMAGE:$IMAGE_TAG" \
-            uv run snakemake --unlock --config workdir=/app/state
+          mkdir -p "$TMP"  # first snakemake step; the mount source must exist before docker run
+          ./docker.sh snakemake --unlock --config workdir=/app/state tmp=/app/tmp
       - name: Run the sources lane (Snakemake) and publish
         env:
           INPUT_SOURCE: ${{ github.event.inputs.source }}
           INPUT_FORCE: ${{ github.event.inputs.force }}
+          # LOCAL-disk per-run scratch (docker.sh mounts it at /app/tmp): logs + benchmarks land
+          # here, off the network store volume. Step-scoped to avoid redirecting other steps'
+          # Python tempfile writes.
+          TMP: /var/tmp/seascape-tmp
         run: |
           set -euo pipefail
+          mkdir -p "$TMP"
           # Optional target args, collected into an array so an empty one contributes nothing
           # (no unquoted word-splitting) and a source id can't smuggle extra tokens.
-          extra=(--config workdir=/app/state)
+          extra=(--config workdir=/app/state tmp=/app/tmp)
           if [ -n "$INPUT_SOURCE" ]; then
             # source ids are directory names ([a-z0-9_]); reject anything else before it
             # reaches the docker/snakemake command line.
@@ -191,31 +188,21 @@ jobs:
           # --cores 16 > vCPUs: width for IO-bound fetches; mem_gb caps the heavy jobs
           # (28 = 32 GB - 4 reserved). Box-only — laptops keep cores:all as their cap.
           rc=0
-          docker run --rm \
-            -e RCLONE_CONFIG_R2_TYPE -e RCLONE_CONFIG_R2_PROVIDER -e RCLONE_CONFIG_R2_ENDPOINT \
-            -e RCLONE_CONFIG_R2_ACCESS_KEY_ID -e RCLONE_CONFIG_R2_SECRET_ACCESS_KEY \
-            -e RCLONE_CONFIG_R2_NO_CHECK_BUCKET -e DATA_BUCKET -e MIRROR_ALLOW_SHRINK \
-            -v "$PWD:/app" -v "$STATE:/app/state" \
-            "$IMAGE:$IMAGE_TAG" \
-            uv run snakemake refresh --keep-going --rerun-incomplete \
-              --cores 16 --resources mem_gb=28 -R mirror_source "${extra[@]}" || rc=$?
-          docker run --rm \
-            -e RCLONE_CONFIG_R2_TYPE -e RCLONE_CONFIG_R2_PROVIDER -e RCLONE_CONFIG_R2_ENDPOINT \
-            -e RCLONE_CONFIG_R2_ACCESS_KEY_ID -e RCLONE_CONFIG_R2_SECRET_ACCESS_KEY \
-            -e RCLONE_CONFIG_R2_NO_CHECK_BUCKET -e DATA_BUCKET -e MIRROR_ALLOW_SHRINK \
-            -v "$PWD:/app" -v "$STATE:/app/state" \
-            "$IMAGE:$IMAGE_TAG" \
-            uv run snakemake catalogs publish --keep-going --rerun-incomplete \
-              --cores 16 --resources mem_gb=28 "${extra[@]}" || rc=$?
+          ./docker.sh snakemake refresh --keep-going --rerun-incomplete \
+            --cores 16 --resources mem_gb=28 -R mirror_source "${extra[@]}" || rc=$?
+          ./docker.sh snakemake catalogs publish --keep-going --rerun-incomplete \
+            --cores 16 --resources mem_gb=28 "${extra[@]}" || rc=$?
           exit "$rc"
-      # Per-job wall/CPU/max-RSS from the benchmark: directives (this job runs on the box,
-      # so the volume path is directly readable).
-      - name: Upload snakemake benchmarks
+      # Per-job wall/CPU/max-RSS from the benchmark: directives, plus per-job stderr logs —
+      # both live in the box's local-disk scratch (TMP), the durable home is this artifact.
+      - name: Upload snakemake benchmarks + logs
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: snakemake-bench-${{ github.run_id }}
-          path: ${{ env.STATE }}/store/bench/
+          path: |
+            /var/tmp/seascape-tmp/bench/
+            /var/tmp/seascape-tmp/logs/
           if-no-files-found: ignore
           retention-days: 90
 

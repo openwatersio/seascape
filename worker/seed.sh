@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Seed the local wrangler R2 simulation from pipelines/store/bundle so `wrangler
-# dev` serves the freshly-built bundles. Run after `just preview` / `just planet`.
+# dev` serves the freshly-built bundles. Run after `snakemake preview` / `snakemake planet`.
 set -euo pipefail
 cd "$(dirname "$0")"
 # Ensure wrangler is installed (fresh checkout, or the container's empty node_modules
