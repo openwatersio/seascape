@@ -16,9 +16,13 @@ on:
         required: false
         default: ""
       force:
-        description: "Force re-registration: -F (rebuild everything) + ignore the volatile shrink guard"
+        description: "Force re-registration from warm raw (re-run prep + catalog, NO refetch) + ignore the volatile shrink guard"
         type: boolean
         default: false
+      snakemake_args:
+        description: "Extra snakemake args, e.g. -R cover (aggregation-code changes) or -F (true cold rebuild incl. refetch)"
+        required: false
+        default: ""
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
@@ -162,13 +166,22 @@ jobs:
         env:
           INPUT_SOURCE: ${{ github.event.inputs.source }}
           INPUT_FORCE: ${{ github.event.inputs.force }}
+          INPUT_ARGS: ${{ github.event.inputs.snakemake_args }}
           # LOCAL-disk per-run scratch (docker.sh mounts it at /app/tmp): logs + benchmarks land
           # here, off the network store volume. Step-scoped to avoid redirecting other steps'
           # Python tempfile writes.
           TMP: /var/tmp/seascape-tmp
         run: |
           set -euo pipefail
-          mkdir -p "$TMP"
+          mkdir -p "$TMP/logs"
+          # Memory/swap time series (Hetzner's metrics API has neither) — logs/ ships in the
+          # artifact. Same sampler build.yml runs, minus the progress heartbeat (no build status).
+          ( while sleep 60; do
+              free -m | awk -v t="$(date -u +%FT%TZ)" 'NR==2{u=$3;a=$7} NR==3{print t" used_mb="u" avail_mb="a" swap_used_mb="$3}' \
+                >> "$TMP/logs/memory.log"
+            done ) &
+          mem=$!
+          trap 'kill "$mem" 2>/dev/null || true' EXIT
           # Optional target args, collected into an array so an empty one contributes nothing
           # (no unquoted word-splitting) and a source id can't smuggle extra tokens.
           extra=(--config workdir=/app/state tmp=/app/tmp)
@@ -180,7 +193,13 @@ jobs:
             esac
             extra+=("source=$INPUT_SOURCE")
           fi
-          if [ "$INPUT_FORCE" = "true" ]; then extra+=(-F); fi
+          # Re-register from warm raw: fetch_asset is upstream of prep_source, so --forcerun
+          # re-runs prep + catalog (+ downstream) without refetching. Cold rebuild: -F via snakemake_args.
+          if [ "$INPUT_FORCE" = "true" ]; then extra+=(-R prep_source catalog_item); fi
+          # Extra args reach the command as separate words; reject anything shell-active.
+          case "$INPUT_ARGS" in *[!-A-Za-z0-9_=\ .]*) echo "invalid snakemake_args" >&2; exit 1 ;; esac
+          read -r -a xargs <<<"$INPUT_ARGS"
+          extra+=("${xargs[@]}")
           # Two invocations: the forced re-listing first, alone — across the invocation
           # boundary the engine's input checksums cure unchanged registrations, so the
           # main invocation cascades (catalog → cover → coverage → publish) only on real
