@@ -1,0 +1,8 @@
+{
+    "name": "New Zealand Coastal LiDAR 1m DEM",
+    "producer": "Toitū Te Whenua Land Information New Zealand",
+    "website": "https://registry.opendata.aws/nz-coastal/",
+    "license": "CC-BY-4.0",
+    "max_zoom": 14,
+    "datum": "NZVD2016 (~MSL geoid); elevation, seafloor negative (like GEBCO) — no transform"
+}
