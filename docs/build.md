@@ -47,9 +47,9 @@ Everything lands in `bathymetry/build/<sha>/` (byte-compatible with the old buil
 
 - `planet.pmtiles` — merged Terrarium raster base, z0–`MACROTILE_Z` (z8)
 - `overlay-{z}-{x}-{y}.pmtiles` — one per populated `OVERLAY_SPLIT_Z` grid cell, above z8
-- `vector.pmtiles` — contours + soundings + depare, tile-joined in one pass
+- `vector.pmtiles` — contours + soundings + depare, ONE `--generate-variable-depth-tile-pyramid` run → a sparse pyramid the Worker overzooms
 - `coverage.pmtiles` — source-provenance footprints, its own small z0–8 tileset
-- `manifest.json` — planet metadata + overlay cell map; **written and pushed last, its presence marks a complete build** (release.yml refuses a sha without one)
+- `manifest.json` — planet metadata + overlay cell map + `vector.max_zoom` (the covering's max child_z, which turns on the Worker's vector overzoom); **written and pushed last, its presence marks a complete build** (release.yml refuses a sha without one)
 
 A build from `main` auto-dispatches `release.yml` for its sha; feature-branch and `bbox` builds write `build/<sha>/` but don't ship.
 

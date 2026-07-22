@@ -375,50 +375,21 @@ rule tiles:
         tile_inputs
 
 
-# ── bundles — the three vector layers tile-join into one vector.pmtiles ──
-# Each bundler consumes the PLAIN per-stem outputs (0-byte = an empty tile, kept by size),
-# asserts the covering is hole-free, and always rebuilds — Snakemake owns freshness. depare
-# rides only when SKIP_DEPARE is unset (DEPARE).
-
-rule soundings_bundle:
-    input:
-        lambda wc: expand("store/soundings/{stem}.geojson", stem=covering_stems())
-    output:
-        "store/bundle/soundings.pmtiles"
-    params:
-        bbox=os.environ.get("BBOX", ""),  # scope stamp — see mosaic_index
-    benchmark:
-        f"{TMP}/bench/soundings-bundle.tsv"
-    log:
-        f"{TMP}/logs/soundings-bundle.log"
-    shell:
-        "{PY}/soundings_run.py bundle --stable 2> {log}"
-
-
-# Guarded out entirely when SKIP_DEPARE is set: the input list would be empty.
-if DEPARE:
-    rule depare_bundle:
-        input:
-            lambda wc: expand("store/depare/{stem}.fgb", stem=depare_stems())
-        output:
-            "store/bundle/depare.pmtiles"
-        params:
-            bbox=os.environ.get("BBOX", ""),  # scope stamp — see mosaic_index
-        benchmark:
-            f"{TMP}/bench/depare-bundle.tsv"
-        log:
-            f"{TMP}/logs/depare-bundle.log"
-        shell:
-            "{PY}/depare_run.py bundle --stable 2> {log}"
-
-
-# The contour tippecanoe + the single tile-join that folds soundings (+ depare when enabled)
-# into vector.pmtiles — so both bundled layers are inputs, not just the contour FGBs.
+# ── vector bundle — ONE variable-depth tippecanoe run over all three layers ──
+# contour_run.bundle_stable reads the PLAIN per-stem outputs of all three layers (0-byte = an empty
+# tile, kept by size), asserts each covering is hole-free, and runs ONE
+# --generate-variable-depth-tile-pyramid over contours + soundings + depare → a sparse
+# vector.pmtiles the Worker overzooms. No tile-join, no separate soundings/depare archives: the
+# leaf decision is made per tile across every layer jointly (separately-tiled layers leaf at
+# different depths and a join then vanishes the shallower-leafing layer from deep tiles). All zoom
+# gating rides as per-feature tippecanoe.minzoom (contour tiers, depare's z6 floor, sounding pyramid
+# levels). depare rides only when SKIP_DEPARE is unset (DEPARE). Always rebuilds — Snakemake owns
+# freshness.
 rule vector_bundle:
     input:
         contours=lambda wc: expand("store/contour/{stem}.fgb", stem=covering_stems()),
-        soundings="store/bundle/soundings.pmtiles",
-        depare=(["store/bundle/depare.pmtiles"] if DEPARE else []),
+        soundings=lambda wc: expand("store/soundings/{stem}.geojson", stem=covering_stems()),
+        depare=lambda wc: expand("store/depare/{stem}.fgb", stem=depare_stems()),
     output:
         "store/bundle/vector.pmtiles"
     params:
@@ -471,12 +442,11 @@ rule overlay_bundle:
 
 
 def bundle_inputs(wc):
-    """The finished archive set: the vector layers + the raster planet/overlay archives. Both the
-    `bundles` inventory target and `stage_build` gate on it, so neither references the other's
-    input list (which, being a function, doesn't resolve cleanly through `rules`)."""
-    return (["store/bundle/soundings.pmtiles"]
-            + (["store/bundle/depare.pmtiles"] if DEPARE else [])
-            + ["store/bundle/vector.pmtiles", "store/bundle/planet.pmtiles"]
+    """The finished archive set: the one vector.pmtiles + the raster planet/overlay archives. Both
+    the `bundles` inventory target and `stage_build` gate on it, so neither references the other's
+    input list (which, being a function, doesn't resolve cleanly through `rules`). soundings/depare
+    are no longer separate archives — the vector bundle folds them into vector.pmtiles in one run."""
+    return (["store/bundle/vector.pmtiles", "store/bundle/planet.pmtiles"]
             + expand("store/bundle/overlay-{cell}.pmtiles", cell=bundle.overlay_cells(render_stems())))
 
 

@@ -235,9 +235,11 @@ def stage_build(bundle_dir="store/bundle"):
     manifest.json deliberately ABSENT from upload_files — the publisher sends it LAST.
 
     planet + vector are REQUIRED (a missing one is an interrupted build). Overlay cells ride
-    when populated. soundings/depare are NOT shipped — they tile-join INTO vector.pmtiles, the
-    only vector archive the Worker fetches. coverage.pmtiles is a catalogs product (this graph
-    never writes it); it ships when the warm volume has it, and the Worker tolerates its absence."""
+    when populated. soundings/depare are NOT separate archives — the vector bundle folds them into
+    vector.pmtiles in one joint run, the only vector archive the Worker fetches. The manifest carries
+    vector.max_zoom (the covering's max child_z) so the Worker overzooms the sparse pyramid past its
+    baked leaves. coverage.pmtiles is a catalogs product (this graph never writes it); it ships when
+    the warm volume has it, and the Worker tolerates its absence."""
     planet = f"{bundle_dir}/planet.pmtiles"
     vector = f"{bundle_dir}/vector.pmtiles"
     for req in (planet, vector):
@@ -247,7 +249,8 @@ def stage_build(bundle_dir="store/bundle"):
     # earlier coverings (shrunk coverage, bbox leftovers) that must not ship or be advertised.
     import mosaic
     import terrain
-    cells = overlay_cells(terrain.render_stems(mosaic.covering_stems()))
+    covering = mosaic.covering_stems()
+    cells = overlay_cells(terrain.render_stems(covering))
     overlays = [f"{bundle_dir}/overlay-{c}.pmtiles" for c in cells]
     missing = [o for o in overlays if not os.path.isfile(o)]
     if missing:
@@ -269,6 +272,11 @@ def stage_build(bundle_dir="store/bundle"):
         "overlay": {"split_z": SPLIT_Z, "cells": {
             os.path.basename(o)[len("overlay-"):-len(".pmtiles")]: _archive_meta(o)["max_zoom"]
             for o in overlays}},
+        # The Worker's vector serving depth: the covering's max child_z, NOT vector.pmtiles' header
+        # maxzoom. The archive is a SPARSE variable-depth pyramid whose header records the deepest
+        # baked leaf (shallower where content leafs early); advertising that would stop clients
+        # requesting the deeper tiles the Worker synthesizes by overzoom. This turns Part 1 on.
+        "vector": {"max_zoom": contour_run._stems_maxz(covering)},
         "source_ids": config.sources(),  # the viewer's provenance palette
         "attribution": attribution(),
     }
@@ -368,6 +376,8 @@ def _check():
         assert m["planet"]["file"] == "planet.pmtiles" and m["planet"]["max_zoom"] == 8
         assert m["planet"]["bbox"] == [-180.0, -85.0, 180.0, 85.0], m["planet"]["bbox"]
         assert m["overlay"] == {"split_z": SPLIT_Z, "cells": {"5-1-1": 14}}, m["overlay"]
+        # vector.max_zoom is the covering's max child_z (8-8-8-14 -> 14), the Worker's serving depth
+        assert m["vector"] == {"max_zoom": 14}, m["vector"]
         assert m["source_ids"] == ["src"] and m["attribution"] == utils.ATTRIBUTION
         assert json.load(open(stage_build()[1])) == m, "manifest not deterministic across a re-walk"
 

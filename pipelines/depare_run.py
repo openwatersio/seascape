@@ -47,12 +47,12 @@ Per tile: bands (gdal_contour -p at DEPARE_LEVELS / DEPARE_LEVELS_FT, drop land,
 (inland-water polygons minus the DEM's water coverage and the drying) -> clip to the
 unbuffered tile bbox in shapely (polygon-only by construction, see _polys) -> 4326 ->
 store/depare/{stem}.fgb. Same seam contract as contours: deterministic on the buffered grid,
-so neighbouring tiles' features abut exactly at the clip line. bundle() tippecanoes them into
-a `depare` layer pmtiles; the contours tile-join folds it into vector.pmtiles like soundings.
+so neighbouring tiles' features abut exactly at the clip line. The vector bundle
+(contour_run.bundle_stable) folds these into the `depare` layer of the one joint run, gated at z6
+by a per-feature tippecanoe.minzoom (contour_run.DEPARE_MINZOOM).
 """
 
 import os
-import subprocess
 import sys
 
 import mercantile
@@ -62,11 +62,10 @@ import config
 import contour_run
 import utils
 
-# The bands' zoom floor (matches the style's depth-areas/contour-lines minzoom):
-# partitions can't be level-thinned per zoom like the lines' CONTOUR_TIERS (dropping
-# one leaves a hole), so the floor is the low-zoom cost control — the raster depth
-# shading carries z<6.
-MIN_ZOOM = 6
+# The bands' zoom floor (z6, matching the style's depth-areas/contour-lines minzoom) is now applied
+# per feature by the vector bundle (contour_run.DEPARE_MINZOOM): partitions can't be level-thinned
+# per zoom like the lines' CONTOUR_TIERS (dropping one leaves a hole), so the floor is the low-zoom
+# cost control — the raster depth shading carries z<6.
 
 # DEPARE_LEVELS derives from CONTOUR_LEVELS, which the style hand-mirrors (style/index.ts
 # DEPARE_LADDER_M/FT) — warn when an env override diverges the bands from the style. Upgrade
@@ -285,44 +284,6 @@ def tile(stem):
     shutil.rmtree(tmp)
 
 
-# ── bundle ───────────────────────────────────────────────────────────────────
-
-def _tippecanoe(fgbs, maxz, out):
-    """tippecanoe the per-tile depare FGBs into `out` (layer `depare`, z MIN_ZOOM..maxz).
-    --detect-shared-borders keeps shared partition edges identical through per-zoom simplification
-    (no cracks between bands); --coalesce-smallest-as-needed, never --drop-densest: a dropped
-    partition is a tint hole, a coalesced one mis-tints a sub-pixel blob. drval1/drval2 are Real
-    (numeric MVT; absent on nodata, the fill's switch key); rank is FlatGeobuf Integer64, so
-    -T rank:int keeps it numeric (else it lands as a string, like the contour depth ints)."""
-    subprocess.run(
-        ["tippecanoe", "-o", out, "-f", "-l", "depare",
-         "-n", "Depth areas", "-A", utils.ATTRIBUTION,
-         "-Z", str(MIN_ZOOM), "-z", str(maxz), "-P", "-q",
-         "--detect-shared-borders", "--coalesce-smallest-as-needed",
-         "--simplification", os.environ.get("DEPARE_SIMPLIFICATION", "8"),
-         "-y", "drval1", "-y", "drval2", "-y", "sys", "-y", "kind", "-y", "rank",
-         "-T", "rank:int", *fgbs],
-        check=True)
-
-
-def bundle_stable():
-    """Depare bundle: tippecanoe the per-stem FGBs for the covering into store/bundle/depare.pmtiles.
-    A 0-byte per-tile file is a legitimately waterless tile (filtered by size); a MISSING one is an
-    incomplete build (require_stable_complete). Snakemake decides when to invoke, so this always
-    rebuilds."""
-    import mosaic
-    stems = mosaic.covering_stems()
-    files = [f"store/depare/{s}.fgb" for s in stems]
-    contour_run.require_stable_complete("depare", stems, files)
-    fgbs = [f for f in files if os.path.getsize(f) > 0]
-    out = "store/bundle/depare.pmtiles"
-    utils.create_folder("store/bundle")
-    own_max = max((int(os.path.basename(f).split(".")[0].rsplit("-", 1)[1]) for f in fgbs), default=0)
-    maxz = contour_run.bundle_maxz_stable(own_max)
-    _tippecanoe(fgbs, maxz, out)
-    print(f"depare bundle (stable): {out} (z{MIN_ZOOM}-{maxz}, {len(fgbs)} FGBs)")
-
-
 def _check():
     """gdal_contour -p buckets on a synthetic DEM: land above the cap dropped, the metre ladder's
     extra DRYING_CAP level yields the [0, DRYING_CAP] drying bucket (selected by 0 < amax <= cap,
@@ -432,9 +393,7 @@ if __name__ == "__main__":
     a = sys.argv[1:]
     if a[:1] == ["tile"] and len(a) == 2:
         tile(a[1])
-    elif a == ["bundle", "--stable"]:
-        bundle_stable()
     elif a[:1] == ["check"]:
         _check()
     else:
-        sys.exit("usage: depare_run.py tile <stem> | bundle --stable | check")
+        sys.exit("usage: depare_run.py tile <stem> | check")

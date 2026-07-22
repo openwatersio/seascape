@@ -16,6 +16,11 @@ checkpoint that gates stage 2/3 (``snakemake bundles``) — and asserts:
   - a CONTOUR_LEVELS change reruns contour_tile + the vector bundle but ZERO
     mosaic_tile and ZERO terrain_render (the stage split's payoff — no re-merge,
     no re-render — proven by a dry run's rerun table);
+  - the vector bundle is ONE variable-depth run: contours + soundings + depare fold
+    into a single sparse vector.pmtiles (no separate soundings/depare archives), and
+    its self-check invariants hold (no depare below z6, no contour below its tier
+    minzoom, depare m-bands disjoint, soundings present); the manifest carries
+    vector.max_zoom = the covering's max child_z (the Worker's serving depth);
   - scope transitions: a bbox build re-merges nothing, and the next planet build
     heals the bbox-truncated forks (input-set trigger) and rebuilds every
     scope-stamped aggregate (params trigger) — regional artifacts never survive;
@@ -126,6 +131,17 @@ def decode_bundles(tmp):
     return by_zoom
 
 
+def _pm_tiles(path):
+    """{zoom: [(x, y), ...]} present in a pmtiles archive (its directory IS the availability index —
+    a sparse variable-depth archive has gaps by design)."""
+    from pmtiles.reader import Reader, MmapSource, all_tiles
+    byz = {}
+    with open(path, "r+b") as f:
+        for (z, x, y), _ in all_tiles(Reader(MmapSource(f)).get_bytes):
+            byz.setdefault(z, []).append((x, y))
+    return byz
+
+
 def _job_counts(dry_stdout):
     """Parse snakemake's dry-run job table into {rule: count}. Rows look like ``rule_name   N``
     under a ``job      count`` header."""
@@ -233,7 +249,31 @@ def main():
         assert os.path.exists(f"{tmp}/store/bundle/planet.pmtiles"), "missing planet.pmtiles"
         overlays = glob(f"{tmp}/store/bundle/overlay-*.pmtiles")
         assert overlays, "the z11 fine tiles must produce at least one overlay archive"
-        assert os.path.exists(f"{tmp}/store/bundle/vector.pmtiles"), "missing vector.pmtiles"
+        vec = f"{tmp}/store/bundle/vector.pmtiles"
+        assert os.path.exists(vec), "missing vector.pmtiles"
+        # soundings/depare are NOT separate archives — the one joint run folds them into vector.pmtiles.
+        for gone in ("soundings.pmtiles", "depare.pmtiles"):
+            assert not os.path.exists(f"{tmp}/store/bundle/{gone}"), \
+                f"{gone} must not exist as a separate archive (folded into vector.pmtiles)"
+
+        # ── the joint variable-depth run's safety invariants (Verification 3,4,5): one archive,
+        # three layers, all zoom gating per-feature. _vector_selfcheck asserts no depare below z6,
+        # no contour below its tier minzoom, depare m-bands disjoint, soundings present — it ran
+        # in-build; re-run it here so the test OWNS the invariant, not just the build. ──
+        sys.path.insert(0, PIPE)
+        import contour_run
+        maxz = contour_run._stems_maxz(stems)
+        layers = set()
+        for z in (max(child_zs), 6, 5):  # leaf zoom, the depare floor, just below it
+            for x, y in _pm_tiles(vec).get(z, [])[:4]:
+                layers |= set(contour_run._decode_tile(vec, z, x, y))
+                if z < 6:
+                    assert "depare" not in contour_run._decode_tile(vec, z, x, y), \
+                        f"depare must not appear below z6 (z{z} {x}/{y})"
+        assert {"contours", "soundings", "depare"} <= layers, \
+            f"the joint run must carry all three layers: {sorted(layers)}"
+        contour_run._vector_selfcheck(vec, maxz)  # raises SystemExit on any invariant violation
+        print(f"vector joint-run ok — one sparse archive, layers {sorted(layers)}, self-check passed")
 
         by_zoom = decode_bundles(tmp)
         assert by_zoom, "no tiles in any terrain bundle"
@@ -283,7 +323,7 @@ def main():
         # input-set trigger — and rebuild every scope-stamped aggregate.
         assert counts.get("contour_tile", 0) == 4, f"planet must re-fork the 4 bbox-truncated stems: {counts}"
         assert counts.get("soundings_tile", 0) == 4, f"soundings heal too: {counts}"
-        for agg in ("mosaic_index", "soundings_bundle", "vector_bundle", "terrain_planet_bundle"):
+        for agg in ("mosaic_index", "vector_bundle", "terrain_planet_bundle"):
             assert counts.get(agg, 0) == 1, f"{agg} must rebuild after a scope change: {counts}"
         snake(tmp, "-c", "4", "bundles")  # restore planet-scoped products for the checks below
         print("scope-transition ok — bbox->planet re-merges nothing, heals 4 truncated forks, "
@@ -297,15 +337,21 @@ def main():
             [sys.executable, "-c",
              f"import sys, json; sys.path.insert(0, {PIPE!r}); import bundle\n"
              "up, mp = bundle.stage_build()\n"
-             "print(json.dumps({'uploads': up, 'cells': sorted(json.load(open(mp))['overlay']['cells'])}))"],
+             "m = json.load(open(mp))\n"
+             "print(json.dumps({'uploads': up, 'cells': sorted(m['overlay']['cells']), "
+             "'vector_max_zoom': m['vector']['max_zoom']}))"],
             cwd=tmp, env=_base_env(tmp, {"SOURCES_DIR": "sources"}), capture_output=True, text=True)
         assert proc.returncode == 0, f"stage_build failed:\n{proc.stdout}\n{proc.stderr}"
         staged = json.loads(proc.stdout.splitlines()[-1])
         assert "9-99-99" not in staged["cells"], f"stale cell advertised: {staged['cells']}"
         assert not any("9-99-99" in u for u in staged["uploads"]), "stale overlay staged for upload"
         assert "stale" in proc.stdout, "staging must report the ignored stale file"
+        # the manifest carries the Worker's vector serving depth = the covering's max child_z (11)
+        assert staged["vector_max_zoom"] == max(child_zs), \
+            f"manifest vector.max_zoom must be the covering max child_z {max(child_zs)}: {staged['vector_max_zoom']}"
         os.remove(stale_path)
-        print("staging-inventory ok — stale overlay excluded from uploads + manifest")
+        print("staging-inventory ok — stale overlay excluded; manifest carries "
+              f"vector.max_zoom={staged['vector_max_zoom']}")
 
         # ── the hole-free gate: a missing per-tile fork output makes --stable bundle refuse ──
         victim = sorted(glob(f"{tmp}/store/contour/*.fgb"))[0]
