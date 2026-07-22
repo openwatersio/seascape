@@ -95,6 +95,7 @@ jobs:
     outputs:
       label: ${{ steps.runner.outputs.label }}
       server_id: ${{ steps.runner.outputs.server_id }}
+      ip: ${{ steps.attach.outputs.ip }}
     steps:
       # The runner action takes a numeric SSH key ID only; resolve the friendlier key NAME
       # in vars.HCLOUD_SSH_KEY (empty var -> "null" = no key).
@@ -122,13 +123,14 @@ jobs:
           location: ${{ env.SERVER_LOCATION }}
           image: ${{ env.SERVER_IMAGE }}
           # Repo variable HCLOUD_SSH_KEY = an SSH key ID/name in the hcloud project; lets
-          # operators (and Claude, via the build/box status below) ssh root@<ip> for live diagnosis.
+          # operators (and Claude, via the root@<ip> in the build status) ssh in for live diagnosis.
           ssh_key: ${{ steps.sshkey.outputs.id }}
           volume: "null"
       # The store volume holds the canonical stage-1 sources the build reads FROM — attached
       # for bbox smokes too: the build always reads the volume's catalogs and writes plain-named
       # tiles beside them.
       - name: Attach persistent store volume
+        id: attach
         env:
           HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
           SERVER_ID: ${{ steps.runner.outputs.server_id }}
@@ -142,10 +144,14 @@ jobs:
           hcloud volume attach "$STORE_VOLUME" --server "$SERVER_ID"
           echo "volume $STORE_VOLUME attached to server $SERVER_ID"
           ip=$(hcloud server ip "$SERVER_ID")
+          echo "ip=$ip" >> "$GITHUB_OUTPUT"
+          # One `build` status for the whole lifecycle: seed it pending here (root@<ip> lets
+          # operators ssh in for live diagnosis), the heartbeat carries it, the final step
+          # flips it to success with the bundle URL.
           curl -fsS -X POST -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
-            -d "{\"state\":\"pending\",\"context\":\"build/box\",\"description\":\"root@$ip\",\"target_url\":\"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\"}" \
+            -d "{\"state\":\"pending\",\"context\":\"build\",\"description\":\"root@$ip · booting\",\"target_url\":\"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\"}" \
             >/dev/null
 
   # The build: covering (catalogs invocation) then bundles + publish (build invocation), natively
@@ -218,6 +224,7 @@ jobs:
           INPUT_FORCE: ${{ github.event.inputs.force }}
           INPUT_ARGS: ${{ github.event.inputs.snakemake_args }}
           GH_TOKEN: ${{ github.token }} # the progress-heartbeat gh api calls
+          BOX_IP: ${{ needs.create-runner.outputs.ip }} # carried in the build status desc
           # Mirrored sources (CUDEM/S-102) stream from the public mirror; prepped sources
           # read the volume (source_path: a local file wins per file). Curl caches sized to
           # fit inside the global reserve below.
@@ -295,7 +302,7 @@ jobs:
               curl -fsS -X POST -H "Authorization: Bearer $GH_TOKEN" \
                 -H "Accept: application/vnd.github+json" \
                 "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
-                -d "{\"state\":\"pending\",\"context\":\"build/progress\",\"description\":\"$p ($((n * 100 / m))%), ~$run running\",\"target_url\":\"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\"}" \
+                -d "{\"state\":\"pending\",\"context\":\"build\",\"description\":\"root@$BOX_IP · $p ($((n * 100 / m))%), ~$run running\",\"target_url\":\"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\"}" \
                 >/dev/null 2>>"$TMP/logs/heartbeat.log"
             done ) &
           hb=$!
@@ -313,6 +320,25 @@ jobs:
             --keep-going --rerun-incomplete \
             --cores "$cores" --resources mem_gb="$budget_gb" disk_mb="$disk_budget_mb" \
             --config workdir=/app/state tmp=/app/tmp 2>&1 | tee "$buildlog"
+      # Close the `build` status to success so it never lingers at pending. A planet run points
+      # it at the published build/<sha>/ prefix; a bbox smoke runs no stage_build (nothing there),
+      # so it points back at the run.
+      - name: Publish build status
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BBOX: ${{ github.event.inputs.bbox }}
+        run: |
+          if [ -z "$BBOX" ]; then
+            desc="published build/$GITHUB_SHA"; url="$PUBLIC_BASE/build/$GITHUB_SHA"
+          else
+            desc="bbox smoke complete"; url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          fi
+          curl -fsS -X POST -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -d "{\"state\":\"success\",\"context\":\"build\",\"description\":\"$desc\",\"target_url\":\"$url\"}" \
+            >/dev/null
       # Per-job wall/CPU/max-RSS from the benchmark: directives, plus per-job stderr logs —
       # both live in the box's local-disk scratch (TMP), the durable home is this artifact.
       - name: Upload snakemake benchmarks + logs
