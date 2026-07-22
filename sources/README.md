@@ -18,10 +18,10 @@ Selection rule: **resolution sets the zoom cap, an openly-redistributable licens
 | [DDM (Denmark)](ddm/)                                              | 50 m        | z12       | Danish EEZ                          | MSL (DKMSL2022)         |
 | [CUDEM 1/9](cudem/)                                                | ~3.4 m      | z13       | US coast + territories              | NAVD88 / local (terr.)  |
 | [CUDEM 1/3](cudem_third/)                                          | ~10 m       | z12       | US coast + territories (broader)    | NAVD88 / local (terr.)  |
-| [NOAA S-102](noaa_s102/)                                           | ~4–16 m     | z14       | US navigable                        | MLLW (+ uncertainty)    |
+| [NOAA S-102](noaa_s102/)                                           | ~4–16 m     | z15 (native) | US navigable                     | MLLW (+ uncertainty)    |
 | [Vaklodingen](vaklodingen/)                                        | 20 m        | z12       | Netherlands                         | NAP (~MSL)              |
 | INFOMAR ([10 m](infomar_10m/), [25 m](infomar_25m/))               | 10 m / 25 m | z13 / z11 | Ireland inshore + shelf             | **LAT**                 |
-| [UK SurfZone](uk_surfzone/)                                        | 2 m         | z14       | England intertidal                  | ODN (~MSL)              |
+| [UK SurfZone](uk_surfzone/)                                        | 2 m         | z15 (native) | England intertidal               | ODN (~MSL)              |
 | [GSC Atlantic](gsc_atlantic/)                                      | 100 m       | ~z10      | Scotian Shelf + NL                  | unverified              |
 | [GSC Pacific](gsc_pacific/)                                        | 10 m        | z13       | BC coast + Salish Sea               | unverified              |
 | [gbr30](gbr30/)                                                    | 30 m        | z12       | GBR + Coral Sea                     | MSL                     |
@@ -31,8 +31,8 @@ Selection rule: **resolution sets the zoom cap, an openly-redistributable licens
 | [NOS Estuarine](noaa_estuarine/)                                   | 30 m        | z11       | 70 US estuaries                     | **MLLW**                |
 | [Great Lakes (NCEI)](great_lakes/)                                 | ~90 m       | z10       | Great Lakes (incl. Canadian halves) | **LWD**                 |
 | [African Great Lakes](african_great_lakes/)                        | 50–100 m    | z13       | Victoria/Albert/Edward/George       | lake surface            |
-| swissBATHY3D ([Léman](lac_leman/), [Neuchâtel](lac_neuchatel/))    | 1–2 m       | z14       | Léman, Neuchâtel                    | LN02 − surface offset   |
-| [Bodensee](bodensee/)                                              | 3 m         | z14       | Lake Constance                      | DHHN92 − surface offset |
+| swissBATHY3D ([Léman](lac_leman/), [Neuchâtel](lac_neuchatel/))    | 1–2 m       | z15 / z16 (native) | Léman, Neuchâtel           | LN02 − surface offset   |
+| [Bodensee](bodensee/)                                              | 3 m         | z15 (native) | Lake Constance                   | DHHN92 − surface offset |
 | [Lake Tahoe](lake_tahoe/)                                          | 10 m        | z13       | Lake Tahoe                          | MSL − surface offset    |
 
 Priority is derived, not configured: `(maxzoom, id)`, so GEBCO (smallest maxzoom) loses wherever a finer regional source overlaps — except a datum-authoritative source can set `priority` in metadata (S-102 over CUDEM, INFOMAR over EMODnet) to win regardless of zoom. Zoom caps are display caps (`max_zoom`), not native resolution. Inland lakes are pure GEBCO gap-fill: hydraulically isolated, so no seam against the ocean base; freshwater grids store lakebed _elevation_, so each carries a "subtract surface level" offset.
