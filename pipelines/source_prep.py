@@ -63,6 +63,8 @@ DATA_EXTS = {"tif", "tiff", "zip", "nc", "asc", "xyz", "img", "gz", "7z", "grd"}
 def ext_for(url):
     last = url.split("?")[0].split("#")[0].rsplit("/", 1)[-1]
     ext = last.rsplit(".", 1)[-1].lower() if "." in last else ""
+    if ext == "tiff":  # canonicalize to .tif — the staged extension the rest of the lane globs
+        return "tif"
     return ext if ext in DATA_EXTS else "tif"
 
 
@@ -345,7 +347,7 @@ def _check_raster(path):
 def prep(source):
     meta = config.load_metadata(source)
     stage(source)
-    tifs = sorted(glob(f"store/source/{source}/*.tif"))  # *.tif only: legacy parity (.tiff stays raw)
+    tifs = sorted(glob(f"store/source/{source}/*.tif"))  # staging canonicalizes .tiff -> .tif (ext_for)
 
     negate = bool(meta.get("negate", False))
     offset = float(meta.get("datum_offset_m", 0.0))
@@ -384,6 +386,12 @@ def _check():
     import numpy as np
     import rasterio
     from rasterio.transform import from_origin
+
+    # ext_for canonicalizes both GeoTIFF spellings to the staged .tif the lane globs, and
+    # falls back to .tif for a non-data extension (GDAL reads by content, not name).
+    assert ext_for("https://x/a.tiff") == "tif" and ext_for("https://x/a.tif") == "tif"
+    assert ext_for("https://x/a.TIFF?k=v") == "tif" and ext_for("https://x/page.html?z") == "tif"
+    assert ext_for("https://x/a.zip") == "zip" and ext_for("https://x/a.nc") == "nc"
 
     d = tempfile.mkdtemp()
     cwd, saved = os.getcwd(), config.SOURCES_DIR
