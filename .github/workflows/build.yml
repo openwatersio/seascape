@@ -1,20 +1,22 @@
 name: Build
 
-# Runs the planet build on ONE ephemeral Hetzner box against the persistent store volume, in
-# TWO chained Snakemake invocations — the catalogs invocation (covering from the volume's
-# canonical sources), then the build invocation (pipelines/build.smk bundles + publish), which
-# parses purely from disk and structurally contains no fetch rule, so a build can never contact
-# upstream.
+# Runs the planet build on ONE ephemeral Hetzner box against the persistent store volume, in ONE
+# Snakemake invocation over ONE DAG: `snakemake bundles publish_mosaic`. The `cover` checkpoint
+# runs first (the covering, from the volume's canonical registrations), then the graph
+# re-evaluates into the per-stem mosaic → forks → bundles → publish. No fetch runs: every source
+# byte streams from R2 via /vsicurl (SOURCE_VSI_BASE), and cover is up-to-date on a warm volume,
+# so its stage-1 producers never fire.
 #
 # Every job runs isolated with a benchmark: directive, so per-tile max-RSS lands in the box's
-# local-disk scratch (TMP) and ships as an artifact. Tiles are plain-named on the volume; the publish rule
+# local-disk scratch (TMP) and ships as an artifact. Tiles are plain-named on the volume; publish_mosaic
 # content-addresses them to R2 under hashed names with a CANDIDATE pointer (index + gti) — the
 # serving pointer mosaic.gti is never written from here, so serving state is structurally
 # untouchable.
 #
-# A warm volume is assumed: if a source's registration is missing, the cover invocation can reach
-# stage-1 prep rules (it is the catalogs invocation) — run sources.yml first. A bbox smoke before
-# the first full planet dispatch is the intended path.
+# A warm volume is assumed: the fetch/prep rules now live in the same graph, so a MISSING
+# registration would let cover cascade into them. The step guards refuse a blank volume / absent
+# covering — run sources.yml first. A bbox smoke before the first full planet dispatch is the
+# intended path.
 
 on:
   workflow_dispatch:
@@ -28,9 +30,9 @@ on:
         type: boolean
         default: false
       server_type:
-        description: "Hetzner type — ccx63 (48 vCPU/192 GB) for planet; ccx33 (8/32) for a bbox smoke"
+        description: "Hetzner type — ccx33 (8/32) fits incremental/bundle-tail builds; pick ccx63 (48/192) for wide runs (cold builds, big invalidations)"
         required: false
-        default: ccx63
+        default: ccx33
       snakemake_args:
         description: "Extra snakemake args, e.g. -R publish (code changes are force-only)"
         required: false
@@ -302,9 +304,12 @@ jobs:
           # drop them so the engine re-merges instead of poisoning downstream VRT reads.
           # cd /app/state: docker.sh starts in /app; only snakemake chdirs to the state mount
           ./docker.sh run sh -c "cd /app/state && uv run --project /app /app/pipelines/mosaic.py verify"
-          # stage_build only for planet runs: a bbox smoke must not stage regional archives
-          targets=(bundles publish); [ -z "$BBOX" ] && targets+=(stage_build)
-          ./docker.sh snakemake -s pipelines/build.smk "${targets[@]}" "${extra[@]}" "${force[@]}" \
+          # ONE invocation, one DAG: the `cover` checkpoint runs first, then the build
+          # re-evaluates into bundles + the mosaic publish (publish_mosaic — `publish` is the
+          # per-source push in publish.smk, run by sources.yml). stage_build only for planet
+          # runs: a bbox smoke must not stage regional archives.
+          targets=(bundles publish_mosaic); [ -z "$BBOX" ] && targets+=(stage_build)
+          ./docker.sh snakemake "${targets[@]}" "${extra[@]}" "${force[@]}" \
             --keep-going --rerun-incomplete \
             --cores "$cores" --resources mem_gb="$budget_gb" disk_mb="$disk_budget_mb" \
             --config workdir=/app/state tmp=/app/tmp 2>&1 | tee "$buildlog"

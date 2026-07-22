@@ -1,12 +1,18 @@
-# Stage 1 (sources) of the Snakemake build — see docs/plans/2026-07-14-snakemake-build.md.
+# The Snakemake build — ONE DAG, ONE entry (this file). See docs/plans/2026-07-14-snakemake-build.md.
 # Per-source knobs (crs/nodata/negate/datum_offset_m/clamp_positive/archive_members)
 # live in sources/<id>/metadata.json. Run from the repo root:
 #   uv run snakemake sources [--config source=<id>] [-n]
 #   uv run snakemake catalogs                     # + masks, covering, coverage
 #   uv run snakemake check --config source=<id>
-#   uv run snakemake publish [--config source=<id>]
+#   uv run snakemake publish [--config source=<id>]   # per-source R2 push
+#   uv run snakemake bundles [publish_mosaic]     # stage 2/3: mosaic → forks → bundles
 #   ./docker.sh snakemake sources                 # same, in the toolchain container
 # Pipeline-code edits don't invalidate outputs; force explicitly (-R prep_source / -F).
+#
+# `cover` is a CHECKPOINT: the covering (the stem inventory the whole build scopes from) is a
+# runtime product, so stage 2/3 targets can't enumerate their per-stem jobs at parse. Their
+# input functions derive STEMS through the checkpoint (see pipelines/build.smk), so ONE
+# invocation walks sources → covering → mosaic → forks → bundles with no second `-s` entry.
 
 include: "pipelines/common.smk"
 
@@ -201,9 +207,12 @@ rule watermask:
         "{PY}/landmask.py prep-water 2> {log}"
 
 
-# The covering — stage 1's downstream interface. BBOX rides as a param so a changed
-# window reruns it (write-if-changed prunes in-window stale tiles, keeps out-of-window).
-rule cover:
+# The covering — the seam between stage 1 and stage 2/3, as a CHECKPOINT: it writes the stem
+# inventory the build scopes from, so the engine re-evaluates the DAG (per-stem mosaic/fork/
+# terrain jobs) AFTER it runs. BBOX rides as a param so a changed window reruns it (write-if-
+# changed prunes in-window stale tiles, keeps out-of-window). Body/inputs/outputs are the plain
+# rule's — only the `checkpoint` keyword differs.
+checkpoint cover:
     input:
         expand("store/source/{source}/bounds.csv", source=PREPPED + MIRRORED),
         expand("store/source/{source}/catalog.json", source=PREPPED + MIRRORED),
@@ -258,3 +267,8 @@ rule check:
         f"{TMP}/logs/check.log"
     shell:
         "{PY}/source_check.py {params.source} 2> {log}"
+
+
+# Stage 2/3 (mosaic → cartographic forks → bundles → publish), gated on the `cover` checkpoint
+# above. Kept in its own file for grouping — but it is INCLUDED here, so there is one entry.
+include: "pipelines/build.smk"

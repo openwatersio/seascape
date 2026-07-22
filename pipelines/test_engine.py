@@ -3,8 +3,8 @@
 Builds two synthetic sources in an isolated tmp dir — a coarse broad ``base``
 (-101 m, native ~z10) and a fine small ``fine`` (-51 m, native ~z13 but capped to
 z11 in metadata) inside it — registers them through the real stage-1 CLIs (bounds
-→ catalog → covering), then drives the real stage-2/3 engine DAG
-(``snakemake -s build.smk bundles``) and asserts:
+→ catalog → covering), then drives the real stage-2/3 engine DAG through the ONE Snakefile — past the `cover`
+checkpoint that gates stage 2/3 (``snakemake bundles``) — and asserts:
 
   - the per-source max_zoom CAP binds (fine renders at z11, not its native z13);
   - PRIORITY: at the fine source's zoom the merged value is the fine value (-51),
@@ -66,10 +66,12 @@ def cli(tmp, script, *args, env=None):
 
 
 def snake(tmp, *args, env=None, check=True):
-    """Run the engine DAG against build.smk (workdir=tmp, sources from tmp/sources)."""
+    """Run the engine DAG against the ONE Snakefile (workdir=tmp, sources from tmp/sources). The
+    covering already exists (the CLI wrote it above), so the `cover` checkpoint is up to date and
+    the DAG re-evaluates straight past it into the per-stem jobs."""
     e = _base_env(tmp, env)
     proc = subprocess.run(
-        ["uv", "run", "snakemake", "-s", os.path.join(PIPE, "build.smk"),
+        ["uv", "run", "snakemake", "-s", os.path.join(PIPE, "..", "Snakefile"),
          "--config", f"workdir={tmp}", *args],
         cwd=PIPE, env=e, capture_output=True, text=True)
     if check and proc.returncode != 0:

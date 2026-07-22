@@ -1,38 +1,95 @@
-# Stage 2+ — the planet/preview invocation: `snakemake -s pipelines/build.smk mosaic`.
+# Stage 2/3 — the mosaic → cartographic forks → bundles → publish half of the ONE DAG. Included
+# from the repo-root Snakefile (never run with `-s`), so cover/masks/catalogs and these rules
+# share one graph and one invocation.
 #
-# A SEPARATE entry Snakefile keeps the two invocations structurally apart: this
-# graph parses PURELY from disk (the --stable covering `snakemake catalogs` wrote) and
-# defines no rule that writes catalogs, masks, or coverings — and no fetch/mirror rule,
-# so builds can never contact upstream, by graph construction rather than discipline.
+# Freshness here is ENGINE provenance (inputs + params). CODE is deliberately not an input
+# (force-only: `-R mosaic_tile`) — an innocuous merge-module edit must not re-merge the planet
+# by default.
 #
-# Freshness here is ENGINE provenance (inputs + params). CODE is deliberately not an
-# input (force-only: `-R mosaic_tile`) — an innocuous merge-module edit must not
-# re-merge the planet by default.
-
-include: "common.smk"
+# STEMS are a RUNTIME product: the `cover` checkpoint (repo-root Snakefile) writes the covering
+# this build scopes from, so nothing per-stem is known at parse. Every aggregator derives its
+# stem set through covering_stems() below, which forces the checkpoint and re-triggers DAG
+# evaluation once the covering lands. The per-stem wildcard rules (mosaic_tile, contour_tile,
+# soundings_tile, depare_tile, terrain_render, overlay_bundle) keep their wildcards and per-tile
+# input functions — those only run when a job is instantiated, which is after the checkpoint.
 
 import json
 
 import aggregation_reproject
+import bundle
+import contour_run
+import depare_run
 import landmask
 import mosaic as mosaic_mod
+import smooth
+import soundings_run
+import terrain as terrain_mod
 import utils
 
 # Mask inputs only when they are local files — a /vsicurl mask (streamed preview) has no
 # file to track; its identity rides in the mask content, tracked via its input file.
 MASKS = [p for p in (landmask.path(), landmask.water_path()) if not p.startswith("/vsi")]
 
-# STEMS — parse-time, purely from disk, scoped to the BBOX env. The covering is the full
-# on-disk inventory (write-if-changed keeps out-of-window tiles — on the box it is the
-# PLANET), so the bbox filter lives here, not in the file's extent. Refusing to run without
-# a covering (instead of silently building nothing) is the seam.
-_covering = Path(config.get("workdir", str(SCRIPTS))) / "store" / "aggregation" / "covering.txt"
-if not _covering.is_file():
-    raise WorkflowError(f"no covering at {_covering} — run `snakemake catalogs` first")
-STEMS = mosaic_mod.covering_stems(str(_covering))
-if not STEMS:
-    raise WorkflowError(f"covering has no tiles in BBOX={os.environ.get('BBOX', '')!r} — "
-                        "check the window, or run `snakemake catalogs` first")
+# depare rides only when SKIP_DEPARE is unset — an env gate, known at parse, so it decides which
+# depare rules even EXIST (an empty input list would break the bundle rules). The stem set behind
+# it is still checkpoint-derived (depare_stems()).
+DEPARE = not os.environ.get("SKIP_DEPARE")
+
+
+# ── checkpoint-gated stem derivation ──────────────────────────────────────────────────────
+# covering_stems() forces the `cover` checkpoint (checkpoints.cover.get()) and returns the
+# BBOX-scoped covering — the covering is the full on-disk inventory, so the window filter lives
+# here (mosaic_mod.covering_stems), not in the file's extent. Cached per DAG evaluation, keyed on
+# the covering's path+mtime+BBOX so a re-derivation after cover reruns picks up the new file. The
+# empty-BBOX refusal (a window over open ocean) moved here from parse: it raises in the input
+# function, still before any job runs.
+_STEMS = {}
+_CELLS = {}
+
+
+def _covering_key():
+    path = checkpoints.cover.get().output[0]
+    return path, (path, os.path.getmtime(path), os.environ.get("BBOX", ""))
+
+
+def covering_stems(wc=None):
+    path, key = _covering_key()
+    if key not in _STEMS:
+        stems = mosaic_mod.covering_stems(path)
+        if not stems:
+            raise WorkflowError(
+                f"covering has no tiles in BBOX={os.environ.get('BBOX', '')!r} — check the window")
+        _STEMS[key] = stems
+    return _STEMS[key]
+
+
+def depare_stems(wc=None):
+    return covering_stems() if DEPARE else []
+
+
+_RENDER_STEMS = {}
+
+
+def render_stems(wc=None):
+    # Memoized like covering_stems: several input functions call this per DAG evaluation,
+    # and the cascade over a planet covering is minutes of pure Python if recomputed.
+    _, key = _covering_key()
+    if key not in _RENDER_STEMS:
+        _RENDER_STEMS[key] = terrain_mod.render_stems(covering_stems())
+    return _RENDER_STEMS[key]
+
+
+def cell_stems():
+    """cell -> [render stems] for the overlay bundles, built once per DAG evaluation: deriving it
+    per input-function call costs O(cells x render_stems), minutes at planet scale."""
+    _, key = _covering_key()
+    if key not in _CELLS:
+        m = {}
+        for s in render_stems():
+            for c in bundle.overlay_cells([s]):
+                m.setdefault(c, []).append(s)
+        _CELLS[key] = m
+    return _CELLS[key]
 
 
 wildcard_constraints:
@@ -43,9 +100,10 @@ _TILE_SOURCES = {}
 
 
 def tile_sources(stem):
-    """The source ids intersecting one covering tile — DAG-build time, from its stable CSV."""
+    """The source ids intersecting one covering tile — job-instantiation time (after the
+    checkpoint), from its stable CSV beside the covering."""
     if stem not in _TILE_SOURCES:
-        rows = (_covering.parent / f"{stem}-aggregation.csv").read_text().splitlines()[1:]
+        rows = Path(f"store/aggregation/{stem}-aggregation.csv").read_text().splitlines()[1:]
         _TILE_SOURCES[stem] = sorted({r.split(",")[0] for r in rows if r.strip()})
     return _TILE_SOURCES[stem]
 
@@ -53,8 +111,7 @@ def tile_sources(stem):
 def merge_inputs(wc):
     """A tile's staleness inputs: its covering CSV, each intersecting source's catalog item
     (the registration marker — a re-prepped or re-mirrored source restamps it, so exactly the
-    intersecting tiles re-merge), and the masks (their content enters every merged tile). All LEAF
-    files here — their producing rules live only in the Snakefile."""
+    intersecting tiles re-merge), and the masks (their content enters every merged tile)."""
     return ([f"store/aggregation/{wc.stem}-aggregation.csv"]
             + [f"store/source/{s}/catalog.json" for s in tile_sources(wc.stem)]
             + MASKS)
@@ -118,7 +175,7 @@ rule mosaic_tile:
 # this index, so it can't become a planet-wide barrier at the DAG's widest point.
 rule mosaic_index:
     input:
-        tiles=expand("store/mosaic/tiles/{stem}.tif", stem=STEMS),
+        tiles=lambda wc: expand("store/mosaic/tiles/{stem}.tif", stem=covering_stems()),
         covering="store/aggregation/covering.txt",
     params:
         # scope stamp: a bbox build's regional artifact must not read as current in a later
@@ -145,8 +202,9 @@ rule mosaic:
 # Content-address the plain tiles + planet-z8 to R2 under hashed names and write a CANDIDATE
 # pointer (index + gti). Publishing is remote, so there is no on-disk output — a plain
 # always-runnable target gated on the finished index. The serving pointer mosaic.gti is never
-# written from here; promotion is out of scope.
-rule publish:
+# written from here; promotion is out of scope. Named publish_mosaic (not publish) — `publish`
+# is the per-source R2 push in publish.smk; one DAG, so the two can't share a name.
+rule publish_mosaic:
     input:
         rules.mosaic_index.output
     benchmark:
@@ -159,16 +217,6 @@ rule publish:
 
 # ── stage 3 (cartographic products): every consumer reads windows of the persisted ──
 # ── mosaic, as a separate job rather than riding inside the merge                    ──
-
-import bundle
-import contour_run
-import depare_run
-import smooth
-import soundings_run
-import terrain as terrain_mod
-
-RENDER_STEMS = terrain_mod.render_stems(STEMS)
-DEPARE_STEMS = [] if os.environ.get("SKIP_DEPARE") else STEMS
 
 # The one shared f(depth, zoom) — a knob change reruns stage 3 only, never a merge.
 SMOOTH_CFG = json.dumps({} if os.environ.get("SKIP_SMOOTH") else {
@@ -290,44 +338,50 @@ rule terrain_render:
         "{PY}/terrain.py render {wildcards.stem} 2> {log}"
 
 
-# Product-inventory aggregates: each family buildable alone against a warm mosaic.
+# Product-inventory aggregates: each family buildable alone against a warm mosaic. Every stem
+# set is checkpoint-derived, so the input is a function (not a parse-time expand()).
 rule contours:
     input:
-        expand("store/contour/{stem}.fgb", stem=STEMS)
+        lambda wc: expand("store/contour/{stem}.fgb", stem=covering_stems())
 
 
 rule soundings:
     input:
-        expand("store/soundings/{stem}.geojson", stem=STEMS)
+        lambda wc: expand("store/soundings/{stem}.geojson", stem=covering_stems())
 
 
 rule depare:
     input:
-        expand("store/depare/{stem}.fgb", stem=DEPARE_STEMS)
+        lambda wc: expand("store/depare/{stem}.fgb", stem=depare_stems())
 
 
 rule terrain:
     input:
-        expand("store/pmtiles/{stem}.pmtiles", stem=RENDER_STEMS)
+        lambda wc: expand("store/pmtiles/{stem}.pmtiles", stem=render_stems())
 
 
-# Everything cartographic (bundles + publish arrive next; DEPARE rides only when enabled).
+def tile_inputs(wc):
+    """Everything cartographic per stem — the union the `tiles` target gates on (DEPARE rides
+    only when enabled)."""
+    return (expand("store/contour/{stem}.fgb", stem=covering_stems())
+            + expand("store/soundings/{stem}.geojson", stem=covering_stems())
+            + expand("store/depare/{stem}.fgb", stem=depare_stems())
+            + expand("store/pmtiles/{stem}.pmtiles", stem=render_stems()))
+
+
 rule tiles:
     input:
-        rules.contours.input,
-        rules.soundings.input,
-        rules.depare.input,
-        rules.terrain.input,
+        tile_inputs
 
 
 # ── bundles — the three vector layers tile-join into one vector.pmtiles ──
 # Each bundler consumes the PLAIN per-stem outputs (0-byte = an empty tile, kept by size),
 # asserts the covering is hole-free, and always rebuilds — Snakemake owns freshness. depare
-# rides only when SKIP_DEPARE is unset (DEPARE_STEMS).
+# rides only when SKIP_DEPARE is unset (DEPARE).
 
 rule soundings_bundle:
     input:
-        expand("store/soundings/{stem}.geojson", stem=STEMS)
+        lambda wc: expand("store/soundings/{stem}.geojson", stem=covering_stems())
     output:
         "store/bundle/soundings.pmtiles"
     params:
@@ -340,11 +394,11 @@ rule soundings_bundle:
         "{PY}/soundings_run.py bundle --stable 2> {log}"
 
 
-# Guarded out entirely when DEPARE_STEMS is empty (SKIP_DEPARE): the input list would be empty.
-if DEPARE_STEMS:
+# Guarded out entirely when SKIP_DEPARE is set: the input list would be empty.
+if DEPARE:
     rule depare_bundle:
         input:
-            expand("store/depare/{stem}.fgb", stem=DEPARE_STEMS)
+            lambda wc: expand("store/depare/{stem}.fgb", stem=depare_stems())
         output:
             "store/bundle/depare.pmtiles"
         params:
@@ -359,13 +413,11 @@ if DEPARE_STEMS:
 
 # The contour tippecanoe + the single tile-join that folds soundings (+ depare when enabled)
 # into vector.pmtiles — so both bundled layers are inputs, not just the contour FGBs.
-_VECTOR_DEPARE = ["store/bundle/depare.pmtiles"] if DEPARE_STEMS else []
-
 rule vector_bundle:
     input:
-        expand("store/contour/{stem}.fgb", stem=STEMS),
-        "store/bundle/soundings.pmtiles",
-        _VECTOR_DEPARE,
+        contours=lambda wc: expand("store/contour/{stem}.fgb", stem=covering_stems()),
+        soundings="store/bundle/soundings.pmtiles",
+        depare=(["store/bundle/depare.pmtiles"] if DEPARE else []),
     output:
         "store/bundle/vector.pmtiles"
     params:
@@ -385,7 +437,7 @@ rule vector_bundle:
 
 rule terrain_planet_bundle:
     input:
-        expand("store/pmtiles/{stem}.pmtiles", stem=RENDER_STEMS)
+        lambda wc: expand("store/pmtiles/{stem}.pmtiles", stem=render_stems())
     output:
         "store/bundle/planet.pmtiles"
     params:
@@ -402,17 +454,9 @@ wildcard_constraints:
     cell=r"\d+-\d+-\d+"
 
 
-# One cell -> stems map, built once: deriving it inside the input function costs
-# O(cells x render_stems) at DAG build, minutes at planet scale.
-_CELL_STEMS = {}
-for _s in RENDER_STEMS:
-    for _c in bundle.overlay_cells([_s]):
-        _CELL_STEMS.setdefault(_c, []).append(_s)
-
-
 rule overlay_bundle:
     input:
-        lambda wc: [f"store/pmtiles/{s}.pmtiles" for s in _CELL_STEMS.get(wc.cell, [])]
+        lambda wc: [f"store/pmtiles/{s}.pmtiles" for s in cell_stems().get(wc.cell, [])]
     output:
         "store/bundle/overlay-{cell}.pmtiles"
     params:
@@ -425,25 +469,31 @@ rule overlay_bundle:
         "{PY}/bundle.py cell {wildcards.cell} --stable 2> {log}"
 
 
+def bundle_inputs(wc):
+    """The finished archive set: the vector layers + the raster planet/overlay archives. Both the
+    `bundles` inventory target and `stage_build` gate on it, so neither references the other's
+    input list (which, being a function, doesn't resolve cleanly through `rules`)."""
+    return (["store/bundle/soundings.pmtiles"]
+            + (["store/bundle/depare.pmtiles"] if DEPARE else [])
+            + ["store/bundle/vector.pmtiles", "store/bundle/planet.pmtiles"]
+            + expand("store/bundle/overlay-{cell}.pmtiles", cell=bundle.overlay_cells(render_stems())))
+
+
 # The bundle-inventory target: the vector layers + the raster planet/overlay archives,
 # buildable alone against a warm terrain render.
 rule bundles:
     input:
-        rules.soundings_bundle.output,
-        (rules.depare_bundle.output if DEPARE_STEMS else []),
-        rules.vector_bundle.output,
-        rules.terrain_planet_bundle.output,
-        expand("store/bundle/overlay-{cell}.pmtiles", cell=bundle.overlay_cells(RENDER_STEMS)),
+        bundle_inputs
 
 
 # Upload the finished archives + manifest.json to bathymetry/build/<sha>/ (manifest LAST,
 # marking a complete build; release.yml promotes it). Publishing is remote, so there is no
 # on-disk output — a plain always-runnable target gated on the finished bundles. coverage.pmtiles
-# rides from disk when the catalogs invocation left it; the graph never writes it. Dispatch-only
+# rides from disk when the `coverage` rule left it; stage_build never writes it. Dispatch-only
 # (SHA from the env) — deliberately absent from the workflow's default target list.
 rule stage_build:
     input:
-        rules.bundles.input
+        bundle_inputs
     benchmark:
         f"{TMP}/bench/stage-build.tsv"
     log:
