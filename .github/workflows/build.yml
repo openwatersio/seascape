@@ -25,6 +25,10 @@ on:
         description: 'Bounding box "W,S,E,N" (empty = full planet)'
         required: false
         default: ""
+      depare:
+        description: "Build the DEPARE depth-area layer (clears SKIP_DEPARE). First enable on a volume: also pass snakemake_args '-R depare_tile' to force past any stale outputs."
+        type: boolean
+        default: false
       force:
         description: "Force: -F on the build invocation (code changes are force-only by design)"
         type: boolean
@@ -51,9 +55,10 @@ env:
   # with these public URLs (mosaic.public_base); the serving pointer is never written from here.
   DATA_BUCKET: data
   PUBLIC_BASE: https://data.openwaters.io/bathymetry
-  # DEPARE stays out of builds until its dense-tile GEOS tail is bounded;
-  # docs/perf/optimization-backlog.md owns the re-enable work.
-  SKIP_DEPARE: "1"
+  # DEPARE is gated by the `depare` dispatch input, not a workflow-level env: the enable value
+  # must be EMPTY (build.smk treats any non-empty SKIP_DEPARE as skip), which a GitHub Actions
+  # `&& '' || '1'` ternary can't produce (empty is falsy → always yields '1'). So the build step
+  # exports SKIP_DEPARE=1 unless the input is set. See docs/perf/optimization-backlog.md.
 
 # One store-mutating workflow at a time, globally: builds, sources runs, and GC share this
 # group. NOTE: a second queued dispatch EVICTS the first — one dispatch at a time.
@@ -222,6 +227,7 @@ jobs:
           # Dispatch inputs reach the shell as env vars, never interpolated into a shell line.
           BBOX: ${{ github.event.inputs.bbox }}
           INPUT_FORCE: ${{ github.event.inputs.force }}
+          INPUT_DEPARE: ${{ github.event.inputs.depare }}
           INPUT_ARGS: ${{ github.event.inputs.snakemake_args }}
           GH_TOKEN: ${{ github.token }} # the progress-heartbeat gh api calls
           BOX_IP: ${{ needs.create-runner.outputs.ip }} # carried in the build status desc
@@ -240,6 +246,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$TMP"
+          # DEPARE gate: skip unless the depare input is set. docker.sh forwards SKIP_DEPARE via
+          # `-e SKIP_DEPARE`, so an unset var (depare=true) reaches the container as enabled.
+          if [ "$INPUT_DEPARE" != "true" ]; then export SKIP_DEPARE=1; fi
           # Disk headroom: the mosaic tiles live permanently on the volume (~360 G), so
           # planet runs are incremental — 100 G covers the index/planet-z8/scratch churn.
           # Refuse early rather than fill mid-run.
