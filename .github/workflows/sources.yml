@@ -170,6 +170,17 @@ jobs:
           STATE=/mnt/seascape-store
           mkdir -p "$STATE/store"
           echo "STATE=$STATE" >> "$GITHUB_ENV"
+          # Swap SAFETY NET on the LOCAL root disk (never the store volume) — the ccx33 has 32 GB
+          # RAM and no swap, so a heavy single job (a source's footprint ST_Union) that over-peaks
+          # is OOM-killed and the whole run is lost. Insurance, not headroom; swappiness=10 keeps
+          # the working set in RAM. Same pattern as build.yml.
+          if [ ! -e /swapfile ]; then
+            fallocate -l 64G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=65536
+            chmod 600 /swapfile
+            mkswap /swapfile
+            swapon /swapfile
+            sysctl vm.swappiness=10
+          fi
       - uses: ./.github/actions/ghcr-login
       # A SIGKILLed previous run (box reaped, OOM) leaves .snakemake locks + incomplete
       # markers ON THE VOLUME, wedging every later run at startup. Unlock is safe here:
