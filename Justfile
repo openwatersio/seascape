@@ -65,6 +65,7 @@ test-sources:
     uv run python source_remote.py
     uv run python source_fetch.py --check
     uv run python source_prep.py --check
+    uv run python source_polygonize.py --check
     uv run python source_check.py --check
     uv run snakemake -s ../Snakefile -n sources > /dev/null
 
