@@ -22,6 +22,7 @@ real seam mitigation.)
 import collections
 import json
 import os
+import re
 import shutil
 import tempfile
 import subprocess
@@ -361,6 +362,13 @@ VECTOR_ATTRS = ["depth_m", "depth_abs_m", "sys", "depth_ft", "depth_fm",
                 "drval1", "drval2", "kind", "rank"]
 VECTOR_TYPES = ["depth_abs_m:int", "depth_ft:int", "depth_fm:int", "rank:int"]
 DEPARE_MINZOOM = 6  # depare's zoom floor, now per-feature (was depare_run's run-level -Z)
+# Down-zoom partition-gap tolerance: a parent tile quantizes geometry to the same 4096-cell grid over
+# 4× the area of each child, so band-union areas differ by a few percent (measured ≤2.7% either way)
+# purely from that. The gap check is one-sided (only a SHRINK — children covering less than the parent
+# — is a hole) with margin over that noise; a gross partition hole (a whole band missing from the
+# children, e.g. the 50% test case) clears it easily, while sub-band holes are caught by the id
+# completeness check. Not the 2% overlap tolerance, which is same-tile (no cross-zoom quantization).
+DEPARE_GAP_TOL = 0.10
 
 
 def _json_scalar(v):
@@ -378,13 +386,45 @@ def _json_scalar(v):
     return v
 
 
-def _fgb_to_seq(fgbs, cols, minzoom_fn, out_path):
+# tippecanoe simplifies away lines/polygons that shrink below ~a pixel at a tile's zoom; even at the
+# finest (leaf = -z) zoom a sub-pixel sliver is dropped — a legitimate loss, not the regression. So a
+# line/polygon is REQUIRED to survive (enters the completeness set) only above this many pixels at
+# maxz; below it, it's exempt. Measured on the real preview: 22 contour fragments dropped, all
+# ≤1.5 px, while the smallest required curve is ~6 px — 4 px sits clear of both. Points (soundings)
+# are never simplified away, so they are always required.
+COMPLETENESS_MIN_PX = 4
+
+
+def _leaf_pixel_deg(maxz):
+    """One MVT pixel at the leaf zoom, in degrees of longitude (tile extent 4096)."""
+    return 360.0 / (2 ** maxz) / 4096
+
+
+def _survives_leaf(geom, min_deg):
+    """Whether tippecanoe must keep this geometry at the leaf zoom (so completeness can require it).
+    Points always; lines by length; polygons by linear size sqrt(area) — all in degrees, min_deg being
+    COMPLETENESS_MIN_PX leaf pixels. Anisotropy (lon vs lat degrees) is inside the 4-px margin."""
+    t = geom.geom_type
+    if "Point" in t:
+        return True
+    if "Polygon" in t:
+        return geom.area ** 0.5 >= min_deg
+    return geom.length >= min_deg
+
+
+def _fgb_to_seq(fgbs, cols, minzoom_fn, out_path, layer, identity_fn, id0, maxz):
     """Stream per-tile FGBs → one GeoJSONSeq (newline-delimited features) carrying a per-feature
     tippecanoe.minzoom — FGB can't hold the tippecanoe extension, so the joint run reads GeoJSON
-    like soundings already do. One tile in memory at a time (macrotile-sized). Returns the count."""
+    like soundings already do. One tile in memory at a time (macrotile-sized). Every feature gets a
+    unique GeoJSON id counting up from id0 (globally unique across layers) — tippecanoe preserves
+    ids, so the self-check proves each input survived. Returns (next_id, {id: identity} for the
+    completeness set) — only above-leaf-pixel features enter it (sub-pixel slivers are exempt, since
+    tippecanoe drops them legitimately), while EVERY feature (id included) is still written to tippecanoe."""
     import geopandas as gpd
     from shapely.geometry import mapping
-    n = 0
+    min_deg = COMPLETENESS_MIN_PX * _leaf_pixel_deg(maxz)
+    fid = id0
+    ids = {}
     with open(out_path, "w") as fh:
         for fgb in fgbs:
             g = gpd.read_file(fgb)
@@ -394,25 +434,32 @@ def _fgb_to_seq(fgbs, cols, minzoom_fn, out_path):
                     v = _json_scalar(getattr(r, c, None))
                     if v is not None:
                         props[c] = v
-                feat = {"type": "Feature", "tippecanoe": {"minzoom": minzoom_fn(props)},
+                feat = {"type": "Feature", "id": fid,
+                        "tippecanoe": {"minzoom": minzoom_fn(props)},
                         "properties": props, "geometry": mapping(r.geometry)}
                 fh.write(json.dumps(feat))
                 fh.write("\n")
-                n += 1
-    return n
+                if _survives_leaf(r.geometry, min_deg):
+                    ids[fid] = f"{layer} {identity_fn(props)}"
+                fid += 1
+    return fid, ids
 
 
-def _soundings_to_seq(gjs, out_path):
+def _soundings_to_seq(gjs, out_path, id0):
     """Concatenate the per-tile sounding FeatureCollections into one GeoJSONSeq, features passed
-    through untouched — each already carries its own tippecanoe.minzoom (pyramid level)."""
-    n = 0
+    through untouched except a unique GeoJSON id (counting up from id0) for the completeness check —
+    each already carries its own tippecanoe.minzoom (pyramid level). Returns (next_id, {id: identity})."""
+    fid = id0
+    ids = {}
     with open(out_path, "w") as fh:
         for gj in gjs:
             for ft in json.load(open(gj)).get("features", []):
+                ft["id"] = fid
                 fh.write(json.dumps(ft))
                 fh.write("\n")
-                n += 1
-    return n
+                ids[fid] = f"sounding depth={ft.get('properties', {}).get('depth_m')}"
+                fid += 1
+    return fid, ids
 
 
 def _tippecanoe_joint(layers, maxz, out):
@@ -467,12 +514,19 @@ def bundle_stable():
     cseq = utils.vector_scratch("contours.geojsons")
     sseq = utils.vector_scratch("soundings.geojsons")
     dseq = utils.vector_scratch("depare.geojsons")
+    nid = 1  # one running counter → feature ids globally unique across the three layers
+    cids = sids = dids = {}
     try:
-        nc = _fgb_to_seq(cfgbs, ("depth_m", "depth_abs_m", "sys", "depth_ft", "depth_fm"),
-                         lambda p: contour_minzoom(p["sys"], float(p["depth_m"])), cseq)
-        ns = _soundings_to_seq(sgjs, sseq)
-        nd = _fgb_to_seq(dfgbs, ("drval1", "drval2", "sys", "kind", "rank"),
-                         lambda p: DEPARE_MINZOOM, dseq)
+        nid, cids = _fgb_to_seq(cfgbs, ("depth_m", "depth_abs_m", "sys", "depth_ft", "depth_fm"),
+                                lambda p: contour_minzoom(p["sys"], float(p["depth_m"])), cseq,
+                                "contour", lambda p: f"sys={p.get('sys')} depth_m={p.get('depth_m')}",
+                                nid, maxz)
+        nid, sids = _soundings_to_seq(sgjs, sseq, nid)
+        nid, dids = _fgb_to_seq(dfgbs, ("drval1", "drval2", "sys", "kind", "rank"),
+                                lambda p: DEPARE_MINZOOM, dseq,
+                                "depare", lambda p: f"drval1={p.get('drval1')} kind={p.get('kind')}",
+                                nid, maxz)
+        nc, ns, nd = len(cids), len(sids), len(dids)
         layers = []
         if nc:
             layers.append(("contours", cseq))
@@ -487,7 +541,7 @@ def bundle_stable():
         for seq in (cseq, sseq, dseq):
             if os.path.exists(seq):
                 os.remove(seq)
-    _vector_selfcheck(vec, maxz)
+    _vector_selfcheck(vec, maxz, {"contours": cids, "soundings": sids, "depare": dids})
     print(f"vector bundle (stable): {vec} (z0-{maxz}; contours={nc} soundings={ns} depare={nd})")
 
 
@@ -509,11 +563,52 @@ def _decode_tile(vec, z, x, y):
     return layers
 
 
-def _vector_selfcheck(vec, maxz, per_zoom=6):
-    """Cheap continuous guard on the sparse archive (the STEP-0 gate proved semantic equivalence to
-    the old 3-run + tile-join oracle; this samples a few tiles per zoom to catch a regression in the
-    minzoom wiring or the global coalesce). Asserts: no depare below its z6 floor, no contour below
-    its tier minzoom, depare m-bands pairwise disjoint (coalesce displaced nothing), soundings present."""
+# A decoded feature line carries its id right after the type; anchor on the type so a future
+# property named "id" (there is none today) can't be mistaken for it.
+_FEATURE_ID_RE = re.compile(r'"type": "Feature", "id": (\d+)')
+
+
+def _seen_ids(vec):
+    """Union of feature ids across EVERY tile of the archive, from ONE streaming whole-archive
+    tippecanoe-decode (measured 0.85 s / 4 MB preview → 60 MB decoded; the pass streams, so memory is
+    the distinct-id set, not the JSON). Each input feature is written at its native leaf tile, so a
+    present id proves the feature survived; a feature dropped by leafing above -z is in NO tile."""
+    # ponytail: cost is O(features summed over all zooms) and the id set is ~1 int/feature; at planet
+    # scale both shrink ~4^Δz-fold by scoping the decode to leaf tiles (no children in the pmtiles
+    # directory) — every feature already lives at its leaf, so the union is unchanged. Not needed yet.
+    seen = set()
+    p = subprocess.Popen(["tippecanoe-decode", vec], stdout=subprocess.PIPE, text=True)
+    for line in p.stdout:
+        m = _FEATURE_ID_RE.search(line)
+        if m:
+            seen.add(int(m.group(1)))
+    if p.wait() != 0:  # a partial decode would undercount and fail completeness for the wrong reason
+        raise SystemExit(f"vector self-check: tippecanoe-decode failed on {vec}")
+    return seen
+
+
+def _mbands(feats):
+    """Decoded depare metre depth-area bands: sys=m with a real drval1 — INCLUDING the 0-m band.
+    The `drval1 is not None and >= 0` test is deliberate: `drval1 or -1` treated 0 as missing and
+    dropped the 0-m band from the partition checks (the confirmed bug)."""
+    return [f for f in feats
+            if f["properties"].get("sys") == "m"
+            and f["properties"].get("drval1") is not None
+            and f["properties"]["drval1"] >= 0]
+
+
+def _vector_selfcheck(vec, maxz, expected=None, per_zoom=6):
+    """Completeness + partition guard on the sparse archive. PRIMARY check (when `expected` — the
+    {layer: {id: identity}} maps the seq-builders return): every input feature id must survive
+    somewhere in the archive, per layer. COMPLETE (not sampled), and it is what catches a contour,
+    sounding, OR whole depare polygon that variable-depth dropped — the exact regression this PR
+    prevents — because a dropped feature appears in no tile and its id is missing from the union.
+    Robust to legitimate per-zoom minzoom thinning and to --coalesce-smallest-as-needed (a feature
+    that only coalesces at a low zoom still appears at its full-detail native leaf; one present
+    nowhere is a real drop). Plus the sampled complementary checks: no depare below its z6 floor, no
+    contour below its tier minzoom, soundings present, depare m-bands pairwise disjoint (coalesce
+    displaced nothing), and the partition conserved down-zoom (a parent m-band union ≈ its 4
+    children's — a shrink means a gap opened deeper; whole missing polygons are already caught above)."""
     from pmtiles.reader import Reader, MmapSource, all_tiles
     from shapely.geometry import shape
     from shapely.ops import unary_union
@@ -523,7 +618,22 @@ def _vector_selfcheck(vec, maxz, per_zoom=6):
         for tile_tuple, _ in all_tiles(reader.get_bytes):
             z, x, y = tile_tuple
             byz[z].append((x, y))
+    present = {z: set(xys) for z, xys in byz.items()}
     problems, n_soundings = [], 0
+
+    if expected is not None:
+        seen = _seen_ids(vec)
+        for layer, idmap in expected.items():
+            missing = [i for i in idmap if i not in seen]
+            if missing:
+                sample = "; ".join(idmap[i] for i in missing[:5])
+                problems.append(f"{layer}: {len(missing)} of {len(idmap)} input features dropped "
+                                f"(present in no tile) — e.g. {sample}")
+
+    def mband_area(feats):
+        geoms = [shape(f["geometry"]).buffer(0) for f in _mbands(feats)]
+        return unary_union(geoms).area if geoms else 0.0
+
     for z in sorted(byz):
         ts = byz[z]
         for x, y in ts[:: max(1, len(ts) // per_zoom)]:
@@ -538,21 +648,30 @@ def _vector_selfcheck(vec, maxz, per_zoom=6):
                     problems.append(f"z{z} {x}/{y}: contour depth_m={d} sys={s} below minzoom "
                                     f"{contour_minzoom(s, float(d))}")
                     break
-            mbands = [feat for feat in L.get("depare", [])
-                      if feat["properties"].get("sys") == "m"
-                      and (feat["properties"].get("drval1") or -1) >= 0]
+            mbands = _mbands(L.get("depare", []))
             if mbands:
-                geoms = [shape(feat["geometry"]).buffer(0) for feat in mbands]
+                geoms = [shape(f["geometry"]).buffer(0) for f in mbands]
                 asum, uni = sum(g.area for g in geoms), unary_union(geoms).area
                 if uni and (asum - uni) / uni >= 0.02:
                     problems.append(f"z{z} {x}/{y}: depare m-bands overlap {(asum - uni) / uni:.2%} "
                                     f"(coalesce displaced a partition)")
+                # partition conserved into z+1: a present-children parent's band union ≈ its 4
+                # children's combined union; a one-sided SHRINK (children covering less) is a gap that
+                # opened at the deeper zoom (a grow is just finer-grid quantization, not a hole).
+                kids = [(2 * x, 2 * y), (2 * x + 1, 2 * y), (2 * x, 2 * y + 1), (2 * x + 1, 2 * y + 1)]
+                if z + 1 <= maxz and uni and all(k in present.get(z + 1, ()) for k in kids):
+                    child = sum(mband_area(_decode_tile(vec, z + 1, kx, ky).get("depare", []))
+                                for kx, ky in kids)
+                    if (uni - child) / uni >= DEPARE_GAP_TOL:
+                        problems.append(f"z{z} {x}/{y}: depare band area {uni:.3g} shrank to children "
+                                        f"{child:.3g} ({(uni - child) / uni:.2%} gap opened deeper)")
     if n_soundings == 0:
         problems.append("no soundings in any sampled tile (the layer vanished)")
     if problems:
         raise SystemExit("vector self-check FAILED:\n  " + "\n  ".join(problems[:20]))
+    ids_note = f", {sum(len(m) for m in expected.values())} ids complete" if expected else ""
     print(f"vector self-check ok ({sum(len(v) for v in byz.values())} tiles, "
-          f"z{min(byz)}-{max(byz)}, {n_soundings} sampled soundings)")
+          f"z{min(byz)}-{max(byz)}, {n_soundings} sampled soundings{ids_note})")
 
 
 def _check():
