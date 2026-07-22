@@ -40,6 +40,12 @@ BLOCK = int(os.environ.get("SMOOTH_BLOCK", "2048"))          # window side (px);
 TRUNCATE = 4.0                                               # gaussian_filter default kernel cutoff (σ)
 
 
+def halo_px():
+    """The gaussian truncation radius (TRUNCATE·σ, +1 for the gradient) in pixels — the window
+    halo the block-wise smooth, terrain's window_tiles, and the stage-3 read buffer all size from."""
+    return int(np.ceil(TRUNCATE * max(DEM_SIGMA, DEM_SIGMA_DEEP, MASK_SIGMA))) + 1
+
+
 def smooth_array(dem, res, nodata=NODATA):
     valid = dem != nodata
     water = valid & (dem < 0)
@@ -71,7 +77,7 @@ def smooth_tiff(path, block=None):
     feeds each block real neighbours, so interior output is identical to a whole-array
     smooth; only the true raster edge falls back to mode='nearest', exactly as before."""
     block = block or BLOCK
-    halo = int(np.ceil(TRUNCATE * max(DEM_SIGMA, DEM_SIGMA_DEEP, MASK_SIGMA))) + 1
+    halo = halo_px()
     with rasterio.open(path) as src:
         profile = src.profile
         res = src.res[0]
