@@ -63,11 +63,15 @@ builder if you manage the paint property yourself.
 
 ## Depth readout
 
-`readDepth(tilesBase, lngLat, zoom)` → chart-datum elevation in metres
-(negative below datum, positive above; `null` on a tile miss), decoded from
-the Terrarium DEM tile pixel at native resolution. Use it instead of
-`queryTerrainElevation`, which needs 3D terrain enabled and samples a coarse
-mesh that reads land over deep water near coasts. Browser-only.
+`readDepth(tilesBase, lngLat, zoom)` → the decoded Terrarium DEM sample in metres (`null` only on a fetch failure — the Worker serves the land code for missing tiles, so those read as land), read at native resolution. The published DEM is a depth product, not a topo map — decoded value `v`:
+
+- `v < 0` — elevation below the winning source's datum; `-v` is charted depth on measured water. The encoding is shallow-biased; the datum is per-source (≈MSL sources read deep vs a low-water chart datum until datum unification).
+- `v == 0` — water present, **depth unknown** (ENC `UNSARE` analogue), not a measured depth of ~0.
+- `v == 1` — **drying foreshore**: covers and uncovers with the tide. The height is not carried — the `depare` layer's `drval` bands are the only drying-height source.
+- `v == 2` — **land / out of scope**. Not measured elevation (the Worker also serves it for missing tiles).
+- Fractions between codes are smoothing/overzoom interpolation transitions — round to the nearest code, or consult `depare` for the categorical truth.
+
+Use it instead of `queryTerrainElevation`, which needs 3D terrain enabled and samples a coarse mesh that reads land over deep water near coasts. Browser-only.
 
 ```js
 map.on("click", async (e) => {

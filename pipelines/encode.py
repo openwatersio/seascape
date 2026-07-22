@@ -37,13 +37,13 @@ step shallow bias, which is sub-perceptual at the zoom each step is applied
 (z0 step = 2048 m on a 0..-10000 m range; z12 step = 0.5 m). Pass
 ``conservative=False`` for minimal-error round-to-nearest.
 
-One exception to the pure rounding: water never quantizes to 0. Elevation 0 is
-the land value (the land mask clamps land pixels to it, and the depth ramp
-draws it as land), so a negative input that would round to >= 0 — water
-shallower than its local per-pixel step, i.e. min(zoom step, depth cap), at
-most SHALLOW_MIN_STEP and smaller still at fine zooms — is capped at -LSB
-instead. Still shoal-biased; the only inputs it deepens are true depths
-shallower than the ~4 mm LSB, which are noise.
+One exception to the pure rounding: water never quantizes to 0. The published
+non-negative domain is categorical (terrain.py: 0 unknown-depth water, 1 drying,
+2 land), so a negative input that would round to >= 0 — water shallower than its
+local per-pixel step, i.e. min(zoom step, depth cap), at most SHALLOW_MIN_STEP
+and smaller still at fine zooms — is capped at -LSB instead. Still shoal-biased;
+the only inputs it deepens are true depths shallower than the ~4 mm LSB, which
+are noise.
 """
 
 import numpy as np
@@ -158,9 +158,26 @@ def _check():
     assert decode(encode(np.array([-1000.0]), 6))[0] == -992.0  # ceil(-1000/32)*32
 
     # The water floor: water shallower than the local step, which would round to
-    # 0 (land), caps at -LSB and survives the RGB round-trip exactly.
+    # 0 (a category code), caps at -LSB and survives the RGB round-trip exactly.
     assert decode(encode(np.array([-0.2]), 9))[0] == -LSB
     assert decode(encode(np.array([-0.001]), 12))[0] == -LSB
+
+    # The published category codes (terrain.py: 0 unknown water, 1 drying, 2 land) survive
+    # quantization exactly at every zoom — multiples of the 0.25 m floor, and ceil is exact there.
+    for z in range(0, 16):
+        assert np.array_equal(decode(encode(np.array([0.0, 1.0, 2.0]), z)),
+                              [0.0, 1.0, 2.0]), z
+
+    # Render-path contract (terrain.py clamps land to the sentinel DRYING_CAP+1 and nudges
+    # land-side exact-0 to +LSB before this encode): at EVERY zoom the sentinel decodes above the
+    # cap (so v > DRYING_CAP => land holds despite ceil rounding lifting +17 to +18 at coarse
+    # zooms), exact 0 decodes exactly 0 (water of unknown depth), and +LSB decodes strictly
+    # positive (land). config's cap is the anchor.
+    import config
+    for z in range(0, FULL_RESOLUTION_ZOOM + 1):
+        assert decode(encode(np.array([config.DRYING_CAP + 1.0]), z))[0] > config.DRYING_CAP, z
+        assert decode(encode(np.array([0.0]), z))[0] == 0.0, z
+        assert decode(encode(np.array([LSB]), z))[0] > 0.0, z
 
     print("encode.py self-check ok")
 

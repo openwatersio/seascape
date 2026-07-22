@@ -3,6 +3,8 @@
 Each output zoom renders by reading the MOSAIC at that zoom's resolution
   -> depth/zoom-gated smooth AT THAT RESOLUTION (smooth.smooth_array — the ONE smoothing
      function the contour fork also calls, so isobaths agree with the shading)
+  -> land sentinel (clamp to DRYING_CAP+1 so decoded v > DRYING_CAP reads land/out-of-scope) +
+     land-side 0 nudge (land-side exact-0 -> +LSB so decoded 0 stays unambiguously water)
   -> Terrarium encode (encode.py's conservative, bias-shallow quantization)
   -> single-zoom pmtiles bundle.py concatenates (store/pmtiles/<stem>.pmtiles).
 
@@ -43,7 +45,9 @@ import numpy as np
 import rasterio
 
 import aggregation_reproject
+import config
 import encode
+import landmask
 import mosaic
 import smooth
 import utils
@@ -114,21 +118,46 @@ def _q(path):
 
 # ── render one stem ────────────────────────────────────────────────────────────────────────────
 
-def _encode_tile(i, j, src_path, halo, out_webp, cz):
+# The published raster carries depth only: `v < 0` is bathymetry, and the non-negative domain is
+# three flat codes — 0 unknown-depth water, 1 drying foreshore, 2 land. Flat codes have no slope,
+# so client hillshade shows nothing on land (no halo ring at 0-filled lakes, no fake topo relief);
+# all three are exact multiples of the 0.25 m quantize floor, so they decode exactly at every zoom.
+UNKNOWN, DRYING, LAND = 0.0, 1.0, 2.0
+
+
+def _encode_tile(i, j, src_path, halo, out_webp, cz, mask_path=None):
     """One 512-tile of the smoothed window -> a lossless Terrarium webp at zoom `cz`. The window's
     interior starts at `halo`; nodata (a build-edge hole the mosaic legitimately carries — GEBCO
     fills the ocean, so this is only the beyond-build fringe) resolves to 0 for the served render,
     which has no transparency."""
     col = i * 512 + halo
     row = j * 512 + halo
+    win = rasterio.windows.Window(col, row, 512, 512)
     with rasterio.open(src_path) as src:
-        data = src.read(1, window=rasterio.windows.Window(col, row, 512, 512))
+        data = src.read(1, window=win)
+        dims = (src.height, src.width)
     # GEBCO (priority 0, global) is inside the mosaic, so any surviving interior nodata is genuinely
     # UNCOVERED — no source has it. Resolving it to 0 m = shoreline/datum, which is shallow and
     # chart-safe (never a false DEEP); the served Terrarium has no transparency, so it must be some
     # value, and shoaling it is the conservative choice. (In practice this is only the beyond-build
     # fringe; true interior holes don't occur while GEBCO blankets the planet.)
     data[data == NODATA] = 0
+    pos = data > 0
+    if mask_path is not None:
+        with rasterio.open(mask_path) as m:
+            if (m.height, m.width) != dims:  # same guard as the landmask clamps
+                raise ValueError(f"land mask {(m.height, m.width)} != window {dims} for {src_path}")
+            land = m.read(1, window=win) == 1
+        # Water-side (0, cap] is genuine drying — the 4th-quadrant clamp zeroed coarse fakes at
+        # warp, so only trusted-source foreshore survives there. Everything else positive (land
+        # topo, land-side lowland, tall unmapped rock over water) is land, as is land-side exact-0
+        # (clamped polders); water-side exact-0 stays the unknown code.
+        drying = pos & ~land & (data <= config.DRYING_CAP)
+        data[pos] = LAND
+        data[drying] = DRYING
+        data[(data == 0) & land] = LAND
+    else:
+        data[pos] = LAND  # maskless (coarse stems / no feed): drying is sub-pixel there anyway
     utils.save_terrarium_tile(data, out_webp)  # utils parses zoom from the {cz}-{x}-{y}.webp name
 
 
@@ -158,12 +187,25 @@ def _render(stem, out_pmtiles):
     if not os.environ.get("SKIP_SMOOTH"):
         smooth.smooth_tiff(window)  # the ONE f(depth,zoom); halo makes interior identical to whole
 
+    # Rasterize the combined land mask on the window's exact grid so _encode_tile can nudge
+    # land-side exact-0 pixels (clamped polders, beyond-build land fringe) to land, keeping decoded
+    # 0 unambiguously water. Same #24 machinery, degrades to no-nudge when no mask is published.
+    # Regional windows only (cz>=8, the per-tile VRT path): a planet-scale window's -spat clip
+    # streams the entire vector mask (GBs) instead of an indexed subset. At z<=7 a land-side
+    # exact-0 area is a few pixels; a rasterized planet-z8 mask artifact is the upgrade path.
+    mask = None
+    if cz >= 8 and landmask._present(landmask.path()):
+        mask = f"{tmp}/landmask.tif"
+        with rasterio.open(window) as w:
+            b, wres = w.bounds, w.res[0]
+        landmask.rasterize((b.left, b.bottom, b.right, b.top), wres, mask)
+
     x_min, y_min = x * span, y * span
     from concurrent.futures import ThreadPoolExecutor
     threads = min(os.cpu_count() or 1, 8)
     with ThreadPoolExecutor(max_workers=threads) as pool:
         futures = [
-            pool.submit(_encode_tile, i, j, window, halo, f"{tmp}/{cz}-{tx}-{ty}.webp", cz)
+            pool.submit(_encode_tile, i, j, window, halo, f"{tmp}/{cz}-{tx}-{ty}.webp", cz, mask)
             for i, tx in enumerate(range(x_min, x_min + span))
             for j, ty in enumerate(range(y_min, y_min + span))
         ]
@@ -201,7 +243,7 @@ def _config():
         "quant_full_zoom": encode.FULL_RESOLUTION_ZOOM,
         "shallow_rel": encode.SHALLOW_REL, "shallow_min_step": encode.SHALLOW_MIN_STEP,
         "macrotile_z": utils.macrotile_z, "num_overviews": utils.num_overviews,
-        "resample": aggregation_reproject.RESAMPLE,
+        "resample": aggregation_reproject.RESAMPLE, "drying_cap": config.DRYING_CAP,
     }
     if not os.environ.get("SKIP_SMOOTH"):
         cfg["smooth"] = {
@@ -331,6 +373,36 @@ def _check():
         wet = allpx[allpx < -1]  # the covered water (0 = beyond-build fill / nodata; ignore)
         assert len(wet) and abs(float(np.median(wet)) - (-30.0)) < 3.0, \
             f"overview served depth must track the mosaic (-30 m), median {np.median(wet):.1f}"
+
+        # _encode_tile's render-path classification. A window with a land-topo block, a land-side
+        # lowland, a land-side 0, a water-side drying height, and a water-side 0, plus a matching
+        # land mask: every non-negative pixel decodes to its exact code at this zoom — land topo,
+        # land lowland, and land-0 all 2; water-side (0, cap] exactly 1; water-side 0 exactly 0 —
+        # and measured depth passes through untouched.
+        win = np.full((512, 512), -30.0, dtype="float32")
+        win[100:120, 100:120] = 5000.0  # land topo block
+        win[0, 0], win[0, 1], win[1, 0] = 12.0, 0.0, 0.0  # land lowland, land-side 0, water-side 0
+        win[5, 5] = 4.0  # water-side drying height (trusted-source foreshore)
+        wt, mkt = f"{d}/win.tif", f"{d}/winmask.tif"
+        wtr = from_origin(b.left, b.top, res, res)
+        with rasterio.open(wt, "w", driver="GTiff", height=512, width=512, count=1, dtype="float32",
+                           crs="EPSG:3857", transform=wtr) as dst:
+            dst.write(win, 1)
+        mk = np.zeros((512, 512), dtype="uint8")
+        mk[100:120, 100:120] = 1
+        mk[0, 0], mk[0, 1] = 1, 1  # land at the topo block + lowland + land-0; water elsewhere
+        with rasterio.open(mkt, "w", driver="GTiff", height=512, width=512, count=1, dtype="uint8",
+                           crs="EPSG:3857", transform=wtr) as dst:
+            dst.write(mk, 1)
+        _encode_tile(0, 0, wt, 0, f"{cz}-0-0.webp", cz, mkt)
+        with open(f"{cz}-0-0.webp", "rb") as f:
+            dec = encode.decode(imagecodecs.webp_decode(f.read()).astype("float32"))
+        assert dec[110, 110] == LAND and dec[0, 0] == LAND and dec[0, 1] == LAND, \
+            ("land topo / lowland / land-0 must all decode the exact land code",
+             dec[110, 110], dec[0, 0], dec[0, 1])
+        assert dec[5, 5] == DRYING, ("water-side (0, cap] must decode the drying code", dec[5, 5])
+        assert dec[1, 0] == UNKNOWN, ("water-side 0 must stay exactly 0", dec[1, 0])
+        assert abs(dec[200, 200] - (-30.0)) < 0.5, ("measured depth must pass through", dec[200, 200])
         print("terrain.py self-check ok")
     finally:
         os.chdir(cwd)

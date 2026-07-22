@@ -373,6 +373,54 @@ def clamp_positive_water(cog_path, water_tif):
                             ds.write(al, alpha, window=win)
 
 
+def clamp_positive_ocean(cog_path, mask_tif, water_tif=None):
+    """4th-quadrant per-source clamp, sibling of clamp mirrored to the ocean side: on a flagged
+    source's warped COG, where a valid pixel is > 0 AND seaward of the OSM land line (combined
+    mask==0) AND outside mapped inland water, set it to 0. A coarse global source's shoreline cells
+    read slightly positive just seaward of the land line (a ~460 m cell straddling the coast); left
+    raw they fabricate drying foreshore in the depare/drying bucket, which reads the UNCLAMPED
+    mosaic in (0, DRYING_CAP]. The one deliberate deep-ward move in the pipeline: it bets the true
+    seabed under a coarse coastal cell is subtidal, and where a flagged source is the sole coverage
+    of a macrotidal coast, genuine intertidal signal degrades to unknown-depth water (both read
+    non-safe-water). Clamp to 0 (chart datum at the shoreline, NOT nodata — the ocean has
+    a real depth here, just not one a coarse land cell can assert), so the pixel drops out of the
+    strictly-positive drying bucket. Keys on the combined land mask for 'not land'; the water-only
+    mask (rasterize_water) excludes inland water, whose positive is the #24 case that
+    clamp_positive_water clears to nodata. Absent a water feed, ocean is just mask==0 (unmapped
+    inland water then reads as ocean — the same land-only degrade the rest of the module takes).
+
+    Same windowed, mask-first, GDAL_CACHEMAX-bounded scan as _clamp_negative_land."""
+    with rasterio.open(mask_tif) as m:
+        mask_shape = (m.height, m.width)
+    block = 2048
+    with rasterio.env.Env(GDAL_CACHEMAX=64):
+        water = rasterio.open(water_tif) if water_tif is not None else None
+        with rasterio.open(cog_path, "r+", IGNORE_COG_LAYOUT_BREAK="YES") as ds, \
+                rasterio.open(mask_tif) as m:
+            try:
+                if (ds.height, ds.width) != mask_shape:
+                    raise ValueError(
+                        f"land mask {mask_shape} != raster {(ds.height, ds.width)} for {cog_path} "
+                        "(rasterize -te/-tr must match the warp)")
+                for row in range(0, ds.height, block):
+                    for col in range(0, ds.width, block):
+                        win = rasterio.windows.Window(
+                            col, row, min(block, ds.width - col), min(block, ds.height - row))
+                        ocean = m.read(1, window=win) == 0
+                        if water is not None:
+                            ocean &= water.read(1, window=win) == 0
+                        if not ocean.any():
+                            continue
+                        a = ds.read(1, window=win)
+                        hit = ocean & (ds.read_masks(1, window=win) != 0) & (a > 0)
+                        if hit.any():
+                            a[hit] = 0
+                            ds.write(a, 1, window=win)
+            finally:
+                if water is not None:
+                    water.close()
+
+
 def _check():
     """Clamp semantics on the REAL pipeline file (a COG with an ADD_ALPHA mask band, like
     negate_band1's check), the inland-water subtraction (water burns land back to water, an
@@ -489,12 +537,19 @@ def _check():
     with rasterio.open(ocean_only) as m:
         assert m.read(1).sum() == 0, "an offshore extent must rasterize_water to all-zero"
 
-    wy2, wx2 = np.where(wonly == 1)   # inland water
-    ny2, nx2 = np.where(wonly == 0)   # land-not-water or ocean — both must be untouched (water==0)
+    # The full positive-clamp invariant, run as the pipeline runs both clamps: positive over LAND
+    # survives (the terrain sentinel handles land), positive over OCEAN clamps to 0 (4th quadrant),
+    # positive over INLAND WATER clears to nodata (#24). mask_water (lw) is the combined mask with
+    # inland water burned to water; water_only (wonly) isolates inland water; ocean is the rest.
+    iwy, iwx = np.where(wonly == 1)                   # inland water
+    ocy, ocx = np.where((lw == 0) & (wonly == 0))     # ocean (not land, not inland water)
+    ldy, ldx = np.where(lw == 1)                      # land (not water)
+    assert len(iwy) > 1 and len(ocy) and len(ldy), "need inland-water, ocean, and land test pixels"
     dem2 = np.full((h, w), -5.0, dtype="float32")
-    dem2[wy2[0], wx2[0]] = 42.0       # positive over inland water -> must clear to nodata
-    # dem2[wy2[1], wx2[1]] stays -5.0: negative in water (cryptodepression) -> must survive
-    dem2[ny2[0], nx2[0]] = 42.0       # positive over non-water (land/ocean) -> must survive
+    dem2[iwy[0], iwx[0]] = 42.0       # positive over inland water -> clears to nodata (#24)
+    # dem2[iwy[1], iwx[1]] stays -5.0: negative in water (cryptodepression) -> survives
+    dem2[ocy[0], ocx[0]] = 42.0       # positive over ocean -> clamps to 0 (4th quadrant)
+    dem2[ldy[0], ldx[0]] = 42.0       # positive over land -> survives (the sentinel's job, not here)
     src2 = f"{d}/dem2.tif"
     with rasterio.open(src2, "w", driver="GTiff", height=h, width=w, count=1, dtype="float32",
                        nodata=NODATA, crs="EPSG:3857", transform=tr) as dst:
@@ -502,13 +557,16 @@ def _check():
     cog2 = f"{d}/dem2_cog.tif"
     aggregation_reproject.translate(src2, cog2)
     clamp_positive_water(cog2, water_only)
+    clamp_positive_ocean(cog2, mask_water, water_only)
     with rasterio.open(cog2) as r:
         out2, valid2 = r.read(1), (r.read_masks(1) != 0)
-    assert not valid2[wy2[0], wx2[0]], "positive over inland water must clear to nodata"
-    assert valid2[wy2[1], wx2[1]] and out2[wy2[1], wx2[1]] == -5.0, \
+    assert not valid2[iwy[0], iwx[0]], "positive over inland water must clear to nodata"
+    assert valid2[iwy[1], iwx[1]] and out2[iwy[1], iwx[1]] == -5.0, \
         "negative in water (cryptodepression) must survive — positive-only"
-    assert valid2[ny2[0], nx2[0]] and out2[ny2[0], nx2[0]] == 42.0, \
-        "positive over non-water (land/ocean, water==0) must survive"
+    assert valid2[ocy[0], ocx[0]] and out2[ocy[0], ocx[0]] == 0.0, \
+        "positive over ocean must clamp to 0 (4th quadrant)"
+    assert valid2[ldy[0], ldx[0]] and out2[ldy[0], ldx[0]] == 42.0, \
+        "positive over land must survive (the terrain sentinel handles land, not this clamp)"
 
     print(f"landmask.py self-check ok (mask {h}x{w}, land {int(land.sum())}, "
           f"water-subtracted {int(subtracted.sum())}, water-only {int((wonly == 1).sum())})")

@@ -232,30 +232,37 @@ async function synthesize(
   });
 }
 
-let seaEtagCache: string | undefined;
-async function seaLevelEtag(): Promise<string> {
-  if (!seaEtagCache) seaEtagCache = await contentEtag(await seaLevelBytes());
-  return seaEtagCache;
+let landEtagCache: string | undefined;
+async function landFallbackEtag(): Promise<string> {
+  if (!landEtagCache) landEtagCache = await contentEtag(await landFallbackBytes());
+  return landEtagCache;
 }
 
-let seaLevelCache: ArrayBuffer | undefined;
-async function _makeSeaLevelTile(): Promise<ArrayBuffer> {
-  // Terrarium 0 m — the land value, which the depth ramp paints as the land
+// Missing-tile fill: the land code (published raster codes: 0 unknown-depth water,
+// 1 drying, 2 land — pipelines/terrain.py). 0 would read as unknown-depth WATER
+// under the published contract.
+const LAND_SENTINEL = 2;
+
+let landFallbackCache: ArrayBuffer | undefined;
+async function _makeLandFallbackTile(): Promise<ArrayBuffer> {
+  // Terrarium +2 m — the land code, which the depth ramp paints as the land
   // wash. A missing tile degrades to land rendering, never to phantom water
   // (Terrarium has no transparency to degrade to).
   await ensureCodec();
   const out = new Uint8ClampedArray(TILE * TILE * 4);
+  const packed = LAND_SENTINEL + 32768; // 32770 → R=128, G=2, B=0
   for (let k = 0; k < TILE * TILE; k++) {
-    out[k * 4] = 128; // 32768 → R=128, G=0, B=0  (height 0)
+    out[k * 4] = packed >> 8;
+    out[k * 4 + 1] = packed & 0xff;
     out[k * 4 + 3] = 255;
   }
   return encodeWebp({ data: out, width: TILE, height: TILE } as ImageData, {
     lossless: 1,
   });
 }
-async function seaLevelBytes(): Promise<ArrayBuffer> {
-  if (!seaLevelCache) seaLevelCache = await _makeSeaLevelTile();
-  return seaLevelCache;
+async function landFallbackBytes(): Promise<ArrayBuffer> {
+  if (!landFallbackCache) landFallbackCache = await _makeLandFallbackTile();
+  return landFallbackCache;
 }
 
 const CORS = { "access-control-allow-origin": "*" };
@@ -617,7 +624,7 @@ export default {
     if (x >= n || y >= n)
       return isVector
         ? noTile()
-        : sendTile(await seaLevelBytes(), WEBP, await seaLevelEtag(), false);
+        : sendTile(await landFallbackBytes(), WEBP, await landFallbackEtag(), false);
 
     if (isVector) {
       const t = await tile(renv, "vector.pmtiles", z, x, y);
@@ -631,7 +638,7 @@ export default {
       const t = await tile(renv, "planet.pmtiles", z, x, y);
       return t
         ? sendTile(t, WEBP, await contentEtag(t))
-        : sendTile(await seaLevelBytes(), WEBP, await seaLevelEtag());
+        : sendTile(await landFallbackBytes(), WEBP, await landFallbackEtag());
     }
     // The tile's grid cell, if populated: serve it directly, else overzoom the
     // deepest ancestor present in the cell — the cell's max_zoom is only its
@@ -667,7 +674,7 @@ export default {
     // Nothing in the cell: overzoom the planet, or sea-level if even that's absent.
     const planetOz = await overzoomTile("planet.pmtiles", mf.planet.max_zoom);
     return (
-      planetOz ?? sendTile(await seaLevelBytes(), WEBP, await seaLevelEtag())
+      planetOz ?? sendTile(await landFallbackBytes(), WEBP, await landFallbackEtag())
     );
   },
 };

@@ -313,10 +313,11 @@ TERRAIN_FACTOR = 2.0  # native renders unproven at scale (corpus n=1); keep the 
 
 def terrain_inputs(wc):
     """cz>=8 renders read a per-stem VRT of their halo-buffered tile set, so they run the
-    moment their neighborhood merges; cz<8 needs the GTI's planet-z8-COG fall-through."""
+    moment their neighborhood merges; cz<8 needs the GTI's planet-z8-COG fall-through. The masks
+    ride too: the render rasterizes the land mask to nudge land-side exact-0 pixels to land."""
     if int(wc.stem.split("-")[3]) >= 8:
-        return [f"store/mosaic/tiles/{s}.tif" for s in terrain_mod.window_tiles(wc.stem)]
-    return rules.mosaic_index.output
+        return [f"store/mosaic/tiles/{s}.tif" for s in terrain_mod.window_tiles(wc.stem)] + MASKS
+    return list(rules.mosaic_index.output) + MASKS
 
 
 rule terrain_render:
