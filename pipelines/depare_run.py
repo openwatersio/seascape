@@ -276,11 +276,13 @@ def _depare_dem(dem, tile_obj, tmp, label):
             effective = bucket.difference(land_geom)
             _mark("drying-diff-land")
             if water_parts:
-                # One float intersection against the union of near parts — the window-spanning
-                # BUCKET is the unbounded operand, so pairwise would be quadratic (912 s+
-                # measured). No GRID here: this shape measured byte-exact on every profile stem,
-                # and the snap-rounded variant traded that exactness for nothing.
-                near = [water_parts[i] for i in STRtree(water_parts).query(bucket)]
+                # Prune to water parts that truly intersect the bucket (predicate, like the nodata
+                # pass — cut drying-water-terms 63->17 s on 6-19-18-9), then ONE float intersection
+                # against their union: the window-spanning BUCKET is the unbounded operand, so
+                # pairwise would be quadratic (912 s+ measured). No GRID here — this shape measured
+                # byte-exact on every profile stem, and snap-rounding traded that for nothing.
+                near = [water_parts[i]
+                        for i in STRtree(water_parts).query(bucket, predicate="intersects")]
                 if near:
                     effective = valid_union([effective, bucket.intersection(shapely.union_all(near))])
                 _mark("drying-water-terms")
