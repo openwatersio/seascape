@@ -93,9 +93,14 @@ rule prep_source:
 # a forced producer schedules all dependents at plan time, but across an invocation
 # boundary the engine's checksums cure unchanged registrations, so the main invocation
 # cascades only on real upstream drift.
+# The objects push rides here too: mirror_objects is on the mirror.txt branch, NOT the
+# catalog cascade the boundary suppresses, so pulling it into this invocation overlaps each
+# source's ~190 GB copy with the next source's re-listing instead of stranding it behind the
+# barrier. Objects stay additive and land before catalog.json, so cross-boundary atomicity holds.
 rule refresh:
     input:
         expand("store/source/{source}/bounds.csv", source=MIRRORED),
+        expand("store/meta/publish/{source}.objects", source=MIRRORED),
 
 
 # Volatile mirrored collections register objects/<key> rows off the public bucket.
