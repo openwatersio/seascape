@@ -93,7 +93,12 @@ map.on("load", () => {
       id: "land-hillshade",
       type: "hillshade",
       source: "mapterhorn",
-      paint: { "hillshade-exaggeration": 0.2 },
+      paint: {
+        "hillshade-exaggeration": 0.3,
+        "hillshade-shadow-color": "#8a7455",
+        "hillshade-highlight-color": "#fffdf2",
+        "hillshade-accent-color": "#b3a184",
+      },
     },
     "contour-lines", // under the chart linework, over the land wash
   );
@@ -123,7 +128,8 @@ map.on("load", () => {
   };
   apply();
   // dev-only: bands needs the DEPARE layer, absent from production builds
-  if (import.meta.env.DEV) document.getElementById("shading-control").hidden = false;
+  if (import.meta.env.DEV)
+    document.getElementById("shading-control").hidden = false;
   document.getElementById("safety-depth")?.addEventListener("input", apply);
   document.getElementById("unit-select")?.addEventListener("change", apply);
   document.getElementById("shading-select")?.addEventListener("change", apply);
