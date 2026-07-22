@@ -84,7 +84,22 @@ jobs:
     outputs:
       label: ${{ steps.runner.outputs.label }}
       server_id: ${{ steps.runner.outputs.server_id }}
+      ip: ${{ steps.attach.outputs.ip }}
     steps:
+      # The runner action takes a numeric SSH key ID only; resolve the friendlier key NAME
+      # in vars.HCLOUD_SSH_KEY (empty var -> "null" = no key).
+      - name: Resolve SSH key id
+        id: sshkey
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+          KEY_NAME: ${{ vars.HCLOUD_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          id=null
+          if [ -n "$KEY_NAME" ]; then
+            id=$(curl -fsS -H "Authorization: Bearer $HCLOUD_TOKEN" "https://api.hetzner.cloud/v1/ssh_keys?name=$KEY_NAME" | jq -r '.ssh_keys[0].id // "null"')
+          fi
+          echo "id=$id" >> "$GITHUB_OUTPUT"
       - name: Create runner
         id: runner
         uses: Cyclenerd/hcloud-github-runner@v1
@@ -96,8 +111,12 @@ jobs:
           server_type: ${{ env.SERVER_TYPE }}
           location: ${{ env.SERVER_LOCATION }}
           image: ${{ env.SERVER_IMAGE }}
+          # Repo variable HCLOUD_SSH_KEY = an SSH key ID/name in the hcloud project; lets
+          # operators ssh in as root@<ip> for live diagnosis of a long-running sources build.
+          ssh_key: ${{ steps.sshkey.outputs.id }}
           volume: "null"
       - name: Attach persistent store volume
+        id: attach
         env:
           HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
           SERVER_ID: ${{ steps.runner.outputs.server_id }}
@@ -112,7 +131,9 @@ jobs:
             hcloud volume create --name "$STORE_VOLUME" --size "$STORE_VOLUME_GB" --location "$SERVER_LOCATION"
           fi
           hcloud volume attach "$STORE_VOLUME" --server "$SERVER_ID"
-          echo "volume $STORE_VOLUME attached to server $SERVER_ID"
+          ip=$(hcloud server ip "$SERVER_ID")
+          echo "ip=$ip" >> "$GITHUB_OUTPUT"
+          echo "volume $STORE_VOLUME attached to server $SERVER_ID — ssh root@$ip"
 
   # The whole sources build in one job: fetch/prep/catalog every source and publish, keep-going,
   # forcing a re-list of the volatile mirrors (-R mirror_source). Shares the store on the
