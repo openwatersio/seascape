@@ -11,62 +11,124 @@ discarded hypotheses live in [optimization-history.md](optimization-history.md).
 
 ## Remaining action items
 
-Ranked by expected impact on the cold planet build. No clean end-to-end mosaic number exists yet:
-the first planet attempt reached 82% of 3,244 tiles in ~35 minutes on a ccx63 before an fd-limit
-crash, and its resume then serialized the stranded z14 heavies for hours — the priority-inversion
-tail the ×1000 fix targets, unverified until the next full-planet dispatch. The dominant remaining
-cold costs are vector bundling and the pathological DEPARE tail.
+Ranked by expected impact on the incremental (weekly-refresh) build first, cold planet second.
+Run 29847332817 (2026-07-21, ccx63, first dispatch after the DAG unification) is the reference
+incremental measurement: **8 h 12 m wall for a build with zero changed source data**. All
+mosaic-side work (239 overlay bundles, 344 terrain renders, index, publish) finished inside the
+first hour; the remaining 7 h+ was the serial `soundings_bundle → vector_bundle → stage_build`
+chain on an otherwise idle 48-core box. No clean cold planet number exists yet: the first planet
+attempt reached 82% of 3,244 tiles in ~35 minutes on a ccx63 before an fd-limit crash. The
+dominant costs are spurious rebuild triggers, vector bundling, and the pathological DEPARE tail.
 
-### Bound DEPARE and re-enable it
+### Stop false planet rebuilds — trigger hygiene
 
-Still the worst pathological tail, and the planet bench corpus relocated it: the worst stems are
-**coarse**, not the dense z14 coast — `6-21-22-9` (cz9) **32,126 s = 8.9 h** single-core, `6-19-18-9`
-5.2 h, `6-18-19-8` (cz8) 2.3 h; the densest NY z14 stem `8-75-96-14` measured 5,425 s (90 min) vs
-208 s through the legacy path. Low RSS (2–4.7 GB) at huge wall = GEOS grinding on continent-scale
-land/water unions in coarse windows. The stage-3 `depare` rule ships behind `SKIP_DEPARE` until the
-unbounded GEOS operation gets a spatial/window bound or a per-tile timeout with honest failure
-reporting. Success: every covering tile finishes DEPARE within an explicit bound; a planet build
-publishes a complete DEPARE bundle. Effort: medium. Risk: medium.
-Execution plan: [../plans/2026-07-21-depare-perf.md](../plans/2026-07-21-depare-perf.md).
+Run 29847332817 rebuilt the world off a metadata artifact, not data: `mosaic_index`,
+`soundings_bundle`, and all 239 `overlay_bundle` jobs re-ran with reason *"Params have changed
+since last execution: before: `<nothing exclusive>` now: `''`"* — the params-provenance transition
+from the single-DAG migration. Everything else cascaded by mtime: `mosaic_index` rewrote
+`mosaic.gti`/`planet-z8.tif` → 344 terrain renders + a full `publish_mosaic`; `soundings_bundle` →
+`vector_bundle` → `stage_build`. Total: 8 h 12 m of ccx63 for a no-op.
 
-### Vector bundling — the dominant cold cost
+- Pin an explicit `--rerun-triggers` policy (e.g. `mtime`), consistent with the existing
+  convention that code/config changes dirty nothing and are rebuilt by deliberate force — one
+  chosen behavior, not Snakemake's default params/code triggers firing on rule refactors.
+- Add a dry-run gate: `snakemake -n` job summary logged at the top of every build, and a loud
+  warning (or abort for scheduled runs) when a refresh-class dispatch schedules planet-scale
+  bundle jobs.
+- Verify the next dispatch is a near-no-op (hydrate + stage checks, well under an hour). The
+  params records are now written, so this specific transition should be one-time — confirm it.
 
-Legacy baseline: soundings + contour Tippecanoe + tile-join = **7h01m, 62%** of the 11h19m build,
-at 1-6 cores on a 48-core box. Two measured results to build on:
+Success: a build with no changed inputs finishes in minutes, and any planet-scale re-run is
+deliberate. Effort: small. Risk: low.
 
-- **Unified invocation** (contours + soundings in one named-layer Tippecanoe, no join): planet-scale
-  benchmark saved 25m57s (22.8%) — semantically exact on the 16-stem sample, but under the 30%
-  adoption gate. Preferred command shape, not the full fix.
-- **Sharding experiment (not yet run):** spatially partition the unified inputs into 4/8 balanced
-  Tippecanoe shards on NVMe, merge into one archive; adopt only if total wall < 4,775 s (30% under
-  legacy) with identical addressed tiles, per-layer counts, and canonical hashes.
+### Vector bundling — the dominant cost, now fully measured
 
-First Snakemake planet run (2026-07-20) measured the tail live: `soundings_bundle` ran ALONE for
-**2 h 20 m** (20:16:11–22:36:25) at 0.2 cores / 5 MB/s (single-threaded tippecanoe feature read)
-on an otherwise idle 48-core ccx63, and `vector_bundle` (contour tippecanoe, 2,450 inputs) only
-then started — serial **by data dependency**: soundings.pmtiles is a vector_bundle input (the
-join folds the soundings layer in).
-Leads, roughly in order: per-layer archives (below) makes the bundles independent and
-parallel; `--read-parallel` on line-delimited input attacks the single-threaded read phase;
-sharding attacks the tiling phase.
+Run 29847332817 measured the whole chain end-to-end on a ccx63:
 
-**Publish hash pass — resolved 2026-07-21:** the no-op publish re-hashed the whole tile store
-(~40 min); `_HashCache` (mtime_ns+size keyed, store/mosaic/hash-cache.json) now answers
-unchanged files instantly. **Coarse renders — mostly resolved by the per-stem VRT** (measured
-run 29795677492 vs the GTI-era corpus): cz9 731→164 s, cz10 592→45 s, cz13 132→16 s. Remaining:
-the cz<8 planet-COG readers (z5 anchors up to ~90 min) still read through the GTI, and cz8
-regressed 83→257 s (n=9; now decimating z14 tiles 64× through the VRT — check whether the
-GTI fall-through was the better path for cz8).
+- `soundings_bundle` **2 h 56 m** (16:16–19:12): ~80 min in the single-threaded tippecanoe feature
+  read at 0.2 cores / 5 MiB/s over 2,531 inputs, then ~2 h of tiling at only 1.4–2 cores.
+- `vector_bundle` **4 h 35 m** (19:12–23:47): contour tippecanoe 2 h 53 m at 1.6–4 cores over
+  2,450 inputs, then the tile-join folding soundings in — **1 h 42 m at ~20 cores**.
+- Serial **by data dependency** (soundings.pmtiles is a vector_bundle input), so the chain is
+  7 h 31 m of wall regardless of core count; the box is >90% idle throughout.
+- Any dirty tile re-pays the full chain: tippecanoe is all-or-nothing over the planet's inputs,
+  so the weekly volatile refresh hits this every time. This is the steady-state cost, not a
+  cold-build cost.
 
-Both may be mooted by the plan's **per-layer archives** direction (contours/depth-areas/soundings
-as independent pmtiles, first post-migration change): that deletes the tile-join entirely and lets
-layers bundle concurrently as ordinary rules. Decide per-layer vs sharding before investing in
-either. One DEPARE FGB makes Tippecanoe 2.79 fail Wagyu cleaning (exit 106) — preserved as a
-correctness fixture; resolve before any combined three-layer archive.
+Attack in this order:
+
+1. **Per-layer archives** (contours/depth-areas/soundings as independent pmtiles, first
+   post-migration change): deletes the 1 h 42 m tile-join outright and breaks the serial
+   dependency — the two tippecanoe runs become parallel rules, wall ≈ max(2 h 56 m, 2 h 53 m)
+   ≈ 3 h. Also removes the one ~20-core consumer, making the ccx33 default safe. One DEPARE FGB
+   once made Tippecanoe 2.79 fail Wagyu cleaning (exit 106); no fixture was actually preserved
+   (searched repo, history, R2 — 2026-07-21), and all 18 current post-fix DEPARE FGBs pass 2.79
+   with the bundle flags — re-verify at the first combined three-layer archive.
+2. **`--read-parallel` / input format** for the ~80 min single-threaded read phase, and
+   **sharding** for the low-parallelism tiling phase (spatially partition into 4/8 balanced
+   shards on NVMe, merge; adopt only with identical addressed tiles, per-layer counts, canonical
+   hashes). Target: each per-layer bundle under ~1 h.
+3. **Incremental bundling** — the end state that makes refresh builds minutes, not hours: keep
+   per-shard (or per-cell, like `overlay_bundle`) archives cached in the store and rebuild only
+   dirty shards, merging cheaply at publish. The overlay bundles already prove the shape: 239 of
+   them rebuilt in ~2 min wall. Sketch after per-layer + sharding land, since shard boundaries
+   and the merge step are shared machinery.
+
+Prior data points that still inform the work: unified invocation (contours + soundings in one
+named-layer tippecanoe) saved 22.8% at planet scale, semantically exact on the 16-stem sample —
+preferred command shape if a combined archive ever returns. Legacy baseline was 7 h 01 m / 62% of
+the 11 h 19 m build.
+
+**Publish hash pass:** `_HashCache` (mtime_ns+size keyed, store/mosaic/hash-cache.json) was in
+run 29847332817 but cold — `mosaic_publish` still read 376 GB in 30.6 min populating it. Expect
+the warm-cache no-op publish to be near-instant; verify on the next run. **Coarse renders —
+mostly resolved by the per-stem VRT** (measured run 29795677492 vs the GTI-era corpus): cz9
+731→164 s, cz10 592→45 s, cz13 132→16 s. Remaining: the cz<8 planet-COG readers (z5 anchors up
+to ~90 min) still read through the GTI, and cz8 regressed 83→257 s (n=9; now decimating z14
+tiles 64× through the VRT — check whether the GTI fall-through was the better path for cz8).
 
 Keep the operational lessons regardless: Tippecanoe tmp + output on NVMe (never Ceph), minute-level
 heartbeats (elapsed, CPU, RSS, IO deltas, deleted-open tmp bytes, disk headroom) around every long
 subprocess.
+
+### Bound DEPARE and re-enable it
+
+The bound is implemented and measured (2026-07-21, working tree; execution plan + full findings:
+[../plans/2026-07-21-depare-perf.md](../plans/2026-07-21-depare-perf.md)). The planet corpus put
+the tail in **coarse stems**, not the dense coast — `6-21-22-9` (cz9) 8.9 h, `6-19-18-9` 5.2 h on
+the box vs 90 min for the densest z14 — all attributed to the nodata pass differencing every OSM
+water feature against one monolithic coverage∪drying union. Fix in `depare_run.py`: STRtree
+true-intersects prefilter + subdivision of parts over 512 vertices + one `grid_size=1e-6`
+snap-rounded difference (float OverlayNG mis-overlays some multi-piece unions — GEOS 3.13,
+point-in-polygon-arbitrated). Local results: 366/84/102 s on the three profile stems, bands +
+drying byte-exact, nodata deltas arbitrated benign; `DEPARE_TIMEOUT` backstop added. The seam gate
+then caught defects across the stage-3 seam, now fixed: coarse windows under-buffered for the smooth
+halo (halo-scaled `window_buffer_3857`, band seams pass — this also surfaced and forced the contour
+`ogr2ogr -clipsrc` → shapely-clip port, which additionally recovers 2 features ogr2ogr silently
+dropped); the drying sliver filter run per-clip not per-source-polygon (moved to a pre-clip area
+gate, seam 2.08e-2° → 7.49e-4°); and the nodata + residual-band seam "mismatches", which proved to
+be a **false positive in `check_depare` itself** — the depare geometry is already seam-consistent to
+~2e-8°, but the on-seam coverage selector used `ON_EDGE_PIXELS` (0.1 px ≈ 15 m), counting OSM
+boundary detail that merely *grazes* near the seam (one-sided) as coverage. Fixed with a tight
+`ON_SEAM_PIXELS = 1e-3` selector in `check_depare` only (contour crossings keep the looser point
+snap); the real tolerance (`TOL_PIXELS = 3`) is unchanged and the shifted-band negative test still
+fails, so real misalignment is still caught. All depare bands, drying, and nodata now PASS the seam
+gate (≤2.7e-7°). Remaining before removing `SKIP_DEPARE`: box bbox validation via the build.yml
+`depare` input + stale `store/depare` cleanup, per-zoom `DEPARE_GB` re-fit from box benchmarks, then
+the planet run. Effort remaining: small-medium. Risk: low-medium.
+
+One real pre-existing seam mismatch (NOT caused by this work) is deferred:
+
+- **Deep Chaikin-smoothed contours diverge at tile seams** (measured on 6-19-18-9|6-19-19-9: the
+  20 fm / 50 m / 30 fm levels, all deeper than `NAV_SMOOTH_MAX` = 30 m). Shallow (unsmoothed)
+  contours match exactly; the deep lines smooth away from the raw tile-edge per window, so the two
+  windows' Chaikin passes disagree at the seam. This is the intentional shallow-bias smoothing the
+  module docstring already calls "fundamental," not a clip or window bug (the shapely-clip A/B
+  proved the clip faithful). Decision owed: `seam_check.check_contours` should either exclude levels
+  above `NAV_SMOOTH_MAX` or carry a wider tolerance for them — it currently flags them as MISMATCH.
+  (The `check_depare` false positive above was the same *class* of over-sensitive-gate issue but a
+  distinct mechanism — grazing coverage vs. per-window smoothing — and only the depare side is
+  fixed; contours keep `ON_EDGE_PIXELS` because a line crosses the seam at a point.)
 
 ### Reintroduce windowed contours
 
@@ -78,15 +140,16 @@ seam gaps or fragment kinks. Effort: small. Risk: medium (seam verification).
 
 ### Publish overlap and large-object upload tuning
 
-When the stage-3/publish rules land: uploads are per-product rules that overlap compute in the DAG
-(the old stage-hook design is obsolete — rules are the hooks), with pointer-last ordering intact.
-Two measured knobs carry over:
+`stage_build` in run 29847332817 was a pure upload tail: **36 min** reading ~35 GB of bundles at
+~16 MB/s effective, starting only after vector_bundle finished, at ~0.15 cores. Two fixes:
 
-- Many-tile copies already sustain ~201 MB/s (peak 542) with `--transfers 32`.
-- The single planet-z8 BigTIFF crawled at **25 MB/s** on one rclone transfer: tune
-  `--s3-upload-concurrency` + explicit `--s3-chunk-size` (memory ≈ concurrency × chunk) for
-  `copyto`/large objects only. Target ≥2× without regressing tile copies. Retain
-  `--stats-log-level NOTICE`.
+- Overlap: make bundle uploads per-product rules that run as each bundle lands (overlays were done
+  7 h before their upload started), pointer-last ordering intact.
+- Throughput: the large single objects (vector ~10 GB, soundings ~6 GB) crawl on one transfer —
+  same knob as the planet-z8 BigTIFF (**25 MB/s** measured): tune `--s3-upload-concurrency` +
+  explicit `--s3-chunk-size` (memory ≈ concurrency × chunk) for `copyto`/large objects only.
+  Target ≥2× without regressing tile copies, which already sustain ~201 MB/s (peak 542) with
+  `--transfers 32`. Retain `--stats-log-level NOTICE`.
 
 ### Memory reservation upkeep
 
