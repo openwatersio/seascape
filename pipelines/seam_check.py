@@ -49,6 +49,16 @@ import mercantile
 # -spat reads a SPAT_PAD_PIXELS halo so a feature merely touching the edge is still selected.
 TOL_PIXELS = 3.0
 ON_EDGE_PIXELS = 0.1
+# Depare coverage is read off ring segments lying ON the seam, which are clip edges — exactly on
+# the boundary to float precision. ON_EDGE_PIXELS (0.1 px ≈ 15 m at cz9) is far too loose for that:
+# a detailed OSM water/nodata boundary that merely GRAZES within 15 m of the seam (never touching
+# it) gets counted as seam coverage on whichever tile owns it, and since that feature exists on
+# only one side, it registers as a false mismatch. Measured on 6-19-18-9|6-19-19-9: at 0.1 px the
+# nodata sym-diff is 4.3e-2° and the 30-50 m band 5.2e-3°, but the TRUE on-seam coverage (clip
+# edges, within 1e-4 px) matches to 2e-8° on every band — the whole discrepancy is grazing. A tight
+# threshold counts only real clip edges and excludes grazing detail (pixel-scale). Contour crossings
+# keep ON_EDGE_PIXELS (a line touches the seam at a POINT, needing the looser near-seam snap).
+ON_SEAM_PIXELS = 1e-3
 SPAT_PAD_PIXELS = 4.0
 # Tile boundaries are dyadic (360/2**z divisions), so neighbours' shared coordinates are equal to
 # float precision — this epsilon only guards the exact-match comparisons, not real tolerance.
@@ -285,7 +295,7 @@ def check_depare(fgbA, fgbB, edge, coarser_cz):
     """Per (drval1, drval2, sys) band, the edge coverage from A and B (as 1-D intervals along the
     boundary) must match: symmetric-difference length under tol. Returns (ok, report_lines)."""
     pix = pixel_deg(coarser_cz)
-    tol_len, on = TOL_PIXELS * pix, ON_EDGE_PIXELS * pix
+    tol_len, on = TOL_PIXELS * pix, ON_SEAM_PIXELS * pix
     fa, fb = _read(fgbA, edge, tol_len), _read(fgbB, edge, tol_len)
     ax = 0 if edge.kind == "lon" else 1
     pos = 1 - ax
@@ -301,7 +311,9 @@ def check_depare(fgbA, fgbB, edge, coarser_cz):
             for ring in _rings(g):
                 for u, v in zip(ring, ring[1:]):
                     # a ring segment lying ON the boundary (both ends on the line) is this band's
-                    # coverage of the edge; clip its span to the shared segment.
+                    # coverage of the edge; clip its span to the shared segment. ON_SEAM_PIXELS, not
+                    # ON_EDGE_PIXELS: only true clip edges (exactly on the seam) are coverage —
+                    # grazing detail near the seam is one-sided and would be a false mismatch.
                     if abs(u[ax] - edge.const) <= on and abs(v[ax] - edge.const) <= on:
                         a, b = min(u[pos], v[pos]), max(u[pos], v[pos])
                         a, b = max(a, edge.lo), min(b, edge.hi)
