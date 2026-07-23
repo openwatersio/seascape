@@ -28,6 +28,7 @@ Selection rule: **resolution sets the zoom cap, an openly-redistributable licens
 | [AusBathyTopo](ausbathytopo/)                                      | 250 m       | z9        | Australia EEZ                       | MSL                     |
 | [BATNAS](batnas/)                                                  | ~180 m      | z10       | Indonesia                           | MSL                     |
 | [swIOBC](swiobc/)                                                  | 250 m       | z9        | SW Indian Ocean                     | ~MSL                    |
+| [NZ Coastal LiDAR](nz_coastal/)                                    | 1 m         | z15 (native z16 pending sparse-merge) | NZ coastal clusters            | NZVD2016 (~MSL)         |
 | [NOS Estuarine](noaa_estuarine/)                                   | 30 m        | z11       | 70 US estuaries                     | **MLLW**                |
 | [Great Lakes (NCEI)](great_lakes/)                                 | ~90 m       | z10       | Great Lakes (incl. Canadian halves) | **LWD**                 |
 | [African Great Lakes](african_great_lakes/)                        | 50–100 m    | z13       | Victoria/Albert/Edward/George       | lake surface            |
