@@ -706,13 +706,14 @@ export default {
         const src = parent;
         const sx = x >> dz,
           sy = y >> dz;
-        const layers = await vectorGate(async () =>
-          synthesizeLayers([{ z: sz, x: sx, y: sy, layers: decodeTile(src) }], z, x, y),
-        );
+        const bytes = await vectorGate(async () => {
+          const layers = synthesizeLayers([{ z: sz, x: sx, y: sy, layers: decodeTile(src) }], z, x, y);
+          return featureCount(layers) === 0 ? null : encodeTile(layers);
+        });
         // A present ancestor whose features all clip away from this child → nothing
         // to draw here (open water past the data): 204, same contract as a miss.
-        if (featureCount(layers) === 0) return noTile();
-        return sendTile(encodeTile(layers), MVT, tag);
+        if (!bytes) return noTile();
+        return sendTile(bytes, MVT, tag);
       }
       return noTile();
     }
