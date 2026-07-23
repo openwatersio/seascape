@@ -170,6 +170,23 @@ jobs:
           STATE=/mnt/seascape-store
           mkdir -p "$STATE/store"
           echo "STATE=$STATE" >> "$GITHUB_ENV"
+          # Self-heal the pinned masks from R2. Rebuilding water.fgb scans the ENTIRE planet's
+          # Overture water (hours, 28 GB+ intermediate), so a crashed/forced rebuild that strands
+          # the volume without it makes every later run re-pay that scan. publish_masks makes the
+          # R2 copy canonical — restore it (minutes). A deliberate Overture refresh must clear the
+          # R2 copy first, else this re-seeds the old mask.
+          mkdir -p "$STATE/store/landmask"
+          for m in land water; do
+            f="$STATE/store/landmask/$m.fgb"
+            if [ ! -s "$f" ]; then
+              echo "hydrating $m.fgb from R2 (missing on volume)"
+              if curl -fsSL "https://data.openwaters.io/bathymetry/landmask/$m.fgb" -o "$f.tmp"; then
+                mv "$f.tmp" "$f"
+              else
+                rm -f "$f.tmp"; echo "warning: could not hydrate $m.fgb; the mask rule will rebuild"
+              fi
+            fi
+          done
           # Swap SAFETY NET on the LOCAL root disk (never the store volume) — the ccx33 has 32 GB
           # RAM and no swap, so a heavy single job (a source's footprint ST_Union) that over-peaks
           # is OOM-killed and the whole run is lost. Insurance, not headroom; swappiness=10 keeps
