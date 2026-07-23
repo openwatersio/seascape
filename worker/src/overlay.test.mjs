@@ -52,5 +52,12 @@ assert.equal(
 );
 assert.equal(previewRoute("/3/1/2.webp", B), null); // no sha → 404
 assert.equal(previewRoute("/NOTHEX0/0/0/0.pbf", B), null); // non-hex → 404
+// a -bbox suffix selects a regional stage (build/<sha>-bbox/), sha-folded mount intact
+assert.equal(
+  previewRoute(`/${sha}-bbox/manifest.json`, B).prefix,
+  `bathymetry/build/${sha}-bbox/`,
+);
+assert.equal(previewRoute(`/${sha}-bbox/3/1/2.webp`, B).rel, "/3/1/2.webp");
+assert.equal(previewRoute(`/${sha}-bogus/0/0/0.pbf`, B), null); // unknown suffix → 404
 
 console.log("previewRoute ok — sha peel, rel/mount rewrite, hex+length guard");
