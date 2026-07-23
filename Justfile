@@ -65,6 +65,7 @@ test-sources:
     uv run python source_remote.py
     uv run python source_fetch.py --check
     uv run python source_prep.py --check
+    uv run python source_polygonize.py --check
     uv run python source_check.py --check
     uv run snakemake -s ../Snakefile -n sources > /dev/null
 
@@ -74,6 +75,7 @@ test-engine:
     uv run python test_engine.py
     uv run python aggregation_reproject.py --check
     uv run python aggregation_covering.py --check
+    uv run python landmask.py --check
     uv run python mosaic.py --check
     uv run python bundle.py --check
     uv run python test_build.py
