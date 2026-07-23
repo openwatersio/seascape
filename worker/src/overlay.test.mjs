@@ -1,6 +1,11 @@
 // Run: node src/overlay.test.mjs   (Node ≥22.18 strips the imported .ts)
 import assert from "node:assert/strict";
-import { overlayFor, previewRoute } from "./overlay.ts";
+import {
+  overlayFor,
+  previewRoute,
+  ManifestMissing,
+  isPreviewMiss,
+} from "./overlay.ts";
 
 const ov = {
   split_z: 5,
@@ -61,3 +66,9 @@ assert.equal(previewRoute(`/${sha}-bbox/3/1/2.webp`, B).rel, "/3/1/2.webp");
 assert.equal(previewRoute(`/${sha}-bogus/0/0/0.pbf`, B), null); // unknown suffix → 404
 
 console.log("previewRoute ok — sha peel, rel/mount rewrite, hex+length guard");
+
+// ── isPreviewMiss: a missing manifest 404s ONLY on preview — prod keeps its 500 ──
+assert.equal(isPreviewMiss(new ManifestMissing("m"), true), true);
+assert.equal(isPreviewMiss(new ManifestMissing("m"), false), false); // prod: loud 500
+assert.equal(isPreviewMiss(new Error("other"), true), false); // real bugs stay 500
+console.log("isPreviewMiss ok — preview-only 404 for the typed manifest miss");

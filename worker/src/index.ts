@@ -32,7 +32,13 @@ import { CachedSource, contentEtag, OVERZOOM_TAG_VERSION } from "./cache";
 import { coverageTileJSON } from "./coverage";
 import { unpackTerrarium, packTerrariumInto, cubicBSpline } from "./terrarium";
 import { composite, rasterizeMask, waterMask } from "./mask";
-import { OverlayIndex, overlayFor, previewRoute } from "./overlay";
+import {
+  OverlayIndex,
+  overlayFor,
+  previewRoute,
+  ManifestMissing,
+  isPreviewMiss,
+} from "./overlay";
 import { limiter } from "./semaphore";
 // jSquash on Workers: WASM must be imported as a module and passed to init()
 // (no fetch-based instantiation in the Workers runtime).
@@ -130,7 +136,7 @@ async function manifest(env: Env): Promise<Manifest> {
   const cacheable = !!env.RELEASE_PREFIX && !env.PREVIEW;
   if (manifestCache && cacheable) return manifestCache;
   const obj = await env.TILES.get((env.RELEASE_PREFIX ?? "") + "manifest.json");
-  if (!obj) throw new Error("manifest.json missing");
+  if (!obj) throw new ManifestMissing("manifest.json missing");
   const m: Manifest = JSON.parse(await obj.text());
   // Tolerate a pre-grid manifest (old release / local seed): planet-only, no 500s.
   m.overlay ??= { split_z: 0, cells: {} };
@@ -365,8 +371,14 @@ export default {
   ): Promise<Response> {
     // An uncaught throw becomes the runtime's bare 500 with no CORS headers,
     // which browsers report as a CORS block (masking the real status) and
-    // MapLibre then won't retry cleanly. Catch everything and answer with CORS.
+    // MapLibre then won't retry cleanly. Catch everything and answer with CORS;
+    // an unstaged preview sha (typed miss) answers 404 instead of the 500.
     return this.handle(req, env, ctx).catch((e: unknown) => {
+      if (isPreviewMiss(e, !!env.PREVIEW))
+        return new Response(
+          "no build staged at this path — never published, or expired by the build/ lifecycle",
+          { status: 404, headers: { "cache-control": "no-store", ...CORS } },
+        );
       console.log(`unhandled: ${e}`);
       return new Response("internal error", {
         status: 500,
