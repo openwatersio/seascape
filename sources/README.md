@@ -105,6 +105,3 @@ Check the catalog above first — the candidate may already be cataloged (with v
 2. `just source <id>` — runs the lane for that source (verify it lands in `pipelines/store/source/<id>/`); equivalently `uv run snakemake sources --config source=<id>` from the repo root.
 3. `just planet` — its tiles fold into the grid-cell overlays + manifest automatically (priority is derived from `(maxzoom, id)`). `just preview` over its bbox to eyeball depths and seams.
 4. Nothing to wire in CI — the sources workflow discovers `sources/<id>/` directories automatically; dispatch it (optionally filtered to the new source), then dispatch a build.
-
-Transform params live in the recipe (CLI args); `metadata.json` is attribution +
-the optional `max_zoom` cap only.
