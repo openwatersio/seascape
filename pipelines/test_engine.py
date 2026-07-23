@@ -92,6 +92,13 @@ def make_source(tmp, sid, west, north, deg, px, value, max_zoom, extra_meta=None
     meta = {"name": sid, "max_zoom": max_zoom, **(extra_meta or {})}
     with open(f"{tmp}/sources/{sid}/metadata.json", "w") as f:
         json.dump(meta, f)
+    # The COG is dropped in already 'prepped', so the enumerate checkpoint is a no-op — but its
+    # output must be present + up-to-date, else re-evaluating catalog.json's staleness would
+    # schedule an enumerate that has no file_list to read. Empty enumeration ⇒ zero fetch jobs.
+    with open(f"{tmp}/sources/{sid}/file_list.txt", "w") as f:
+        f.write("")
+    with open(f"{tmp}/store/source/{sid}/items.txt", "w") as f:
+        f.write("")
 
 
 def make_masks(tmp):
@@ -213,8 +220,9 @@ def main():
         make_masks(tmp)
 
         # ── stage 1 (per-item CLIs, exactly what the Snakefile rules shell out to) ──
+        # source_catalog scans the prepped COGs into the item's seascape:files (the retired
+        # source_bounds folded in), so one CLI is the whole registration.
         for sid in ("base", "fine"):
-            cli(tmp, "source_bounds.py", sid)
             cli(tmp, "source_catalog.py", sid)
         cli(tmp, "aggregation_covering.py", "--stable")   # the `cover` rule: covering.txt + CSVs
 

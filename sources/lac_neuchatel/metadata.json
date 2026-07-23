@@ -4,6 +4,7 @@
     "website": "https://www.swisstopo.admin.ch/en/height-model-swissbathy3d",
     "license": "swisstopo open data (free use, attribution)",
     "max_zoom": 14,
+    "unpack": "asc-mosaic",
     "datum": "bed elevation in LN02 (m above sea level); surface 429.3 m → offset -429.3",
     "datum_offset_m": -429.3,
     "clamp_positive": true,

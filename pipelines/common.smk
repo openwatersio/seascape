@@ -26,9 +26,12 @@ def pat(ids):
 
 
 def raw_assets(wc):
-    """One raw/<index> input per file_list.txt entry."""
-    return [f"store/source/{wc.source}/raw/{i}"
-            for i in range(len(pipeline_config.file_list(wc.source)))]
+    """One raw/<item-hash> input per enumerated item — gated on the enumerate checkpoint so
+    the fetch jobs are known only once items.txt exists."""
+    items_txt = checkpoints.enumerate.get(source=wc.source).output[0]
+    with open(items_txt) as f:
+        urls = [l.strip() for l in f if l.strip()]
+    return [f"store/source/{wc.source}/raw/{pipeline_config.item_hash(u)}" for u in urls]
 
 
 def recipe_files(wc):

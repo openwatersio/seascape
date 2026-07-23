@@ -151,7 +151,7 @@ Kept for reservation fitting and bbox selection (regenerate via `aggregation_cov
 
 ~84% of tiles are cheap; the heavy tail is the 178 z14 coastal macrotiles, clustered on the US
 NE/mid-Atlantic coast (S-102 + CUDEM stacks, bbox `-77.344,36.598,-70.312,42.033`; `8-128-85-14`
-is a separate dense region). Weekly volatile refreshes dirty these same tiles — the heavy tail is
+is a separate dense region). Weekly raw-source refreshes dirty these same tiles — the heavy tail is
 steady-state, not a one-time cost. Densest stems by merge-input files: 8-73-99-14 (184),
 8-77-95-14 (171), 8-75-96-14 (158), 8-76-95-14 (157), 8-73-101-14 (141). Fresh per-tile peaks now
 come from the per-run `bench/mosaic/*.tsv` (the benchmark artifact) on every run.

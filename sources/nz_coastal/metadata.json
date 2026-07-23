@@ -4,5 +4,6 @@
     "website": "https://registry.opendata.aws/nz-coastal/",
     "license": "CC-BY-4.0",
     "max_zoom": 14,
+    "filter": "*/dem_1m/*/*.tiff",
     "datum": "NZVD2016 (~MSL geoid); elevation, seafloor negative (like GEBCO) — no transform"
 }

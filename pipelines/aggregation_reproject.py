@@ -6,8 +6,8 @@ and dstnodata -9999, then short-circuit once the accumulated result has no nodat
 (highest-res source wins; lower ones only fill gaps). A halo buffer is always added
 so contour lines stay continuous across tile seams; the raster output crops it back.
 
-Internal paths only (store/aggregation tmp + source filenames from our bounds.csv);
-shells out via utils.run_command.
+Internal paths only (store/aggregation tmp + source filenames from the covering CSVs, which
+the catalog's seascape:files feeds); shells out via utils.run_command.
 """
 
 import json

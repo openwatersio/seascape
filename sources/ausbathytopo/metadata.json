@@ -3,6 +3,7 @@
     "producer": "Geoscience Australia / AusSeabed",
     "website": "https://www.ausseabed.gov.au/data/bathymetry",
     "license": "CC-BY 4.0",
+    "unpack": "zip:*.tif",
     "datum": "MSL (approx)",
     "crs": "EPSG:4326"
 }

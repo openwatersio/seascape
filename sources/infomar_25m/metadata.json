@@ -5,6 +5,7 @@
     "license": "CC-BY 4.0",
     "max_zoom": 11,
     "priority": 1,
+    "unpack": "zip:*.tif",
     "datum": "LAT (chart datum)",
     "crs": "EPSG:4326"
 }

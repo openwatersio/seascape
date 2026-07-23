@@ -6,7 +6,9 @@
     "max_zoom": 14,
     "band": 1,
     "mixed_crs": true,
-    "volatile": true,
+    "raw": true,
+    "filter": "*.h5",
+    "dedupe": "s102-issue",
     "negate": true,
     "priority": 1
 }

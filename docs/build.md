@@ -26,7 +26,7 @@ Running the build *on* the box rather than SSH-ing into an ephemeral box from a 
 
 | Prefix                              | Contents                                                                          |
 | ----------------------------------- | --------------------------------------------------------------------------------- |
-| `source/<id>/`                      | Prepared/mirrored COGs + `bounds.csv` + `catalog.json` (sources.yml owns these; the catalog item carries the recipe hash + flags the tile keys read) |
+| `source/<id>/`                      | Processed COGs (or a raw source's mirrored objects) + `catalog.json` — the single registration artifact (sources.yml owns these; the item carries the per-file bounds, recipe hash + flags the tile keys read) |
 | `polygon/<id>.gpkg`                 | Per-source provenance footprints                                                   |
 | `landmask/`                         | `land.fgb` + `water.fgb` (sources.yml owns these)                                  |
 | `pmtiles/`                          | Per-tile terrain + overview pmtiles, **content-addressed** `<stem>-<key12>.pmtiles` |
@@ -37,7 +37,7 @@ Running the build *on* the box rather than SSH-ing into an ephemeral box from a 
 
 The `pmtiles/`/`contour/`/… prefixes carry **no `.key` sidecars** — the key is in the filename, so freshness is "the named file exists". Superseded keys (a re-tile / re-key / retired diff-era `aggregation/<ulid>/` coverings / legacy mutable names) linger unreferenced until `gc.yml` sweeps them.
 
-Planet builds hydrate **selectively**: the store artifacts the manifest names, plus `bounds.csv` + `catalog.json` + footprints, come down before `cover` (the covering, the tile keys, and the coverage layer need them); then the masks hydrate (their content hashes enter the tile keys, so the manifest step below must see the same mask state aggregate will), and once the covering exists, `just sources-manifest` derives the exact `(source, filename)` union the key-stale tiles reference and the box `rclone copy --files-from`s those files into the local store — `aggregate` then reads everything from local disk (the preview-local path: no `SOURCE_VSI_BASE`/`LANDMASK`/`WATERMASK` env, so `config.source_path` and the landmask defaults resolve `store/…`). Two real runs that streamed sources per tile banked zero tiles in 2.5–3.9 healthy hours — a coastal macrotile re-read the same S-102/CUDEM bytes over `/vsicurl` for every tile. A legacy bounds row whose filename is already an absolute `/vsi` path is filtered out of the hydrate list, passes through `source_path` untouched, and still streams — acceptable fallback. `bbox` builds stay fully streaming (self-contained, no volume), exactly the old behavior.
+Planet builds hydrate **selectively**: the store artifacts the manifest names, plus `catalog.json` + footprints, come down before `cover` (the covering, the tile keys, and the coverage layer need them — the item's `seascape:files` carries each source's per-file bounds); then the masks hydrate (their content hashes enter the tile keys, so the manifest step below must see the same mask state aggregate will), and once the covering exists, `just sources-manifest` derives the exact `(source, filename)` union the key-stale tiles reference and the box `rclone copy --files-from`s those files into the local store — `aggregate` then reads everything from local disk (the preview-local path: no `SOURCE_VSI_BASE`/`LANDMASK`/`WATERMASK` env, so `config.source_path` and the landmask defaults resolve `store/…`). Two real runs that streamed sources per tile banked zero tiles in 2.5–3.9 healthy hours — a coastal macrotile re-read the same S-102/CUDEM bytes over `/vsicurl` for every tile. A registration row whose filename is already an absolute `/vsi` path is filtered out of the hydrate list, passes through `source_path` untouched, and still streams — acceptable fallback. `bbox` builds stay fully streaming (self-contained, no volume), exactly the old behavior.
 
 **Secrets**: `HCLOUD_TOKEN` (create/destroy the box + volume, held by `create-runner`/`delete-runner`), `RUNNER_PAT` (a fine-grained PAT with repo **Administration: read & write** — the runner action uses it to mint a registration token and register/deregister the self-hosted runner; the job's `GITHUB_TOKEN` can't do this, hence a dedicated secret), `R2_ACCOUNT_ID` + `R2_ACCESS_KEY_ID` + `R2_SECRET_ACCESS_KEY` (rclone reads them as `RCLONE_CONFIG_R2_*`; the AWS S3-API vars ride along for any `/vsis3` path). `github.token` (with `packages: read`) logs the box into GHCR to pull the image. On the box the secrets are **native job `env:`** — never written to a file and never `source`d, so there's no sourced-file injection vector to quote around (the old `build.env` + `%q` is gone).
 
@@ -51,7 +51,7 @@ Everything lands in `bathymetry/build/<sha>/` (byte-compatible with the old buil
 - `coverage.pmtiles` — source-provenance footprints, its own small z0–8 tileset
 - `manifest.json` — planet metadata + overlay cell map; **written and pushed last, its presence marks a complete build** (release.yml refuses a sha without one)
 
-A build from `main` auto-dispatches `release.yml` for its sha; feature-branch and `bbox` builds write `build/<sha>/` but don't ship.
+A build from `main` auto-dispatches `release.yml` for its sha; feature-branch builds write `build/<sha>/` but don't ship, and `bbox` builds stage under `build/<sha>-bbox/` — previewable at the same Worker route, invisible to release (it promotes the bare sha).
 
 ## The box lifecycle
 
@@ -101,7 +101,7 @@ Constraints every modification to the build must respect.
 A dispatch with `bbox` set builds a regional slice — the primary way to test build changes without a multi-hour planet run. What "accept BBOX" means still splits three ways:
 
 - **Rebuild-scoping steps** (cover, coverage, aggregate, downsample, the vector forks) honor `BBOX` (empty = planet): the box passes `-e BBOX` into every `docker run`, and the covering carries the scope transitively.
-- **Shared-metadata steps** (source prep / `bounds.csv`, the land + water masks) are **not in this build at all** — they moved to `sources.yml`, which is always global. A build never writes them.
+- **Shared-metadata steps** (source prep / `catalog.json`, the land + water masks) are **not in this build at all** — they moved to `sources.yml`, which is always global. A build never writes them.
 - **Planet-scoped-pointer steps** (hydrate, the store manifest + pointer flip) **skip** when BBOX is set — a regional run never writes a planet-scoped pointer (`store/manifest.json`), and content-addressed artifacts from a window can't corrupt the planet store (worst case they add unreferenced keys for the GC). The manifest/pointer block is guarded `if [ -z "$BBOX" ]`.
 
 A `bbox` build is otherwise **self-contained**: it skips the hydrate and flips no pointer — it may push content-addressed store artifacts (harmless, unreferenced garbage) but its `build/<sha>/` outputs reflect only the window. So `planet.pmtiles`/`vector.pmtiles` from a bbox build reflect only the window (compare a bbox build's tiles over the bbox, not against the planet). A bbox build never releases.
@@ -136,9 +136,9 @@ It deletes:
 
 - store artifacts under `pmtiles/`/`contour/`/`soundings/`/`depare/` **not referenced by the union of the last N = 3 store manifests** (keeps a couple of builds of hydrate/rollback headroom). Pre-phase-4 mutable-named artifacts + their `.key` sidecars fall out here for free — they sit in those prefixes and no manifest names them;
 - the retired diff-era `aggregation/<ulid>/` coverings (phase 4 hydrates from the manifest — nothing reads a covering from R2);
-- volatile sources' retired `source/<id>/.recipe-hash` markers (their hash lives in `catalog.json` now).
+- retired `source/<id>/bounds.csv` registrations (`catalog.json` carries the per-file rows as `seascape:files` now).
 
-It **never touches**: `build/<sha>/` (an R2 lifecycle rule collects it after 7 days — see `release.yml` — and releases are promoted to the separate tiles bucket, so keeping `build/<sha>/` out of GC scope is the conservative choice), source COGs / `bounds.csv` / `catalog.json`, the **live** `landmask/.recipe-hash`, the store manifests, or the pointer.
+It **never touches**: `build/<sha>/` (an R2 lifecycle rule collects it after 7 days — see `release.yml` — and releases are promoted to the separate tiles bucket, so keeping `build/<sha>/` out of GC scope is the conservative choice), source COGs / `catalog.json`, the store manifests, or the pointer.
 
 Guards: it refuses to delete anything unless the pointer **and** every one of the last N manifests fetch as valid JSON, and unless the referenced set actually matches objects present in the store (a path/listing mismatch must never delete the world); it logs a full per-prefix inventory (kept/deleted) before deleting; and it deletes in bounded batches. The Collect arithmetic + every refusal guard live in one script, [`scripts/gc-collect.sh`](../scripts/gc-collect.sh) — gc.yml invokes it with the rclone backend, and its test [`pipelines/test_gc.sh`](../pipelines/test_gc.sh) (`just test-gc`, run by ci.yml on every push) invokes the same script with the local backend against a synthetic tree, covering the happy path and each refusal — so the workflow and its test cannot drift.
 
