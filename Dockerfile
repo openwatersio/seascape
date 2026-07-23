@@ -36,8 +36,10 @@ ENV GDAL_HTTP_MAX_RETRY=5 \
 
 # tippecanoe + tile-join (Felt fork) — vector tiles. Pinned at felt/tippecanoe#397 (variable-depth
 # pyramids must honor per-feature tippecanoe.minzoom; the joint vector bundle depends on it).
-RUN git clone https://github.com/felt/tippecanoe.git /tmp/tippecanoe \
-  && cd /tmp/tippecanoe && git checkout 0dc1e00eee8efa68b7d1a1834a59910dedddf903 \
+RUN git init -q /tmp/tippecanoe \
+  && cd /tmp/tippecanoe \
+  && git fetch -q --depth 1 https://github.com/felt/tippecanoe.git 0dc1e00eee8efa68b7d1a1834a59910dedddf903 \
+  && git checkout -q FETCH_HEAD \
   && make -j"$(nproc)" && make install && rm -rf /tmp/tippecanoe
 
 # just (task runner) + uv (Python env manager) — the pipeline's two entrypoints.
