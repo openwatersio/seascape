@@ -202,6 +202,7 @@ rule watermask:
         "store/landmask/water.fgb"
     priority: 10_000_000  # see landmask
     retries: 2
+    threads: 8  # the planet read is tiled + parallel (landmask._water_tile); IO-bound S3 reads
     resources:
         mem_gb=8  # the planet Overture-water reproject; refine from the benchmark
     benchmark:
@@ -209,7 +210,7 @@ rule watermask:
     log:
         f"{TMP}/logs/watermask.log"
     shell:
-        "{PY}/landmask.py prep-water 2> {log}"
+        "{PY}/landmask.py prep-water {threads} 2> {log}"
 
 
 # The covering — the seam between stage 1 and stage 2/3, as a CHECKPOINT: it writes the stem

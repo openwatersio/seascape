@@ -54,6 +54,9 @@ LANDMASK / WATERMASK override the paths (defaults store/landmask/{land,water}.fg
 import os
 import sys
 import zipfile
+import shutil
+import tempfile
+from multiprocessing import Pool
 
 import numpy as np
 import rasterio
@@ -139,7 +142,7 @@ def prep():
     print(f"land mask ready: {out}")
 
 
-def prep_water():
+def prep_water(processes=8):
     """Build the inland-water mask once: read the Overture water parquet, keep only polygonal
     non-ocean features (rivers/lakes/canals/reservoirs — the ocean is already bounded by the
     land polygons), reproject to EPSG:3857, and write one spatial-indexed FlatGeobuf at
@@ -163,34 +166,81 @@ def prep_water():
     (trusted sources are never clamped) but it gates drying there until OSM grows an area or
     another feed does.
 
-    BBOX (W,S,E,N lon/lat, the same regional-build env the covering uses) pushes a -spat
-    prefilter into the remote read, so a regional or preview build pulls only that window
-    instead of scanning the planet's ~65M features. Unset (a normal CI build) → whole planet."""
+    The planet read is TILED: each tile carries its own -spat, so GDAL uses the GeoParquet bbox
+    row-group pushdown (skipping the ocean-only groups) and the tiles read + transform in parallel
+    to LOCAL scratch. One un-tiled global read has no bbox to push down, so it scans every row group
+    of the ~65M-feature dataset single-threaded and writes a ~28 GB GPKG onto the network volume —
+    hours. BBOX (W,S,E,N lon/lat, the regional-build env) is itself one window, kept as one read."""
     out = water_path()
     if os.path.isfile(out):
         print(f"inland-water mask already present: {out}")
         return
     utils.create_folder(os.path.dirname(out) or ".")
-    raw = out + ".raw.gpkg"
     bbox = os.environ.get("BBOX", "").strip()
-    spat = f"-spat {bbox.replace(',', ' ')} " if bbox else ""
+    if bbox:
+        w, s, e, n = (float(c) for c in bbox.split(","))
+        windows = [(w, max(s, -MERC_LAT), e, min(n, MERC_LAT))]
+    else:
+        windows = list(_water_grid(WATER_TILE_DEG))
+    tmp = tempfile.mkdtemp(prefix="water-")  # LOCAL scratch (honors TMPDIR), never the store volume
     try:
-        utils.run_command(
-            "AWS_NO_SIGN_REQUEST=YES AWS_DEFAULT_REGION=us-west-2 "
-            f"ogr2ogr -f GPKG -overwrite -nln water_raw -lco SPATIAL_INDEX=NO "
-            f"{spat}-where \"subtype <> 'ocean'\" "
-            f"{raw} {WATER_PARQUET_URL}",
-            silent=False)
-        utils.run_command(
-            f"ogr2ogr -f FlatGeobuf -t_srs EPSG:3857 -overwrite -nln water -dialect SQLITE "
-            "-sql \"SELECT geometry, subtype AS kind FROM water_raw "
-            "WHERE GeometryType(geometry) LIKE '%POLYGON%'\" "  # geometry/subtype names from the parquet
-            f"-clipsrc -180 -{MERC_LAT} 180 {MERC_LAT} {out} {raw}",
-            silent=False)
+        jobs = [(*win, f"{tmp}/raw_{i}.gpkg", f"{tmp}/tile_{i}.gpkg")
+                for i, win in enumerate(windows)]
+        with Pool(processes) as pool:
+            tiles = [t for t in pool.map(_water_tile, jobs) if t]
+        if not tiles:
+            raise SystemExit("prep-water: no polygonal water in the read window")
+        print(f"{len(tiles)}/{len(jobs)} windows held water; merging -> {out}")
+        merged = f"{tmp}/merged.gpkg"  # FlatGeobuf can't append; concat in GPKG, then convert once
+        for i, t in enumerate(tiles):
+            utils.run_command(
+                f"ogr2ogr -f GPKG {'-overwrite' if i == 0 else '-update -append'} "
+                f"-nln water {merged} {t}", silent=True)
+        utils.run_command(f"ogr2ogr -f FlatGeobuf -overwrite -nln water {out} {merged}", silent=False)
     finally:
-        if os.path.isfile(raw):
-            os.remove(raw)
+        shutil.rmtree(tmp, ignore_errors=True)
     print(f"inland-water mask ready: {out}")
+
+
+# Tile edge (degrees) for the planet read. 20° balances startup (~11 s/tile) against load: a
+# handful of dense land tiles (Europe/Asia rivers) dominate, most tiles are near-empty ocean.
+WATER_TILE_DEG = int(os.environ.get("WATER_TILE_DEG", "20"))
+
+
+def _water_grid(step):
+    """(w, s, e, n) windows tiling the whole lon range and the web-mercator lat band, clamped so no
+    tile spills past ±180 / ±MERC_LAT (an inverted -clipsrc errors)."""
+    lon = -180
+    while lon < 180:
+        lat = -MERC_LAT
+        while lat < MERC_LAT:
+            yield (lon, lat, min(lon + step, 180), min(lat + step, MERC_LAT))
+            lat += step
+        lon += step
+
+
+def _water_tile(job):
+    """One Overture window: read non-ocean features (bbox-pushed-down), then the local pass that
+    drops river/stream *centerlines* (polygons only — GeometryType can't push through the parquet
+    read), reprojects to 3857, and clips to the tile. GPKG throughout so an empty ocean window is
+    tolerated (an empty indexed FlatGeobuf errors). Returns the tile GPKG, or None if it held no
+    polygonal water."""
+    w, s, e, n, raw, tile = job
+    utils.run_command(
+        "AWS_NO_SIGN_REQUEST=YES AWS_DEFAULT_REGION=us-west-2 "
+        f"ogr2ogr -f GPKG -overwrite -nln water_raw -lco SPATIAL_INDEX=NO "
+        f"-spat {w} {s} {e} {n} -where \"subtype <> 'ocean'\" {raw} {WATER_PARQUET_URL}",
+        silent=True)
+    if not os.path.isfile(raw):
+        return None  # open ocean: the read selected nothing
+    utils.run_command(
+        f"ogr2ogr -f GPKG -t_srs EPSG:3857 -overwrite -nln water -dialect SQLITE "
+        "-sql \"SELECT geometry, subtype AS kind FROM water_raw "
+        "WHERE GeometryType(geometry) LIKE '%POLYGON%'\" "
+        f"-clipsrc {w} {s} {e} {n} {tile} {raw}",
+        silent=True)
+    os.remove(raw)
+    return tile if os.path.isfile(tile) else None
 
 
 def _present(p):
@@ -428,6 +478,13 @@ def _check():
     import json
     import tempfile
 
+    # The planet water grid: covers the full lon range and the merc band, never spilling past
+    # ±180 / ±MERC_LAT (an inverted -clipsrc would error).
+    tiles = list(_water_grid(WATER_TILE_DEG))
+    assert min(w for w, _, _, _ in tiles) == -180 and max(e for _, _, e, _ in tiles) == 180
+    assert min(s for _, s, _, _ in tiles) == -MERC_LAT and max(n for _, _, _, n in tiles) == MERC_LAT
+    assert all(w < e and s < n for w, s, e, n in tiles), "no inverted/empty tiles"
+
     import aggregation_reproject  # translate() -> the real COG profile
     from rasterio.transform import from_origin
 
@@ -576,7 +633,7 @@ if __name__ == "__main__":
     if sys.argv[1:2] == ["prep"]:
         prep()
     elif sys.argv[1:2] == ["prep-water"]:
-        prep_water()
+        prep_water(int(sys.argv[2]) if len(sys.argv) > 2 else 8)
     elif sys.argv[1:2] == ["--check"]:
         _check()
     else:
