@@ -247,6 +247,20 @@ rule coverage:
         "{PY}/contour_run.py coverage 2> {log}"
 
 
+# Serve-time land-mask tileset. Rebuilds only when the masks change (-R landmask/watermask
+# upstream), not per DEM build — like coverage, a catalogs product stage_build ships from disk.
+rule land:
+    input:
+        land="store/landmask/land.fgb",
+        water="store/landmask/water.fgb",
+    output:
+        "store/bundle/land.pmtiles"
+    log:
+        f"{TMP}/logs/land.log"
+    shell:
+        "{PY}/landmask.py tiles 2> {log}"
+
+
 # The complete stage-1 product set (what the stage-2/3 invocation parses from).
 rule catalogs:
     input:
@@ -255,6 +269,7 @@ rule catalogs:
         "store/landmask/water.fgb",
         "store/aggregation/covering.txt",
         "store/bundle/coverage.pmtiles",
+        "store/bundle/land.pmtiles",
 
 
 # Validate one source's contract (requires --config source=<id>).
