@@ -136,7 +136,7 @@ export function decodeTile(bytes: ArrayBuffer | Uint8Array): DecodedLayer[] {
 // op-list (each moveto starts a ring). Polygons handed back closed, which is
 // what vt-pbf.writeGeometry expects (it drops the closing repeat and re-emits a
 // closepath command itself).
-function featureView(f: DecodedFeature) {
+function featureView(f: DecodedFeature, extent: number) {
   const rings: { x: number; y: number }[][] = [];
   let cur: { x: number; y: number }[] | null = null;
   for (const p of f.ops) {
@@ -160,7 +160,7 @@ function featureView(f: DecodedFeature) {
     loadGeometry: () => { x: number; y: number }[][];
   } = {
     type: f.type,
-    extent: 1 << DETAIL,
+    extent,
     properties: f.properties,
     loadGeometry: () => rings,
   };
@@ -171,12 +171,13 @@ function featureView(f: DecodedFeature) {
 export function encodeTile(layers: DecodedLayer[]): Uint8Array {
   const tileLayers: Record<string, unknown> = {};
   for (const l of layers) {
+    const extent = l.extent || 1 << DETAIL;
     tileLayers[l.name] = {
       version: l.version || 2,
       name: l.name,
-      extent: l.extent || 1 << DETAIL,
+      extent,
       length: l.features.length,
-      feature: (i: number) => featureView(l.features[i]),
+      feature: (i: number) => featureView(l.features[i], extent),
     };
   }
   const buf = vtpbf.fromVectorTileJs({ layers: tileLayers });

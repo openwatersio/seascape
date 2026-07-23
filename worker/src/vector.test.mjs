@@ -230,6 +230,22 @@ console.log("vector.ts F ok — multi-parent merge across sources at differing d
 }
 console.log("vector.ts G ok — layer name, feature id, and property types survive encode/decode");
 
+// ── G2: non-4096 layer extent encodes coherently (feature view must use the layer's
+// extent, not the default — a desync scales geometry wrong through the wire) ─────
+{
+  const half = [
+    { name: "contours", version: 2, extent: 2048,
+      features: [{ id: 7, type: LINE, properties: { depth_m: 5 },
+                   ops: [{ op: 1, x: 0, y: 256 }, { op: 2, x: 2048, y: 256 }] }] },
+  ];
+  const rt = decodeTile(encodeTile(half))[0];
+  assert.equal(rt.extent, 2048, "layer extent survives");
+  const pts = rt.features[0].ops.map(({ x, y }) => [x, y]);
+  assert.deepEqual([pts[0], pts[pts.length - 1]], [[0, 256], [2048, 256]],
+    "geometry unscaled through encode/decode at the layer's own extent");
+}
+console.log("vector.ts G2 ok — non-default extent stays coherent through the wire");
+
 // ── H: line overzoom clips and scales ─────────────────────────────────────────
 {
   // horizontal line across the parent at y=1024 (top quarter band)
