@@ -10,7 +10,7 @@ Checks, in order:
      bounds.csv recomputed via source_catalog._bbox_and_count.
   4. every local bounds.csv row's file exists under store/source/<id>/, opens with rasterio,
      and carries a CRS and a nodata value. Rows whose filename starts with ``objects/`` or
-     ``/vsi`` are remote (mirrored/streamed collections) and skip the on-disk raster checks —
+     ``/vsi`` are remote (raw/streamed collections) and skip the on-disk raster checks —
      their bytes live outside the store.
 
 Run from pipelines/:  uv run python source_check.py <source-id>

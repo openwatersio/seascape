@@ -3,7 +3,7 @@ a public bucket and registered from header/index reads instead of a bulk downloa
 
 ``bounds.csv`` IS the registration: one row per tile — a filename plus 3857 bounds
 and pixel dims. ``config.source_path`` resolves the filename to a GDAL-openable
-path, so rows may be relative store paths (``objects/<key>``, the mirrored-source
+path, so rows may be relative store paths (``objects/<key>``, the raw-source
 shape ``source_mirror`` maintains) or absolute ``/vsi`` URLs (passed through
 verbatim, which is what makes a cutover between the two shapes safe in both
 directions). These helpers are the pieces any enumeration front-end shares: the

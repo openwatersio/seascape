@@ -88,7 +88,7 @@ def _bbox_and_count(source):
 
 def _crs_epsg(source, mixed_crs):
     """EPSG code of the normalized COG, or None. None for a mixed_crs source (per-file CRS,
-    so no single code) and for a mirrored source (no local COG — its CRS lives in the remote
+    so no single code) and for a raw source (no local COG — its CRS lives in the remote
     objects). Reads the first local .tif's assigned CRS otherwise."""
     if mixed_crs:
         return None
@@ -103,14 +103,14 @@ def _datum(source):
     """The datum facts downstream reads: (negate, offset_m, clamp_positive).
 
     ``negate`` is the one field with a machine consumer — aggregation_reproject flips band 1
-    when it's true — so it must mean "negate at aggregation", which only a mirrored/streamed
+    when it's true — so it must mean "negate at aggregation", which only a raw/streamed
     source (no sidecar; negates nothing at prep) ever needs. A sidecar means the transform is
     already baked into the prepared COGs, so negate is False regardless of what was applied —
     publishing the applied flag here made aggregation flip prepared depths back to positive
     (the african_great_lakes/ddm double-negation). ``offset_m``/``clamp_positive`` stay the
-    applied-at-prep record (provenance + tile keying; nothing re-applies them). Every prepped
+    applied-at-prep record (provenance + tile keying; nothing re-applies them). Every processed
     source has a sidecar (source_prep writes one even for a no-op transform); no sidecar
-    means a mirrored source, whose negate comes from metadata."""
+    means a raw source, whose negate comes from metadata."""
     sidecar = f"store/source/{source}/datum.json"
     if os.path.isfile(sidecar):
         with open(sidecar) as f:
@@ -146,7 +146,7 @@ def build_item(source, recipe_hash=None):
             "seascape:priority": int(meta.get("priority", 0)),
             "seascape:max_zoom": meta.get("max_zoom"),
             "seascape:land_clamp": bool(meta.get("land_clamp", False)),
-            "seascape:volatile": bool(meta.get("volatile", False)),
+            "seascape:raw": bool(meta.get("raw", False)),
             "seascape:mixed_crs": bool(meta.get("mixed_crs", False)),
             "seascape:band": meta.get("band"),
             "seascape:vertical_datum": meta.get("datum"),
@@ -179,8 +179,9 @@ def main():
 def _check():
     """Offline synthetic self-check: an item assembles from a synthetic source, the recorded
     datum offset round-trips (sidecar → negate publishes False), a sidecar-less source takes
-    negate from metadata (the mirrored model), an antimeridian-wrapped bounds row is
-    represented (west > east), and missing metadata.json fails registration."""
+    negate from metadata (the raw model), ``raw`` round-trips to seascape:raw and the retired
+    seascape:volatile key still reads back through source_property, an antimeridian-wrapped
+    bounds row is represented (west > east), and missing metadata.json fails registration."""
     import shutil
     import tempfile
 
@@ -248,11 +249,24 @@ def _check():
         assert abs(w2 - 175.0) < 0.01 and abs(e2 - -150.0) < 0.01, (w2, e2)
         assert s2 < n2, (s2, n2)
 
-        # No sidecar = the mirrored model: negate comes from metadata (a prepped source
-        # always has a sidecar — source_prep writes one even for a no-op transform).
+        # No sidecar = the raw model: negate comes from metadata (a processed source
+        # always has a sidecar — source_prep writes one even for a no-op transform). The
+        # declared `raw` flag round-trips to seascape:raw.
         with open(f"sources/{sid2}/metadata.json", "w") as f:
-            json.dump({"name": "Wrap Source", "negate": True, "volatile": True}, f)
-        assert build_item(sid2)["properties"]["seascape:negate"] is True
+            json.dump({"name": "Wrap Source", "negate": True, "raw": True}, f)
+        p2 = build_item(sid2)["properties"]
+        assert p2["seascape:negate"] is True and p2["seascape:raw"] is True, p2
+
+        # Cutover fallback: a catalog published before the rename carries seascape:volatile and
+        # no seascape:raw; source_property("raw") must still read it (delete with the fallback).
+        sid3 = "_catalog_volatile_fallback"
+        os.makedirs(f"sources/{sid3}")
+        os.makedirs(f"store/source/{sid3}")
+        with open(f"sources/{sid3}/metadata.json", "w") as f:
+            json.dump({"name": "Legacy Source"}, f)
+        with open(f"store/source/{sid3}/catalog.json", "w") as f:
+            json.dump({"properties": {"seascape:volatile": True}}, f)
+        assert config.source_property(sid3, "raw") is True, "seascape:volatile must read back as raw"
 
         # missing metadata.json → hard error
         shutil.rmtree(f"sources/{sid}")

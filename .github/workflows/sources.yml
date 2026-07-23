@@ -1,6 +1,6 @@
 name: Sources
 
-# Runs the sources build — fetch/prep/catalog every source, mirror the volatile collections,
+# Runs the sources build — fetch/prep/catalog every source, mirror the raw collections,
 # and publish — as ONE Snakemake invocation on an ephemeral Hetzner box against the persistent
 # store volume, publishing to the bathymetry/ prefix builds read. --keep-going gives per-source
 # isolation: one red source fails its own jobs, the rest complete, and the run goes red as the
@@ -16,7 +16,7 @@ on:
         required: false
         default: ""
       force:
-        description: "Force re-registration from warm raw (re-run prep + catalog, NO refetch) + ignore the volatile shrink guard"
+        description: "Force re-registration from warm raw (re-run prep + catalog, NO refetch) + ignore the raw-collection shrink guard"
         type: boolean
         default: false
       snakemake_args:

@@ -1,5 +1,5 @@
-"""Register a *mirrored* source from its enumerated items — a volatile tile collection
-published on a public bucket, whose objects get copied into the local store rather than
+"""Register a *raw* source from its enumerated items — a tile collection published on a
+public bucket, whose objects get mirrored 1:1 into the local store rather than
 read from the upstream at aggregate time.
 
 Enumeration (listing/filter/dedupe/shrink-guard) happens upstream in the enumerate

@@ -26,7 +26,7 @@ Running the build *on* the box rather than SSH-ing into an ephemeral box from a 
 
 | Prefix                              | Contents                                                                          |
 | ----------------------------------- | --------------------------------------------------------------------------------- |
-| `source/<id>/`                      | Prepared/mirrored COGs + `bounds.csv` + `catalog.json` (sources.yml owns these; the catalog item carries the recipe hash + flags the tile keys read) |
+| `source/<id>/`                      | Processed COGs (or a raw source's mirrored objects) + `bounds.csv` + `catalog.json` (sources.yml owns these; the catalog item carries the recipe hash + flags the tile keys read) |
 | `polygon/<id>.gpkg`                 | Per-source provenance footprints                                                   |
 | `landmask/`                         | `land.fgb` + `water.fgb` (sources.yml owns these)                                  |
 | `pmtiles/`                          | Per-tile terrain + overview pmtiles, **content-addressed** `<stem>-<key12>.pmtiles` |
@@ -136,7 +136,7 @@ It deletes:
 
 - store artifacts under `pmtiles/`/`contour/`/`soundings/`/`depare/` **not referenced by the union of the last N = 3 store manifests** (keeps a couple of builds of hydrate/rollback headroom). Pre-phase-4 mutable-named artifacts + their `.key` sidecars fall out here for free — they sit in those prefixes and no manifest names them;
 - the retired diff-era `aggregation/<ulid>/` coverings (phase 4 hydrates from the manifest — nothing reads a covering from R2);
-- volatile sources' retired `source/<id>/.recipe-hash` markers (their hash lives in `catalog.json` now).
+- raw sources' retired `source/<id>/.recipe-hash` markers (their hash lives in `catalog.json` now).
 
 It **never touches**: `build/<sha>/` (an R2 lifecycle rule collects it after 7 days — see `release.yml` — and releases are promoted to the separate tiles bucket, so keeping `build/<sha>/` out of GC scope is the conservative choice), source COGs / `bounds.csv` / `catalog.json`, the **live** `landmask/.recipe-hash`, the store manifests, or the pointer.
 

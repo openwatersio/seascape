@@ -95,25 +95,33 @@ _CATALOG_KEY = {
     "land_clamp": "seascape:land_clamp",
     "offset": "seascape:datum_offset_m",
     "negate": "seascape:negate",
-    "volatile": "seascape:volatile",
+    "raw": "seascape:raw",
     "band": "seascape:band",
     "mixed_crs": "seascape:mixed_crs",
 }
 
 
 def source_property(source, name, default=None):
-    """A source's build property (priority/max_zoom/land_clamp/offset/negate/volatile/band/
+    """A source's build property (priority/max_zoom/land_clamp/offset/negate/raw/band/
     mixed_crs), read from the catalog item's seascape:<field> when present, else metadata.json.
     ``offset`` lives only in the catalog (recorded by source_datum at prep time), so it defaults
     to 0 without an item."""
     cat = load_catalog(source)
     if cat is not None:
-        val = cat.get("properties", {}).get(_CATALOG_KEY[name])
+        props = cat.get("properties", {})
+        val = props.get(_CATALOG_KEY[name])
+        # Cutover fallback (docs/plans/2026-07-23-declarative-sources.md): a catalog published
+        # before the rename still carries seascape:volatile. Delete once every source has re-registered.
+        if val is None and name == "raw":
+            val = props.get("seascape:volatile")
         if val is not None:  # a genuinely-null field (an uncapped max_zoom) falls through
             return val
     if name == "offset":
         return default if default is not None else 0.0
-    return load_metadata(source).get(name, default)
+    meta = load_metadata(source)
+    if name == "raw" and "raw" not in meta:
+        return meta.get("volatile", default)  # legacy metadata key, same cutover window
+    return meta.get(name, default)
 
 
 def source_recipe_hash(source):

@@ -17,12 +17,12 @@
 include: "pipelines/common.smk"
 
 ALL_SOURCES = pipeline_config.sources()
-# volatile: true ⇒ mirrored registration (remote objects); everything else preps locally
-MIRRORED = [s for s in ALL_SOURCES if pipeline_config.load_metadata(s).get("volatile")]
-PREPPED = [s for s in ALL_SOURCES if s not in MIRRORED]
+# raw: true ⇒ register remote objects 1:1 (header reads + object mirror); everything else preps locally
+RAW = [s for s in ALL_SOURCES if pipeline_config.load_metadata(s).get("raw")]
+PROCESSED = [s for s in ALL_SOURCES if s not in RAW]
 # listed ⇒ the enumerate checkpoint lists a bucket/urllist (vs echoing a committed file_list);
-# these re-enumerate on the weekly cron. Orthogonal to prepped/mirrored: nz_coastal is listed
-# AND prepped, the volatile mirrors are listed AND mirrored, the rest are static.
+# these re-enumerate on the weekly cron. Orthogonal to processed/raw: nz_coastal is listed
+# AND processed, the raw collections are listed AND raw, the rest are static.
 LISTED = [s for s in ALL_SOURCES if "filter" in pipeline_config.load_metadata(s)]
 
 # ── streaming ("source access resolves per source, local wins") ──────────────────────
@@ -35,14 +35,14 @@ STREAM_BASE = config.get("stream_base", "https://data.openwaters.io/bathymetry/s
 _wd = Path(config.get("workdir", str(SCRIPTS)))
 STREAMED = ([s for s in ALL_SOURCES if not (_wd / "store/source" / s / "raw").is_dir()]
             if config.get("stream") else [])
-LOCAL_PREPPED = [s for s in PREPPED if s not in STREAMED]
-LOCAL_MIRRORED = [s for s in MIRRORED if s not in STREAMED]
+LOCAL_PROCESSED = [s for s in PROCESSED if s not in STREAMED]
+LOCAL_RAW = [s for s in RAW if s not in STREAMED]
 LOCAL_LISTED = [s for s in LISTED if s not in STREAMED]
 
 ONLY = config.get("source")
-if ONLY and ONLY not in PREPPED + MIRRORED:
-    raise WorkflowError(f"unknown source {ONLY!r} — known: {PREPPED + MIRRORED}")
-TARGETS = [ONLY] if ONLY else PREPPED + MIRRORED
+if ONLY and ONLY not in PROCESSED + RAW:
+    raise WorkflowError(f"unknown source {ONLY!r} — known: {PROCESSED + RAW}")
+TARGETS = [ONLY] if ONLY else PROCESSED + RAW
 
 include: "pipelines/publish.smk"  # needs the source lists above
 
@@ -50,7 +50,7 @@ include: "pipelines/publish.smk"  # needs the source lists above
 rule sources:
     input:
         expand("store/source/{source}/catalog.json", source=TARGETS),
-        expand("store/polygon/{source}.gpkg", source=[s for s in TARGETS if s in PREPPED]),
+        expand("store/polygon/{source}.gpkg", source=[s for s in TARGETS if s in PROCESSED]),
 
 
 # Enumerate every source's fetchable items through ONE code path (source_enumerate). A
@@ -66,7 +66,7 @@ checkpoint enumerate:
     output:
         "store/source/{source}/items.txt"
     wildcard_constraints:
-        source=pat(LOCAL_PREPPED + LOCAL_MIRRORED)
+        source=pat(LOCAL_PROCESSED + LOCAL_RAW)
     log:
         f"{TMP}/logs/enumerate/{{source}}.log"
     shell:
@@ -83,7 +83,7 @@ rule fetch_item:
     output:
         "store/source/{source}/raw/{hash}"
     wildcard_constraints:
-        source=pat(LOCAL_PREPPED), hash=r"[0-9a-f]{16}"
+        source=pat(LOCAL_PROCESSED), hash=r"[0-9a-f]{16}"
     retries: 2
     benchmark:
         f"{TMP}/bench/fetch/{{source}}-{{hash}}.tsv"
@@ -104,7 +104,7 @@ rule prep_source:
         # staged tif names aren't knowable at parse; bounds.csv is the declared artifact
         "store/source/{source}/bounds.csv"
     wildcard_constraints:
-        source=pat(LOCAL_PREPPED)
+        source=pat(LOCAL_PROCESSED)
     priority: source_priority
     resources:
         mem_gb=8  # asc-mosaic / archive-extract jobs hold whole rasters in flight
@@ -131,10 +131,10 @@ rule refresh:
     input:
         expand("store/source/{source}/bounds.csv", source=LOCAL_LISTED),
         expand("store/meta/publish/{source}.objects",
-               source=[s for s in LOCAL_LISTED if s in MIRRORED]),
+               source=[s for s in LOCAL_LISTED if s in RAW]),
 
 
-# Volatile mirrored collections register objects/<key> rows off the public bucket, reading the
+# Raw collections register objects/<key> rows off the public bucket, reading the
 # enumerate checkpoint's items.txt. Re-listing on cadence is the enumerate checkpoint's job
 # (the weekly workflow runs `refresh -R enumerate`); this step just materializes bounds.csv +
 # the mirror manifests from whatever items.txt currently holds.
@@ -142,12 +142,13 @@ rule register:
     input:
         "store/source/{source}/items.txt",
     output:
-        # Use `update` to keep the previous bounds in place.
+        # Use `update` to keep the previous bounds in place. mirror.txt/mirror-bucket.txt keep
+        # their names — they're the object-copy store contract, out of scope to rename.
         bounds=update("store/source/{source}/bounds.csv"),
         mirror="store/source/{source}/mirror.txt",
         bucket="store/source/{source}/mirror-bucket.txt",
     wildcard_constraints:
-        source=pat(LOCAL_MIRRORED)
+        source=pat(LOCAL_RAW)
     # Priority BANDS, separated by orders of magnitude so no byte-weighted prep (raw MB,
     # realistically <1,000,000) can cross into a higher band, and so the values dominate
     # the scheduler's packing objective (which otherwise favors count-maximizing selection of
@@ -170,7 +171,7 @@ rule polygon:
     output:
         "store/polygon/{source}.gpkg"
     wildcard_constraints:
-        source=pat(LOCAL_PREPPED)
+        source=pat(LOCAL_PROCESSED)
     threads: 4
     log:
         f"{TMP}/logs/polygon/{{source}}.log"
@@ -186,7 +187,7 @@ rule catalog_item:
     output:
         "store/source/{source}/catalog.json"
     wildcard_constraints:
-        source=pat(LOCAL_PREPPED + LOCAL_MIRRORED)
+        source=pat(LOCAL_PROCESSED + LOCAL_RAW)
     log:
         f"{TMP}/logs/catalog_item/{{source}}.log"
     shell:
@@ -252,8 +253,8 @@ rule watermask:
 # rule's — only the `checkpoint` keyword differs.
 checkpoint cover:
     input:
-        expand("store/source/{source}/bounds.csv", source=PREPPED + MIRRORED),
-        expand("store/source/{source}/catalog.json", source=PREPPED + MIRRORED),
+        expand("store/source/{source}/bounds.csv", source=PROCESSED + RAW),
+        expand("store/source/{source}/catalog.json", source=PROCESSED + RAW),
     output:
         "store/aggregation/covering.txt"
     params:
@@ -267,9 +268,9 @@ checkpoint cover:
 # Source-coverage provenance tileset.
 rule coverage:
     input:
-        expand("store/polygon/{source}.gpkg", source=PREPPED),
-        expand("store/source/{source}/bounds.csv", source=PREPPED + MIRRORED),
-        expand("store/source/{source}/catalog.json", source=PREPPED + MIRRORED),
+        expand("store/polygon/{source}.gpkg", source=PROCESSED),
+        expand("store/source/{source}/bounds.csv", source=PROCESSED + RAW),
+        expand("store/source/{source}/catalog.json", source=PROCESSED + RAW),
         "store/aggregation/covering.txt",  # sequencing only; coverage reads footprints + bounds
     output:
         "store/bundle/coverage.pmtiles"
@@ -282,7 +283,7 @@ rule coverage:
 # The complete stage-1 product set (what the stage-2/3 invocation parses from).
 rule catalogs:
     input:
-        expand("store/source/{source}/catalog.json", source=PREPPED + MIRRORED),
+        expand("store/source/{source}/catalog.json", source=PROCESSED + RAW),
         "store/landmask/land.fgb",
         "store/landmask/water.fgb",
         "store/aggregation/covering.txt",

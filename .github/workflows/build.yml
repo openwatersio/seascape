@@ -225,7 +225,7 @@ jobs:
           INPUT_ARGS: ${{ github.event.inputs.snakemake_args }}
           GH_TOKEN: ${{ github.token }} # the progress-heartbeat gh api calls
           BOX_IP: ${{ needs.create-runner.outputs.ip }} # carried in the build status desc
-          # Mirrored sources (CUDEM/S-102) stream from the public mirror; prepped sources
+          # Raw sources (CUDEM/S-102) stream from the public mirror; processed sources
           # read the volume (source_path: a local file wins per file). Curl caches sized to
           # fit inside the global reserve below.
           SOURCE_VSI_BASE: /vsicurl/https://data.openwaters.io/bathymetry/source
