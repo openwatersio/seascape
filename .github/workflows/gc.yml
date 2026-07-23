@@ -12,12 +12,10 @@ name: GC
 #     prefixes and no manifest names them.
 #   - retired diff-era aggregation/<ulid>/ coverings (phase 4 hydrates from the manifest, so nothing
 #     reads a covering from R2 any more).
-#   - raw sources' retired source/<id>/.recipe-hash markers (their hash lives in catalog.json
-#     now — sources.yml).
 # NEVER touches: build/<sha>/ (an R2 lifecycle rule collects it after 7 days — see release.yml — and
 # releases live in the separate tiles bucket, so keeping build/<sha>/ out of GC scope is the
-# conservative choice), source COGs/bounds.csv/catalog.json (sources.yml owns them), the LIVE
-# landmask/.recipe-hash, the store manifests, or the pointer.
+# conservative choice), source COGs/bounds.csv/catalog.json (sources.yml owns them), the store
+# manifests, or the pointer.
 #
 # Guards: refuse to delete anything unless the pointer AND every one of the last N manifests fetch
 # as valid JSON, and unless the referenced set actually matches objects present in the store (a

@@ -135,10 +135,9 @@ Deletion is out-of-band: [`.github/workflows/gc.yml`](../.github/workflows/gc.ym
 It deletes:
 
 - store artifacts under `pmtiles/`/`contour/`/`soundings/`/`depare/` **not referenced by the union of the last N = 3 store manifests** (keeps a couple of builds of hydrate/rollback headroom). Pre-phase-4 mutable-named artifacts + their `.key` sidecars fall out here for free — they sit in those prefixes and no manifest names them;
-- the retired diff-era `aggregation/<ulid>/` coverings (phase 4 hydrates from the manifest — nothing reads a covering from R2);
-- raw sources' retired `source/<id>/.recipe-hash` markers (their hash lives in `catalog.json` now).
+- the retired diff-era `aggregation/<ulid>/` coverings (phase 4 hydrates from the manifest — nothing reads a covering from R2).
 
-It **never touches**: `build/<sha>/` (an R2 lifecycle rule collects it after 7 days — see `release.yml` — and releases are promoted to the separate tiles bucket, so keeping `build/<sha>/` out of GC scope is the conservative choice), source COGs / `bounds.csv` / `catalog.json`, the **live** `landmask/.recipe-hash`, the store manifests, or the pointer.
+It **never touches**: `build/<sha>/` (an R2 lifecycle rule collects it after 7 days — see `release.yml` — and releases are promoted to the separate tiles bucket, so keeping `build/<sha>/` out of GC scope is the conservative choice), source COGs / `bounds.csv` / `catalog.json`, the store manifests, or the pointer.
 
 Guards: it refuses to delete anything unless the pointer **and** every one of the last N manifests fetch as valid JSON, and unless the referenced set actually matches objects present in the store (a path/listing mismatch must never delete the world); it logs a full per-prefix inventory (kept/deleted) before deleting; and it deletes in bounded batches. The Collect arithmetic + every refusal guard live in one script, [`scripts/gc-collect.sh`](../scripts/gc-collect.sh) — gc.yml invokes it with the rclone backend, and its test [`pipelines/test_gc.sh`](../pipelines/test_gc.sh) (`just test-gc`, run by ci.yml on every push) invokes the same script with the local backend against a synthetic tree, covering the happy path and each refusal — so the workflow and its test cannot drift.
 
