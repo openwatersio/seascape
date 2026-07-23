@@ -106,17 +106,26 @@ _EXPECT_KIND = {
 }
 
 
+# Archive formats select members by glob; the rest transform the whole asset.
+_GLOB_FORMATS = {"zip", "tar.gz", "7z"}
+
+
 def _parse_unpack(spec):
     """Parse a metadata `unpack` string `format[:glob][!N]` → (format, glob, expect).
-    `expect` is the exact per-archive match count asserted by `!N` (else None); `glob`
-    is None for the glob-less formats (e00/netcdf/asc-mosaic)."""
+    `expect` is the exact per-archive match count asserted by `!N` (else None). Archive
+    formats require a member glob; the glob-less formats (e00/netcdf/asc-mosaic) reject one."""
     fmt, _, rest = spec.partition(":")
     members_glob, expect = (rest or None), None
     if members_glob and "!" in members_glob:
         members_glob, _, n = members_glob.partition("!")
+        members_glob = members_glob or None
         expect = int(n)
     if fmt not in _EXPECT_KIND:
         sys.exit(f"unknown unpack format {fmt!r} (expected one of {sorted(_EXPECT_KIND)})")
+    if fmt in _GLOB_FORMATS and not members_glob:
+        sys.exit(f"unpack {spec!r}: {fmt} needs a member glob, e.g. {fmt!r}:*.tif")
+    if fmt not in _GLOB_FORMATS and (members_glob or expect is not None):
+        sys.exit(f"unpack {spec!r}: {fmt} takes no member glob or !N")
     return fmt, members_glob, expect
 
 
@@ -223,8 +232,15 @@ def _stage_e00(raw, root, source, index, seen, origin):
     with gzip.open(raw, "rb") as fin, open(inner, "wb") as fout:
         shutil.copyfileobj(fin, fout)
     try:
+        # validate the inner bytes too — a gzip of not-an-e00 must self-heal, not crash the parser
+        with open(inner, "rb") as f:
+            if _kind(f.read(512)) != "e00":
+                raise CorruptRaw("gzip inner content is not an ARC/INFO e00 export")
         _claim(seen, f"{source}.tif", origin)
-        e00_to_tif(inner, f"{root}/{source}.tif")
+        try:
+            e00_to_tif(inner, f"{root}/{source}.tif")
+        except (AssertionError, ValueError, IndexError) as e:
+            raise CorruptRaw(f"e00 parse failed: {e}") from e
         return "e00 → tif"
     finally:
         if os.path.exists(inner):
@@ -451,6 +467,15 @@ def _check():
         assert False, "expected an unknown unpack format to exit"
     except SystemExit as e:
         assert "unknown unpack format" in str(e), e
+    # archive formats require a glob ("zip"/"zip:" would crash in _members later);
+    # glob-less formats reject one.
+    for bad, msg in (("zip", "needs a member glob"), ("zip:", "needs a member glob"),
+                     ("e00:*.tif", "takes no member glob"), ("netcdf:!1", "takes no member glob")):
+        try:
+            _parse_unpack(bad)
+            assert False, f"expected {bad!r} to exit"
+        except SystemExit as e:
+            assert msg in str(e), (bad, e)
 
     H = config.item_hash
 
@@ -634,6 +659,15 @@ def _check():
         stage(eid)
         with rasterio.open(f"store/source/{eid}/{eid}.tif") as src:
             assert src.shape == (2, 2) and src.read(1)[0, 0] == 1.0, src.read(1)
+        # a gzip whose inner bytes are NOT an e00 export self-heals as a corrupt raw
+        with _gz.open(raw_of(eid, eu), "wb") as f:
+            f.write(b"<html>503 not an e00</html>")
+        try:
+            stage(eid)
+            assert False, "expected a non-e00 gzip payload to exit as corrupt"
+        except SystemExit as e:
+            assert "corrupt raw" in str(e), e
+        assert not os.path.exists(raw_of(eid, eu)), "corrupt e00 raw must be deleted"
 
         # Corrupt raws self-heal: a truncated declared zip (PK magic intact), a declared zip
         # whose bytes are not a zip at all (an error page), and — with no `unpack` — a server

@@ -188,6 +188,13 @@ def write_items(source, items, listed):
     """Write items.txt (write-if-changed). A listed enumeration guards against a shrink past
     SHRINK_TOLERANCE vs the previous items.txt; a static one never does."""
     path = f"store/source/{source}/items.txt"
+    # raws are keyed by URL hash and staged names by list position, so a duplicate URL
+    # would silently collapse to one raw yet stage twice — fail at the source of truth
+    if len(set(items)) != len(items):
+        from collections import Counter
+        dupes = sorted(u for u, n in Counter(items).items() if n > 1)
+        sys.exit(f"{source}: duplicate item URL(s) in the enumeration: {dupes[:3]}"
+                 f"{' …' if len(dupes) > 3 else ''}")
     if listed:
         prev = config.items(source)
         shrink = 1 - len(items) / len(prev) if prev else 0.0
@@ -278,6 +285,12 @@ def _check():
         assert config.items(sid) == items
         write_items(sid, ["https://x/a.tif"], listed=False)  # static shrink is fine — no guard
         assert config.items(sid) == ["https://x/a.tif"]
+        # duplicate URLs fail fast — they'd collapse to one raw hash but stage twice
+        try:
+            write_items(sid, ["https://x/a.tif", "https://x/a.tif"], listed=False)
+            assert False, "expected duplicate items to exit"
+        except SystemExit as e:
+            assert "duplicate item URL" in str(e) and "a.tif" in str(e), e
 
         with open(f"sources/{sid}/file_list.txt", "w") as f:
             f.write("https://x/prefix/\n")
