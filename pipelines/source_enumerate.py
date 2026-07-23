@@ -180,6 +180,10 @@ def enumerate_source(source):
     if not kept:
         sys.exit(f"{source}: filter {filter_pat!r} matched none of {len(candidates)} listed "
                  "keys — the upstream layout may have moved")
+    if dedupe and any(m is None for _, m in kept):
+        # every current strategy compares LastModified; urllist entries carry none
+        sys.exit(f"{source}: dedupe {dedupe!r} needs LastModified timestamps — "
+                 "urllist entries don't carry them; use a bucket-prefix listing")
     items = DEDUPERS[dedupe](kept) if dedupe else sorted(u for u, _ in kept)
     return items, True
 
@@ -291,6 +295,25 @@ def _check():
             assert False, "expected duplicate items to exit"
         except SystemExit as e:
             assert "duplicate item URL" in str(e) and "a.tif" in str(e), e
+
+        # a timestamp deduper on a urllist enumeration exits with the named mismatch
+        # (urllist entries carry no LastModified) — offline via a rebound fetcher
+        did = "_enum_dedupe_urllist"
+        os.makedirs(f"sources/{did}")
+        with open(f"sources/{did}/file_list.txt", "w") as f:
+            f.write("https://x/urllist.txt\n")
+        with open(f"sources/{did}/metadata.json", "w") as f:
+            json.dump({"name": "D", "filter": "*.h5", "dedupe": "s102-issue"}, f)
+        g = globals()
+        real_fetch = g["_fetch_urllist"]
+        g["_fetch_urllist"] = lambda url: ["https://x/a.h5", "https://x/b.h5"]
+        try:
+            enumerate_source(did)
+            assert False, "expected a timestamp-less dedupe to exit"
+        except SystemExit as e:
+            assert "needs LastModified" in str(e), e
+        finally:
+            g["_fetch_urllist"] = real_fetch
 
         with open(f"sources/{sid}/file_list.txt", "w") as f:
             f.write("https://x/prefix/\n")
