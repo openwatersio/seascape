@@ -34,16 +34,11 @@ ENV GDAL_HTTP_MAX_RETRY=5 \
   GDAL_HTTP_RETRY_DELAY=1 \
   GDAL_HTTP_USERAGENT="seascape/1.0 (+https://github.com/openwatersio/seascape)"
 
-# tippecanoe + tile-join (Felt fork) — vector tiles. Pinned to the commit our patch targets and
-# patched: the stock leaf-prevention guard consults only feature_minzoom, so
-# --generate-variable-depth-tile-pyramid prunes features carrying an explicit tippecanoe.minzoom
-# above the leaf — the patch fixes it (see patches/ + docs plan Part 2). patches/*.patch rides in
-# the image hash (ghcr-login), so editing the patch rebuilds the toolchain image.
-COPY patches/tippecanoe-variable-depth-minzoom.patch /tmp/tc.patch
+# tippecanoe + tile-join (Felt fork) — vector tiles. Pinned at felt/tippecanoe#397 (variable-depth
+# pyramids must honor per-feature tippecanoe.minzoom; the joint vector bundle depends on it).
 RUN git clone https://github.com/felt/tippecanoe.git /tmp/tippecanoe \
-  && cd /tmp/tippecanoe && git checkout 0c650b8 \
-  && git apply /tmp/tc.patch \
-  && make -j"$(nproc)" && make install && rm -rf /tmp/tippecanoe /tmp/tc.patch
+  && cd /tmp/tippecanoe && git checkout 0dc1e00eee8efa68b7d1a1834a59910dedddf903 \
+  && make -j"$(nproc)" && make install && rm -rf /tmp/tippecanoe
 
 # just (task runner) + uv (Python env manager) — the pipeline's two entrypoints.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh \
