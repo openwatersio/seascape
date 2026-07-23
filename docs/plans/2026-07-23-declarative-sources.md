@@ -70,13 +70,13 @@ uk_surfzone's key sweep) and keeps writing file_list.txt.
 
 | Sources | Declaration |
 |---|---|
-| gebco, emodnet, ausbathytopo, gbr30, infomar_10m/25m | `unpack: "zip:*.tif"` |
+| gebco, emodnet, ausbathytopo, gbr30, infomar_10m/25m, uk_surfzone | `unpack: "zip:*.tif"` |
 | great_lakes | `unpack: "tar.gz:*_lld.tif!1"` |
 | african_great_lakes | `unpack: "7z:*_ras.tif"` |
 | bodensee, lac_leman, lac_neuchatel | `unpack: "asc-mosaic"` |
 | noaa_estuarine | `unpack: "netcdf"` |
-| gsc_atlantic, lake_tahoe | `unpack: "e00"` |
-| ddm, vaklodingen, swiobc, batnas, gsc_pacific, uk_surfzone | (bare rasters — no keys) |
+| lake_tahoe | `unpack: "e00"` |
+| ddm, vaklodingen, swiobc, batnas, gsc_pacific, gsc_atlantic | (bare rasters — no keys) |
 | cudem, cudem_third | `raw: true` (urllist lines as today) |
 | noaa_s102 | `raw: true, filter: "*.h5", dedupe: "s102-issue"` |
 | nz_coastal | `filter: "*/dem_1m/*/*.tiff"` — listed + processed |
