@@ -29,12 +29,13 @@ export function overlayFor(
  * the remaining tile path, and the sha-folded mount (so emitted TileJSON/style
  * URLs point back correctly) — or null if the segment is absent/malformed (→ 404).
  * The 7–40 hex bound validates the sha AND stops a bare z/x/y path (single digits)
- * from being mistaken for one. */
+ * from being mistaken for one. A `-bbox` suffix selects a regional bbox build's
+ * stage (build.yml stages those under build/<sha>-bbox/, unpromotable by release). */
 export function previewRoute(
   rel: string,
   mount: string,
 ): { prefix: string; rel: string; mount: string } | null {
-  const s = rel.match(/^\/([0-9a-f]{7,40})(?=\/|$)/);
+  const s = rel.match(/^\/([0-9a-f]{7,40}(?:-bbox)?)(?=\/|$)/);
   if (!s) return null;
   const sha = s[1];
   return {

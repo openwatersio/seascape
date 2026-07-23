@@ -4,6 +4,7 @@
     "website": "https://www.ausseabed.gov.au/data/bathymetry",
     "license": "CC-BY 4.0",
     "max_zoom": 12,
+    "unpack": "zip:*.tif",
     "datum": "MSL (approx)",
     "crs": "EPSG:4326"
 }

@@ -1,6 +1,6 @@
 name: Sources
 
-# Runs the sources build — fetch/prep/catalog every source, mirror the volatile collections,
+# Runs the sources build — fetch/prep/catalog every source, mirror the raw collections,
 # and publish — as ONE Snakemake invocation on an ephemeral Hetzner box against the persistent
 # store volume, publishing to the bathymetry/ prefix builds read. --keep-going gives per-source
 # isolation: one red source fails its own jobs, the rest complete, and the run goes red as the
@@ -16,7 +16,7 @@ on:
         required: false
         default: ""
       force:
-        description: "Force re-registration from warm raw (re-run prep + catalog, NO refetch) + ignore the volatile shrink guard"
+        description: "Force re-registration from warm raw (re-run prep + catalog, NO refetch) + ignore the raw-collection shrink guard"
         type: boolean
         default: false
       snakemake_args:
@@ -27,7 +27,7 @@ on:
 env:
   IMAGE: ghcr.io/${{ github.repository }}
   DATA_BUCKET: data
-  # Volatile registration refuses a >5% row shrink unless forced — see pipelines/source_mirror.py.
+  # A listed enumeration refuses a >5% shrink unless forced — see pipelines/source_enumerate.py.
   MIRROR_ALLOW_SHRINK: ${{ github.event.inputs.force == 'true' && '1' || '' }}
   # R2 via rclone's env-var remote (remote "r2" exists ambiently in every rclone call).
   RCLONE_CONFIG_R2_TYPE: s3
@@ -136,7 +136,7 @@ jobs:
           echo "volume $STORE_VOLUME attached to server $SERVER_ID — ssh root@$ip"
 
   # The whole sources build in one job: fetch/prep/catalog every source and publish, keep-going,
-  # forcing a re-list of the volatile mirrors (-R mirror_source). Shares the store on the
+  # forcing a re-enumeration of the listed sources (-R enumerate). Shares the store on the
   # volume and publishes to the production bathymetry/ prefix — one store, one mirror.
   sources:
     needs: [image, create-runner]
@@ -249,15 +249,16 @@ jobs:
           case "$INPUT_ARGS" in *[!-A-Za-z0-9_=\ .]*) echo "invalid snakemake_args" >&2; exit 1 ;; esac
           read -r -a xargs <<<"$INPUT_ARGS"
           extra+=("${xargs[@]}")
-          # Two invocations: the forced re-listing first, alone — across the invocation
+          # Two invocations: the forced re-enumeration first, alone — across the invocation
           # boundary the engine's input checksums cure unchanged registrations, so the
           # main invocation cascades (catalog → cover → coverage → publish) only on real
-          # drift. A red refresh still lets the rest publish; the step exits red after.
-          # --cores 16 > vCPUs: width for IO-bound fetches; mem_gb caps the heavy jobs
-          # (28 = 32 GB - 4 reserved). Box-only — laptops keep cores:all as their cap.
+          # drift. A re-listing that yields an unchanged items.txt (write-if-changed) leaves
+          # the whole downstream cured. A red refresh still lets the rest publish; the step
+          # exits red after. --cores 16 > vCPUs: width for IO-bound fetches; mem_gb caps the
+          # heavy jobs (28 = 32 GB - 4 reserved). Box-only — laptops keep cores:all as their cap.
           rc=0
           ./docker.sh snakemake refresh --keep-going --rerun-incomplete \
-            --cores 16 --resources mem_gb=28 -R mirror_source "${extra[@]}" || rc=$?
+            --cores 16 --resources mem_gb=28 -R enumerate "${extra[@]}" || rc=$?
           ./docker.sh snakemake catalogs publish --keep-going --rerun-incomplete \
             --cores 16 --resources mem_gb=28 "${extra[@]}" || rc=$?
           exit "$rc"

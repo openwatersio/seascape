@@ -4,6 +4,7 @@
     "website": "https://doi.org/10.1594/PANGAEA.855987",
     "license": "CC-BY 3.0",
     "max_zoom": 14,
+    "unpack": "asc-mosaic",
     "datum": "DHHN92 orthometric (lake surface ~395.2 m → offset -395.2, clamp above-surface terrain)",
     "datum_offset_m": -395.2,
     "clamp_positive": true,

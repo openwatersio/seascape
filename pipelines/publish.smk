@@ -1,5 +1,6 @@
 # Per-source R2 publish rules. Ordering is the atomicity mechanism: artifacts, then
-# bounds.csv, then catalog.json LAST (the currency marker lands after what it vouches for).
+# catalog.json LAST — the source's single registration artifact + currency marker, landing
+# after everything it vouches for (bounds.csv is retired; R2's stale copies stay, harmless).
 
 DATA_PREFIX = config.get("data_prefix", "bathymetry")
 DEST = f"r2:$DATA_BUCKET/{DATA_PREFIX}"  # $DATA_BUCKET stays a shell env var (no braces)
@@ -13,10 +14,9 @@ PUBLISH_GUARD = (
 
 
 def publish_inputs(wc):
-    """bounds + catalog always; polygon (prepped) or the objects stamp (volatile)."""
-    ins = {"bounds": f"store/source/{wc.source}/bounds.csv",
-           "catalog": f"store/source/{wc.source}/catalog.json"}
-    if wc.source in MIRRORED:
+    """catalog always; polygon (processed) or the objects stamp (raw)."""
+    ins = {"catalog": f"store/source/{wc.source}/catalog.json"}
+    if wc.source in RAW:
         ins["objects"] = f"store/meta/publish/{wc.source}.objects"
     else:
         ins["polygon"] = f"store/polygon/{wc.source}.gpkg"
@@ -32,7 +32,7 @@ rule mirror_objects:
     output:
         touch("store/meta/publish/{source}.objects")
     wildcard_constraints:
-        source=pat(MIRRORED)
+        source=pat(RAW)
     priority: 5000  # ~190 GB when it runs; start first
     log:
         f"{TMP}/logs/mirror_objects/{{source}}.log"
@@ -48,23 +48,24 @@ rule mirror_objects:
         '--stats 60s --stats-one-line ) 2> {log}'
 
 
-# Push one source, catalog.json last. Prepped: sync + footprint. Volatile: copy, never
-# sync (objects/ under the prefix must never be swept).
+# Push one source, catalog.json last. Processed: sync + footprint. Raw: copy, never
+# sync (objects/ under the prefix must never be swept). bounds.csv stays excluded on both
+# legs, so a dead local copy is never pushed and R2's retired object is never deleted.
 rule publish_source:
     input:
         unpack(publish_inputs)
     output:
         touch("store/meta/publish/{source}")
     params:
-        volatile=lambda wc: "true" if wc.source in MIRRORED else "false",
+        raw=lambda wc: "true" if wc.source in RAW else "false",
     wildcard_constraints:
-        source=pat(PREPPED + MIRRORED)
+        source=pat(PROCESSED + RAW)
     log:
         f"{TMP}/logs/publish_source/{{source}}.log"
     shell:
         "( " + PUBLISH_GUARD +
         'src="store/source/{wildcards.source}"; dest="{DEST}/source/{wildcards.source}"; '
-        'if [ "{params.volatile}" = "true" ]; then '
+        'if [ "{params.raw}" = "true" ]; then '
         '  rclone copy "$src" "$dest" --exclude "bounds.csv" --exclude "catalog.json" --exclude "objects/**" --exclude "raw/**" --retries 5; '
         'else '
         '  rclone sync "$src" "$dest" --exclude "bounds.csv" --exclude "catalog.json" --exclude "raw/**" --retries 5; '
@@ -72,7 +73,6 @@ rule publish_source:
         '    rclone copyto "store/polygon/{wildcards.source}.gpkg" "{DEST}/polygon/{wildcards.source}.gpkg" --retries 5; '
         '  fi; '
         'fi; '
-        'rclone copyto "$src/bounds.csv" "$dest/bounds.csv" --retries 5; '
         'rclone copyto "$src/catalog.json" "$dest/catalog.json" --retries 5 ) 2> {log}'
 
 

@@ -276,7 +276,7 @@ def _write_gti(index_path, planet_path, resolution):
     rename, so the pointer only ever names a complete world.
 
     The R2 push publishes the mosaic/ prefix (tiles, index, planet-z8) BEFORE this pointer — same
-    artifacts-before-pointer discipline as bounds.csv-last — then PUTs mosaic.gti last. This module
+    artifacts-before-pointer discipline as catalog.json-last — then PUTs mosaic.gti last. This module
     only writes it locally."""
     rel_index = os.path.relpath(index_path, os.path.dirname(gti_path()))
     rel_planet = os.path.relpath(planet_path, os.path.dirname(gti_path()))

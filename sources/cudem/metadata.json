@@ -4,5 +4,6 @@
     "website": "https://www.ncei.noaa.gov/products/coastal-relief-model",
     "license": "public domain (U.S. Government work)",
     "max_zoom": 13,
-    "volatile": true
+    "raw": true,
+    "filter": "*.tif|*.tiff"
 }

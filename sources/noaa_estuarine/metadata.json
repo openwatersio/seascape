@@ -4,6 +4,7 @@
     "website": "https://www.ncei.noaa.gov/products/estuarine-bathymetric-digital-elevation-models",
     "license": "public domain (U.S. Government work)",
     "max_zoom": 11,
+    "unpack": "netcdf",
     "datum": "MLLW (local tidal datum, 19-yr epoch) — coastal source, no offset",
     "mixed_crs": true
 }
