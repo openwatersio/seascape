@@ -59,7 +59,8 @@ for f in "${mosaic_keep[@]}" "${mosaic_del[@]}"; do : > "$tree/$f"; done
 printf '<GDALTileIndexDataset><IndexDataset>index/01CCCCCCCCCCCCCCCCCCCCCCCC.parquet</IndexDataset><LocationField>location</LocationField></GDALTileIndexDataset>\n' \
   > "$tree/mosaic/mosaic.gti"
 
-# Sources: bounds/catalog are never swept (source/ is not a content prefix).
+# Sources: the retired bounds.csv is swept (catalog.json carries seascape:files now);
+# the catalog itself is never touched.
 : > "$tree/source/gebco/bounds.csv"
 : > "$tree/source/gebco/catalog.json"
 
@@ -96,16 +97,16 @@ for f in "${keep_objs[@]}"; do assert_out "$f" "$out/gc-delete.txt"; done
 # mosaic: superseded tiles/overview/index collected; current tiles/overview/index + the pointer kept
 for f in "${mosaic_del[@]}";  do assert_in  "$f" "$out/gc-delete.txt"; done
 for f in "${mosaic_keep[@]}"; do assert_out "$f" "$out/gc-delete.txt"; done
-# source/ registrations are not a swept prefix, never listed
-assert_out "source/gebco/bounds.csv"   "$out/gc-delete.txt"
+# the retired bounds.csv is swept; the catalog item is never touched
+assert_in  "source/gebco/bounds.csv"   "$out/gc-delete.txt"
 assert_out "source/gebco/catalog.json" "$out/gc-delete.txt"
 # both diff-era coverings are queued for purge
 assert_in "01OLDCOVERING0000000000000" "$out/gc-purge-dirs.txt"
 assert_in "01NEWCOVERING0000000000000" "$out/gc-purge-dirs.txt"
 [ "$(grep -c . "$out/gc-purge-dirs.txt")" -eq 2 ] || { echo "FAIL: expected 2 covering dirs to purge"; fail=1; }
-# exact count: 4 unreferenced content objects + 3 superseded mosaic objects
-[ "$(wc -l < "$out/gc-delete.txt")" -eq 7 ] \
-  || { echo "FAIL: delete set size $(wc -l < "$out/gc-delete.txt") != 7"; cat "$out/gc-delete.txt"; fail=1; }
+# exact count: 4 unreferenced content objects + 3 superseded mosaic objects + 1 retired bounds.csv
+[ "$(wc -l < "$out/gc-delete.txt")" -eq 8 ] \
+  || { echo "FAIL: delete set size $(wc -l < "$out/gc-delete.txt") != 8"; cat "$out/gc-delete.txt"; fail=1; }
 # the full inventory printed before anything would delete
 grep -q "── inventory ──" "$out/log" || { echo "FAIL: no inventory in the collect log"; fail=1; }
 
@@ -169,4 +170,4 @@ done
 rm -rf "$tmpb"
 
 [ "$fail" -eq 0 ] || exit 1
-echo "gc-sim ok — ${#del_objs[@]} content + ${#mosaic_del[@]} mosaic garbage flagged, ${#keep_objs[@]} content + ${#mosaic_keep[@]} mosaic referenced kept, 2 coverings purged, 6 guards refuse, absent-pointer no-op, batches bounded"
+echo "gc-sim ok — ${#del_objs[@]} content + ${#mosaic_del[@]} mosaic garbage + 1 bounds.csv flagged, ${#keep_objs[@]} content + ${#mosaic_keep[@]} mosaic referenced kept, 2 coverings purged, 6 guards refuse, absent-pointer no-op, batches bounded"

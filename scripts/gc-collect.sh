@@ -111,9 +111,14 @@ kept=$(comm -12 "$GC_OUT/gc-all.txt" "$GC_OUT/gc-referenced.txt" | wc -l)
 # 5) Unreferenced content objects (pre-phase-4 mutable names + .key sidecars fall out here too —
 #    they sit in these prefixes and no manifest names them).
 comm -23 "$GC_OUT/gc-all.txt" "$GC_OUT/gc-referenced.txt" > "$GC_OUT/gc-delete.txt"
+
+# 6) Named legacy debris beyond the content prefixes: retired source/<id>/bounds.csv
+#    registrations (catalog.json carries the per-file rows as seascape:files now).
+bk_files source | grep '/bounds\.csv$' | sed 's#^#source/#' >> "$GC_OUT/gc-delete.txt" || true
+sort -u -o "$GC_OUT/gc-delete.txt" "$GC_OUT/gc-delete.txt"
 del=$(wc -l < "$GC_OUT/gc-delete.txt")
 
-# 6) Retired diff-era coverings — whole aggregation/<ulid>/ dirs (nothing reads a covering from
+# 7) Retired diff-era coverings — whole aggregation/<ulid>/ dirs (nothing reads a covering from
 #    the store under phase 4; hydrate is manifest-driven).
 bk_dirs aggregation > "$GC_OUT/gc-purge-dirs.txt"
 dirs=$(grep -c . "$GC_OUT/gc-purge-dirs.txt" || true)
@@ -125,6 +130,8 @@ for p in mosaic pmtiles contour soundings depare; do
   pd=$(grep -c "^$p/" "$GC_OUT/gc-delete.txt" || true)
   echo "  $p: $pt objects, $((pt - pd)) kept, $pd to delete"
 done
+bc=$(grep -c '^source/.*/bounds\.csv$' "$GC_OUT/gc-delete.txt" || true)
+echo "  source/*/bounds.csv: $bc to delete"
 echo "  aggregation/ coverings: $dirs dir(s) to purge"
 echo "totals: $del objects + $dirs covering dir(s) to delete; $kept of $ref referenced objects present"
 echo "── first 20 objects flagged for deletion ──"

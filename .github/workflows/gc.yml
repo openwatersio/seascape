@@ -12,6 +12,8 @@ name: GC
 #     prefixes and no manifest names them.
 #   - retired diff-era aggregation/<ulid>/ coverings (phase 4 hydrates from the manifest, so nothing
 #     reads a covering from R2 any more).
+#   - retired source/<id>/bounds.csv registrations (catalog.json carries the per-file rows as
+#     seascape:files now — sources.yml).
 # NEVER touches: build/<sha>/ (an R2 lifecycle rule collects it after 7 days — see release.yml — and
 # releases live in the separate tiles bucket, so keeping build/<sha>/ out of GC scope is the
 # conservative choice), source COGs/catalog.json (sources.yml owns them), the store
