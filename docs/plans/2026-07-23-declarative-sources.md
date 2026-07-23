@@ -96,11 +96,14 @@ uk_surfzone's key sweep) and keeps writing file_list.txt.
                         filter + dedupe + shrink guard (the source_mirror guards move here)
   rule fetch_item       processed sources only, one job per item; raw/<urlhash> not
                         raw/<index> so a list insertion stops mass-refetching later indices
-  rule prep_source      declared unpack + datum + normalize (processed) — no sniff routing
-  rule register         bounds.csv: local files (processed) | header reads with
-                        carry-forward + broken-product triage (raw)
-  catalog_item / polygon / publish   unchanged (catalog.json last; raw publishes objects)
+  rule prep_source      declared unpack + datum + normalize + catalog (processed) — no sniff
+                        routing; catalog.json is the declared output (phase 4)
+  rule register         header reads with carry-forward + broken-product triage, then catalog
+                        (raw); catalog.json is the declared output (phase 4)
+  polygon / publish     unchanged (catalog.json last; raw publishes objects)
   ```
+  (Phase 4 merged the separate `catalog_item` rule into `prep_source`/`register` and retired
+  `bounds.csv` into the item's `seascape:files` — see "Phase 4 — one registration artifact".)
 - `PREPPED`/`MIRRORED`/`STREAMED` wildcard-constraint lists derive from declarations.
 - Weekly cron = `-R enumerate` over list-enumerated sources; the cross-invocation
   checksum-curing behavior (refresh then catalogs/publish) is unchanged.
@@ -122,3 +125,56 @@ uk_surfzone's key sweep) and keeps writing file_list.txt.
 - Per-item incrementality inside prep (re-normalizing only new items of a listed processed
   source) is deliberately out of scope; the seam is items.txt diffing, noted for later.
 - catalog.json's `seascape:volatile` key renames with a fallback read during cutover.
+
+## Phase 4 — one registration artifact
+
+`bounds.csv` is retired: `catalog.json` absorbs the per-file rows and becomes each source's
+SINGLE registration artifact — the one file publish ordering vouches for, the one file a
+streamed preview fetches, the one currency marker.
+
+- **Shape.** The item gains `seascape:files`: a compact list of 7-element arrays
+  `[filename, left, bottom, right, top, width, height]` in exactly the retired bounds.csv
+  column order (bounds EPSG:3857, `filename` resolvable by `config.source_path`). Array-of-
+  arrays, not objects — S-102 carries ~4.3k rows. The column order is documented once in
+  `source_catalog.py`. `bbox` + `seascape:file_count` derive from these rows (antimeridian
+  union kept in `_bbox_and_count`), so the summary can't drift from the file list.
+- **Single reader.** `config.source_files(source)` returns the typed rows — the ONE reader
+  every consumer goes through (aggregation covering, `source_polygonize`, `source_check`,
+  and `source_mirror`'s carry-forward). It reads the item's `seascape:files`; when the item
+  exists but lacks the key (a published item from before this change) it falls back to the
+  sibling `bounds.csv`. That single fallback (`config._read_bounds_csv`) is delete-able once
+  every source has re-registered with the key.
+- **Merged rules.** The separate `catalog_item` rule is gone. Processed sources: `prep_source`
+  runs `source_prep.py && source_catalog.py --hash-recipe` and declares `catalog.json` as its
+  output — `source_catalog.scan_local_files` folds the old `source_bounds.py` scan in (module
+  deleted; its antimeridian + non-finite guards kept). Raw sources: `register` runs
+  `source_mirror.py && source_catalog.py --hash-recipe` and outputs `catalog.json` (+ the
+  mirror manifests). `recipe_files` is an input of both merged rules so a recipe edit restamps.
+- **Raw handoff.** Raw rows come from thousands of network header reads (with carry-forward)
+  that only `source_mirror` does — too expensive to recompute during catalog assembly, and the
+  two run as separate processes in one shell, so they can't share memory. `source_mirror`
+  writes the rows to a private, uncommitted `store/source/<id>/.rows.csv`; `source_catalog`
+  reads it and DELETES it in the same shell invocation, folding the rows into `seascape:files`.
+  (Rejected: `source_mirror` writing `catalog.json` itself — catalog assembly belongs to
+  `source_catalog`; and re-running `register()` inside `source_catalog` — it would repeat the
+  whole network sweep.) `catalog.json` is `update()`-marked on the `register` rule so
+  `source_mirror`'s carry-forward can read the PREVIOUS item before the rule rewrites it.
+- **Carry-forward.** `source_mirror`'s `_prev_files` reads the previous registration from the
+  previous `catalog.json`'s `seascape:files` (via `config.source_files`, so the legacy
+  bounds.csv fallback applies when the item predates phase 4).
+- **Streamed fetch.** `fetch_catalog` fetches only `catalog.json`; if the fetched item lacks
+  `seascape:files`, it also fetches the sibling `bounds.csv` (what `config.source_files` falls
+  back to). tmp+mv atomicity kept. Delete-able with the same fallback.
+- **Publish.** `publish.smk` stops PUTting `bounds.csv`; `catalog.json` (already last) is the
+  whole registration + currency marker. `bounds.csv` stays excluded on both rclone legs, so a
+  dead local copy is never pushed and R2's retired object is never swept. R2's existing
+  `bounds.csv` objects stay (harmless; sources.yml owns them).
+- **Store/local migration.** Local stores keep old `bounds.csv` files — they become dead
+  (never read once the item carries `seascape:files`, never cleaned up; no error on their
+  presence). The rule merge changes which rule PRODUCES `catalog.json` (was `catalog_item`,
+  now `prep_source`/`register`); on a warm store from a prior run, the first invocation may
+  need `--rerun-incomplete` (or `-R prep_source` / `-R register`) so Snakemake re-derives the
+  provenance under the new producing rule. Fresh runs need nothing special.
+- **Delete-able later.** `config._read_bounds_csv` + the `source_files` fallback branch; the
+  `fetch_catalog` `bounds.csv` fetch; and `source_mirror`'s legacy-bounds carry-forward — all
+  once every source has re-registered with `seascape:files`.

@@ -124,6 +124,43 @@ def source_property(source, name, default=None):
     return meta.get(name, default)
 
 
+def source_files(source):
+    """The per-file registration rows: (filename, left, bottom, right, top, width, height),
+    bounds in EPSG:3857 (the column order source_catalog documents). The SINGLE reader of a
+    source's file list — every consumer (covering, polygonize, check, mirror carry-forward)
+    goes through here. Reads the catalog item's ``seascape:files``; the item is a source's one
+    registration artifact.
+
+    Fallback (docs/plans/2026-07-23-declarative-sources.md): a catalog item published before
+    phase 4 has no ``seascape:files``, so read the sibling ``bounds.csv`` beside it. Delete the
+    fallback (and _read_bounds_csv) once every source has re-registered with an item that
+    carries the key."""
+    cat = load_catalog(source)
+    if cat is not None:
+        files = cat.get("properties", {}).get("seascape:files")
+        if files is not None:
+            return [(f[0], float(f[1]), float(f[2]), float(f[3]), float(f[4]),
+                     int(f[5]), int(f[6])) for f in files]
+    return _read_bounds_csv(source)
+
+
+def _read_bounds_csv(source):
+    """Fallback for source_files: parse a legacy store/source/<id>/bounds.csv into the same
+    typed rows. Delete with the source_files fallback branch."""
+    path = f"store/source/{source}/bounds.csv"
+    if not os.path.isfile(path):
+        return []
+    rows = []
+    with open(path) as f:
+        next(f, None)  # header
+        for line in f:
+            parts = line.rstrip("\n").split(",")
+            if len(parts) == 7:
+                rows.append((parts[0], float(parts[1]), float(parts[2]), float(parts[3]),
+                             float(parts[4]), int(parts[5]), int(parts[6])))
+    return rows
+
+
 def source_recipe_hash(source):
     """The content hash the source stage stamped into the catalog item (seascape:recipe_hash) —
     the per-source input the tile keys read. None locally (RECIPE_HASH is empty on a laptop) and
@@ -136,7 +173,8 @@ def source_recipe_hash(source):
 
 
 def source_path(source, filename):
-    """A bounds.csv ``filename`` resolved to a GDAL-openable path. Three forms:
+    """A registration ``filename`` (a seascape:files row's first field) resolved to a
+    GDAL-openable path. Three forms:
 
     1. The filename is already a full ``/vsi`` path (a streaming source like CUDEM,
        registered straight off a public bucket) — use it verbatim.
@@ -183,3 +221,46 @@ def items(source):
         return []
     with open(path) as f:
         return [l.strip() for l in f if l.strip()]
+
+
+def _check():
+    """Offline: source_files reads seascape:files from a catalog and types it (floats +
+    ints), and an item WITHOUT the key falls back to the sibling bounds.csv — the same
+    condition fetch_catalog's shell tests before also fetching bounds.csv."""
+    import shutil
+    import tempfile
+
+    d = tempfile.mkdtemp()
+    cwd = os.getcwd()
+    try:
+        os.chdir(d)
+        _catalog_cache.clear()
+        sid = "_config_files"
+        os.makedirs(f"store/source/{sid}")
+        with open(f"store/source/{sid}/catalog.json", "w") as f:
+            json.dump({"properties": {"seascape:files": [
+                ["a.tif", 0.0, 1.5, 2.0, 3.0, 10, 20]]}}, f)
+        rows = source_files(sid)
+        assert rows == [("a.tif", 0.0, 1.5, 2.0, 3.0, 10, 20)], rows
+        assert isinstance(rows[0][5], int) and isinstance(rows[0][1], float), rows
+
+        # A pre-phase-4 item (no seascape:files) falls back to the bounds.csv beside it.
+        sid2 = "_config_files_legacy"
+        os.makedirs(f"store/source/{sid2}")
+        with open(f"store/source/{sid2}/catalog.json", "w") as f:
+            json.dump({"properties": {}}, f)
+        with open(f"store/source/{sid2}/bounds.csv", "w") as f:
+            f.write("filename,left,bottom,right,top,width,height\n"
+                    "b.tif,1.0,2.0,3.0,4.0,5,6\n")
+        assert source_files(sid2) == [("b.tif", 1.0, 2.0, 3.0, 4.0, 5, 6)], source_files(sid2)
+        print("config.py self-check ok")
+    finally:
+        os.chdir(cwd)
+        _catalog_cache.clear()
+        shutil.rmtree(d, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    import sys
+    if sys.argv[1:2] == ["--check"]:
+        _check()

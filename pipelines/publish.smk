@@ -1,5 +1,6 @@
 # Per-source R2 publish rules. Ordering is the atomicity mechanism: artifacts, then
-# bounds.csv, then catalog.json LAST (the currency marker lands after what it vouches for).
+# catalog.json LAST — the source's single registration artifact + currency marker, landing
+# after everything it vouches for (bounds.csv is retired; R2's stale copies stay, harmless).
 
 DATA_PREFIX = config.get("data_prefix", "bathymetry")
 DEST = f"r2:$DATA_BUCKET/{DATA_PREFIX}"  # $DATA_BUCKET stays a shell env var (no braces)
@@ -13,9 +14,8 @@ PUBLISH_GUARD = (
 
 
 def publish_inputs(wc):
-    """bounds + catalog always; polygon (processed) or the objects stamp (raw)."""
-    ins = {"bounds": f"store/source/{wc.source}/bounds.csv",
-           "catalog": f"store/source/{wc.source}/catalog.json"}
+    """catalog always; polygon (processed) or the objects stamp (raw)."""
+    ins = {"catalog": f"store/source/{wc.source}/catalog.json"}
     if wc.source in RAW:
         ins["objects"] = f"store/meta/publish/{wc.source}.objects"
     else:
@@ -49,7 +49,8 @@ rule mirror_objects:
 
 
 # Push one source, catalog.json last. Processed: sync + footprint. Raw: copy, never
-# sync (objects/ under the prefix must never be swept).
+# sync (objects/ under the prefix must never be swept). bounds.csv stays excluded on both
+# legs, so a dead local copy is never pushed and R2's retired object is never deleted.
 rule publish_source:
     input:
         unpack(publish_inputs)
@@ -72,7 +73,6 @@ rule publish_source:
         '    rclone copyto "store/polygon/{wildcards.source}.gpkg" "{DEST}/polygon/{wildcards.source}.gpkg" --retries 5; '
         '  fi; '
         'fi; '
-        'rclone copyto "$src/bounds.csv" "$dest/bounds.csv" --retries 5; '
         'rclone copyto "$src/catalog.json" "$dest/catalog.json" --retries 5 ) 2> {log}'
 
 

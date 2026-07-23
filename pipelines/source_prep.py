@@ -233,8 +233,8 @@ def _stage_e00(raw, root, source, index, seen, origin):
 
 def _stage_netcdf(raw, root, url, seen, origin):
     """Translate a netCDF to a GeoTIFF, preserving the file's embedded CRS (no -a_srs) —
-    a mixed-CRS source keeps each file's zone. Named after the URL stem so bounds.csv stays
-    legible. A file with no embedded CRS is assigned EPSG:4326 (else source_bounds fails)."""
+    a mixed-CRS source keeps each file's zone. Named after the URL stem so the registration
+    stays legible. A file with no embedded CRS is assigned EPSG:4326 (else the catalog scan fails)."""
     import rasterio
     stem = url.rsplit("/", 1)[-1].rsplit(".", 1)[0]
     _claim(seen, f"{stem}.tif", origin)

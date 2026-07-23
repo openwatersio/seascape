@@ -6,12 +6,12 @@ Checks, in order:
   1. metadata.json carries name + license + producer + website (attribution basics).
   2. a datum note (metadata ``datum``) is present — an "unknown"/"unverified" value counts
      (the fact is recorded, even when it can't be pinned down), an absent one does not.
-  3. store/source/<id>/catalog.json exists, parses, and its bbox + file count agree with
-     bounds.csv recomputed via source_catalog._bbox_and_count.
-  4. every local bounds.csv row's file exists under store/source/<id>/, opens with rasterio,
-     and carries a CRS and a nodata value. Rows whose filename starts with ``objects/`` or
-     ``/vsi`` are remote (raw/streamed collections) and skip the on-disk raster checks —
-     their bytes live outside the store.
+  3. store/source/<id>/catalog.json exists, parses, and its bbox + file count agree with a
+     recompute from its seascape:files (config.source_files) via source_catalog._bbox_and_count.
+  4. every registered file (config.source_files) exists under store/source/<id>/, opens with
+     rasterio, and carries a CRS and a nodata value. Rows whose filename starts with
+     ``objects/`` or ``/vsi`` are remote (raw/streamed collections) and skip the on-disk raster
+     checks — their bytes live outside the store.
 
 Run from pipelines/:  uv run python source_check.py <source-id>
 """
@@ -51,24 +51,22 @@ def check(source):
     except json.JSONDecodeError as e:
         fail(source, f"catalog.json does not parse: {e}")
 
-    bbox, count = _bbox_and_count(source)
+    rows = config.source_files(source)
+    bbox, count = _bbox_and_count(rows)
     cat_bbox = catalog.get("bbox")
     if bbox != cat_bbox:
-        fail(source, f"catalog bbox {cat_bbox} disagrees with bounds.csv recompute {bbox}")
+        fail(source, f"catalog bbox {cat_bbox} disagrees with seascape:files recompute {bbox}")
     cat_count = catalog.get("properties", {}).get("seascape:file_count")
     if cat_count != count:
-        fail(source, f"catalog file_count {cat_count} disagrees with bounds.csv rows {count}")
+        fail(source, f"catalog file_count {cat_count} disagrees with seascape:files rows {count}")
 
-    with open(f"store/source/{source}/bounds.csv") as f:
-        rows = [l.strip() for l in f.readlines()[1:] if l.strip()]
     checked = 0
-    for row in rows:
-        filename = row.split(",")[0]
+    for filename, *_bounds in rows:
         if filename.startswith("objects/") or filename.startswith("/vsi"):
             continue  # remote object — not on disk to open
         path = f"store/source/{source}/{filename}"
         if not os.path.isfile(path):
-            fail(source, f"bounds.csv references {filename} but {path} is missing")
+            fail(source, f"seascape:files references {filename} but {path} is missing")
         with rasterio.open(path) as src:
             if src.crs is None:
                 fail(source, f"{filename} has no CRS")
@@ -110,7 +108,7 @@ def _check():
             json.dump({"name": "Synth", "license": "CC0 1.0", "producer": "Test Co",
                        "website": "https://x", "datum": "MSL (approx)", "crs": "EPSG:3857"}, f)
 
-        # One real raster tile at a known 3857 origin, and a bounds.csv row that matches it.
+        # One real raster tile at a known 3857 origin; its scanned rows become seascape:files.
         x = utils.X_MAX_3857 / 180.0
         transform = from_origin(0.0, 111325.14, x / 100, x / 100)  # ~ small cell
         tif = f"store/source/{sid}/a.tif"
@@ -122,49 +120,47 @@ def _check():
                 dst.write(np.full((10, 10), -5.0, dtype="float32"), 1)
 
         write_tif(tif, -9999.0)
-        # bounds.csv row must reproduce _bbox_and_count → build the catalog from it so they agree.
-        with rasterio.open(tif) as src:
-            b = src.bounds
-        with open(f"store/source/{sid}/bounds.csv", "w") as f:
-            f.write("filename,left,bottom,right,top,width,height\n"
-                    f"a.tif,{b.left},{b.bottom},{b.right},{b.top},10,10\n")
         with open(f"store/source/{sid}/datum.json", "w") as f:
             json.dump({"negate": False, "offset_m": 0.0, "clamp_positive": False}, f)
-        item = source_catalog.build_item(sid)
+        # The catalog embeds the scanned rows as seascape:files, so its bbox/count agree with
+        # the recompute source_files reads back.
+        item = source_catalog.build_item(sid, source_catalog.scan_local_files(sid))
         with open(f"store/source/{sid}/catalog.json", "w") as f:
             json.dump(item, f)
 
+        # load_catalog caches per (cwd, source); clear it before each mutated re-check so the
+        # check reads the catalog we just wrote (never a stale cache — a non-issue in
+        # production, where check runs once per process).
+        def rechecking_fails(match):
+            config._catalog_cache.clear()
+            try:
+                check(sid); assert False, f"expected {match!r} to fail"
+            except SystemExit as e:
+                assert match in str(e), e
+
+        config._catalog_cache.clear()
         check(sid)  # passes
 
         # (1) missing attribution field → hard error
         with open(f"sources/{sid}/metadata.json", "w") as f:
             json.dump({"name": "Synth", "license": "CC0 1.0", "producer": "Test Co",
                        "datum": "MSL"}, f)  # no website
-        try:
-            check(sid); assert False, "expected missing-website to fail"
-        except SystemExit as e:
-            assert "website" in str(e), e
+        rechecking_fails("website")
         with open(f"sources/{sid}/metadata.json", "w") as f:
             json.dump({"name": "Synth", "license": "CC0 1.0", "producer": "Test Co",
                        "website": "https://x", "datum": "MSL", "crs": "EPSG:3857"}, f)
 
-        # (2) catalog bbox disagreeing with bounds.csv → hard error
+        # (2) catalog bbox disagreeing with its seascape:files → hard error
         bad = dict(item); bad["bbox"] = [0, 0, 1, 1]
         with open(f"store/source/{sid}/catalog.json", "w") as f:
             json.dump(bad, f)
-        try:
-            check(sid); assert False, "expected bbox mismatch to fail"
-        except SystemExit as e:
-            assert "bbox" in str(e), e
+        rechecking_fails("bbox")
         with open(f"store/source/{sid}/catalog.json", "w") as f:
             json.dump(item, f)
 
         # (3) a raster with no nodata → hard error
         write_tif(tif, None)
-        try:
-            check(sid); assert False, "expected missing nodata to fail"
-        except SystemExit as e:
-            assert "nodata" in str(e), e
+        rechecking_fails("nodata")
         print("source_check.py self-check ok")
     finally:
         os.chdir(cwd)

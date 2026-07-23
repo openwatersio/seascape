@@ -57,8 +57,8 @@ def store_tree(store):
 
 
 def registration(store, sources_dir):
-    """A synthetic source registered through `cover`'s inputs (bounds + catalog) plus masks, so
-    the checkpoint is SCHEDULABLE cold and considered up-to-date once the covering is present."""
+    """A synthetic source registered through `cover`'s input (catalog.json) plus masks, so the
+    checkpoint is SCHEDULABLE cold and considered up-to-date once the covering is present."""
     os.makedirs(f"{store}/aggregation")
     os.makedirs(f"{store}/source/synth")
     os.makedirs(f"{store}/landmask")
@@ -69,8 +69,6 @@ def registration(store, sources_dir):
         f.write("")  # a source with no items — the enumerate checkpoint is a no-op…
     with open(f"{store}/source/synth/items.txt", "w") as f:
         f.write("")  # …and its output is present + up-to-date, so no enumerate job schedules
-    with open(f"{store}/source/synth/bounds.csv", "w") as f:
-        f.write("x\n")
     with open(f"{store}/source/synth/catalog.json", "w") as f:
         f.write('{"properties": {}}')
     for m in ("land.fgb", "water.fgb"):

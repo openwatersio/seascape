@@ -14,7 +14,7 @@ name: GC
 #     reads a covering from R2 any more).
 # NEVER touches: build/<sha>/ (an R2 lifecycle rule collects it after 7 days — see release.yml — and
 # releases live in the separate tiles bucket, so keeping build/<sha>/ out of GC scope is the
-# conservative choice), source COGs/bounds.csv/catalog.json (sources.yml owns them), the store
+# conservative choice), source COGs/catalog.json (sources.yml owns them), the store
 # manifests, or the pointer.
 #
 # Guards: refuse to delete anything unless the pointer AND every one of the last N manifests fetch

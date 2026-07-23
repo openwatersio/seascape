@@ -6,15 +6,18 @@ Enumeration (listing/filter/dedupe/shrink-guard) happens upstream in the enumera
 checkpoint; this module is the REGISTRATION half. It reads ``store/source/<id>/items.txt``
 (one fetchable object URL per line, all on one public bucket) and writes:
 
-- ``bounds.csv`` — one row per object, a **relative** ``objects/<upstream-key>`` filename
-  plus 3857 bounds and pixel dims (``config.source_path`` resolves it against the store;
-  upstream key paths preserved 1:1, so provenance stays readable and no rename logic exists);
+- ``.rows.csv`` — the per-object registration handoff (one row per object, a **relative**
+  ``objects/<upstream-key>`` filename plus 3857 bounds and pixel dims;
+  ``config.source_path`` resolves it against the store; upstream key paths preserved 1:1, so
+  provenance stays readable and no rename logic exists). source_catalog (run next in the same
+  shell) folds it into the catalog's ``seascape:files`` and deletes it — the catalog item is
+  the source's single registration artifact;
 - ``mirror.txt`` — the full HEALTHY upstream key list, one per line, for whatever process
   maintains the store's copy of those objects (always the FULL list, so a partial prior
   mirror self-heals on the next pass);
 - ``mirror-bucket.txt`` — the single bucket those keys live on.
 
-Incremental: a key already registered in the previous ``bounds.csv`` is carried forward with
+Incremental: a key already registered in the previous catalog's ``seascape:files`` is carried forward with
 **zero network reads**; only newly-listed keys get a header read — from the upstream URL, not
 the store, because a new object was listed seconds ago and may not be mirrored yet. A
 header-read failure is a hard error path, triaged below (carry the previous issue forward or
@@ -38,7 +41,7 @@ from rasterio.warp import transform_bounds
 
 import config
 from source_enumerate import _split_bucket_key, cell_key
-from source_remote import _prev_bounds, bounds_3857, to_vsicurl, wrap_antimeridian, write_bounds
+from source_remote import _prev_files, bounds_3857, to_vsicurl, wrap_antimeridian, write_rows
 
 # More listed-but-unreadable products than this aborts the registration — the carry-forward
 # tolerance must not quietly absorb a half-broken edition.
@@ -96,7 +99,7 @@ def read_header(bucket, key):
 
 
 def _upstream_key(filename):
-    """A previous bounds.csv filename -> its upstream key, for the removed-key diff. Handles
+    """A previous-registration filename -> its upstream key, for the removed-key diff. Handles
     both this module's relative ``objects/<key>`` rows and the absolute ``/vsicurl/https://…``
     rows the pre-mirror registration wrote, so the first run after cutover diffs honestly."""
     if filename.startswith("objects/"):
@@ -106,7 +109,7 @@ def _upstream_key(filename):
 
 
 def register(source, keys, header):
-    """bounds.csv + mirror.txt from the enumerated upstream keys.
+    """.rows.csv handoff + mirror.txt from the enumerated upstream keys.
 
     Carry-forward first: a key whose ``objects/<key>`` row is already registered keeps it
     verbatim — zero network reads, so a steady-state refresh touches ~tens of headers, not
@@ -123,7 +126,7 @@ def register(source, keys, header):
     by cell). Broken and carried keys stay OUT of mirror.txt — the object copier must never
     chase an upstream-deleted or empty object."""
     keys = sorted(set(keys))
-    prev = _prev_bounds(source)
+    prev = _prev_files(source)
     removed = sorted({_upstream_key(f) for f in prev} - set(keys))
     for key in removed:
         print(f"REMOVED upstream: {key} (was registered, no longer listed)")
@@ -188,7 +191,7 @@ def register(source, keys, header):
     os.makedirs(f"store/source/{source}", exist_ok=True)
     with open(f"store/source/{source}/mirror.txt", "w") as f:
         f.writelines(key + "\n" for key in sorted(healthy))
-    write_bounds(source, rows)
+    write_rows(source, rows)
     kept = len(keys) - len(todo)
     n_broken = len(todo) - read_ok if todo else 0
     print(f"{source}: {kept} carried forward, {read_ok} newly read, {n_broken} broken, "
@@ -217,31 +220,36 @@ def main():
 
 
 def _check():
+    import json
     import shutil
+
+    from source_remote import HANDOFF
+    config._catalog_cache.clear()
 
     # URL splitting + previous-filename normalization for the removed-key diff.
     assert _split_bucket_key("s3://b/k/t.tif") == ("b", "k/t.tif")
     assert _upstream_key("objects/dem/x.tif") == "dem/x.tif"
     assert _upstream_key("/vsicurl/https://noaa-s102-pds.s3.amazonaws.com/ed3.0.0/a.h5") == "ed3.0.0/a.h5"
 
-    # register(): carried-forward rows do ZERO network reads (the fake header fn records every
-    # call — same offline assertion pattern as source_remote), rows come out relative, and
-    # mirror.txt carries the FULL key list, not just new keys.
-    src = "_mirror_selfcheck"
-    shutil.rmtree(f"store/source/{src}", ignore_errors=True)
-    os.makedirs(f"store/source/{src}", exist_ok=True)
-    with open(f"store/source/{src}/bounds.csv", "w") as f:
-        f.write("filename,left,bottom,right,top,width,height\n"
-                "objects/dem/a.tif,1.0,2.0,3.0,4.0,10,20\n")
     reads = []
 
     def fake_header(key):
         reads.append(key)
         return (0.0, 0.0, 1.0, 1.0, 5, 5)
 
+    # register(): the carry-forward reads the PREVIOUS registration from the catalog's
+    # seascape:files (the retired bounds.csv's payload). A carried key does ZERO network reads
+    # (the fake header fn records every call), rows come out relative into the .rows.csv
+    # handoff, and mirror.txt carries the FULL key list, not just new keys.
+    src = "_mirror_selfcheck"
+    shutil.rmtree(f"store/source/{src}", ignore_errors=True)
+    os.makedirs(f"store/source/{src}", exist_ok=True)
+    with open(f"store/source/{src}/catalog.json", "w") as f:
+        json.dump({"properties": {"seascape:files": [
+            ["objects/dem/a.tif", 1.0, 2.0, 3.0, 4.0, 10, 20]]}}, f)
     register(src, ["dem/a.tif", "dem/b.tif"], fake_header)
     assert reads == ["dem/b.tif"], reads  # only the NEW key was read
-    with open(f"store/source/{src}/bounds.csv") as f:
+    with open(f"store/source/{src}/{HANDOFF}") as f:
         out = f.read().splitlines()
     assert out[1] == "objects/dem/a.tif,1.0,2.0,3.0,4.0,10,20", out  # carried verbatim
     assert out[2].startswith("objects/dem/b.tif,"), out              # relative path
@@ -249,15 +257,31 @@ def _check():
         assert f.read().splitlines() == ["dem/a.tif", "dem/b.tif"]
     shutil.rmtree(f"store/source/{src}")
 
+    # Legacy carry-forward: a source whose previous registration predates phase 4 has no
+    # catalog.json, only a bounds.csv — config.source_files falls back to it, so the carry-
+    # forward still does zero network reads on the already-registered key.
+    src_legacy = "_mirror_legacy"
+    shutil.rmtree(f"store/source/{src_legacy}", ignore_errors=True)
+    os.makedirs(f"store/source/{src_legacy}", exist_ok=True)
+    with open(f"store/source/{src_legacy}/bounds.csv", "w") as f:
+        f.write("filename,left,bottom,right,top,width,height\n"
+                "objects/dem/a.tif,1.0,2.0,3.0,4.0,10,20\n")
+    reads.clear()
+    register(src_legacy, ["dem/a.tif", "dem/b.tif"], fake_header)
+    assert reads == ["dem/b.tif"], reads  # legacy bounds.csv carried the old key with no read
+    with open(f"store/source/{src_legacy}/{HANDOFF}") as f:
+        assert "objects/dem/a.tif,1.0,2.0,3.0,4.0,10,20" in f.read()
+    shutil.rmtree(f"store/source/{src_legacy}")
+
     # Broken-product triage: a persistently-unreadable NEW issue carries the previous cell's
     # row forward (the mirror still holds its object) and stays out of mirror.txt; a broken
     # brand-new cell is dropped; more than BROKEN_TOLERANCE aborts.
     src2 = "_mirror_broken"
     shutil.rmtree(f"store/source/{src2}", ignore_errors=True)
     os.makedirs(f"store/source/{src2}", exist_ok=True)
-    with open(f"store/source/{src2}/bounds.csv", "w") as f:
-        f.write("filename,left,bottom,right,top,width,height\n"
-                "objects/p/102US005AAAAA111111.h5,1.0,2.0,3.0,4.0,10,20\n")
+    with open(f"store/source/{src2}/catalog.json", "w") as f:
+        json.dump({"properties": {"seascape:files": [
+            ["objects/p/102US005AAAAA111111.h5", 1.0, 2.0, 3.0, 4.0, 10, 20]]}}, f)
 
     def broken_header(key):
         if "BROKEN" in key or "NEWCEL" in key:
@@ -268,7 +292,7 @@ def _check():
                     "p/102US005NEWCLNEWCEL.h5",    # broken new cell → dropped
                     "p/102US005CCCCC222222.h5"],   # healthy new
              broken_header)
-    with open(f"store/source/{src2}/bounds.csv") as f:
+    with open(f"store/source/{src2}/{HANDOFF}") as f:
         out2 = f.read()
     assert "objects/p/102US005AAAAA111111.h5,1.0,2.0,3.0,4.0,10,20" in out2, \
         "broken re-issue must carry the previous cell's row"

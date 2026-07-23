@@ -27,8 +27,8 @@ LISTED = [s for s in ALL_SOURCES if "filter" in pipeline_config.load_metadata(s)
 
 # ── streaming ("source access resolves per source, local wins") ──────────────────────
 # --config stream=1 (laptop preview): a source with no local prep evidence
-# (store/source/<id>/raw/) fetches its published registration (bounds.csv +
-# catalog.json) from R2 instead of prepping, and its COGs stream via SOURCE_VSI_BASE.
+# (store/source/<id>/raw/) fetches its published catalog.json (the whole registration) from
+# R2 instead of prepping, and its COGs stream via SOURCE_VSI_BASE.
 # A locally-prepped source keeps its prep rules — local wins. Off (the box, the
 # sources workflow): STREAMED is empty and nothing changes.
 STREAM_BASE = config.get("stream_base", "https://data.openwaters.io/bathymetry/source")
@@ -95,14 +95,17 @@ rule fetch_item:
         "{PY}/source_fetch.py {wildcards.source} {wildcards.hash} 2> {log}"
 
 
-# Stage → datum → normalize → bounds, one job per source.
+# Stage → datum → normalize → register, one job per source. source_catalog scans the
+# normalized COGs into the item's seascape:files, so catalog.json is the SINGLE registration
+# artifact (the separate bounds/catalog steps collapsed into this one).
 rule prep_source:
     input:
         raw_assets,
         metadata=str(SOURCES_DIR / "{source}/metadata.json"),
+        recipe=recipe_files,  # everything --hash-recipe hashes, so any recipe edit restamps
     output:
-        # staged tif names aren't knowable at parse; bounds.csv is the declared artifact
-        "store/source/{source}/bounds.csv"
+        # staged tif names aren't knowable at parse; catalog.json is the declared artifact
+        "store/source/{source}/catalog.json"
     wildcard_constraints:
         source=pat(LOCAL_PROCESSED)
     priority: source_priority
@@ -113,7 +116,8 @@ rule prep_source:
     log:
         f"{TMP}/logs/prep/{{source}}.log"
     shell:
-        "( {PY}/source_prep.py {wildcards.source} && {PY}/source_bounds.py {wildcards.source} ) 2> {log}"
+        "( {PY}/source_prep.py {wildcards.source} && "
+        "{PY}/source_catalog.py {wildcards.source} --hash-recipe ) 2> {log}"
 
 
 # The weekly forced source refresh — run as its OWN invocation before catalogs/publish:
@@ -129,22 +133,25 @@ rule prep_source:
 # barrier. Objects stay additive and land before catalog.json, so cross-boundary atomicity holds.
 rule refresh:
     input:
-        expand("store/source/{source}/bounds.csv", source=LOCAL_LISTED),
+        expand("store/source/{source}/catalog.json", source=LOCAL_LISTED),
         expand("store/meta/publish/{source}.objects",
                source=[s for s in LOCAL_LISTED if s in RAW]),
 
 
 # Raw collections register objects/<key> rows off the public bucket, reading the
-# enumerate checkpoint's items.txt. Re-listing on cadence is the enumerate checkpoint's job
-# (the weekly workflow runs `refresh -R enumerate`); this step just materializes bounds.csv +
-# the mirror manifests from whatever items.txt currently holds.
+# enumerate checkpoint's items.txt. source_mirror header-reads (with carry-forward) into the
+# .rows.csv handoff, then source_catalog folds it into catalog.json — the SINGLE registration
+# artifact. Re-listing on cadence is the enumerate checkpoint's job (the weekly workflow runs
+# `refresh -R enumerate`); this step just materializes the registration from items.txt.
 rule register:
     input:
         "store/source/{source}/items.txt",
+        recipe=recipe_files,  # any recipe edit restamps the item's hash
     output:
-        # Use `update` to keep the previous bounds in place. mirror.txt/mirror-bucket.txt keep
-        # their names — they're the object-copy store contract, out of scope to rename.
-        bounds=update("store/source/{source}/bounds.csv"),
+        # `update` keeps the previous catalog.json in place so source_mirror can carry forward
+        # its seascape:files without a full re-read. mirror.txt/mirror-bucket.txt keep their
+        # names — they're the object-copy store contract, out of scope to rename.
+        catalog=update("store/source/{source}/catalog.json"),
         mirror="store/source/{source}/mirror.txt",
         bucket="store/source/{source}/mirror-bucket.txt",
     wildcard_constraints:
@@ -162,12 +169,13 @@ rule register:
     log:
         f"{TMP}/logs/register/{{source}}.log"
     shell:
-        "{PY}/source_mirror.py {wildcards.source} 2> {log}"
+        "( {PY}/source_mirror.py {wildcards.source} && "
+        "{PY}/source_catalog.py {wildcards.source} --hash-recipe ) 2> {log}"
 
 
 rule polygon:
     input:
-        "store/source/{source}/bounds.csv",
+        "store/source/{source}/catalog.json",
     output:
         "store/polygon/{source}.gpkg"
     wildcard_constraints:
@@ -179,27 +187,14 @@ rule polygon:
         "{PY}/source_polygonize.py {wildcards.source} {threads} 2> {log}"
 
 
-# catalog.json: the per-source currency signal, last in every source's chain.
-rule catalog_item:
-    input:
-        "store/source/{source}/bounds.csv",
-        recipe=recipe_files,  # everything --hash-recipe hashes, so any recipe edit restamps
-    output:
-        "store/source/{source}/catalog.json"
-    wildcard_constraints:
-        source=pat(LOCAL_PROCESSED + LOCAL_RAW)
-    log:
-        f"{TMP}/logs/catalog_item/{{source}}.log"
-    shell:
-        "{PY}/source_catalog.py {wildcards.source} --hash-recipe 2> {log}"
-
-
 # The streamed half of the catalogs invocation (--config stream=1): fetch a not-locally-
-# prepped source's published registration. Absent-only (engine: outputs exist ⇒ done);
-# -R fetch_catalog refreshes. tmp+mv so a 404 never leaves a truncated file.
+# prepped source's published catalog.json — the whole registration. Absent-only (engine:
+# outputs exist ⇒ done); -R fetch_catalog refreshes. tmp+mv so a 404 never leaves a truncated
+# file. Fallback: a published item from before phase 4 has no seascape:files, so ALSO fetch
+# the sibling bounds.csv that config.source_files falls back to (drop when every source has
+# re-registered — mirrors the config.source_files fallback, self-checked there).
 rule fetch_catalog:
     output:
-        bounds="store/source/{source}/bounds.csv",
         catalog="store/source/{source}/catalog.json",
     wildcard_constraints:
         source=pat(STREAMED)
@@ -207,11 +202,11 @@ rule fetch_catalog:
     log:
         f"{TMP}/logs/fetch_catalog/{{source}}.log"
     shell:
-        "((curl -fsS {STREAM_BASE}/{wildcards.source}/bounds.csv -o {output.bounds}.tmp && "
-        "mv {output.bounds}.tmp {output.bounds} && "
-        "curl -fsS {STREAM_BASE}/{wildcards.source}/catalog.json -o {output.catalog}.tmp && "
-        "mv {output.catalog}.tmp {output.catalog}) || "
-        "{{ rm -f {output.bounds}.tmp {output.catalog}.tmp; exit 1; }}) 2> {log}"
+        "( set -e; c={output.catalog}; b=store/source/{wildcards.source}/bounds.csv; "
+        "curl -fsS {STREAM_BASE}/{wildcards.source}/catalog.json -o $c.tmp && mv $c.tmp $c; "
+        "if ! grep -q '\"seascape:files\"' $c; then "
+        "  curl -fsS {STREAM_BASE}/{wildcards.source}/bounds.csv -o $b.tmp && mv $b.tmp $b; "
+        "fi ) 2> {log} || {{ rm -f {output.catalog}.tmp store/source/{wildcards.source}/bounds.csv.tmp; exit 1; }}"
 
 
 # Masks rebuild only when forced (-R landmask): pinned snapshot/release ⇒ no data drift.
@@ -253,7 +248,6 @@ rule watermask:
 # rule's — only the `checkpoint` keyword differs.
 checkpoint cover:
     input:
-        expand("store/source/{source}/bounds.csv", source=PROCESSED + RAW),
         expand("store/source/{source}/catalog.json", source=PROCESSED + RAW),
     output:
         "store/aggregation/covering.txt"
@@ -269,9 +263,8 @@ checkpoint cover:
 rule coverage:
     input:
         expand("store/polygon/{source}.gpkg", source=PROCESSED),
-        expand("store/source/{source}/bounds.csv", source=PROCESSED + RAW),
         expand("store/source/{source}/catalog.json", source=PROCESSED + RAW),
-        "store/aggregation/covering.txt",  # sequencing only; coverage reads footprints + bounds
+        "store/aggregation/covering.txt",  # sequencing only; coverage reads footprints + catalogs
     output:
         "store/bundle/coverage.pmtiles"
     log:

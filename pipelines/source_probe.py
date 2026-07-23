@@ -82,7 +82,7 @@ def probe(vsi):
         mx = float(valid.max()) if valid.size else None
         mean = float(valid.mean()) if valid.size else None
         left, bottom, right, top = transform_bounds(src.crs, "EPSG:3857", *src.bounds)
-        if right - left > 0.9 * 2 * utils.X_MAX_3857:  # antimeridian flip (see source_bounds)
+        if right - left > 0.9 * 2 * utils.X_MAX_3857:  # antimeridian flip (see source_remote)
             left, right = right, left
         resolutions = get_mercator_resolutions(0, 24)
         native_z = get_smallest_overzoom(left, bottom, right, top, src.width, src.height, resolutions)
