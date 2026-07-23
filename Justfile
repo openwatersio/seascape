@@ -19,8 +19,8 @@ watermask:
     uv run python landmask.py prep-water
 
 # Regional preview: sources streamed from R2 (a locally-prepped source wins), the whole
-# cartographic chain into store/bundle, then seed the local Worker. Depth areas are skipped
-# by default (their dense-tile tail is unbounded); SKIP_DEPARE= re-enables them.
+# cartographic chain (depth areas included) into store/bundle, then seed the local Worker.
+# SKIP_DEPARE=1 opts out of the (now-bounded) depare fork if you only need the raster preview.
 preview bbox="-74.30,40.40,-73.75,40.80":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -28,7 +28,6 @@ preview bbox="-74.30,40.40,-73.75,40.80":
     export SOURCE_VSI_BASE="${SOURCE_VSI_BASE:-/vsicurl/https://data.openwaters.io/bathymetry/source}"
     export LANDMASK="${LANDMASK:-/vsicurl/https://data.openwaters.io/bathymetry/landmask/land.fgb}"
     export WATERMASK="${WATERMASK:-/vsicurl/https://data.openwaters.io/bathymetry/landmask/water.fgb}"
-    export SKIP_DEPARE="${SKIP_DEPARE-1}"
     # One invocation: the `cover` checkpoint runs inside the bundles build (streamed sources),
     # then the DAG re-evaluates into the per-stem mosaic/fork/terrain jobs.
     uv run snakemake -s ../Snakefile bundles --config stream=1 --cores 8
