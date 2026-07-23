@@ -16,6 +16,11 @@ checkpoint that gates stage 2/3 (``snakemake bundles``) — and asserts:
   - a CONTOUR_LEVELS change reruns contour_tile + the vector bundle but ZERO
     mosaic_tile and ZERO terrain_render (the stage split's payoff — no re-merge,
     no re-render — proven by a dry run's rerun table);
+  - the vector bundle is ONE variable-depth run: contours + soundings + depare fold
+    into a single sparse vector.pmtiles (no separate soundings/depare archives), and
+    its self-check invariants hold (no depare below z6, no contour below its tier
+    minzoom, depare m-bands disjoint, soundings present); the manifest carries
+    vector.max_zoom = the covering's max child_z (the Worker's serving depth);
   - scope transitions: a bbox build re-merges nothing, and the next planet build
     heals the bbox-truncated forks (input-set trigger) and rebuilds every
     scope-stamped aggregate (params trigger) — regional artifacts never survive;
@@ -126,6 +131,17 @@ def decode_bundles(tmp):
     return by_zoom
 
 
+def _pm_tiles(path):
+    """{zoom: [(x, y), ...]} present in a pmtiles archive (its directory IS the availability index —
+    a sparse variable-depth archive has gaps by design)."""
+    from pmtiles.reader import Reader, MmapSource, all_tiles
+    byz = {}
+    with open(path, "r+b") as f:
+        for (z, x, y), _ in all_tiles(Reader(MmapSource(f)).get_bytes):
+            byz.setdefault(z, []).append((x, y))
+    return byz
+
+
 def _job_counts(dry_stdout):
     """Parse snakemake's dry-run job table into {rule: count}. Rows look like ``rule_name   N``
     under a ``job      count`` header."""
@@ -203,6 +219,119 @@ def check_pmtiles_reproducible():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def check_vector_selfcheck():
+    """_vector_selfcheck is the completeness guard the sparse variable-depth bundle relies on to
+    prove no chart content was dropped. PROVE it can actually detect drops: build tiny archives with
+    the (patched) tippecanoe and assert it RAISES on each failure mode — a dropped contour, a dropped
+    sounding, a depare gap (missing polygon leaving a partition hole), an overlapping depare pair, and
+    specifically a dropped drval1==0 band (guards the `drval1 or -1` bug from regressing) — and that a
+    correct archive passes. Each negative RED-fails without the fix and GREEN-passes with it."""
+    import mercantile
+    sys.path.insert(0, PIPE)
+    import contour_run as cr
+    tmp = tempfile.mkdtemp()
+
+    # Plain tiling (every zoom materialized) makes these fixtures deterministic — the completeness
+    # mechanism (id survival) is agnostic to how a tile subdivided, and a real variable-depth joint
+    # run is exercised end-to-end by main()'s bundle_stable. (A sparse synthetic archive leafs above
+    # a depare feature's minzoom and never emits it — realistic only at production density.)
+    def build(layers, maxz):
+        vec = f"{tmp}/v.pmtiles"
+        cmd = ["tippecanoe", "-o", vec, "-f", "-Z", "0", "-z", str(maxz), "-P", "-q",
+               "--no-tile-size-limit", "--detect-shared-borders"]
+        for name, feats in layers:
+            seq = f"{tmp}/{name}.geojsons"
+            with open(seq, "w") as f:
+                f.write("\n".join(json.dumps(x) for x in feats))
+            cmd += ["-L", f"{name}:{seq}"]
+        subprocess.run(cmd, check=True, capture_output=True)
+        return vec
+
+    def feat(fid, geom, props, mn=0, mx=None):
+        tc = {"minzoom": mn}
+        if mx is not None:
+            tc["maxzoom"] = mx
+        return {"type": "Feature", "id": fid, "tippecanoe": tc, "properties": props, "geometry": geom}
+
+    def line(cs):
+        return {"type": "LineString", "coordinates": cs}
+
+    def pt(xy):
+        return {"type": "Point", "coordinates": xy}
+
+    def square(x0, y0, s):
+        return {"type": "Polygon", "coordinates": [[[x0, y0], [x0 + s, y0], [x0 + s, y0 + s],
+                                                    [x0, y0 + s], [x0, y0]]]}
+
+    def must_raise(vec, maxz, expected, needle, label):
+        try:
+            cr._vector_selfcheck(vec, maxz, expected)
+        except SystemExit as e:
+            assert needle in str(e), f"{label}: raised but not for '{needle}':\n{e}"
+            return
+        raise AssertionError(f"{label}: _vector_selfcheck did NOT raise (expected '{needle}')")
+
+    try:
+        # ── base 3-layer archive: big features well above the leaf-pixel floor, all present ──
+        contours = [feat(1, line([[0.0, 0.0], [0.1, 0.05]]), {"depth_m": -4000, "sys": "m"}),
+                    feat(2, line([[0.0, 0.1], [0.1, 0.15]]), {"depth_m": -4000, "sys": "m"})]
+        soundings = [feat(3, pt([0.02, 0.02]), {"depth_m": 5}),
+                     feat(4, pt([0.05, 0.12]), {"depth_m": 9})]
+        depare = [feat(5, square(0.0, 0.0, 0.05), {"sys": "m", "drval1": 5}, mn=6),
+                  feat(6, square(0.2, 0.2, 0.05), {"sys": "m", "drval1": 10}, mn=6)]
+        vec = build([("contours", contours), ("soundings", soundings), ("depare", depare)], 8)
+        expected = {"contours": {1: "contour sys=m depth_m=-4000", 2: "contour sys=m depth_m=-4000"},
+                    "soundings": {3: "sounding depth=5", 4: "sounding depth=9"},
+                    "depare": {5: "depare drval1=5", 6: "depare drval1=10"}}
+        cr._vector_selfcheck(vec, 8, expected)  # POSITIVE: a correct archive must pass
+        print("  positive: correct 3-layer archive passes")
+
+        # (a) dropped contour — an expected id present in no tile
+        must_raise(vec, 8, {**expected, "contours": {**expected["contours"], 9991: "contour sys=m depth_m=-30"}},
+                   "contours", "dropped contour")
+        # (b) dropped sounding
+        must_raise(vec, 8, {**expected, "soundings": {**expected["soundings"], 9992: "sounding depth=13"}},
+                   "soundings", "dropped sounding")
+        print("  (a) dropped contour and (b) dropped sounding both caught by completeness")
+
+        # (d) overlapping depare pair (two m-bands, ~50% overlap in one tile)
+        snd = [feat(3, pt([0.5, 0.5]), {"depth_m": 5})]
+        over = [feat(1, square(0.4, 0.4, 0.1), {"sys": "m", "drval1": 5}, mn=6),
+                feat(2, square(0.45, 0.45, 0.1), {"sys": "m", "drval1": 10}, mn=6)]
+        vov = build([("soundings", snd), ("depare", over)], 8)
+        must_raise(vov, 8, None, "overlap", "overlapping depare pair")
+        # (e) dropped drval1==0 band — the 0-band must participate in the partition check
+        # (with the `drval1 or -1` bug it was excluded, so this overlap went undetected → no raise)
+        zero = [feat(1, square(0.4, 0.4, 0.1), {"sys": "m", "drval1": 0}, mn=6),
+                feat(2, square(0.45, 0.45, 0.1), {"sys": "m", "drval1": 5}, mn=6)]
+        vz = build([("soundings", snd), ("depare", zero)], 8)
+        must_raise(vz, 8, None, "overlap", "drval1==0 band in partition check")
+        print("  (d) overlapping depare pair and (e) drval1==0 band both caught by the overlap check")
+
+        # (c) missing depare polygon leaving a gap: a right-half band capped at z6 (present at the
+        # parent, gone at its 4 z7 children) shrinks the partition deeper → the gap check fires.
+        T = mercantile.tile(1.0, 1.0, 6)
+        b = mercantile.bounds(T)
+        eps = (b.east - b.west) * 0.02
+        midx = (b.west + b.east) / 2
+
+        def half(x0, x1):
+            return {"type": "Polygon", "coordinates": [[[x0 + eps, b.south + eps], [x1 - eps, b.south + eps],
+                    [x1 - eps, b.north - eps], [x0 + eps, b.north - eps], [x0 + eps, b.south + eps]]]}
+        gdepare = [feat(1, half(b.west, midx), {"sys": "m", "drval1": 5}, mn=6),
+                   feat(2, half(midx, b.east), {"sys": "m", "drval1": 10}, mn=6, mx=6)]
+        gsnd = [feat(10 + i, pt([(mercantile.bounds(ch).west + mercantile.bounds(ch).east) / 2,
+                                 (mercantile.bounds(ch).south + mercantile.bounds(ch).north) / 2]),
+                     {"depth_m": 5})
+                for i, ch in enumerate(mercantile.children(T))]
+        vgap = build([("soundings", gsnd), ("depare", gdepare)], 7)
+        must_raise(vgap, 7, None, "gap", "depare partition gap")
+        print("  (c) depare partition gap caught by the down-zoom area check")
+        print("vector self-check negative tests ok — every drop mode raises; a correct archive passes")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     tmp = tempfile.mkdtemp()
     try:
@@ -233,7 +362,31 @@ def main():
         assert os.path.exists(f"{tmp}/store/bundle/planet.pmtiles"), "missing planet.pmtiles"
         overlays = glob(f"{tmp}/store/bundle/overlay-*.pmtiles")
         assert overlays, "the z11 fine tiles must produce at least one overlay archive"
-        assert os.path.exists(f"{tmp}/store/bundle/vector.pmtiles"), "missing vector.pmtiles"
+        vec = f"{tmp}/store/bundle/vector.pmtiles"
+        assert os.path.exists(vec), "missing vector.pmtiles"
+        # soundings/depare are NOT separate archives — the one joint run folds them into vector.pmtiles.
+        for gone in ("soundings.pmtiles", "depare.pmtiles"):
+            assert not os.path.exists(f"{tmp}/store/bundle/{gone}"), \
+                f"{gone} must not exist as a separate archive (folded into vector.pmtiles)"
+
+        # ── the joint variable-depth run's safety invariants (Verification 3,4,5): one archive,
+        # three layers, all zoom gating per-feature. _vector_selfcheck asserts no depare below z6,
+        # no contour below its tier minzoom, depare m-bands disjoint, soundings present — it ran
+        # in-build; re-run it here so the test OWNS the invariant, not just the build. ──
+        sys.path.insert(0, PIPE)
+        import contour_run
+        maxz = contour_run._stems_maxz(stems)
+        layers = set()
+        for z in (max(child_zs), 6, 5):  # leaf zoom, the depare floor, just below it
+            for x, y in _pm_tiles(vec).get(z, [])[:4]:
+                layers |= set(contour_run._decode_tile(vec, z, x, y))
+                if z < 6:
+                    assert "depare" not in contour_run._decode_tile(vec, z, x, y), \
+                        f"depare must not appear below z6 (z{z} {x}/{y})"
+        assert {"contours", "soundings", "depare"} <= layers, \
+            f"the joint run must carry all three layers: {sorted(layers)}"
+        contour_run._vector_selfcheck(vec, maxz)  # raises SystemExit on any invariant violation
+        print(f"vector joint-run ok — one sparse archive, layers {sorted(layers)}, self-check passed")
 
         by_zoom = decode_bundles(tmp)
         assert by_zoom, "no tiles in any terrain bundle"
@@ -283,7 +436,7 @@ def main():
         # input-set trigger — and rebuild every scope-stamped aggregate.
         assert counts.get("contour_tile", 0) == 4, f"planet must re-fork the 4 bbox-truncated stems: {counts}"
         assert counts.get("soundings_tile", 0) == 4, f"soundings heal too: {counts}"
-        for agg in ("mosaic_index", "soundings_bundle", "vector_bundle", "terrain_planet_bundle"):
+        for agg in ("mosaic_index", "vector_bundle", "terrain_planet_bundle"):
             assert counts.get(agg, 0) == 1, f"{agg} must rebuild after a scope change: {counts}"
         snake(tmp, "-c", "4", "bundles")  # restore planet-scoped products for the checks below
         print("scope-transition ok — bbox->planet re-merges nothing, heals 4 truncated forks, "
@@ -297,15 +450,21 @@ def main():
             [sys.executable, "-c",
              f"import sys, json; sys.path.insert(0, {PIPE!r}); import bundle\n"
              "up, mp = bundle.stage_build()\n"
-             "print(json.dumps({'uploads': up, 'cells': sorted(json.load(open(mp))['overlay']['cells'])}))"],
+             "m = json.load(open(mp))\n"
+             "print(json.dumps({'uploads': up, 'cells': sorted(m['overlay']['cells']), "
+             "'vector_max_zoom': m['vector']['max_zoom']}))"],
             cwd=tmp, env=_base_env(tmp, {"SOURCES_DIR": "sources"}), capture_output=True, text=True)
         assert proc.returncode == 0, f"stage_build failed:\n{proc.stdout}\n{proc.stderr}"
         staged = json.loads(proc.stdout.splitlines()[-1])
         assert "9-99-99" not in staged["cells"], f"stale cell advertised: {staged['cells']}"
         assert not any("9-99-99" in u for u in staged["uploads"]), "stale overlay staged for upload"
         assert "stale" in proc.stdout, "staging must report the ignored stale file"
+        # the manifest carries the Worker's vector serving depth = the covering's max child_z (11)
+        assert staged["vector_max_zoom"] == max(child_zs), \
+            f"manifest vector.max_zoom must be the covering max child_z {max(child_zs)}: {staged['vector_max_zoom']}"
         os.remove(stale_path)
-        print("staging-inventory ok — stale overlay excluded from uploads + manifest")
+        print("staging-inventory ok — stale overlay excluded; manifest carries "
+              f"vector.max_zoom={staged['vector_max_zoom']}")
 
         # ── the hole-free gate: a missing per-tile fork output makes --stable bundle refuse ──
         victim = sorted(glob(f"{tmp}/store/contour/*.fgb"))[0]
@@ -329,4 +488,5 @@ if __name__ == "__main__":
     depare_run._check()
     check_priority()
     check_pmtiles_reproducible()
+    check_vector_selfcheck()
     main()

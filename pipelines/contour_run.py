@@ -19,8 +19,10 @@ it hid GEBCO above z9 — not worth losing GEBCO at high zoom. Smoothing is the
 real seam mitigation.)
 """
 
+import collections
 import json
 import os
+import re
 import shutil
 import tempfile
 import subprocess
@@ -218,42 +220,22 @@ CONTOUR_TIERS = [
 ]
 
 
-def _per_zoom_filter():
-    """tippecanoe's -j filter (exclusive $zoom bands). Metre isobaths (sys=m) keep the hand-picked
-    CONTOUR_TIERS per zoom. Feet/fathom isobaths (sys=ft) mirror that thinning by depth — at each
-    zoom they show only curves at least as deep as the shallowest metre curve shown, so deep
-    fathom curves drop out at low zoom like the metre deep ones. Native+ zoom shows every curve."""
-    bands, lo = [], 0
+def contour_minzoom(sys_tag, depth_m):
+    """Per-curve tippecanoe.minzoom: the first CONTOUR_TIERS band that shows the curve (native+ if
+    none). The leaf-safe replacement for the old -j $zoom PER_ZOOM_FILTER — a variable-depth leaf
+    freezes at its own zoom, so zoom gating must ride each feature, not the $zoom expression. Metre
+    isobaths match a tier's hand-picked levels; feet/fathom curves mirror by depth (shown once at
+    least as deep as the shallowest metre curve the band shows)."""
+    lo = 0
     for hi, depths in CONTOUR_TIERS:
-        min_abs = min(-d for d in depths)  # shallowest metre curve shown in this band
-        # Both bands test depth_m (gdal_contour's Real attribute): -j comparisons are
-        # type-strict, and the enriched int columns (depth_abs_m et al.) reach the filter
-        # as strings via the FlatGeobuf Integer64 path — a numeric test on them matches
-        # nothing, which silently dropped every ft curve below native zoom.
-        bands.append(["all", [">=", "$zoom", lo], ["<", "$zoom", hi], ["==", "sys", "m"], ["in", "depth_m", *depths]])
-        bands.append(["all", [">=", "$zoom", lo], ["<", "$zoom", hi], ["==", "sys", "ft"], ["<=", "depth_m", -min_abs]])
+        if sys_tag == "m":
+            shown = round(depth_m) in depths
+        else:  # ft: at least as deep as the shallowest metre curve shown in this band
+            shown = depth_m <= -min(-d for d in depths)
+        if shown:
+            return lo
         lo = hi
-    bands.append(["all", [">=", "$zoom", lo]])  # native+ zoom: every curve, both systems
-    return json.dumps({"*": ["any", *bands]})
-
-
-PER_ZOOM_FILTER = _per_zoom_filter()
-
-
-def _tippecanoe(fgbs, minz, maxz, out):
-    with utils.log_group(f"contour tippecanoe ({len(fgbs)} inputs, z{minz}-{maxz})"):
-        utils.run_monitored(
-            ["tippecanoe", "-o", out, "-f", "-l", "contours",
-             "-n", "Bathymetric contours", "-A", utils.ATTRIBUTION,
-             "-Z", str(minz), "-z", str(maxz), "-P", "-q", "--drop-densest-as-needed",
-             # Aggressive low-zoom vertex thinning (tolerance scales with zoom distance from
-             # maxz, so maxz detail is untouched). Env-tunable to dial on a re-bundle.
-             "--simplification", os.environ.get("CONTOUR_SIMPLIFICATION", "8"),
-             "-y", "depth_m", "-y", "depth_abs_m", "-y", "sys", "-y", "depth_ft", "-y", "depth_fm",
-             # FlatGeobuf Integer64 attributes otherwise land in the MVT as strings.
-             "-T", "depth_abs_m:int", "-T", "depth_ft:int", "-T", "depth_fm:int",
-             "-j", PER_ZOOM_FILTER, *fgbs],
-            "contour tippecanoe", out)
+    return lo  # native+ band ([lo, inf)); lo is the last tier ceiling
 
 
 def _stems_maxz(stems):
@@ -261,11 +243,11 @@ def _stems_maxz(stems):
     return max(int(s.rsplit("-", 1)[1]) for s in stems)
 
 
-def bundle_maxz_stable(own_max):
-    """The shared tileset maxzoom every vector layer bundles to (contours/soundings/depare
-    tile-join into one vector.pmtiles): the covering's max child_z (so they tile to the same depth and
-    tile-join cleanly), else the caller's own files' max. The covering is always present
-    (Snakemake refuses to run without it), so there is no None fallback."""
+def _vector_maxz(own_max):
+    """The single run's -z: the covering's max child_z (native depth), so a variable-depth leaf can
+    reach it, else the caller's own inputs' max. The covering is always present (Snakemake refuses
+    to run without it). Replaces the old shared bundle_maxz — one joint run, not a shared tile-join
+    maxzoom across three separately-tiled layers."""
     import mosaic
     return max(own_max, _stems_maxz(mosaic.covering_stems()))
 
@@ -352,28 +334,6 @@ def coverage_bundle():
     print(f"coverage bundle: {out} (z0-{COVERAGE_MAX_ZOOM})")
 
 
-def _finalize_contours(archives, out):
-    """tile-join the contour lines pmtiles + the soundings/depare pmtiles (bundled first)
-    into store/bundle/vector.pmtiles. ONE join: tile-join rewrites every tile of the whole
-    archive, so folding each sparse layer in afterwards re-paid the planet-wide join
-    per layer (~90 min each). -pk keeps every feature of every layer. Layers join by
-    CONFIGURATION, never by disk state: soundings always, depare only when SKIP_DEPARE is
-    unset — a stale depare.pmtiles on the store can't leak into the product, and an enabled
-    layer whose bundle is missing fails loudly. Coverage is its own tileset (coverage_bundle),
-    not a layer here. Drying is not its own layer; it folds into `depare` (a DEPARE band with
-    negative drval1)."""
-    layers = ["store/bundle/soundings.pmtiles"]
-    if not os.environ.get("SKIP_DEPARE"):
-        layers.append("store/bundle/depare.pmtiles")
-    missing = [p for p in layers if not os.path.isfile(p)]
-    if missing:
-        raise SystemExit(f"vector join: required layer bundle(s) missing: {', '.join(missing)}")
-    with utils.log_group(f"vector tile-join ({len(archives) + len(layers)} archives)"):
-        utils.run_monitored(["tile-join", "-o", out, "-f", "-pk",
-                             *archives, *layers], "vector tile-join",
-                            out)
-
-
 def require_stable_complete(layer, stems, files):
     """The no-holes gate: every covering stem must have its per-stem file on disk — a 0-byte file
     is a legitimately empty tile, a MISSING one is an incomplete build. The only bundle-time gate;
@@ -386,28 +346,332 @@ def require_stable_complete(layer, stems, files):
             f"{' …' if len(missing) > 5 else ''}")
 
 
+# ── one variable-depth run: contours + soundings + depare → sparse vector.pmtiles ─────────────
+# ONE tippecanoe --generate-variable-depth-tile-pyramid over all three layers, leafing per-tile
+# across them jointly (separately-tiled layers leaf at different depths, and a tile-join then mints
+# deep tiles missing the shallower-leafing layer — the vanishing bug the old shared bundle_maxz
+# existed to prevent). All zoom gating rides as per-feature tippecanoe.minzoom: contour tiers via
+# contour_minzoom, depare's z6 floor as a uniform minzoom (the run-level -Z6 dies in a -Z0 joint
+# run whose soundings need z0), soundings' pyramid levels unchanged. The archive is SPARSE — the
+# Worker overzooms ancestors (Part 1); manifest.vector.max_zoom is what turns that on.
+
+# Union of the three layers' MVT attributes; the FlatGeobuf/GeoJSON Integer64 columns need :int so
+# they don't land as strings. depth_m stays untyped (contours carry an int level, soundings a float
+# depth — tippecanoe detects per layer).
+VECTOR_ATTRS = ["depth_m", "depth_abs_m", "sys", "depth_ft", "depth_fm",
+                "drval1", "drval2", "kind", "rank"]
+VECTOR_TYPES = ["depth_abs_m:int", "depth_ft:int", "depth_fm:int", "rank:int"]
+DEPARE_MINZOOM = 6  # depare's zoom floor, now per-feature (was depare_run's run-level -Z)
+# Down-zoom partition-gap tolerance: a parent tile quantizes geometry to the same 4096-cell grid over
+# 4× the area of each child, so band-union areas differ by a few percent (measured ≤2.7% either way)
+# purely from that. The gap check is one-sided (only a SHRINK — children covering less than the parent
+# — is a hole) with margin over that noise; a gross partition hole (a whole band missing from the
+# children, e.g. the 50% test case) clears it easily, while sub-band holes are caught by the id
+# completeness check. Not the 2% overlap tolerance, which is same-tile (no cross-zoom quantization).
+DEPARE_GAP_TOL = 0.10
+
+
+def _json_scalar(v):
+    """A GeoJSON-safe scalar: unwrap numpy/pandas scalars; None for missing (None/NaN) so the
+    property stays ABSENT in the MVT — depare nodata truly carries no drval1, the fill's switch."""
+    if v is None:
+        return None
+    if hasattr(v, "item"):
+        try:
+            v = v.item()
+        except (ValueError, AttributeError):
+            pass
+    if isinstance(v, float) and v != v:  # NaN
+        return None
+    return v
+
+
+# tippecanoe simplifies away lines/polygons that shrink below ~a pixel at a tile's zoom; even at the
+# finest (leaf = -z) zoom a sub-pixel sliver is dropped — a legitimate loss, not the regression. So a
+# line/polygon is REQUIRED to survive (enters the completeness set) only above this many pixels at
+# maxz; below it, it's exempt. Measured on the real preview: 22 contour fragments dropped, all
+# ≤1.5 px, while the smallest required curve is ~6 px — 4 px sits clear of both. Points (soundings)
+# are never simplified away, so they are always required.
+COMPLETENESS_MIN_PX = 4
+
+
+def _leaf_pixel_deg(maxz):
+    """One MVT pixel at the leaf zoom, in degrees of longitude (tile extent 4096)."""
+    return 360.0 / (2 ** maxz) / 4096
+
+
+def _survives_leaf(geom, min_deg):
+    """Whether tippecanoe must keep this geometry at the leaf zoom (so completeness can require it).
+    Points always; lines by length; polygons by linear size sqrt(area) — all in degrees, min_deg being
+    COMPLETENESS_MIN_PX leaf pixels. Anisotropy (lon vs lat degrees) is inside the 4-px margin."""
+    t = geom.geom_type
+    if "Point" in t:
+        return True
+    if "Polygon" in t:
+        return geom.area ** 0.5 >= min_deg
+    return geom.length >= min_deg
+
+
+def _fgb_to_seq(fgbs, cols, minzoom_fn, out_path, layer, identity_fn, id0, maxz):
+    """Stream per-tile FGBs → one GeoJSONSeq (newline-delimited features) carrying a per-feature
+    tippecanoe.minzoom — FGB can't hold the tippecanoe extension, so the joint run reads GeoJSON
+    like soundings already do. One tile in memory at a time (macrotile-sized). Every feature gets a
+    unique GeoJSON id counting up from id0 (globally unique across layers) — tippecanoe preserves
+    ids, so the self-check proves each input survived. Returns (next_id, {id: identity} for the
+    completeness set) — only above-leaf-pixel features enter it (sub-pixel slivers are exempt, since
+    tippecanoe drops them legitimately), while EVERY feature (id included) is still written to tippecanoe."""
+    import geopandas as gpd
+    from shapely.geometry import mapping
+    min_deg = COMPLETENESS_MIN_PX * _leaf_pixel_deg(maxz)
+    fid = id0
+    ids = {}
+    with open(out_path, "w") as fh:
+        for fgb in fgbs:
+            g = gpd.read_file(fgb)
+            for r in g.itertuples():
+                props = {}
+                for c in cols:
+                    v = _json_scalar(getattr(r, c, None))
+                    if v is not None:
+                        props[c] = v
+                feat = {"type": "Feature", "id": fid,
+                        "tippecanoe": {"minzoom": minzoom_fn(props)},
+                        "properties": props, "geometry": mapping(r.geometry)}
+                fh.write(json.dumps(feat))
+                fh.write("\n")
+                if _survives_leaf(r.geometry, min_deg):
+                    ids[fid] = f"{layer} {identity_fn(props)}"
+                fid += 1
+    return fid, ids
+
+
+def _soundings_to_seq(gjs, out_path, id0):
+    """Concatenate the per-tile sounding FeatureCollections into one GeoJSONSeq, features passed
+    through untouched except a unique GeoJSON id (counting up from id0) for the completeness check —
+    each already carries its own tippecanoe.minzoom (pyramid level). Returns (next_id, {id: identity})."""
+    fid = id0
+    ids = {}
+    with open(out_path, "w") as fh:
+        for gj in gjs:
+            for ft in json.load(open(gj)).get("features", []):
+                ft["id"] = fid
+                fh.write(json.dumps(ft))
+                fh.write("\n")
+                ids[fid] = f"sounding depth={ft.get('properties', {}).get('depth_m')}"
+                fid += 1
+    return fid, ids
+
+
+def _tippecanoe_joint(layers, maxz, out):
+    """ONE --generate-variable-depth-tile-pyramid run over the named layer seqs → out (sparse
+    pmtiles). Global --coalesce-smallest-as-needed (merges, never drops: a dropped depare polygon
+    is a partition hole; contours coalesce cleanly, proven by the STEP-0 gate) since every
+    as-needed strategy is invocation-wide. --detect-shared-borders keeps partition seams crack-free."""
+    cmd = ["tippecanoe", "-o", out, "-f", "--generate-variable-depth-tile-pyramid",
+           "-n", "Open Waters Bathymetry", "-A", utils.ATTRIBUTION,
+           "-Z", "0", "-z", str(maxz), "-P", "-q",
+           "--coalesce-smallest-as-needed", "--detect-shared-borders",
+           "--simplification", os.environ.get("VECTOR_SIMPLIFICATION", "8")]
+    for a in VECTOR_ATTRS:
+        cmd += ["-y", a]
+    for t in VECTOR_TYPES:
+        cmd += ["-T", t]
+    for name, seq in layers:
+        cmd += ["-L", f"{name}:{seq}"]
+    with utils.log_group(f"vector tippecanoe ({len(layers)} layers, z0-{maxz})"):
+        utils.run_monitored(cmd, "vector tippecanoe", out)
+
+
 def bundle_stable():
-    """Vector bundle: tippecanoe the per-stem contour FGBs for the covering into contour lines,
-    then tile-join the already-bundled soundings/depare pmtiles → vector.pmtiles. A 0-byte per-tile
-    file is a legitimately empty tile (filtered by size); a MISSING one is an incomplete build
-    (require_stable_complete). Snakemake decides when to invoke, so this always rebuilds. Depare
-    joins only when SKIP_DEPARE is unset (_finalize_contours), regardless of disk state."""
+    """Vector bundle: ONE variable-depth tippecanoe run over all three per-stem layer sets
+    (contours + soundings + depare) → store/bundle/vector.pmtiles, a SPARSE pyramid the Worker
+    overzooms (Part 1). Replaces the old contour tippecanoe + tile-join fold of soundings/depare. A
+    0-byte per-tile file is a legitimately empty tile (filtered by size); a MISSING one is an
+    incomplete build (require_stable_complete, per layer, before the run). Snakemake decides when to
+    invoke, so this always rebuilds. Depare rides only when SKIP_DEPARE is unset (by CONFIGURATION,
+    never disk state), gated at z6 by a per-feature tippecanoe.minzoom (DEPARE_MINZOOM)."""
     import mosaic
     stems = mosaic.covering_stems()
-    files = [f"store/contour/{s}.fgb" for s in stems]
-    require_stable_complete("contour", stems, files)
-    fgbs = [f for f in files if os.path.getsize(f) > 0]
+    cfiles = [f"store/contour/{s}.fgb" for s in stems]
+    sfiles = [f"store/soundings/{s}.geojson" for s in stems]
+    require_stable_complete("contour", stems, cfiles)
+    require_stable_complete("soundings", stems, sfiles)
+    depare_on = not os.environ.get("SKIP_DEPARE")
+    dfiles = [f"store/depare/{s}.fgb" for s in stems] if depare_on else []
+    if depare_on:
+        require_stable_complete("depare", stems, dfiles)
+    cfgbs = [f for f in cfiles if os.path.getsize(f) > 0]
+    sgjs = [f for f in sfiles if os.path.getsize(f) > 0]
+    dfgbs = [f for f in dfiles if os.path.getsize(f) > 0]
+
     vec = "store/bundle/vector.pmtiles"
     utils.create_folder("store/bundle")
-    own_max = max((int(os.path.basename(f).split(".")[0].rsplit("-", 1)[1]) for f in fgbs), default=0)
-    maxz = bundle_maxz_stable(own_max)
-    lines = utils.vector_scratch("contours-lines.pmtiles")
-    if os.path.exists(lines):
-        os.remove(lines)
-    _tippecanoe(fgbs, 0, maxz, lines)
-    _finalize_contours([lines], vec)  # writes vector.pmtiles directly; Snakemake cleans a torn output
-    os.remove(lines)
-    print(f"contour bundle (stable): {vec} (z0-{maxz}, {len(fgbs)} FGBs)")
+    all_inputs = cfgbs + sgjs + dfgbs
+    own_max = max((int(os.path.basename(f).split(".")[0].rsplit("-", 1)[1]) for f in all_inputs),
+                  default=0)
+    maxz = _vector_maxz(own_max)
+
+    cseq = utils.vector_scratch("contours.geojsons")
+    sseq = utils.vector_scratch("soundings.geojsons")
+    dseq = utils.vector_scratch("depare.geojsons")
+    nid = 1  # one running counter → feature ids globally unique across the three layers
+    cids = sids = dids = {}
+    try:
+        nid, cids = _fgb_to_seq(cfgbs, ("depth_m", "depth_abs_m", "sys", "depth_ft", "depth_fm"),
+                                lambda p: contour_minzoom(p["sys"], float(p["depth_m"])), cseq,
+                                "contour", lambda p: f"sys={p.get('sys')} depth_m={p.get('depth_m')}",
+                                nid, maxz)
+        nid, sids = _soundings_to_seq(sgjs, sseq, nid)
+        nid, dids = _fgb_to_seq(dfgbs, ("drval1", "drval2", "sys", "kind", "rank"),
+                                lambda p: DEPARE_MINZOOM, dseq,
+                                "depare", lambda p: f"drval1={p.get('drval1')} kind={p.get('kind')}",
+                                nid, maxz)
+        nc, ns, nd = len(cids), len(sids), len(dids)
+        layers = []
+        if nc:
+            layers.append(("contours", cseq))
+        if ns:
+            layers.append(("soundings", sseq))
+        if nd:
+            layers.append(("depare", dseq))
+        if not layers:
+            raise SystemExit("vector bundle: no features in any layer for the covering")
+        _tippecanoe_joint(layers, maxz, vec)  # writes vector.pmtiles; Snakemake cleans a torn output
+    finally:
+        for seq in (cseq, sseq, dseq):
+            if os.path.exists(seq):
+                os.remove(seq)
+    _vector_selfcheck(vec, maxz, {"contours": cids, "soundings": sids, "depare": dids})
+    print(f"vector bundle (stable): {vec} (z0-{maxz}; contours={nc} soundings={ns} depare={nd})")
+
+
+def _decode_tile(vec, z, x, y):
+    """{layer: [feature, ...]} for one tile of a pmtiles archive, via tippecanoe-decode (XYZ)."""
+    out = subprocess.run(["tippecanoe-decode", "-c", vec, str(z), str(x), str(y)],
+                         capture_output=True, text=True).stdout
+    layers = collections.defaultdict(list)
+    for line in out.splitlines():
+        line = line.strip().rstrip(",")
+        if not line.startswith("{"):
+            continue
+        try:
+            o = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if o.get("type") == "Feature":
+            layers[o.get("tippecanoe", {}).get("layer", "?")].append(o)
+    return layers
+
+
+# A decoded feature line carries its id right after the type; anchor on the type so a future
+# property named "id" (there is none today) can't be mistaken for it.
+_FEATURE_ID_RE = re.compile(r'"type": "Feature", "id": (\d+)')
+
+
+def _seen_ids(vec):
+    """Union of feature ids across EVERY tile of the archive, from ONE streaming whole-archive
+    tippecanoe-decode (measured 0.85 s / 4 MB preview → 60 MB decoded; the pass streams, so memory is
+    the distinct-id set, not the JSON). Each input feature is written at its native leaf tile, so a
+    present id proves the feature survived; a feature dropped by leafing above -z is in NO tile."""
+    # ponytail: cost is O(features summed over all zooms) and the id set is ~1 int/feature; at planet
+    # scale both shrink ~4^Δz-fold by scoping the decode to leaf tiles (no children in the pmtiles
+    # directory) — every feature already lives at its leaf, so the union is unchanged. Not needed yet.
+    seen = set()
+    p = subprocess.Popen(["tippecanoe-decode", vec], stdout=subprocess.PIPE, text=True)
+    for line in p.stdout:
+        m = _FEATURE_ID_RE.search(line)
+        if m:
+            seen.add(int(m.group(1)))
+    if p.wait() != 0:  # a partial decode would undercount and fail completeness for the wrong reason
+        raise SystemExit(f"vector self-check: tippecanoe-decode failed on {vec}")
+    return seen
+
+
+def _mbands(feats):
+    """Decoded depare metre depth-area bands: sys=m with a real drval1 — INCLUDING the 0-m band.
+    The `drval1 is not None and >= 0` test is deliberate: `drval1 or -1` treated 0 as missing and
+    dropped the 0-m band from the partition checks (the confirmed bug)."""
+    return [f for f in feats
+            if f["properties"].get("sys") == "m"
+            and f["properties"].get("drval1") is not None
+            and f["properties"]["drval1"] >= 0]
+
+
+def _vector_selfcheck(vec, maxz, expected=None, per_zoom=6):
+    """Completeness + partition guard on the sparse archive. PRIMARY check (when `expected` — the
+    {layer: {id: identity}} maps the seq-builders return): every input feature id must survive
+    somewhere in the archive, per layer. COMPLETE (not sampled), and it is what catches a contour,
+    sounding, OR whole depare polygon that variable-depth dropped — the exact regression this PR
+    prevents — because a dropped feature appears in no tile and its id is missing from the union.
+    Robust to legitimate per-zoom minzoom thinning and to --coalesce-smallest-as-needed (a feature
+    that only coalesces at a low zoom still appears at its full-detail native leaf; one present
+    nowhere is a real drop). Plus the sampled complementary checks: no depare below its z6 floor, no
+    contour below its tier minzoom, soundings present, depare m-bands pairwise disjoint (coalesce
+    displaced nothing), and the partition conserved down-zoom (a parent m-band union ≈ its 4
+    children's — a shrink means a gap opened deeper; whole missing polygons are already caught above)."""
+    from pmtiles.reader import Reader, MmapSource, all_tiles
+    from shapely.geometry import shape
+    from shapely.ops import unary_union
+    byz = collections.defaultdict(list)
+    with open(vec, "r+b") as f:
+        reader = Reader(MmapSource(f))
+        for tile_tuple, _ in all_tiles(reader.get_bytes):
+            z, x, y = tile_tuple
+            byz[z].append((x, y))
+    present = {z: set(xys) for z, xys in byz.items()}
+    problems, n_soundings = [], 0
+
+    if expected is not None:
+        seen = _seen_ids(vec)
+        for layer, idmap in expected.items():
+            missing = [i for i in idmap if i not in seen]
+            if missing:
+                sample = "; ".join(idmap[i] for i in missing[:5])
+                problems.append(f"{layer}: {len(missing)} of {len(idmap)} input features dropped "
+                                f"(present in no tile) — e.g. {sample}")
+
+    def mband_area(feats):
+        geoms = [shape(f["geometry"]).buffer(0) for f in _mbands(feats)]
+        return unary_union(geoms).area if geoms else 0.0
+
+    for z in sorted(byz):
+        ts = byz[z]
+        for x, y in ts[:: max(1, len(ts) // per_zoom)]:
+            L = _decode_tile(vec, z, x, y)
+            n_soundings += len(L.get("soundings", []))
+            if z < DEPARE_MINZOOM and L.get("depare"):
+                problems.append(f"z{z} {x}/{y}: {len(L['depare'])} depare below z{DEPARE_MINZOOM}")
+            for feat in L.get("contours", []):
+                p = feat["properties"]
+                d, s = p.get("depth_m"), p.get("sys")
+                if d is not None and s and contour_minzoom(s, float(d)) > z:
+                    problems.append(f"z{z} {x}/{y}: contour depth_m={d} sys={s} below minzoom "
+                                    f"{contour_minzoom(s, float(d))}")
+                    break
+            mbands = _mbands(L.get("depare", []))
+            if mbands:
+                geoms = [shape(f["geometry"]).buffer(0) for f in mbands]
+                asum, uni = sum(g.area for g in geoms), unary_union(geoms).area
+                if uni and (asum - uni) / uni >= 0.02:
+                    problems.append(f"z{z} {x}/{y}: depare m-bands overlap {(asum - uni) / uni:.2%} "
+                                    f"(coalesce displaced a partition)")
+                # partition conserved into z+1: a present-children parent's band union ≈ its 4
+                # children's combined union; a one-sided SHRINK (children covering less) is a gap that
+                # opened at the deeper zoom (a grow is just finer-grid quantization, not a hole).
+                kids = [(2 * x, 2 * y), (2 * x + 1, 2 * y), (2 * x, 2 * y + 1), (2 * x + 1, 2 * y + 1)]
+                if z + 1 <= maxz and uni and all(k in present.get(z + 1, ()) for k in kids):
+                    child = sum(mband_area(_decode_tile(vec, z + 1, kx, ky).get("depare", []))
+                                for kx, ky in kids)
+                    if (uni - child) / uni >= DEPARE_GAP_TOL:
+                        problems.append(f"z{z} {x}/{y}: depare band area {uni:.3g} shrank to children "
+                                        f"{child:.3g} ({(uni - child) / uni:.2%} gap opened deeper)")
+    if n_soundings == 0:
+        problems.append("no soundings in any sampled tile (the layer vanished)")
+    if problems:
+        raise SystemExit("vector self-check FAILED:\n  " + "\n  ".join(problems[:20]))
+    ids_note = f", {sum(len(m) for m in expected.values())} ids complete" if expected else ""
+    print(f"vector self-check ok ({sum(len(v) for v in byz.values())} tiles, "
+          f"z{min(byz)}-{max(byz)}, {n_soundings} sampled soundings{ids_note})")
 
 
 def _check():
@@ -421,18 +685,23 @@ def _check():
     assert _drop_small_rings(ring(100), MIN_RING_AREA_M2) is None        # ~0.03 km² → drop
     assert _drop_small_rings(ring(3000), MIN_RING_AREA_M2) is not None   # ~28 km²  → keep
     assert _drop_small_rings(LineString([(0, 0), (5e3, 0), (1e4, 5e3)]), MIN_RING_AREA_M2) is not None  # open line kept
-    # the shared bundle maxzoom reads child_z off covering stems
+    # the run's -z reads child_z off covering stems
     assert _stems_maxz({"4-5-6-8", "11-300-400-13"}) == 13
     # navigable-band contours skip Chaikin (never bow a shoal deeper); deeper ones smooth
     assert _chaikin_iters(10) == 0 and _chaikin_iters(NAV_SMOOTH_MAX_M) == 0
     assert _chaikin_iters(NAV_SMOOTH_MAX_M + 1) == CHAIKIN_ITERATIONS
-    # metre and feet/fathom isobaths each get their own per-zoom bands in the tippecanoe filter
-    assert '["==", "sys", "m"]' in PER_ZOOM_FILTER and '["==", "sys", "ft"]' in PER_ZOOM_FILTER
-    # the filter must only compare depth_m — the int columns are string-typed at -j time
-    assert "depth_abs_m" not in PER_ZOOM_FILTER
-    # every tier level must exist in the generated contour set (else it filters to nothing)
+    # per-feature minzoom reproduces the CONTOUR_TIERS thinning (the leaf-safe replacement for -j).
+    # A shallow metre curve only shows at native+ (last ceiling); a deep one from the first tier
+    # shows at z0; a fathom curve is gated by depth like the deep metre ones.
+    ceilings = [hi for hi, _ in CONTOUR_TIERS]
+    assert contour_minzoom("m", -2) == ceilings[-1]              # -2 in no tier -> native+
+    assert contour_minzoom("m", -4000) == 0                      # -4000 in the first tier -> z0
+    assert contour_minzoom("m", -50) == 7 and contour_minzoom("m", -10) == 9
+    assert contour_minzoom("ft", -0.5) == ceilings[-1]          # shallower than any band's floor
+    assert contour_minzoom("ft", -4000) == 0                     # deeper than the first band's floor
+    # every tier level must exist in the generated contour set (else it gates nothing)
     assert all(d in config.CONTOUR_LEVELS for _, depths in CONTOUR_TIERS for d in depths)
-    print("contour_run ring-drop self-check ok")
+    print("contour_run ring-drop + minzoom self-check ok")
 
 
 if __name__ == "__main__":

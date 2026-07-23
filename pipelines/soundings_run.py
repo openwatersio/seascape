@@ -15,8 +15,8 @@ small; the viewer's symbol collision (sorted shallow-first) de-conflicts what re
 Per tile: read merged DEM (3857) in row strips -> a staggered-grid PYRAMID (one jittered quincunx
 grid per zoom level, each point valued by the shoalest wet pixel in its block) -> keep points in
 the unbuffered tile bbox -> reproject to 4326 -> store/soundings/{stem}.geojson (per-feature
-tippecanoe minzoom==maxzoom, so each zoom shows one even field, densifying inward). bundle()
-tippecanoes them into a `soundings` layer.
+tippecanoe minzoom==maxzoom, so each zoom shows one even field, densifying inward). The vector
+bundle (contour_run.bundle_stable) folds these into the `soundings` layer of the one joint run.
 
 Chart-cartography grounding (shoal-bias, the radius method, SCAMIN, spacing rules) and the
 seamap fork this mirrors: ../docs/nautical-chart-references.md.
@@ -25,12 +25,10 @@ seamap fork this mirrors: ../docs/nautical-chart-references.md.
 import json
 import math
 import os
-import subprocess
 import sys
 
 import mercantile
 
-import contour_run
 import utils
 
 NODATA = -9999
@@ -196,35 +194,6 @@ def tile(stem):
     shutil.rmtree(tmp)
 
 
-def _tippecanoe(gj, maxz, out):
-    """tippecanoe the per-tile soundings geojsons into `out` (layer `soundings`, z0..maxz). -r1
-    keeps every point: per-feature tippecanoe.minzoom already did the density thinning by zoom."""
-    with utils.log_group(f"soundings tippecanoe ({len(gj)} inputs, z0-{maxz})"):
-        utils.run_monitored(
-            ["tippecanoe", "-o", out, "-f", "-l", "soundings",
-             "-n", "Bathymetric soundings", "-A", utils.ATTRIBUTION, "-Z", "0", "-z", str(maxz),
-             "-P", "-q", "-r1", "-y", "depth_m", "-y", "depth_ft", "-y", "depth_fm",
-             *gj], "soundings tippecanoe", out)
-
-
-def bundle_stable():
-    """Soundings bundle: tippecanoe the per-stem geojsons for the covering into
-    store/bundle/soundings.pmtiles. A 0-byte per-tile file is a legitimately dry tile (filtered by
-    size); a MISSING one is an incomplete build (require_stable_complete). Snakemake decides when to
-    invoke, so this always rebuilds."""
-    import mosaic
-    stems = mosaic.covering_stems()
-    files = [f"store/soundings/{s}.geojson" for s in stems]
-    contour_run.require_stable_complete("soundings", stems, files)
-    gj = [f for f in files if os.path.getsize(f) > 0]
-    out = "store/bundle/soundings.pmtiles"
-    utils.create_folder("store/bundle")
-    own_max = max((int(os.path.basename(g).split(".")[0].rsplit("-", 1)[1]) for g in gj), default=0)
-    maxz = contour_run.bundle_maxz_stable(own_max)
-    _tippecanoe(gj, maxz, out)
-    print(f"soundings bundle (stable): {out} (z0-{maxz}, {len(gj)} tiles)")
-
-
 def _check():
     """Grid shoalest per cell; <min_depth dropped; 2x2 reduction keeps the shoalest; the pyramid
     staggers each zoom into a quincunx and carries a block's shoal up to coarse zoom; depth floors
@@ -280,9 +249,7 @@ if __name__ == "__main__":
     a = sys.argv[1:]
     if a[:1] == ["tile"] and len(a) == 2:
         tile(a[1])
-    elif a == ["bundle", "--stable"]:
-        bundle_stable()
     elif a[:1] == ["check"]:
         _check()
     else:
-        sys.exit("usage: soundings_run.py tile <stem> | bundle --stable | check")
+        sys.exit("usage: soundings_run.py tile <stem> | check")

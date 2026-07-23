@@ -34,9 +34,13 @@ ENV GDAL_HTTP_MAX_RETRY=5 \
   GDAL_HTTP_RETRY_DELAY=1 \
   GDAL_HTTP_USERAGENT="seascape/1.0 (+https://github.com/openwatersio/seascape)"
 
-# tippecanoe + tile-join (Felt fork) — contour vector tiles.
-RUN git clone --depth 1 https://github.com/felt/tippecanoe.git /tmp/tippecanoe \
-  && cd /tmp/tippecanoe && make -j"$(nproc)" && make install && rm -rf /tmp/tippecanoe
+# tippecanoe + tile-join (Felt fork) — vector tiles. Pinned at felt/tippecanoe#397 (variable-depth
+# pyramids must honor per-feature tippecanoe.minzoom; the joint vector bundle depends on it).
+RUN git init -q /tmp/tippecanoe \
+  && cd /tmp/tippecanoe \
+  && git fetch -q --depth 1 https://github.com/felt/tippecanoe.git 0dc1e00eee8efa68b7d1a1834a59910dedddf903 \
+  && git checkout -q FETCH_HEAD \
+  && make -j"$(nproc)" && make install && rm -rf /tmp/tippecanoe
 
 # just (task runner) + uv (Python env manager) — the pipeline's two entrypoints.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh \

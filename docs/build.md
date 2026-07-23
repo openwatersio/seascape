@@ -47,9 +47,9 @@ Everything lands in `bathymetry/build/<sha>/` (byte-compatible with the old buil
 
 - `planet.pmtiles` — merged Terrarium raster base, z0–`MACROTILE_Z` (z8)
 - `overlay-{z}-{x}-{y}.pmtiles` — one per populated `OVERLAY_SPLIT_Z` grid cell, above z8
-- `vector.pmtiles` — contours + soundings + depare, tile-joined in one pass
+- `vector.pmtiles` — contours + soundings + depare, ONE `--generate-variable-depth-tile-pyramid` run → a sparse pyramid the Worker overzooms
 - `coverage.pmtiles` — source-provenance footprints, its own small z0–8 tileset
-- `manifest.json` — planet metadata + overlay cell map; **written and pushed last, its presence marks a complete build** (release.yml refuses a sha without one)
+- `manifest.json` — planet metadata + overlay cell map + `vector.max_zoom` (the covering's max child_z, which turns on the Worker's vector overzoom); **written and pushed last, its presence marks a complete build** (release.yml refuses a sha without one)
 
 A build from `main` auto-dispatches `release.yml` for its sha; feature-branch and `bbox` builds write `build/<sha>/` but don't ship.
 
@@ -91,6 +91,23 @@ Stages push to R2 as they finish (one `rclone copy` pass — the content name se
 - `build/<sha>/manifest.json` → **last** in the build domain, `release.yml`'s completeness marker
 
 Every push is `rclone copy`, **never `sync --delete`** — deletion is out-of-band (`gc.yml`). A crash mid-push leaves the old pointer over a complete old store; this build's pushed-but-unreferenced objects are GC debris.
+
+## Changing a source's resolution cap
+
+A source's built depth is `min(native_overzoom, max_zoom)` floored to `macrotile_z`, where `max_zoom` is the **optional** `sources/<id>/metadata.json` cap (omit it to build to native). Removing the cap lets the source build to its native grid; adding/lowering one is the ops escape hatch for a source that shouldn't be trusted at its full resolution. Either way the covering re-derives `child_z`, the mosaic key re-keys exactly the affected tiles, and the incremental build rebuilds only those cells — no manual state clearing.
+
+**But the edit is inert until the source re-registers.** Builds read the cap from each source's published `catalog.json` (`seascape:max_zoom`), **not** `metadata.json` directly (`config.source_property`: catalog first, metadata only as fallback and only when the catalog's field is null). A planet build dispatched after the metadata edit but before registration re-runs still builds capped — benign (the next build picks it up) but a wasted build. The metadata edit *does* change the source's registration recipe hash, so `sources.yml` re-registers on its own.
+
+Ordered dispatches to make a cap change live, **per source**:
+
+1. **Edit** `sources/<id>/metadata.json` — remove (or change) `max_zoom`. Commit + merge.
+2. **Re-register**: run `sources.yml` (weekly cron picks it up, or dispatch it with the `source` filter). It regenerates `catalog.json` and republishes it last, after the `bounds.csv` pointer.
+   - Pre-req check: `sources.yml` must have completed green. A registration that shrinks a volatile source >5% refuses to publish without `force` — unrelated to the cap, but it blocks the republish, so watch the run.
+3. **Verify the republished catalog dropped the cap** before building — read `seascape:max_zoom` from the published item:
+   `curl -s https://data.openwaters.io/bathymetry/source/<id>/catalog.json | jq .properties.\"seascape:max_zoom\"` → must be `null` (uncap) or the new value.
+4. **Dispatch `build.yml`** (planet, or a `bbox` slice over the source's footprint first to measure). Only now does the deeper `child_z` take effect. Watch planet-build wall clock + mosaic store size — each +1 `child_z` is 4× mosaic pixels + 4× terrain render in the affected stems.
+
+Do these one source at a time when the cost is uncertain (e.g. CUDEM's z13→z15 lift covers the whole US coastal strip); small-footprint sources can be batched into one registration + one build.
 
 ## Requirements for all changes
 

@@ -27,6 +27,15 @@ import type { Source, RangeResponse } from "pmtiles";
 // onto stale renders until their caches age out.
 export const OVERZOOM_TAG_VERSION = "oz1";
 
+// Same idea for the VECTOR overzoom/clean path (vector.ts): synthesized and
+// cleaned vector tiles validate by their INPUT bytes, so any change to the
+// synthesis semantics (clip/scale/repair) or the encoder must rotate these tags
+// or matching revalidations would 304 clients onto stale geometry. The clean tag
+// covers a baked leaf re-served through the clean/simplify pass; the overzoom tag
+// covers a child synthesized from an ancestor (the Δz rides in the tag alongside).
+export const VECTOR_CLEAN_TAG_VERSION = "vc1";
+export const VECTOR_OVERZOOM_TAG_VERSION = "vz1";
+
 // 64 bits of SHA-256 — plenty for cache validation (not a security boundary).
 export async function contentEtag(
   bytes: BufferSource,
