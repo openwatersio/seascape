@@ -48,6 +48,7 @@ LANDMASK / WATERMASK override the paths (defaults store/landmask/{land,water}.fg
 
   python landmask.py prep        download -> unzip -> convert the land mask (run once)
   python landmask.py prep-water  download -> convert the inland-water mask (run once)
+  python landmask.py tiles       tile the masks into store/bundle/land.pmtiles
   python landmask.py --check     self-check
 """
 
@@ -200,6 +201,38 @@ def prep_water(processes=8):
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print(f"inland-water mask ready: {out}")
+
+
+LAND_TILES = "store/bundle/land.pmtiles"
+
+
+def tiles(out=LAND_TILES):
+    """Tile the prepped masks into store/bundle/land.pmtiles for the serve-time land mask —
+    two layers so the Worker subtracts water at rasterize time exactly as rasterize() does,
+    avoiding a planet-scale land∖water difference. maxzoom z12 is sub-pixel at z14 512px tiles.
+    Guarded so a re-run is a no-op; writes a temp then renames so an interrupted run never
+    leaves a truncated archive. Water is optional (absent -> land-only tileset), matching the
+    module's degrade-to-land-only convention. --projection=EPSG:3857: the prepped masks are
+    Web Mercator (prep/-t_srs), which tippecanoe otherwise reads as raw lon/lat and mangles."""
+    if os.path.isfile(out):
+        print(f"land tiles already present: {out}")
+        return
+    land = path()
+    if not _present(land):
+        raise SystemExit(f"land mask {land} not found — run `landmask.py prep` first")
+    utils.create_folder(os.path.dirname(out) or ".")
+    water = water_path()
+    layers = f"-L land:{land}" + (f" -L water:{water}" if _present(water) else "")
+    tmp = out + ".tmp.pmtiles"
+    try:
+        utils.run_command(
+            f"tippecanoe -f -o {tmp} {layers} --projection=EPSG:3857 -Z0 -z12 --coalesce",
+            silent=False)
+        os.replace(tmp, out)
+    finally:
+        if os.path.isfile(tmp):
+            os.remove(tmp)
+    print(f"land tiles ready: {out}")
 
 
 # Tile edge (degrees) for the planet read. 20° balances startup (~11 s/tile) against load: a
@@ -480,10 +513,10 @@ def _check():
 
     # The planet water grid: covers the full lon range and the merc band, never spilling past
     # ±180 / ±MERC_LAT (an inverted -clipsrc would error).
-    tiles = list(_water_grid(WATER_TILE_DEG))
-    assert min(w for w, _, _, _ in tiles) == -180 and max(e for _, _, e, _ in tiles) == 180
-    assert min(s for _, s, _, _ in tiles) == -MERC_LAT and max(n for _, _, _, n in tiles) == MERC_LAT
-    assert all(w < e and s < n for w, s, e, n in tiles), "no inverted/empty tiles"
+    grid = list(_water_grid(WATER_TILE_DEG))
+    assert min(w for w, _, _, _ in grid) == -180 and max(e for _, _, e, _ in grid) == 180
+    assert min(s for _, s, _, _ in grid) == -MERC_LAT and max(n for _, _, _, n in grid) == MERC_LAT
+    assert all(w < e and s < n for w, s, e, n in grid), "no inverted/empty tiles"
 
     import aggregation_reproject  # translate() -> the real COG profile
     from rasterio.transform import from_origin
@@ -625,6 +658,24 @@ def _check():
     assert valid2[ldy[0], ldx[0]] and out2[ldy[0], ldx[0]] == 42.0, \
         "positive over land must survive (the terrain sentinel handles land, not this clamp)"
 
+    # tiles: the two masks tile into a two-layer land.pmtiles (guarded, degrade-to-land-only).
+    # Needs a real tippecanoe; skip the burn assertion where it isn't installed locally.
+    if shutil.which("tippecanoe"):
+        land_pm = f"{d}/land.pmtiles"
+        os.environ["LANDMASK"], os.environ["WATERMASK"] = land_fgb, water_fgb
+        tiles(out=land_pm)
+        from pmtiles.reader import Reader, MmapSource
+        with open(land_pm, "rb") as f:
+            r = Reader(MmapSource(f))
+            meta, hdr = r.metadata(), r.header()
+        ids = {vl["id"] for vl in meta.get("vector_layers", [])}
+        assert {"land", "water"} <= ids, f"land.pmtiles missing a layer: {sorted(ids)}"
+        # The fixture sits at lon/lat 1..2; a mask read as raw lon/lat (no --projection) would
+        # land the 3857-meter coords at a mangled -180..180 bbox.
+        assert -5 < hdr["min_lon_e7"] / 1e7 and hdr["max_lon_e7"] / 1e7 < 5, \
+            "land.pmtiles bbox mangled — the 3857 masks weren't reprojected"
+        tiles(out=land_pm)  # guard: a second call is a no-op, not a re-tile
+
     print(f"landmask.py self-check ok (mask {h}x{w}, land {int(land.sum())}, "
           f"water-subtracted {int(subtracted.sum())}, water-only {int((wonly == 1).sum())})")
 
@@ -634,7 +685,9 @@ if __name__ == "__main__":
         prep()
     elif sys.argv[1:2] == ["prep-water"]:
         prep_water(int(sys.argv[2]) if len(sys.argv) > 2 else 8)
+    elif sys.argv[1:2] == ["tiles"]:
+        tiles()
     elif sys.argv[1:2] == ["--check"]:
         _check()
     else:
-        sys.exit("usage: landmask.py prep | prep-water | --check")
+        sys.exit("usage: landmask.py prep | prep-water | tiles | --check")

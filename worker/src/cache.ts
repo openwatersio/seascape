@@ -25,7 +25,7 @@ import type { Source, RangeResponse } from "pmtiles";
 // encoder settings): synthesized tiles validate by their *input*, so a code
 // change must rotate the tags or matching revalidations would 304 clients
 // onto stale renders until their caches age out.
-export const OVERZOOM_TAG_VERSION = "oz1";
+export const OVERZOOM_TAG_VERSION = "oz2";
 
 // 64 bits of SHA-256 — plenty for cache validation (not a security boundary).
 export async function contentEtag(

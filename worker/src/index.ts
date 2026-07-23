@@ -31,6 +31,7 @@ import { style as seascapeStyle } from "@openwaters/seascape";
 import { CachedSource, contentEtag, OVERZOOM_TAG_VERSION } from "./cache";
 import { coverageTileJSON } from "./coverage";
 import { unpackTerrarium, packTerrariumInto, cubicBSpline } from "./terrarium";
+import { composite, rasterizeMask, waterMask } from "./mask";
 import {
   OverlayIndex,
   overlayFor,
@@ -154,6 +155,66 @@ async function tile(
   return r?.data;
 }
 
+// The mask tileset's zoom ceiling, or null when land.pmtiles is absent (a pre-land release,
+// a rollback, or unseeded dev) — a failed header read means "no mask this release". Cached
+// in prod only, mirroring manifest(): a release is immutable, but dev/preview reseed under
+// the running Worker so the negative must not pin.
+let landInfoCache: { maxZoom: number } | null | undefined;
+async function landInfo(env: Env): Promise<{ maxZoom: number } | null> {
+  const cacheable = !!env.RELEASE_PREFIX && !env.PREVIEW;
+  if (landInfoCache !== undefined && cacheable) return landInfoCache;
+  const info = await pm(env, "land.pmtiles")
+    .getHeader()
+    .then((h) => ({ maxZoom: h.maxZoom }))
+    .catch(() => null);
+  if (cacheable) landInfoCache = info;
+  return info;
+}
+
+// Three outcomes kept distinct (plan Part 3): tile bytes → rasterize; tile absent within a
+// present archive → all-water mask (a no-op on real ocean); archive absent or fetch/decode
+// error → mask()=undefined, serve unmasked. `bytes` is the mask tile's MVT (empty otherwise),
+// folded into the tile's content validator. mask() is lazy and memoized so a matching
+// revalidation (304) never pays the MVT decode + scanline fill — only the fetch.
+interface MaskFetch {
+  mask: () => Uint8Array | undefined;
+  bytes: Uint8Array;
+}
+const EMPTY = new Uint8Array(0);
+const noMask = () => undefined;
+async function fetchMask(
+  env: Env,
+  z: number,
+  x: number,
+  y: number,
+): Promise<MaskFetch> {
+  const info = await landInfo(env);
+  if (!info) return { mask: noMask, bytes: EMPTY };
+  const levels = z - Math.min(z, info.maxZoom);
+  try {
+    const t = await tile(env, "land.pmtiles", z - levels, x >> levels, y >> levels);
+    if (!t) return { mask: waterMask, bytes: EMPTY };
+    let m: Uint8Array | undefined, done = false;
+    return {
+      mask: () => {
+        if (!done) {
+          done = true;
+          try {
+            m = rasterizeMask(t, z, x, y, info.maxZoom);
+          } catch (e) {
+            console.log(`mask decode ${z}/${x}/${y}: ${e}`);
+          }
+        }
+        return m;
+      },
+      bytes: new Uint8Array(t),
+    };
+  } catch (e) {
+    console.log(`mask ${z}/${x}/${y}: ${e}`);
+    return { mask: noMask, bytes: EMPTY };
+  }
+}
+
 // ── Terrarium overzoom: cubic B-spline on decoded heights ───────────────────
 // Decode the ancestor tile to elevations, resample into the output sub-tile with a cubic
 // B-spline (GDAL's `cubicspline`), re-encode. Its basis is non-negative and C2, so it can't
@@ -178,6 +239,7 @@ async function synthesize(
   z: number,
   x: number,
   y: number,
+  mask?: Uint8Array,
 ): Promise<ArrayBuffer> {
   const levels = z - srcMax;
   const span = 1 << levels; // sub-tiles per axis within the ancestor
@@ -197,7 +259,7 @@ async function synthesize(
   for (let p = 0, q = 0; p < ha.length; p++, q += 4)
     ha[p] = unpackTerrarium(src[q], src[q + 1], src[q + 2]);
 
-  const out = new Uint8ClampedArray(TILE * TILE * 4);
+  const oh = new Float64Array(TILE * TILE);
   const srcSize = TILE / span; // pixels of the ancestor this sub-tile spans
   const ox = subX * srcSize,
     oy = subY * srcSize;
@@ -230,9 +292,15 @@ async function synthesize(
         cubicBSpline(ha[r3 + c0], ha[r3 + c1], ha[r3 + c2], ha[r3 + c3], tx),
         ty,
       );
-      packTerrariumInto(out, (j * TILE + i) * 4, h);
+      oh[j * TILE + i] = h;
     }
   }
+  // Composite the effective-land mask into the height field before packing (mask=undefined
+  // when the archive is absent or the mask fetch errored — serve unmasked).
+  if (mask) composite(oh, mask);
+  const out = new Uint8ClampedArray(TILE * TILE * 4);
+  for (let p = 0, di = 0; p < oh.length; p++, di += 4)
+    packTerrariumInto(out, di, oh[p]);
   return encodeWebp({ data: out, width: TILE, height: TILE } as ImageData, {
     lossless: 1,
   });
@@ -610,7 +678,12 @@ export default {
       x = +m[2],
       y = +m[3];
     const ext = m[4];
-    // Overzoom: resolve the ancestor first — the validator derives from it, so
+    // The mask tile is the same for every overzoom attempt at this z/x/y; fetch it lazily
+    // once (only a synthesis path needs it — native tiles don't) and share it across the
+    // overlay walk and the planet fallback.
+    let maskFetchP: Promise<MaskFetch> | undefined;
+    const maskFetch = () => (maskFetchP ??= fetchMask(renv, z, x, y));
+    // Overzoom: resolve the ancestor (and mask) first — the validator derives from both, so
     // a matching revalidation skips the decode → B-spline → encode entirely.
     // (The 304 path doesn't populate the colo cache; the next full GET does.)
     const overzoomTile = async (
@@ -618,12 +691,19 @@ export default {
       srcMax: number,
     ): Promise<Response | null> => {
       const levels = z - srcMax;
-      const parent = await tile(renv, srcFile, srcMax, x >> levels, y >> levels);
+      const parentP = tile(renv, srcFile, srcMax, x >> levels, y >> levels);
+      const mask = await maskFetch(); // in flight alongside the ancestor fetch
+      const parent = await parentP;
       if (!parent) return null; // ancestor missing; caller tries the next source
-      const tag = await contentEtag(parent, OVERZOOM_TAG_VERSION + "-");
+      // Validator = hash of (ancestor ‖ mask tile bytes) — the synthesized tile is a pure
+      // function of both; an absent/errored mask contributes empty bytes.
+      const src = new Uint8Array(parent.byteLength + mask.bytes.length);
+      src.set(new Uint8Array(parent), 0);
+      src.set(mask.bytes, parent.byteLength);
+      const tag = await contentEtag(src, OVERZOOM_TAG_VERSION + "-");
       if (inm === tag) return notModified(tag);
       const body = await overzoomGate(() =>
-        synthesize(parent, srcMax, z, x, y),
+        synthesize(parent, srcMax, z, x, y, mask.mask()),
       );
       return sendTile(body, WEBP, tag);
     };
