@@ -60,10 +60,21 @@ Attack in this order:
 1. **Per-layer archives** (contours/depth-areas/soundings as independent pmtiles, first
    post-migration change): deletes the 1 h 42 m tile-join outright and breaks the serial
    dependency — the two tippecanoe runs become parallel rules, wall ≈ max(2 h 56 m, 2 h 53 m)
-   ≈ 3 h. Also removes the one ~20-core consumer, making the ccx33 default safe. One DEPARE FGB
-   once made Tippecanoe 2.79 fail Wagyu cleaning (exit 106); no fixture was actually preserved
-   (searched repo, history, R2 — 2026-07-21), and all 18 current post-fix DEPARE FGBs pass 2.79
-   with the bundle flags — re-verify at the first combined three-layer archive.
+   ≈ 3 h. Also removes the one ~20-core consumer, making the ccx33 default safe. **Wagyu
+   exit-106 — resolved 2026-07-23.** The regenerated fixture (Stockholm-archipelago stem FGB
+   `store/depare/6-35-18-10.fgb`, 265 MB, 124k polygons) crashes stock tippecanoe 2.79 AND
+   felt/tippecanoe main (v2.80.0 — the box's build) with `--detect-shared-borders`: a Wagyu
+   hole-placement bug ([mapbox/tippecanoe#761](https://github.com/mapbox/tippecanoe/issues/761),
+   unfixed upstream) on dense hole-heavy polygons; input is valid per ST_IsValid, so **no version
+   bump fixes it**. Fix: `depare_run.py` swaps `--detect-shared-borders` →
+   `--no-simplification-of-shared-nodes` (felt's own documented successor — keeps shared edges
+   exact/crack-free and builds clean, all 124k features retained), with an `assert` guarding
+   against reintroduction. Pre-clean was rejected (the collapse is inside tippecanoe at tile
+   quantization, downstream of source precision); feature-split-by-sys works but is fragile. A
+   minimized git-storable fixture is **impossible** (125 MB floor — the crash is emergent from a
+   large connected polygon mass, so spatial bisection stalls), so the assert is the regression
+   guard rather than a CI fixture; the full fixture (kept locally / R2 if ever wanted) is a
+   positive gate since it now builds clean.
 2. **`--read-parallel` / input format** for the ~80 min single-threaded read phase, and
    **sharding** for the low-parallelism tiling phase (spatially partition into 4/8 balanced
    shards on NVMe, merge; adopt only with identical addressed tiles, per-layer counts, canonical

@@ -390,20 +390,25 @@ def tile(stem):
 
 def _tippecanoe(fgbs, maxz, out):
     """tippecanoe the per-tile depare FGBs into `out` (layer `depare`, z MIN_ZOOM..maxz).
-    --detect-shared-borders keeps shared partition edges identical through per-zoom simplification
-    (no cracks between bands); --coalesce-smallest-as-needed, never --drop-densest: a dropped
+    --no-simplification-of-shared-nodes keeps shared partition edges identical through per-zoom
+    simplification (no cracks between bands); --coalesce-smallest-as-needed, never --drop-densest: a dropped
     partition is a tint hole, a coalesced one mis-tints a sub-pixel blob. drval1/drval2 are Real
     (numeric MVT; absent on nodata, the fill's switch key); rank is FlatGeobuf Integer64, so
     -T rank:int keeps it numeric (else it lands as a string, like the contour depth ints)."""
-    subprocess.run(
-        ["tippecanoe", "-o", out, "-f", "-l", "depare",
-         "-n", "Depth areas", "-A", utils.ATTRIBUTION,
-         "-Z", str(MIN_ZOOM), "-z", str(maxz), "-P", "-q",
-         "--detect-shared-borders", "--coalesce-smallest-as-needed",
-         "--simplification", os.environ.get("DEPARE_SIMPLIFICATION", "8"),
-         "-y", "drval1", "-y", "drval2", "-y", "sys", "-y", "kind", "-y", "rank",
-         "-T", "rank:int", *fgbs],
-        check=True)
+    args = ["tippecanoe", "-o", out, "-f", "-l", "depare",
+            "-n", "Depth areas", "-A", utils.ATTRIBUTION,
+            "-Z", str(MIN_ZOOM), "-z", str(maxz), "-P", "-q",
+            "--no-simplification-of-shared-nodes",
+            "--coalesce-smallest-as-needed",
+            "--simplification", os.environ.get("DEPARE_SIMPLIFICATION", "8"),
+            "-y", "drval1", "-y", "drval2", "-y", "sys", "-y", "kind", "-y", "rank",
+            "-T", "rank:int", *fgbs]
+    # --detect-shared-borders drives tippecanoe's wagyu exit-106 hole-placement crash on dense
+    # DEPARE geometry (mapbox/tippecanoe#761, unfixed in felt v2.80.0). Its documented successor
+    # --no-simplification-of-shared-nodes (above) keeps shared edges crack-free without the crash;
+    # this guard fails the build if the old flag is ever reintroduced.
+    assert "--detect-shared-borders" not in args, "DEPARE must not use --detect-shared-borders (wagyu exit-106)"
+    subprocess.run(args, check=True)
 
 
 def bundle_stable():
