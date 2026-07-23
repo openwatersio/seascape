@@ -38,8 +38,8 @@ Staged basenames are tracked across every raw: two members (from any archives or
 paths) sharing a basename is a hard error, never a silent overwrite. The in-place
 datum/normalize steps os.replace onto fresh inodes, so they can never write through into
 raw/. Every derived intermediate (tifs, .nc, gzip spools, VRT/7z scratch, asc/ tiles) is
-removed at entry — all are re-derivable from raw/ + this module — and orphan raw indices
-beyond a shrunken file_list.txt are deleted rather than wedging the source.
+removed at entry — all are re-derivable from raw/ + this module — and orphan raws (a hash no
+longer enumerated, or a stale legacy index name) are deleted rather than wedging the source.
 
 Run from pipelines/:  uv run python source_prep.py <source-id>
 """
@@ -48,6 +48,7 @@ import fnmatch
 import gzip
 import lzma
 import os
+import re
 import shutil
 import sys
 import tarfile
@@ -269,27 +270,28 @@ def _mosaic_asc(root, source, asc_dir):
     shutil.rmtree(asc_dir, ignore_errors=True)
 
 
-def _raw_indices(source, root, n_urls):
-    """Validate raw/ against file_list.txt and return the indices 0..n-1 in order.
-    Orphan indices >= n (the list shrank) are deleted — they're re-fetchable derived
-    state, and leaving them wedges the source until hand-cleanup. Non-index names are
-    an anomaly (a crashed tool's leftovers, a stray file) and error out explicitly;
-    missing indices name exactly what to fetch."""
-    names = [p.rsplit("/", 1)[-1] for p in glob(f"{root}/raw/*")]
-    odd = sorted(n for n in names if not n.isdigit())
-    if odd:
-        sys.exit(f"{source}: unexpected file(s) in raw/ (not list indices): {odd} — "
-                 "remove them; raw/ holds only file_list.txt downloads")
-    present = {int(n) for n in names}
-    for orphan in sorted(i for i in present if i >= n_urls):
-        print(f"{source}: deleting orphan raw/{orphan} (file_list.txt has {n_urls} entries)")
-        os.remove(f"{root}/raw/{orphan}")
-        present.discard(orphan)
-    missing = sorted(set(range(n_urls)) - present)
+def _raw_hashes(source, root, items):
+    """Validate raw/ against items.txt and return [(hash, url), …] in enumeration order.
+    Orphans — a hash no longer listed, or a stale legacy raw/<index> whose item was dropped
+    — are deleted (re-fetchable derived state; leaving them wedges the source). A name that
+    is neither a listed hash nor a legacy index is an anomaly (a crashed tool's leftovers)
+    and errors out; a missing hash names exactly what to fetch."""
+    wanted = {config.item_hash(u): u for u in items}
+    present = set()
+    for name in (p.rsplit("/", 1)[-1] for p in glob(f"{root}/raw/*")):
+        if name in wanted:
+            present.add(name)
+        elif re.fullmatch(r"[0-9a-f]{16}", name) or name.isdigit():
+            print(f"{source}: deleting orphan raw/{name} (not in the current enumeration)")
+            os.remove(f"{root}/raw/{name}")
+        else:
+            sys.exit(f"{source}: unexpected file raw/{name} — raw/ holds only enumerated "
+                     "item downloads; remove it")
+    missing = [u for h, u in wanted.items() if h not in present]
     if missing:
-        sys.exit(f"{source}: raw asset(s) missing for file_list.txt entries {missing} — "
-                 "fetch them before prep")
-    return sorted(present)
+        sys.exit(f"{source}: raw asset(s) missing for {len(missing)} enumerated item(s) "
+                 f"(e.g. {missing[0]}) — fetch them before prep")
+    return [(config.item_hash(u), u) for u in items]
 
 
 def _clear_stale(root):
@@ -349,23 +351,24 @@ def _unpack_one(unpack, raw, root, source, index, url, asc_dir, seen, origin):
 
 def stage(source):
     root = f"store/source/{source}"
-    urls = config.file_list(source)
     spec = config.load_metadata(source).get("unpack")
     unpack = _parse_unpack(spec) if spec else None
-    indices = _raw_indices(source, root, len(urls))
+    hashes = _raw_hashes(source, root, config.items(source))
     _clear_stale(root)
     asc_dir = f"{root}/asc"
     seen = set()  # staged basenames — collisions across raws/archives hard-error
     corrupt = []
-    for index in indices:
-        raw = f"{root}/raw/{index}"
-        origin = f"{source}[{index}]"
+    # `pos` (enumeration position) names bare-raster stagings + archive scratch, so those
+    # stay stable across runs; the raw itself lives at raw/<hash>.
+    for pos, (h, url) in enumerate(hashes):
+        raw = f"{root}/raw/{h}"
+        origin = f"{source}[{pos}]"
         try:
-            note = _unpack_one(unpack, raw, root, source, index, urls[index], asc_dir, seen, origin)
+            note = _unpack_one(unpack, raw, root, source, pos, url, asc_dir, seen, origin)
         except _CORRUPT as e:
             print(f"{origin}: corrupt raw ({e}) — deleted, a rerun refetches it")
             os.remove(raw)
-            corrupt.append(index)
+            corrupt.append(h)
             continue
         print(f"{origin}: {note}")
     if corrupt:
@@ -414,16 +417,17 @@ def main():
 
 
 def _check():
-    """Synthetic sources end to end, driven by declared `unpack`. Common path: a declared
-    zip extracts its glob members, an undeclared raw hardlinks under the legacy name, stale
-    root tifs are cleared, the metadata knobs drive datum + normalize. Failure modes: a
-    missing raw index names what to fetch, a non-index file in raw/ is a distinct error, an
-    orphan index beyond a shrunken file_list is deleted, and a staged-basename collision
-    hard-errors. Format registry: a gzipped tar with `!1` stages exactly its one *_lld.tif
-    (0 → error), a 7z glob filters its members, a gzipped .e00 stages to <id>.tif
-    (pure-Python), and — when the GDAL CLI is present — an asc-mosaic zip mosaics to <id>.tif.
-    Corrupt raws self-heal: a truncated declared zip, a declared zip whose bytes are not a
-    zip, and an undeclared raw that is a server error page are all deleted with a refetch."""
+    """Synthetic sources end to end, driven by declared `unpack`. Raws live at raw/<hash>
+    (config.item_hash of the item URL); items.txt is the enumeration. Common path: a declared
+    zip extracts its glob members, an undeclared raw hardlinks under the legacy <id>_<pos>
+    name, stale root tifs are cleared, the metadata knobs drive datum + normalize. Failure
+    modes: a missing raw names what to fetch, an unexpected non-hash file in raw/ is a distinct
+    error, an orphan (a hash no longer listed, or a stale legacy index) is deleted, and a
+    staged-basename collision hard-errors. Format registry: a gzipped tar with `!1` stages
+    exactly its one *_lld.tif (0 → error), a 7z glob filters its members, a gzipped .e00 stages
+    to <id>.tif (pure-Python), and — when the GDAL CLI is present — an asc-mosaic zip mosaics to
+    <id>.tif. Corrupt raws self-heal: a truncated declared zip, a declared zip whose bytes are
+    not a zip, and an undeclared raw that is a server error page are all deleted with a refetch."""
     import io
     import json
     import tempfile
@@ -448,19 +452,29 @@ def _check():
     except SystemExit as e:
         assert "unknown unpack format" in str(e), e
 
+    H = config.item_hash
+
+    def seed(sid, urls, meta):
+        """A synthetic source: metadata.json + items.txt (the enumeration) + an empty raw/."""
+        os.makedirs(f"sources/{sid}", exist_ok=True)
+        with open(f"sources/{sid}/metadata.json", "w") as f:
+            json.dump(meta, f)
+        os.makedirs(f"store/source/{sid}/raw", exist_ok=True)
+        with open(f"store/source/{sid}/items.txt", "w") as f:
+            f.write("".join(u + "\n" for u in urls))
+
+    def raw_of(sid, url):
+        return f"store/source/{sid}/raw/{H(url)}"
+
     d = tempfile.mkdtemp()
     cwd, saved = os.getcwd(), config.SOURCES_DIR
     try:
         os.chdir(d)
         config.SOURCES_DIR = "sources"
         sid = "_prep_selfcheck"
-        os.makedirs(f"sources/{sid}")
-        os.makedirs(f"store/source/{sid}/raw")
-        with open(f"sources/{sid}/file_list.txt", "w") as f:
-            f.write("https://x/archive.zip\nhttps://x/plain.tif\n")
-        with open(f"sources/{sid}/metadata.json", "w") as f:
-            json.dump({"name": "Synth", "unpack": "zip:*.tif", "negate": True,
-                       "datum_offset_m": -1.0, "crs": "EPSG:28992"}, f)
+        u0, u1 = "https://x/archive.zip", "https://x/plain.zip"
+        seed(sid, [u0, u1], {"name": "Synth", "unpack": "zip:*.tif", "negate": True,
+                             "datum_offset_m": -1.0, "crs": "EPSG:28992"})
 
         def tif_bytes(value):
             buf = io.BytesIO()
@@ -474,21 +488,21 @@ def _check():
         with zipfile.ZipFile(zbuf, "w") as z:
             z.writestr("nested/a.tif", tif_bytes(5.0))  # +5 m depth
             z.writestr("readme.txt", b"skip me")
-        with open(f"store/source/{sid}/raw/0", "wb") as f:
+        with open(raw_of(sid, u0), "wb") as f:
             f.write(zbuf.getvalue())
         with open(f"store/source/{sid}/stale.tif", "w") as f:
             f.write("old")
-        # `unpack` applies to every raw, so index 1 is a zip too (+10 m depth member).
+        # `unpack` applies to every item, so u1 is a zip too (+10 m depth member).
         zbuf1 = io.BytesIO()
         with zipfile.ZipFile(zbuf1, "w") as z:
             z.writestr("b.tif", tif_bytes(10.0))
-        with open(f"store/source/{sid}/raw/1", "wb") as f:
+        with open(raw_of(sid, u1), "wb") as f:
             f.write(zbuf1.getvalue())
 
         prep(sid)
         assert not os.path.exists(f"store/source/{sid}/stale.tif"), "stale tif must be cleared"
         assert not os.path.exists(f"store/source/{sid}/readme.txt")
-        assert open(f"store/source/{sid}/raw/1", "rb").read() == zbuf1.getvalue(), \
+        assert open(raw_of(sid, u1), "rb").read() == zbuf1.getvalue(), \
             "in-place steps must never write through into raw/"
         with open(f"store/source/{sid}/datum.json") as f:
             sidecar = json.load(f)
@@ -498,56 +512,53 @@ def _check():
                 assert src.crs.to_epsg() == 28992, (name, src.crs)
                 assert src.read(1)[0, 0] == want, (name, src.read(1)[0, 0])
 
-        os.remove(f"store/source/{sid}/raw/1")
+        os.remove(raw_of(sid, u1))
         try:
             prep(sid)
-            assert False, "expected a missing raw index to exit"
+            assert False, "expected a missing raw to exit"
         except SystemExit as e:
-            assert "missing" in str(e) and "[1]" in str(e) and "fetch them" in str(e), e
-        # …and a non-index file in raw/ is a distinct, named anomaly (never a bare int() crash).
-        with open(f"store/source/{sid}/raw/junk", "w") as f:
+            assert "missing" in str(e) and "plain.zip" in str(e) and "fetch them" in str(e), e
+        with open(raw_of(sid, u1), "wb") as f:  # restore, then add an anomalous file
+            f.write(zbuf1.getvalue())
+        # An unexpected (non-hash, non-index) file in raw/ is a distinct, named anomaly.
+        with open(f"store/source/{sid}/raw/junk!", "w") as f:
             f.write("?")
         try:
             prep(sid)
-            assert False, "expected a non-index raw file to exit"
+            assert False, "expected an unexpected raw file to exit"
         except SystemExit as e:
-            assert "not list indices" in str(e) and "junk" in str(e), e
-        os.remove(f"store/source/{sid}/raw/junk")
+            assert "unexpected file" in str(e) and "junk!" in str(e), e
+        os.remove(f"store/source/{sid}/raw/junk!")
 
-        # Orphan raw indices beyond the (shrunk) file_list are deleted, not a wedge.
-        with open(f"sources/{sid}/file_list.txt", "w") as f:
-            f.write("https://x/archive.zip\n")  # list shrank 2 → 1
-        with open(f"store/source/{sid}/raw/1", "wb") as f:
-            f.write(zbuf1.getvalue())  # now an orphan
+        # Orphans are deleted, not a wedge: a hash no longer listed AND a stale legacy index.
+        with open(f"store/source/{sid}/items.txt", "w") as f:
+            f.write(u0 + "\n")  # enumeration shrank 2 → 1
+        with open(raw_of(sid, u1), "wb") as f:
+            f.write(zbuf1.getvalue())  # u1's hash is now an orphan
+        with open(f"store/source/{sid}/raw/7", "wb") as f:
+            f.write(b"legacy index leftover")  # a stale pre-hash index name
         prep(sid)
-        assert not os.path.exists(f"store/source/{sid}/raw/1"), "orphan raw must be deleted"
+        assert not os.path.exists(raw_of(sid, u1)), "orphan hash must be deleted"
+        assert not os.path.exists(f"store/source/{sid}/raw/7"), "stale legacy index must be deleted"
 
-        # A bare raster (no `unpack`): the raw hardlinks under the legacy <id>_<index>.<ext>.
+        # A bare raster (no `unpack`): the raw hardlinks under the legacy <id>_<pos>.<ext>.
         bid = "_prep_bare"
-        os.makedirs(f"sources/{bid}")
-        os.makedirs(f"store/source/{bid}/raw")
-        with open(f"sources/{bid}/file_list.txt", "w") as f:
-            f.write("https://x/dem.tif\n")
-        with open(f"sources/{bid}/metadata.json", "w") as f:
-            json.dump({"name": "Bare", "crs": "EPSG:4326"}, f)
-        with open(f"store/source/{bid}/raw/0", "wb") as f:
+        bu = "https://x/dem.tif"
+        seed(bid, [bu], {"name": "Bare", "crs": "EPSG:4326"})
+        with open(raw_of(bid, bu), "wb") as f:
             f.write(tif_bytes(7.0))
         stage(bid)
         assert os.path.isfile(f"store/source/{bid}/{bid}_0.tif"), "bare raster stages under legacy name"
 
         # Two archives whose members share a basename must hard-error, not silently overwrite.
         cid = "_prep_collide"
-        os.makedirs(f"sources/{cid}")
-        os.makedirs(f"store/source/{cid}/raw")
-        with open(f"sources/{cid}/file_list.txt", "w") as f:
-            f.write("https://x/a.zip\nhttps://x/b.zip\n")
-        with open(f"sources/{cid}/metadata.json", "w") as f:
-            json.dump({"name": "Collide", "unpack": "zip:*.tif"}, f)
-        for i in range(2):
+        cu = ["https://x/a.zip", "https://x/b.zip"]
+        seed(cid, cu, {"name": "Collide", "unpack": "zip:*.tif"})
+        for i, u in enumerate(cu):
             zb = io.BytesIO()
             with zipfile.ZipFile(zb, "w") as z:
                 z.writestr(f"pack{i}/dup.tif", tif_bytes(1.0))
-            with open(f"store/source/{cid}/raw/{i}", "wb") as f:
+            with open(raw_of(cid, u), "wb") as f:
                 f.write(zb.getvalue())
         try:
             stage(cid)
@@ -560,12 +571,8 @@ def _check():
         import gzip as _gz
         import tarfile as _tar
         lid = "_prep_lld"
-        os.makedirs(f"sources/{lid}")
-        os.makedirs(f"store/source/{lid}/raw")
-        with open(f"sources/{lid}/file_list.txt", "w") as f:
-            f.write("https://x/huron_lld.geotiff.tar.gz\n")
-        with open(f"sources/{lid}/metadata.json", "w") as f:
-            json.dump({"name": "LLD", "unpack": "tar.gz:*_lld.tif!1"}, f)
+        lu = "https://x/huron_lld.geotiff.tar.gz"
+        seed(lid, [lu], {"name": "LLD", "unpack": "tar.gz:*_lld.tif!1"})
 
         def targz_bytes(members):
             tb = io.BytesIO()
@@ -576,14 +583,14 @@ def _check():
                     t.addfile(info, io.BytesIO(data))
             return _gz.compress(tb.getvalue())
 
-        with open(f"store/source/{lid}/raw/0", "wb") as f:
+        with open(raw_of(lid, lu), "wb") as f:
             f.write(targz_bytes([("huron_lld/huron_lld.tif", tif_bytes(2.0)),
                                  ("huron_lld/huron_lld.prj", b"PROJCS[...]"),
                                  ("huron_lld/extra.tif", tif_bytes(3.0))]))  # non-matching: ignored
         stage(lid)
         assert os.path.isfile(f"store/source/{lid}/huron_lld.tif")
         assert not os.path.exists(f"store/source/{lid}/extra.tif"), "tar stages matches only"
-        with open(f"store/source/{lid}/raw/0", "wb") as f:
+        with open(raw_of(lid, lu), "wb") as f:
             f.write(targz_bytes([("huron_lld/readme.txt", b"no dem here")]))
         try:
             stage(lid)
@@ -595,13 +602,9 @@ def _check():
         # Lakes .7z carries four per-lake rasters).
         import py7zr
         zid = "_prep_7z"
-        os.makedirs(f"sources/{zid}")
-        os.makedirs(f"store/source/{zid}/raw")
-        with open(f"sources/{zid}/file_list.txt", "w") as f:
-            f.write("https://x/rasters.7z\n")
-        with open(f"sources/{zid}/metadata.json", "w") as f:
-            json.dump({"name": "7Z", "unpack": "7z:*_ras.tif"}, f)
-        with py7zr.SevenZipFile(f"store/source/{zid}/raw/0", "w") as z:
+        zu = "https://x/rasters.7z"
+        seed(zid, [zu], {"name": "7Z", "unpack": "7z:*_ras.tif"})
+        with py7zr.SevenZipFile(raw_of(zid, zu), "w") as z:
             z.writestr(tif_bytes(1.0), "Rasters/Lake_A_ras.tif")
             z.writestr(tif_bytes(2.0), "Rasters/Lake_B_ras.tif")
             z.writestr(tif_bytes(3.0), "Rasters/hillshade.tif")  # non-matching: ignored
@@ -613,12 +616,8 @@ def _check():
 
         # Format registry: a gzipped ARC/INFO .e00 export stages to <id>.tif (no GDAL CLI).
         eid = "_prep_e00"
-        os.makedirs(f"sources/{eid}")
-        os.makedirs(f"store/source/{eid}/raw")
-        with open(f"sources/{eid}/file_list.txt", "w") as f:
-            f.write("https://x/grid.e00.gz\n")
-        with open(f"sources/{eid}/metadata.json", "w") as f:
-            json.dump({"name": "E00", "unpack": "e00", "crs": "EPSG:32610"}, f)
+        eu = "https://x/grid.e00.gz"
+        seed(eid, [eu], {"name": "E00", "unpack": "e00", "crs": "EPSG:32610"})
         # Fixed-width GRD: ncols[0:10] nrows[10:20], one space + type digit at [20:22], then
         # nodata at [22:]; values are 14-char E-notation, 5/line, each grid row padded out to
         # ceil(ncols/5)*5 = 5 tokens. A 2x2 grid of [[1,2],[3,4]] with -3.4e38 nodata + pad.
@@ -630,7 +629,7 @@ def _check():
             f"{1.0:.7E} {1.0:.7E}\n0.0 0.0\n2.0 2.0\n"
             + "".join("".join(f"{v:14.7E}" for v in r) + "\n" for r in rows)
             + "EOG\nEOI\n")
-        with _gz.open(f"store/source/{eid}/raw/0", "wb") as f:
+        with _gz.open(raw_of(eid, eu), "wb") as f:
             f.write(e00_text.encode())
         stage(eid)
         with rasterio.open(f"store/source/{eid}/{eid}.tif") as src:
@@ -641,32 +640,28 @@ def _check():
         # error page routed as a raster: all deleted with a refetch; a rerun with good bytes
         # then succeeds. The exact truncated-download / 200-with-garbage cases.
         cid = "_prep_corrupt"
-        os.makedirs(f"sources/{cid}")
-        os.makedirs(f"store/source/{cid}/raw")
-        with open(f"sources/{cid}/file_list.txt", "w") as f:
-            f.write("https://x/a.zip\nhttps://x/b.zip\n")
-        with open(f"sources/{cid}/metadata.json", "w") as f:
-            json.dump({"name": "Corrupt", "unpack": "zip:*.tif"}, f)
+        c0, c1 = "https://x/a.zip", "https://x/b.zip"
+        seed(cid, [c0, c1], {"name": "Corrupt", "unpack": "zip:*.tif"})
         good_zip = io.BytesIO()
         with zipfile.ZipFile(good_zip, "w") as z:
             z.writestr("a.tif", tif_bytes(1.0))
-        with open(f"store/source/{cid}/raw/0", "wb") as f:
+        with open(raw_of(cid, c0), "wb") as f:
             f.write(good_zip.getvalue()[: len(good_zip.getvalue()) // 2])  # truncated, PK intact
-        with open(f"store/source/{cid}/raw/1", "wb") as f:
+        with open(raw_of(cid, c1), "wb") as f:
             f.write(b"<html>503 Service Unavailable</html>")  # not zip bytes → declaration contradicted
         try:
             stage(cid)
             assert False, "expected corrupt raws to exit"
         except SystemExit as e:
-            assert "corrupt raw asset(s) [0, 1]" in str(e), e
-        assert not os.path.exists(f"store/source/{cid}/raw/0"), "truncated zip raw must be deleted"
-        assert not os.path.exists(f"store/source/{cid}/raw/1"), "non-zip raw must be deleted"
-        with open(f"store/source/{cid}/raw/0", "wb") as f:
+            assert "deleted 2 corrupt raw asset(s)" in str(e), e
+        assert not os.path.exists(raw_of(cid, c0)), "truncated zip raw must be deleted"
+        assert not os.path.exists(raw_of(cid, c1)), "non-zip raw must be deleted"
+        with open(raw_of(cid, c0), "wb") as f:
             f.write(good_zip.getvalue())
         good_zip1 = io.BytesIO()
         with zipfile.ZipFile(good_zip1, "w") as z:
             z.writestr("b.tif", tif_bytes(2.0))
-        with open(f"store/source/{cid}/raw/1", "wb") as f:
+        with open(raw_of(cid, c1), "wb") as f:
             f.write(good_zip1.getvalue())
         stage(cid)  # refetched good bytes stage cleanly
         assert os.path.isfile(f"store/source/{cid}/a.tif")
@@ -674,37 +669,29 @@ def _check():
 
         # An undeclared raw that is a server error page (not a raster) also self-heals.
         gid = "_prep_garbage"
-        os.makedirs(f"sources/{gid}")
-        os.makedirs(f"store/source/{gid}/raw")
-        with open(f"sources/{gid}/file_list.txt", "w") as f:
-            f.write("https://x/dem.tif\n")
-        with open(f"sources/{gid}/metadata.json", "w") as f:
-            json.dump({"name": "Garbage"}, f)
-        with open(f"store/source/{gid}/raw/0", "wb") as f:
+        gu = "https://x/dem.tif"
+        seed(gid, [gu], {"name": "Garbage"})
+        with open(raw_of(gid, gu), "wb") as f:
             f.write(b"<html>503 Service Unavailable</html>")
         try:
             stage(gid)
             assert False, "expected a garbage bare raster to exit"
         except SystemExit as e:
-            assert "corrupt raw asset(s) [0]" in str(e), e
-        assert not os.path.exists(f"store/source/{gid}/raw/0"), "garbage raster raw must be deleted"
+            assert "deleted 1 corrupt raw asset(s)" in str(e), e
+        assert not os.path.exists(raw_of(gid, gu)), "garbage raster raw must be deleted"
         assert not os.path.exists(f"store/source/{gid}/{gid}_0.tif"), "bad staged tif must be removed"
 
         # Format registry: an asc-mosaic zip of ESRI ASCII tiles mosaics to <id>.tif (GDAL CLI).
         if shutil.which("gdalbuildvrt") and shutil.which("gdal_translate"):
             aid = "_prep_asc"
-            os.makedirs(f"sources/{aid}")
-            os.makedirs(f"store/source/{aid}/raw")
-            with open(f"sources/{aid}/file_list.txt", "w") as f:
-                f.write("https://x/tiles.esriasciigrid.zip\n")
-            with open(f"sources/{aid}/metadata.json", "w") as f:
-                json.dump({"name": "ASC", "unpack": "asc-mosaic", "crs": "EPSG:2056"}, f)
+            au = "https://x/tiles.esriasciigrid.zip"
+            seed(aid, [au], {"name": "ASC", "unpack": "asc-mosaic", "crs": "EPSG:2056"})
             asc = ("ncols 2\nnrows 2\nxllcorner 0\nyllcorner 0\ncellsize 1\n"
                    "NODATA_value -9999\n1 2\n3 4\n")
             zb = io.BytesIO()
             with zipfile.ZipFile(zb, "w") as z:
                 z.writestr("swissbathy_1.asc", asc)
-            with open(f"store/source/{aid}/raw/0", "wb") as f:
+            with open(raw_of(aid, au), "wb") as f:
                 f.write(zb.getvalue())
             stage(aid)
             assert os.path.isfile(f"store/source/{aid}/{aid}.tif"), "asc zip must mosaic to <id>.tif"

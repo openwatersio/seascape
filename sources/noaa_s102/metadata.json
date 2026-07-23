@@ -7,6 +7,8 @@
     "band": 1,
     "mixed_crs": true,
     "volatile": true,
+    "filter": "*.h5",
+    "dedupe": "s102-issue",
     "negate": true,
     "priority": 1
 }

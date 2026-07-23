@@ -20,6 +20,10 @@ ALL_SOURCES = pipeline_config.sources()
 # volatile: true ⇒ mirrored registration (remote objects); everything else preps locally
 MIRRORED = [s for s in ALL_SOURCES if pipeline_config.load_metadata(s).get("volatile")]
 PREPPED = [s for s in ALL_SOURCES if s not in MIRRORED]
+# listed ⇒ the enumerate checkpoint lists a bucket/urllist (vs echoing a committed file_list);
+# these re-enumerate on the weekly cron. Orthogonal to prepped/mirrored: nz_coastal is listed
+# AND prepped, the volatile mirrors are listed AND mirrored, the rest are static.
+LISTED = [s for s in ALL_SOURCES if "filter" in pipeline_config.load_metadata(s)]
 
 # ── streaming ("source access resolves per source, local wins") ──────────────────────
 # --config stream=1 (laptop preview): a source with no local prep evidence
@@ -33,6 +37,7 @@ STREAMED = ([s for s in ALL_SOURCES if not (_wd / "store/source" / s / "raw").is
             if config.get("stream") else [])
 LOCAL_PREPPED = [s for s in PREPPED if s not in STREAMED]
 LOCAL_MIRRORED = [s for s in MIRRORED if s not in STREAMED]
+LOCAL_LISTED = [s for s in LISTED if s not in STREAMED]
 
 ONLY = config.get("source")
 if ONLY and ONLY not in PREPPED + MIRRORED:
@@ -48,24 +53,46 @@ rule sources:
         expand("store/polygon/{source}.gpkg", source=[s for s in TARGETS if s in PREPPED]),
 
 
-# One download per file_list.txt entry; raw names are the bare index (bytes get sniffed).
-rule fetch_asset:
+# Enumerate every source's fetchable items through ONE code path (source_enumerate). A
+# CHECKPOINT: items.txt is a runtime product (a listed source's items come from a live bucket
+# listing), so the per-item fetch jobs can't be enumerated at parse — the DAG re-evaluates
+# once items.txt lands (raw_assets reads it via checkpoints.enumerate.get). Static sources
+# echo their committed file_list; listed sources list + filter + dedupe. write-if-changed, so
+# an unchanged enumeration doesn't cascade.
+checkpoint enumerate:
+    input:
+        str(SOURCES_DIR / "{source}/file_list.txt"),
+        metadata=str(SOURCES_DIR / "{source}/metadata.json"),
     output:
-        "store/source/{source}/raw/{index}"
-    params:
-        # the URL as a param (not file_list.txt as input): editing one line refetches one index
-        url=lambda wc: pipeline_config.file_list(wc.source)[int(wc.index)],
+        "store/source/{source}/items.txt"
     wildcard_constraints:
-        source=pat(PREPPED), index=r"\d+"
+        source=pat(LOCAL_PREPPED + LOCAL_MIRRORED)
+    log:
+        f"{TMP}/logs/enumerate/{{source}}.log"
+    shell:
+        "{PY}/source_enumerate.py {wildcards.source} 2> {log}"
+
+
+# One download per enumerated item; the raw name is the URL hash (source_fetch), so inserting
+# an item can't re-key the others and a warm legacy raw/<index> self-migrates without refetch.
+# items.txt is `ancient` — it must exist (built by enumerate), but a re-enumeration must not
+# invalidate raws whose URL is unchanged.
+rule fetch_item:
+    input:
+        ancient("store/source/{source}/items.txt")
+    output:
+        "store/source/{source}/raw/{hash}"
+    wildcard_constraints:
+        source=pat(LOCAL_PREPPED), hash=r"[0-9a-f]{16}"
     retries: 2
     benchmark:
-        f"{TMP}/bench/fetch/{{source}}-{{index}}.tsv"
+        f"{TMP}/bench/fetch/{{source}}-{{hash}}.tsv"
     # stderr per job for forensics (a failed job's diagnostics stay isolated in its own log);
     # stdout keeps flowing to the run log so monitors and Actions heartbeats parse progress.
     log:
-        f"{TMP}/logs/fetch/{{source}}-{{index}}.log"
+        f"{TMP}/logs/fetch/{{source}}-{{hash}}.log"
     shell:
-        "{PY}/source_fetch.py {wildcards.source} {wildcards.index} 2> {log}"
+        "{PY}/source_fetch.py {wildcards.source} {wildcards.hash} 2> {log}"
 
 
 # Stage → datum → normalize → bounds, one job per source.
@@ -92,23 +119,28 @@ rule prep_source:
 # The weekly forced source refresh — run as its OWN invocation before catalogs/publish:
 # a forced producer schedules all dependents at plan time, but across an invocation
 # boundary the engine's checksums cure unchanged registrations, so the main invocation
-# cascades only on real upstream drift.
+# cascades only on real upstream drift. Scoped to the LISTED sources: they are the ones whose
+# enumeration can drift week to week (a bucket/urllist listing); static sources change only
+# when their committed file_list.txt does. The workflow runs `refresh -R enumerate`, so a
+# re-listing that produces an unchanged items.txt cures downstream at the boundary.
 # The objects push rides here too: mirror_objects is on the mirror.txt branch, NOT the
 # catalog cascade the boundary suppresses, so pulling it into this invocation overlaps each
 # source's ~190 GB copy with the next source's re-listing instead of stranding it behind the
 # barrier. Objects stay additive and land before catalog.json, so cross-boundary atomicity holds.
 rule refresh:
     input:
-        expand("store/source/{source}/bounds.csv", source=MIRRORED),
-        expand("store/meta/publish/{source}.objects", source=MIRRORED),
+        expand("store/source/{source}/bounds.csv", source=LOCAL_LISTED),
+        expand("store/meta/publish/{source}.objects",
+               source=[s for s in LOCAL_LISTED if s in MIRRORED]),
 
 
-# Volatile mirrored collections register objects/<key> rows off the public bucket.
-# Re-listing on cadence: the weekly workflow runs `refresh -R mirror_source` separately.
-rule mirror_source:
+# Volatile mirrored collections register objects/<key> rows off the public bucket, reading the
+# enumerate checkpoint's items.txt. Re-listing on cadence is the enumerate checkpoint's job
+# (the weekly workflow runs `refresh -R enumerate`); this step just materializes bounds.csv +
+# the mirror manifests from whatever items.txt currently holds.
+rule register:
     input:
-        str(SOURCES_DIR / "{source}/file_list.txt"),
-        metadata=str(SOURCES_DIR / "{source}/metadata.json"),
+        "store/source/{source}/items.txt",
     output:
         # Use `update` to keep the previous bounds in place.
         bounds=update("store/source/{source}/bounds.csv"),
@@ -119,15 +151,15 @@ rule mirror_source:
     # Priority BANDS, separated by orders of magnitude so no byte-weighted prep (raw MB,
     # realistically <1,000,000) can cross into a higher band, and so the values dominate
     # the scheduler's packing objective (which otherwise favors count-maximizing selection of
-    # light jobs): masks 10M > mirrors 5M > preps (raw MB).
+    # light jobs): masks 10M > registrations 5M > preps (raw MB).
     priority: 5_000_000  # long serial job with thousands of network header reads; start early
     retries: 2
     resources:
         mem_gb=2  # header reads + list bookkeeping, no raster in memory
     benchmark:
-        f"{TMP}/bench/mirror/{{source}}.tsv"
+        f"{TMP}/bench/register/{{source}}.tsv"
     log:
-        f"{TMP}/logs/mirror/{{source}}.log"
+        f"{TMP}/logs/register/{{source}}.log"
     shell:
         "{PY}/source_mirror.py {wildcards.source} 2> {log}"
 
@@ -185,7 +217,7 @@ rule fetch_catalog:
 rule landmask:
     output:
         "store/landmask/land.fgb"
-    priority: 10_000_000  # top band (see mirror_source): long single-threaded, ready at t=0 — overlap, don't tail
+    priority: 10_000_000  # top band (see register): long single-threaded, ready at t=0 — overlap, don't tail
     retries: 2
     resources:
         mem_gb=4

@@ -6,6 +6,7 @@ each with ``metadata.json`` (attribution + bathymetry knobs) and ``file_list.txt
 Ported from scripts/config.sh.
 """
 
+import hashlib
 import json
 import os
 from glob import glob
@@ -157,3 +158,20 @@ def file_list(source):
         return []
     with open(path) as f:
         return [l.strip() for l in f if l.strip() and not l.lstrip().startswith("#")]
+
+
+def item_hash(url):
+    """The store's raw/ filename for a fetch item: first 16 hex of sha256(url). Hashing
+    the URL (not a list index) means inserting an item can't re-key later items, so the
+    box refetches only genuinely new URLs."""
+    return hashlib.sha256(url.encode()).hexdigest()[:16]
+
+
+def items(source):
+    """The enumerated fetchable items (store/source/<id>/items.txt, one URL per line),
+    written by the enumerate checkpoint. Empty if it hasn't run yet."""
+    path = f"store/source/{source}/items.txt"
+    if not os.path.isfile(path):
+        return []
+    with open(path) as f:
+        return [l.strip() for l in f if l.strip()]
