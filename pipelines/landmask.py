@@ -197,7 +197,14 @@ def prep_water(processes=8):
             utils.run_command(
                 f"ogr2ogr -f GPKG {'-overwrite' if i == 0 else '-update -append'} "
                 f"-nln water {merged} {t}", silent=True)
-        utils.run_command(f"ogr2ogr -f FlatGeobuf -overwrite -nln water {out} {merged}", silent=False)
+        # _water_tile's -clipsrc runs AFTER its polygon filter, so a clipped feature can
+        # re-enter as a collection/empty; those crash tippecanoe's FlatGeobuf reader
+        # (exit 106) and leave the header untyped. Final conversion re-filters + types.
+        utils.run_command(
+            f"ogr2ogr -f FlatGeobuf -overwrite -nln water -nlt PROMOTE_TO_MULTI "
+            f"-dialect SQLITE -sql \"SELECT * FROM water WHERE "
+            f"GeometryType(geometry) LIKE '%POLYGON%' AND NOT ST_IsEmpty(geometry)\" "
+            f"{out} {merged}", silent=False)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print(f"inland-water mask ready: {out}")
@@ -222,16 +229,31 @@ def tiles(out=LAND_TILES):
         raise SystemExit(f"land mask {land} not found — run `landmask.py prep` first")
     utils.create_folder(os.path.dirname(out) or ".")
     water = water_path()
-    layers = f"-L land:{land}" + (f" -L water:{water}" if _present(water) else "")
     tmp = out + ".tmp.pmtiles"
+    tmp_water = out + ".water.fgb"
     try:
+        layers = f"-L land:{land}"
+        if _present(water):
+            # An already-published water.fgb can carry clip artifacts (empty/collection
+            # geometries an older container GDAL wrote) that tippecanoe's FlatGeobuf reader
+            # hard-fails on ("unsupported geometry type 0", exit 106) — GDAL reads them fine,
+            # so sanitize through it: polygonal + non-empty only, header typed via promote.
+            # land.fgb needs none of this: its header is typed Polygon, so nothing
+            # non-conforming could have been written into it.
+            utils.run_command(
+                f"ogr2ogr -f FlatGeobuf -overwrite -nln water -nlt PROMOTE_TO_MULTI "
+                f"-dialect SQLITE -sql \"SELECT * FROM water WHERE "
+                f"GeometryType(geometry) LIKE '%POLYGON%' AND NOT ST_IsEmpty(geometry)\" "
+                f"{tmp_water} {water}")
+            layers += f" -L water:{tmp_water}"
         utils.run_command(
             f"tippecanoe -f -o {tmp} {layers} --projection=EPSG:3857 -Z0 -z12 --coalesce",
             silent=False)
         os.replace(tmp, out)
     finally:
-        if os.path.isfile(tmp):
-            os.remove(tmp)
+        for f in (tmp, tmp_water):
+            if os.path.isfile(f):
+                os.remove(f)
     print(f"land tiles ready: {out}")
 
 
@@ -541,7 +563,10 @@ def _check():
                    "properties": {"kind": "lake"}, "geometry": {"type": "Polygon", "coordinates":
                                 [[[1.4, 1.4], [1.6, 1.4], [1.6, 1.6], [1.4, 1.6], [1.4, 1.4]]]}}]}, f)
     water_fgb = f"{d}/water.fgb"
-    utils.run_command(f"ogr2ogr -f FlatGeobuf -t_srs EPSG:3857 -overwrite {water_fgb} {wgj}")
+    # -nlt GEOMETRY leaves the FGB header untyped like the published planet water.fgb,
+    # so the tiles() sanitize pre-pass is genuinely exercised below.
+    utils.run_command(
+        f"ogr2ogr -f FlatGeobuf -t_srs EPSG:3857 -nlt GEOMETRY -overwrite {water_fgb} {wgj}")
     absent = f"{d}/no-such-water.fgb"  # never created — the degrade-to-land-only baseline
 
     # A grid spanning the box + margin (lon/lat 0.5..2.5), ~1 km pixels.
