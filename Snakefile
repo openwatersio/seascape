@@ -1,5 +1,5 @@
 # The Snakemake build — ONE DAG, ONE entry (this file). See docs/plans/2026-07-14-snakemake-build.md.
-# Per-source knobs (crs/nodata/negate/datum_offset_m/clamp_positive/archive_members)
+# Per-source knobs (crs/nodata/negate/datum_offset_m/clamp_positive/unpack)
 # live in sources/<id>/metadata.json. Run from the repo root:
 #   uv run snakemake sources [--config source=<id>] [-n]
 #   uv run snakemake catalogs                     # + masks, covering, coverage

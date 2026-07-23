@@ -3,6 +3,7 @@
     "producer": "GEBCO Compilation Group / BODC",
     "website": "https://www.gebco.net/",
     "license": "public domain",
+    "unpack": "zip:*.tif",
     "land_clamp": true,
     "crs": "EPSG:4326"
 }
