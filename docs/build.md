@@ -51,7 +51,7 @@ Everything lands in `bathymetry/build/<sha>/` (byte-compatible with the old buil
 - `coverage.pmtiles` — source-provenance footprints, its own small z0–8 tileset
 - `manifest.json` — planet metadata + overlay cell map; **written and pushed last, its presence marks a complete build** (release.yml refuses a sha without one)
 
-A build from `main` auto-dispatches `release.yml` for its sha; feature-branch and `bbox` builds write `build/<sha>/` but don't ship.
+A build from `main` auto-dispatches `release.yml` for its sha; feature-branch builds write `build/<sha>/` but don't ship, and `bbox` builds stage under `build/<sha>-bbox/` — previewable at the same Worker route, invisible to release (it promotes the bare sha).
 
 ## The box lifecycle
 

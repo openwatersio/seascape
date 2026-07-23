@@ -171,7 +171,9 @@ jobs:
       RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
       # The build/<sha>/ release prefix (stage_build); dispatch-only, so unset elsewhere.
-      SHA: ${{ github.sha }}
+      # A bbox run stages under <sha>-bbox: previewable at the same Worker route, invisible
+      # to release.yml (which promotes the bare sha), so a regional stage can never ship.
+      SHA: ${{ github.event.inputs.bbox && format('{0}-bbox', github.sha) || github.sha }}
     steps:
       - uses: actions/checkout@v6
       # Idempotent box setup — docker + the store volume mount. STATE is the volume root
@@ -313,16 +315,16 @@ jobs:
           ./docker.sh run sh -c "cd /app/state && uv run --project /app /app/pipelines/mosaic.py verify"
           # ONE invocation, one DAG: the `cover` checkpoint runs first, then the build
           # re-evaluates into bundles + the mosaic publish (publish_mosaic — `publish` is the
-          # per-source push in publish.smk, run by sources.yml). stage_build only for planet
-          # runs: a bbox smoke must not stage regional archives.
-          targets=(bundles publish_mosaic); [ -z "$BBOX" ] && targets+=(stage_build)
+          # per-source push in publish.smk, run by sources.yml). stage_build always runs; a
+          # bbox run stages under build/<sha>-bbox (see SHA above), so the regional archives
+          # are previewable but can never be promoted by release.yml.
+          targets=(bundles publish_mosaic stage_build)
           ./docker.sh snakemake "${targets[@]}" "${extra[@]}" "${force[@]}" \
             --keep-going --rerun-incomplete \
             --cores "$cores" --resources mem_gb="$budget_gb" disk_mb="$disk_budget_mb" \
             --config workdir=/app/state tmp=/app/tmp 2>&1 | tee "$buildlog"
-      # Close the `build` status to success so it never lingers at pending. A planet run points
-      # it at the published build/<sha>/ prefix; a bbox smoke runs no stage_build (nothing there),
-      # so it points back at the run.
+      # Close the `build` status to success so it never lingers at pending, pointing at the
+      # published prefix — build/<sha> for planet, build/<sha>-bbox for a bbox preview.
       - name: Publish build status
         if: success()
         env:
@@ -332,7 +334,7 @@ jobs:
           if [ -z "$BBOX" ]; then
             desc="published build/$GITHUB_SHA"; url="$PUBLIC_BASE/build/$GITHUB_SHA"
           else
-            desc="bbox smoke complete"; url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            desc="published build/$GITHUB_SHA-bbox (regional preview)"; url="$PUBLIC_BASE/build/$GITHUB_SHA-bbox"
           fi
           curl -fsS -X POST -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
