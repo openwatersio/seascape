@@ -44,3 +44,13 @@ export function previewRoute(
     mount: `${mount}/${sha}`,
   };
 }
+
+/** Missing manifest.json under the resolved prefix. Thrown by the manifest loader;
+ * on preview it is an expected state (a sha never staged, or expired by the build/
+ * 7-day lifecycle) → 404, while production keeps its loud 500 (a broken release). */
+export class ManifestMissing extends Error {}
+
+/** Should this handler error answer as a preview 404 instead of a 500? */
+export function isPreviewMiss(e: unknown, preview: boolean): boolean {
+  return preview && e instanceof ManifestMissing;
+}
