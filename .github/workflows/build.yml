@@ -199,6 +199,15 @@ jobs:
             [ -n "$dev" ] || { echo "store volume device never appeared — attach step skipped or volume held elsewhere?" >&2; exit 1; }
             mkdir -p /mnt/seascape-store
             mount -o noatime "$dev" /mnt/seascape-store
+            # A Hetzner volume resize grows the block device, not the filesystem — grow it to
+            # match (idempotent: a no-op at full size). Without this the extra capacity is invisible
+            # and the headroom guard still trips at the old size.
+            if [ "$(blkid -o value -s TYPE "$dev" 2>/dev/null)" = xfs ]; then
+              command -v xfs_growfs >/dev/null || { apt-get update -qq && apt-get install -y -qq xfsprogs; }
+              xfs_growfs /mnt/seascape-store || true
+            else
+              resize2fs "$dev" || true  # ext4: online-grow to fill the resized device
+            fi
           fi
           STATE=/mnt/seascape-store
           # Merge-job tmp dirs are transient (each job recreates its own); a killed run
