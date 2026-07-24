@@ -245,7 +245,8 @@ def fork_inputs(wc):
 
 rule contour_tile:
     input:
-        fork_inputs
+        fork_inputs,
+        masks=MASKS,
     output:
         "store/contour/{stem}.fgb"
     params:
@@ -266,7 +267,8 @@ rule contour_tile:
 
 rule soundings_tile:
     input:
-        fork_inputs
+        fork_inputs,
+        masks=MASKS,
     output:
         "store/soundings/{stem}.geojson"
     params:

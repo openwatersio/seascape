@@ -313,9 +313,15 @@ def _present(p):
     return p.startswith("/vsi") or os.path.isfile(p)
 
 
-def rasterize(bounds_3857, res, out_tif, src=None, water_src=None):
+def rasterize(bounds_3857, res, out_tif, src=None, water_src=None, all_touched=False):
     """Burn the land mask onto a Byte raster (1=land, 0=water) on the given 3857 grid, then
     subtract inland water (burn 0 over land) where a water mask is present.
+
+    all_touched burns both passes with -at: every pixel a polygon touches, not just pixel
+    centres. At a coarse grid a narrow island rim slips through centre sampling and keeps
+    its false negative depths — the contour/soundings clamp uses -at so the whole rim
+    clamps (over-clamping errs bias-shallow, the chart-safe direction; -at on the water
+    burn symmetrically keeps narrow river channels open).
 
     Pass the SAME -te/-tr gdalwarp uses for the tile, so the mask aligns pixel-for-pixel
     with the warped raster and neighbouring tiles rasterize their shared halo identically
@@ -350,11 +356,12 @@ def rasterize(bounds_3857, res, out_tif, src=None, water_src=None):
     clip = out_tif + ".clip.gpkg"
     water_clip = out_tif + ".water.gpkg"
     tmp_out = out_tif + ".tmp.tif"
+    at = "-at " if all_touched else ""
     try:
         utils.run_command(
             f"ogr2ogr -f GPKG -overwrite -spat {xmin} {ymin} {xmax} {ymax} {clip} {src}")
         utils.run_command(
-            f"gdal_rasterize -burn 1 -ot Byte -init 0 -te {xmin} {ymin} {xmax} {ymax} "
+            f"gdal_rasterize {at}-burn 1 -ot Byte -init 0 -te {xmin} {ymin} {xmax} {ymax} "
             f"-tr {res} {res} -co COMPRESS=DEFLATE -co TILED=YES -co SPARSE_OK=YES "
             f"{clip} {tmp_out}")
         if _present(water):
@@ -364,7 +371,7 @@ def rasterize(bounds_3857, res, out_tif, src=None, water_src=None):
             utils.run_command(
                 f"ogr2ogr -f GPKG -overwrite -where \"kind <> 'physical'\" "
                 f"-spat {xmin} {ymin} {xmax} {ymax} {water_clip} {water}")
-            utils.run_command(f"gdal_rasterize -burn 0 {water_clip} {tmp_out}")
+            utils.run_command(f"gdal_rasterize {at}-burn 0 {water_clip} {tmp_out}")
         os.replace(tmp_out, out_tif)  # atomic: out_tif only ever exists complete
     finally:
         for f in (clip, water_clip, tmp_out):
@@ -431,6 +438,27 @@ def _clamp_negative_land(dem_path, mask_tif, valid):
                     if hit.any():
                         a[hit] = 0
                         ds.write(a, 1, window=win)
+
+
+def clamp_dem_to_land(dem_path):
+    """Post-smooth land clamp for a derived stage-3 DEM (contours/soundings): re-cut
+    negative-under-land to 0 on the DEM's OWN grid before isolines/minima are extracted.
+    The warp-time clamp runs at source resolution with centre sampling, so narrow island
+    rims keep false negatives, and the pre-contour smoothing smears them back across
+    clamped interiors — isobaths and soundings then land on islands. all_touched here so
+    the whole rim clamps (bias-shallow). No-op without a land mask, like everything else."""
+    if not _present(path()):
+        return
+    with rasterio.open(dem_path) as ds:
+        b = ds.bounds
+        res = ds.res[0]
+    mask_tif = dem_path + ".landmask.tif"
+    try:
+        rasterize((b.left, b.bottom, b.right, b.top), res, mask_tif, all_touched=True)
+        clamp(dem_path, mask_tif)
+    finally:
+        if os.path.isfile(mask_tif):
+            os.remove(mask_tif)
 
 
 def clamp(cog_path, mask_tif):
