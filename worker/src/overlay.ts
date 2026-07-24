@@ -29,12 +29,13 @@ export function overlayFor(
  * the remaining tile path, and the sha-folded mount (so emitted TileJSON/style
  * URLs point back correctly) — or null if the segment is absent/malformed (→ 404).
  * The 7–40 hex bound validates the sha AND stops a bare z/x/y path (single digits)
- * from being mistaken for one. */
+ * from being mistaken for one. A `-bbox` suffix selects a regional bbox build's
+ * stage (build.yml stages those under build/<sha>-bbox/, unpromotable by release). */
 export function previewRoute(
   rel: string,
   mount: string,
 ): { prefix: string; rel: string; mount: string } | null {
-  const s = rel.match(/^\/([0-9a-f]{7,40})(?=\/|$)/);
+  const s = rel.match(/^\/([0-9a-f]{7,40}(?:-bbox)?)(?=\/|$)/);
   if (!s) return null;
   const sha = s[1];
   return {
@@ -42,4 +43,14 @@ export function previewRoute(
     rel: rel.slice(sha.length + 1) || "/",
     mount: `${mount}/${sha}`,
   };
+}
+
+/** Missing manifest.json under the resolved prefix. Thrown by the manifest loader;
+ * on preview it is an expected state (a sha never staged, or expired by the build/
+ * 7-day lifecycle) → 404, while production keeps its loud 500 (a broken release). */
+export class ManifestMissing extends Error {}
+
+/** Should this handler error answer as a preview 404 instead of a 500? */
+export function isPreviewMiss(e: unknown, preview: boolean): boolean {
+  return preview && e instanceof ManifestMissing;
 }

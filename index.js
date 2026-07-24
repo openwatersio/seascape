@@ -12,9 +12,16 @@ import { applyState, readDepth, style } from "@openwaters/seascape";
 // ?tiles=<base> overrides it at runtime so this one viewer (deployed or local)
 // can inspect any build preview, e.g.
 // ?tiles=https://data.openwaters.io/bathymetry/build/<sha>.
-const BBOX = import.meta.env.VITE_BBOX
-  ? import.meta.env.VITE_BBOX.split(",").map(Number)
-  : [-180, -85, 180, 85];
+// #W,S,E,N in the URL sets the initial view (e.g. #174.72,-36.45,174.86,-36.28).
+// It doesn't parse as MapLibre's #zoom/lat/lng hash, so hash:true ignores it,
+// falls back to `bounds`, and rewrites the hash on first move.
+const hashBbox = location.hash.slice(1).split(",").map(Number);
+const BBOX =
+  hashBbox.length === 4 && hashBbox.every(Number.isFinite)
+    ? hashBbox
+    : import.meta.env.VITE_BBOX
+      ? import.meta.env.VITE_BBOX.split(",").map(Number)
+      : [-180, -85, 180, 85];
 const tilesBase = (
   new URLSearchParams(location.search).get("tiles") ||
   import.meta.env.VITE_TILES_BASE ||
@@ -149,6 +156,32 @@ map.on("load", () => {
     input.addEventListener("change", sync);
   }
 });
+
+// ─── Debug: bbox readout/zoom + tile grid ─────────────────────────────────
+// One field for both directions: it tracks the viewport bbox (W,S,E,N), and
+// editing it + Enter fits the map to the typed bbox (the resulting moveend
+// then rewrites it with the actual fitted bounds).
+const bboxInput = document.getElementById("bbox-input");
+const showBbox = () =>
+  (bboxInput.value = map
+    .getBounds()
+    .toArray()
+    .flat()
+    .map((n) => n.toFixed(4))
+    .join(","));
+map.on("moveend", showBbox);
+showBbox();
+bboxInput.addEventListener("change", () => {
+  const b = bboxInput.value.split(",").map(Number);
+  if (b.length === 4 && b.every(Number.isFinite)) map.fitBounds(b);
+});
+// MapLibre's native debug overlay: tile borders + z/x/y labels per source
+document
+  .getElementById("toggle-tiles")
+  .addEventListener(
+    "change",
+    (e) => (map.showTileBoundaries = e.target.checked),
+  );
 
 // ─── Click to inspect ─────────────────────────────────────────────────────
 // Which sources cover a clicked point, deepest footprint first (lex-first id on

@@ -57,16 +57,18 @@ def store_tree(store):
 
 
 def registration(store, sources_dir):
-    """A synthetic source registered through `cover`'s inputs (bounds + catalog) plus masks, so
-    the checkpoint is SCHEDULABLE cold and considered up-to-date once the covering is present."""
+    """A synthetic source registered through `cover`'s input (catalog.json) plus masks, so the
+    checkpoint is SCHEDULABLE cold and considered up-to-date once the covering is present."""
     os.makedirs(f"{store}/aggregation")
     os.makedirs(f"{store}/source/synth")
     os.makedirs(f"{store}/landmask")
     os.makedirs(f"{sources_dir}/synth")
     with open(f"{sources_dir}/synth/metadata.json", "w") as f:
         f.write('{"name": "Synth", "priority": 1, "max_zoom": 10}')
-    with open(f"{store}/source/synth/bounds.csv", "w") as f:
-        f.write("x\n")
+    with open(f"{sources_dir}/synth/file_list.txt", "w") as f:
+        f.write("")  # a source with no items — the enumerate checkpoint is a no-op…
+    with open(f"{store}/source/synth/items.txt", "w") as f:
+        f.write("")  # …and its output is present + up-to-date, so no enumerate job schedules
     with open(f"{store}/source/synth/catalog.json", "w") as f:
         f.write('{"properties": {}}')
     for m in ("land.fgb", "water.fgb"):
@@ -120,7 +122,7 @@ def main():
         assert counts.get("mosaic_tile") == 2, f"expected 2 mosaic_tile jobs: {counts}\n{p.stdout}"
         assert counts.get("mosaic_index") == 1, f"expected 1 mosaic_index job: {counts}"
         assert counts.get("cover", 0) == 0, f"a warm covering must NOT reschedule cover: {counts}"
-        for stage1 in ("fetch_asset", "prep_source", "mirror_source", "catalog_item",
+        for stage1 in ("enumerate", "fetch_item", "prep_source", "register", "catalog_item",
                        "fetch_catalog", "landmask", "watermask", "coverage"):
             assert counts.get(stage1, 0) == 0, f"stage-1 rule {stage1} scheduled: {counts}"
         assert store_tree(store) == before, "a dry run must not touch the store"

@@ -236,8 +236,9 @@ def stage_build(bundle_dir="store/bundle"):
 
     planet + vector are REQUIRED (a missing one is an interrupted build). Overlay cells ride
     when populated. soundings/depare are NOT shipped — they tile-join INTO vector.pmtiles, the
-    only vector archive the Worker fetches. coverage.pmtiles is a catalogs product (this graph
-    never writes it); it ships when the warm volume has it, and the Worker tolerates its absence."""
+    only vector archive the Worker fetches. coverage.pmtiles and land.pmtiles are catalogs products
+    (this graph never writes them); each ships when the warm volume has it, and the Worker tolerates
+    its absence."""
     planet = f"{bundle_dir}/planet.pmtiles"
     vector = f"{bundle_dir}/vector.pmtiles"
     for req in (planet, vector):
@@ -278,6 +279,12 @@ def stage_build(bundle_dir="store/bundle"):
         uploads.append(coverage)
     else:
         print("stage-build: no coverage.pmtiles — shipping without the provenance layer "
+              "(the catalogs invocation produces it)")
+    land = f"{bundle_dir}/land.pmtiles"
+    if os.path.isfile(land):
+        uploads.append(land)
+    else:
+        print("stage-build: no land.pmtiles — shipping without the serve-time land mask "
               "(the catalogs invocation produces it)")
     manifest_path = f"{bundle_dir}/manifest.json"
     tmp = manifest_path + ".tmp"
@@ -349,6 +356,7 @@ def _check():
         synth("store/bundle/overlay-5-1-1.pmtiles", 9, 14, [-10, -10, 10, 10])
         synth("store/bundle/vector.pmtiles", 0, 14, [-180, -85, 180, 85])
         synth("store/bundle/coverage.pmtiles", 0, 14, [-180, -85, 180, 85])
+        synth("store/bundle/land.pmtiles", 0, 12, [-180, -85, 180, 85])
         # soundings/depare exist on disk but must NEVER ship — they fold into vector.pmtiles.
         synth("store/bundle/soundings.pmtiles", 0, 14, [-180, -85, 180, 85])
         synth("store/bundle/depare.pmtiles", 0, 14, [-180, -85, 180, 85])
@@ -356,7 +364,7 @@ def _check():
         uploads, manifest_path = stage_build()
         names = {os.path.basename(u) for u in uploads}
         assert names == {"planet.pmtiles", "vector.pmtiles", "overlay-5-1-1.pmtiles",
-                         "coverage.pmtiles"}, f"upload set {names}"
+                         "coverage.pmtiles", "land.pmtiles"}, f"upload set {names}"
         assert not any("soundings" in n or "depare" in n for n in names), \
             "soundings/depare tile-join into vector.pmtiles — never shipped separately"
         assert "manifest.json" not in names and manifest_path.endswith("/manifest.json"), \
@@ -371,10 +379,12 @@ def _check():
         assert m["source_ids"] == ["src"] and m["attribution"] == utils.ATTRIBUTION
         assert json.load(open(stage_build()[1])) == m, "manifest not deterministic across a re-walk"
 
-        # coverage rides only when present; planet/vector are required.
+        # coverage/land ride only when present; planet/vector are required.
         os.remove("store/bundle/coverage.pmtiles")
-        assert not any("coverage" in os.path.basename(u) for u in stage_build()[0]), \
-            "coverage must drop out of the upload set when absent"
+        os.remove("store/bundle/land.pmtiles")
+        staged = {os.path.basename(u) for u in stage_build()[0]}
+        assert "coverage.pmtiles" not in staged and "land.pmtiles" not in staged, \
+            "coverage/land must drop out of the upload set when absent"
         os.remove("store/bundle/planet.pmtiles")
         try:
             stage_build()

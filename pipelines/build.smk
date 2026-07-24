@@ -110,7 +110,7 @@ def tile_sources(stem):
 
 def merge_inputs(wc):
     """A tile's staleness inputs: its covering CSV, each intersecting source's catalog item
-    (the registration marker — a re-prepped or re-mirrored source restamps it, so exactly the
+    (the registration marker — a re-prepped or re-registered source restamps it, so exactly the
     intersecting tiles re-merge), and the masks (their content enters every merged tile)."""
     return ([f"store/aggregation/{wc.stem}-aggregation.csv"]
             + [f"store/source/{s}/catalog.json" for s in tile_sources(wc.stem)]
@@ -250,7 +250,8 @@ def fork_inputs(wc):
 
 rule contour_tile:
     input:
-        fork_inputs
+        fork_inputs,
+        masks=MASKS,
     output:
         "store/contour/{stem}.fgb"
     params:
@@ -271,7 +272,8 @@ rule contour_tile:
 
 rule soundings_tile:
     input:
-        fork_inputs
+        fork_inputs,
+        masks=MASKS,
     output:
         "store/soundings/{stem}.geojson"
     params:

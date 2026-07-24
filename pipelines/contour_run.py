@@ -31,6 +31,7 @@ import mercantile
 
 import aggregation_covering
 import config
+import landmask
 import utils
 from aggregation_reproject import get_resolution
 
@@ -184,6 +185,10 @@ def tile(stem):
     dem = mosaic.window_dem(stem, f"{tmp}/dem.tiff")
     if not os.environ.get("SKIP_SMOOTH"):
         smooth.smooth_tiff(dem)
+    # After smoothing: it smears sea negatives back across clamp-flattened islands, and
+    # the warp-time clamp's centre-sampled mask misses narrow rims — either puts
+    # isobaths on land.
+    landmask.clamp_dem_to_land(dem)
     final = _contour_dem(dem, mercantile.Tile(x=x, y=y, z=z), child_z, tmp, stem)
     os.makedirs(os.path.dirname(out), exist_ok=True)
     if final:
@@ -273,9 +278,13 @@ def _tippecanoe(fgbs, minz, maxz, out):
             ["tippecanoe", "-o", out, "-f", "-l", "contours",
              "-n", "Bathymetric contours", "-A", utils.ATTRIBUTION,
              "-Z", str(minz), "-z", str(maxz), "-P", "-q", "--drop-densest-as-needed",
-             # Aggressive low-zoom vertex thinning (tolerance scales with zoom distance from
-             # maxz, so maxz detail is untouched). Env-tunable to dial on a re-bundle.
+             # Aggressive low-zoom vertex thinning. -S alone ALSO applies at maxzoom
+             # (~76 m tolerance at z10), which cut isobaths across islands the DEM-level
+             # land clamp had already routed around — pin maxzoom near-lossless so the
+             # deepest tier keeps the clamped shoreline. Env-tunable to dial on a re-bundle.
              "--simplification", os.environ.get("CONTOUR_SIMPLIFICATION", "8"),
+             "--simplification-at-maximum-zoom",
+             os.environ.get("CONTOUR_SIMPLIFICATION_MAXZOOM", "1"),
              "-y", "depth_m", "-y", "depth_abs_m", "-y", "sys", "-y", "depth_ft", "-y", "depth_fm",
              # FlatGeobuf Integer64 attributes otherwise land in the MVT as strings.
              "-T", "depth_abs_m:int", "-T", "depth_ft:int", "-T", "depth_fm:int",

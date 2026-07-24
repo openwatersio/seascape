@@ -59,6 +59,8 @@ test: test-sources test-engine test-workflows
 
 # Offline self-checks (synthetic data, no network).
 test-sources:
+    uv run python config.py --check
+    uv run python source_enumerate.py --check
     uv run python source_mirror.py --check
     uv run python source_catalog.py --check
     uv run python source_remote.py

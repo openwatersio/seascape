@@ -16,6 +16,7 @@ import subprocess
 from multiprocessing import Pool
 import shutil
 
+import config
 import utils
 
 SILENT = True
@@ -71,9 +72,7 @@ def polygonize_tif(source, filename):
 
 
 def get_filenames(source):
-    with open(f"store/source/{source}/bounds.csv") as f:
-        lines = [l.strip() for l in f.readlines()[1:]]
-    return [line.split(",")[0] for line in lines]
+    return [row[0] for row in config.source_files(source)]
 
 
 def polygonize_source(source, processes):
