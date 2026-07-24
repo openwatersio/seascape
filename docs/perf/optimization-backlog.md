@@ -29,9 +29,16 @@ from the single-DAG migration. Everything else cascaded by mtime: `mosaic_index`
 `mosaic.gti`/`planet-z8.tif` → 344 terrain renders + a full `publish_mosaic`; `soundings_bundle` →
 `vector_bundle` → `stage_build`. Total: 8 h 12 m of ccx63 for a no-op.
 
-- Pin an explicit `--rerun-triggers` policy (e.g. `mtime`), consistent with the existing
-  convention that code/config changes dirty nothing and are rebuilt by deliberate force — one
-  chosen behavior, not Snakemake's default params/code triggers firing on rule refactors.
+- **Per-rule `version` force tokens** (stage-2/3 tile rules, 2026-07-24): each rule carries a
+  monotonic `version` int in its `params:`, bumped in the PR that changes the rule's logic. Code
+  stays a non-input (an innocuous edit never re-merges the planet), but a deliberate bump forces
+  exactly that rule via the params trigger — declarative force that lives in the diff, not a `-R`
+  flag to remember. Verified: introducing or bumping the token reruns only that rule + its
+  cascade, a no-op stays 0 jobs. This KEEPS Snakemake's default rerun-triggers (params on) — do
+  **not** pin `--rerun-triggers mtime`, which disables it (this supersedes the earlier mtime-pin
+  idea, which would have pushed every deliberate force back onto `-R` at dispatch). Extend the
+  token to the bundle rules as they're modified; deliberately no CI guard (code can change without
+  warranting a bump).
 - Add a dry-run gate: `snakemake -n` job summary logged at the top of every build, and a loud
   warning (or abort for scheduled runs) when a refresh-class dispatch schedules planet-scale
   bundle jobs.

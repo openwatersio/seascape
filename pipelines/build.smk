@@ -2,9 +2,10 @@
 # from the repo-root Snakefile (never run with `-s`), so cover/masks/catalogs and these rules
 # share one graph and one invocation.
 #
-# Freshness here is ENGINE provenance (inputs + params). CODE is deliberately not an input
-# (force-only: `-R mosaic_tile`) — an innocuous merge-module edit must not re-merge the planet
-# by default.
+# Freshness here is ENGINE provenance (inputs + params). CODE is deliberately not an input — an
+# innocuous merge-module edit must not re-merge the planet. To force a rule when its logic DID
+# change, bump its `version` param (declarative, lives in the rule); `-R <rule>` is the ad-hoc
+# override. This relies on the default rerun-triggers (params on) — never pin `--rerun-triggers mtime`.
 #
 # STEMS are a RUNTIME product: the `cover` checkpoint (repo-root Snakefile) writes the covering
 # this build scopes from, so nothing per-stem is known at parse. Every aggregator derives its
@@ -153,6 +154,7 @@ rule mosaic_tile:
     output:
         "store/mosaic/tiles/{stem}.tif"
     params:
+        version=1, # increment to force a rebuild
         sources=lambda wc: source_props(wc.stem),
         merge=MERGE_CFG,
         toolchain=utils.toolchain(),
@@ -255,6 +257,7 @@ rule contour_tile:
     output:
         "store/contour/{stem}.fgb"
     params:
+        version=1, # increment to force a rebuild
         levels=json.dumps({"m": pipeline_config.CONTOUR_LEVELS, "ft": pipeline_config.CONTOUR_LEVELS_FT}),
         nav=contour_run.NAV_SMOOTH_MAX_M, deep=contour_run.DEEP_CUTOFF_M,
         ring=contour_run.MIN_RING_AREA_M2, smooth=SMOOTH_CFG,
@@ -277,6 +280,7 @@ rule soundings_tile:
     output:
         "store/soundings/{stem}.geojson"
     params:
+        version=1, # increment to force a rebuild
         cell=soundings_run.SOUND_CELL_PX, min_depth=soundings_run.SOUND_MIN_DEPTH_M,
         smooth=SMOOTH_CFG,
     priority: tile_weight  # heavy-first; greedy backfills lighter ready jobs into the rest of the budget
@@ -300,6 +304,7 @@ rule depare_tile:
     output:
         "store/depare/{stem}.fgb"
     params:
+        version=1, # increment to force a rebuild
         levels=json.dumps({"m": pipeline_config.DEPARE_LEVELS, "ft": pipeline_config.DEPARE_LEVELS_FT}),
         drying=pipeline_config.DRYING_CAP, sliver=depare_run.SLIVER_MIN_PX, smooth=SMOOTH_CFG,
     priority: tile_weight  # heavy-first; greedy backfills lighter ready jobs into the rest of the budget
@@ -334,6 +339,7 @@ rule terrain_render:
         "store/pmtiles/{stem}.pmtiles"
     priority: tile_weight  # heavy-first; greedy backfills lighter ready jobs into the rest of the budget
     params:
+        version=1, # increment to force a rebuild
         cfg=json.dumps(terrain_mod._config(), sort_keys=True),
     resources:
         mem_gb=lambda wc, attempt: utils.weight(wc.stem, factor=TERRAIN_FACTOR) * attempt,
