@@ -291,8 +291,14 @@ jobs:
           # Same knob sources.yml uses for its fetches (16 on 8 vCPUs).
           cores=$(( $(nproc) * 2 ))
           # Jobs declare disk_mb for their tmp working set; budget it against the volume's
-          # real free space (80%) so concurrent merge tmps can't overflow the store.
-          disk_budget_mb=$(( $(df -BM --output=avail /mnt/seascape-store | tail -1 | tr -dc '0-9') * 8 / 10 ))
+          # real free space (80%) so concurrent merge tmps can't overflow the store. A depare
+          # planet build accumulates ~50 G of NEW permanent FGBs while merges run — the merge
+          # tmp budget must leave room for that, or concurrent tmps over-commit and fill the
+          # volume mid-run. Reserve it up front (full-planet depare only; the fork rules don't
+          # budget disk, so this reserve is also their headroom).
+          avail_mb=$(df -BM --output=avail /mnt/seascape-store | tail -1 | tr -dc '0-9')
+          reserve_mb=0; [ "$INPUT_DEPARE" = "true" ] && [ -z "$BBOX" ] && reserve_mb=51200
+          disk_budget_mb=$(( (avail_mb - reserve_mb) * 8 / 10 ))
           echo "box: ${total_gb} GB RAM, --cores ${cores} -> budget ${budget_gb} GB (reserve ${reserve_gb} GB)"
           force=()
           if [ "$INPUT_FORCE" = "true" ]; then force=(-F); fi
