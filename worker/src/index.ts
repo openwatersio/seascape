@@ -159,16 +159,41 @@ async function tile(
 // a rollback, or unseeded dev) — a failed header read means "no mask this release". Cached
 // in prod only, mirroring manifest(): a release is immutable, but dev/preview reseed under
 // the running Worker so the negative must not pin.
-let landInfoCache: { maxZoom: number } | null | undefined;
-async function landInfo(env: Env): Promise<{ maxZoom: number } | null> {
+interface LandInfo {
+  maxZoom: number;
+  bbox: readonly [number, number, number, number]; // w, s, e, n
+}
+let landInfoCache: LandInfo | null | undefined;
+async function landInfo(env: Env): Promise<LandInfo | null> {
   const cacheable = !!env.RELEASE_PREFIX && !env.PREVIEW;
   if (landInfoCache !== undefined && cacheable) return landInfoCache;
   const info = await pm(env, "land.pmtiles")
     .getHeader()
-    .then((h) => ({ maxZoom: h.maxZoom }))
+    .then((h) => ({
+      maxZoom: h.maxZoom,
+      bbox: [h.minLon, h.minLat, h.maxLon, h.maxLat] as const,
+    }))
     .catch(() => null);
   if (cacheable) landInfoCache = info;
   return info;
+}
+
+// "Absent mask tile = open ocean" is only valid INSIDE the archive's coverage — outside
+// its header bbox (a partial mask: a bbox preview build) the assumption would knock every
+// land pixel down to unknown-water. CONTAINMENT, not intersection: a tile straddling the
+// bbox edge still has unmasked-territory pixels, so it serves unmasked too.
+function inMaskBounds(
+  bbox: readonly [number, number, number, number],
+  z: number,
+  x: number,
+  y: number,
+): boolean {
+  const n = 1 << z;
+  const lonW = (x / n) * 360 - 180;
+  const lonE = ((x + 1) / n) * 360 - 180;
+  const latN = (Math.atan(Math.sinh(Math.PI * (1 - (2 * y) / n))) * 180) / Math.PI;
+  const latS = (Math.atan(Math.sinh(Math.PI * (1 - (2 * (y + 1)) / n))) * 180) / Math.PI;
+  return lonW >= bbox[0] && lonE <= bbox[2] && latS >= bbox[1] && latN <= bbox[3];
 }
 
 // Three outcomes kept distinct (plan Part 3): tile bytes → rasterize; tile absent within a
@@ -189,7 +214,7 @@ async function fetchMask(
   y: number,
 ): Promise<MaskFetch> {
   const info = await landInfo(env);
-  if (!info) return { mask: noMask, bytes: EMPTY };
+  if (!info || !inMaskBounds(info.bbox, z, x, y)) return { mask: noMask, bytes: EMPTY };
   const levels = z - Math.min(z, info.maxZoom);
   try {
     const t = await tile(env, "land.pmtiles", z - levels, x >> levels, y >> levels);
