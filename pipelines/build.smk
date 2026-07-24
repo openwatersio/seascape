@@ -151,7 +151,8 @@ _ORDER = {}
 def tile_priority(wc, input=None, attempt=None):
     _, key = _covering_key()
     if key not in _ORDER:
-        stems = sorted(covering_stems(), key=utils.weight, reverse=True)
+        # render_stems ⊇ covering_stems: terrain_render prioritizes overview stems too
+        stems = sorted(render_stems(), key=utils.weight, reverse=True)
         n, avg = len(stems), sum(utils.weight(s) for s in stems) / len(stems)
         order, hi, lo, cum = [], 0, n - 1, 0.0
         for i in range(n):
