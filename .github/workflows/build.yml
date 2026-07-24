@@ -26,9 +26,9 @@ on:
         required: false
         default: ""
       depare:
-        description: "Build the DEPARE depth-area layer (clears SKIP_DEPARE). First enable on a volume: also pass snakemake_args '-R depare_tile' to force past any stale outputs."
+        description: "Build the DEPARE depth-area layer (default on). Uncheck for a raster-only build (sets SKIP_DEPARE=1)."
         type: boolean
-        default: false
+        default: true
       force:
         description: "Force: -F on the build invocation (code changes are force-only by design)"
         type: boolean

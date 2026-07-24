@@ -291,8 +291,8 @@ rule soundings_tile:
         "{PY}/soundings_run.py tile {wildcards.stem} 2> {log}"
 
 
-# Behind SKIP_DEPARE until the perf backlog's bounding work: the dense-tile GEOS tail is
-# unbounded (~65 min single-core measured on the densest stem).
+# On by default (the build.yml `depare` input); SKIP_DEPARE=1 opts out. The nodata-pass GEOS
+# tail is bounded — STRtree + subdivision + snap-round difference (docs/plans/2026-07-21-depare-perf.md).
 rule depare_tile:
     input:
         fork_inputs,

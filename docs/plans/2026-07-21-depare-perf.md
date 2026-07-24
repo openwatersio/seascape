@@ -111,9 +111,19 @@ RSS 1.4–2.6 GB. Equivalence: bands byte-exact (rel 0.00e+00) and drying byte-e
 
 Revised numbers first: coarse stems **≤5 min MET** (1.4 / 1.7 min). Dense z14 is 6.1 min total, of which depare-specific logic is now ~100 s — the remaining ~4.5 min is the shared stage-3 floor (window-dem 35 s + smooth 94 s + two `gdal_contour` passes 136 s + drying-bucket-union 54 s), so the **revised dense-stem gate is ≤8 min wall** with the floor documented. `DEPARE_TIMEOUT` sizing in the next phase keys off these numbers (3× worst ≈ 25 min planet-wide bound).
 
-### Still owed before phase 3 (unchanged from the plan body)
+### Findings — phase 3: box validation, Wagyu, seam, flip (2026-07-23/24)
 
-`seam_check.py check_depare` over a ≥4-mosaic-tile window, the Wagyu exit-106 fixture through `bundle`, `test_engine`, and the `DEPARE_TIMEOUT` backstop; then the build.yml `depare` input + stale-state deletion.
+All phase-2 "owed" items are done and phase 3 (box bbox validation) is complete.
+
+- **Seam gate — all pass (≤2.7e-7°).** `seam_check check_depare` on the `6-19-18-9|6-19-19-9` edge surfaced three pre-existing stage-3 defects, all fixed: coarse windows under-buffered for the smooth halo (halo-scaled `window_buffer_3857`, shared with terrain — which also forced the contour `ogr2ogr -clipsrc`→shapely clip port, recovering 2 features ogr2ogr silently dropped); the drying sliver filter run per-clip not per-source-polygon (moved to a pre-clip area gate, 2.08e-2°→7.49e-4°); and the nodata/residual-band mismatch, which was a **false positive in `check_depare`** itself (grazing coverage within 0.1 px counted as one-sided) — fixed with a tight `ON_SEAM_PIXELS`, the real tolerance unchanged and the shifted-band negative test still failing.
+
+- **Wagyu exit-106 resolved.** The recovered Stockholm fixture (`6-35-18-10.fgb`, 124k polygons) crashes BOTH stock tippecanoe 2.79 and felt-main v2.80.0 under `--detect-shared-borders` — a known, unfixed upstream Wagyu bug ([mapbox/tippecanoe#761](https://github.com/mapbox/tippecanoe/issues/761)), so no version bump helps. Fix: swap to `--no-simplification-of-shared-nodes` (felt's own documented successor — crack-free, builds the fixture clean), retire the `DEPARE_NO_SHARED_BORDERS` escape hatch, `assert` guards reintroduction. A <5 MB CI fixture is impossible (125 MB floor — the crash is emergent from a large connected polygon mass), so the assert is the regression guard.
+
+- **Box bbox smokes** (build.yml gains a `depare` dispatch input). NY z14 (run 30008863514): depare 1,247 s / 5.2 GB — 4.3× faster than the pre-fix 90-min tail; `depare_bundle` Wagyu-clean. Ungava cz9 coarse (run 30025132613): 1,123 s / **5.3 GB**, which breaches the 3 GB default — so `DEPARE_GB` gains cz8/cz9 = 4, a deliberate light under-reserve leaning on the box's 64 GB swap + `retries` (most coarse stems are cheap deep-ocean).
+
+- **Default flipped (2026-07-24).** The build.yml `depare` input defaults **true** (opt-out via `depare=false`), and `just preview` builds depare; the `SKIP_DEPARE` gate stays as the kill switch.
+
+**Remaining (phase 4):** one planet build to validate at scale and measure the still-unmeasured reservation classes (cz10–12, z4-anchored coarse). It must force the code-changed rules since v0.2.0 — `-R mosaic_tile contour_tile soundings_tile depare_tile terrain_render` (downstream bundles cascade; `watermask` already forced by the in-flight sources build). Then re-fit reservations from its benchmarks, bump `@openwaters/seascape` 0.2.0→0.3.0 + un-gate the viewer's bands control (`index.js`, not the style package), and close the backlog item.
 
 ## Interactions, named
 
