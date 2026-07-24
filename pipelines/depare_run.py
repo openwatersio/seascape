@@ -366,24 +366,28 @@ def tile(stem):
     z, x, y, child_z = (int(a) for a in stem.split("-"))
     out = f"store/depare/{stem}.fgb"
     tmp = tempfile.mkdtemp(prefix=f"depare-{stem}-")  # local scratch; publish crosses to the store
-    _mark(None)
-    dem = mosaic.window_dem(stem, f"{tmp}/dem.tiff")
-    _mark("window-dem")
-    if not os.environ.get("SKIP_SMOOTH"):
-        smooth.smooth_tiff(dem)
-        _mark("smooth")
-    res = _depare_dem(dem, mercantile.Tile(x=x, y=y, z=z), tmp, stem)
-    os.makedirs(os.path.dirname(out), exist_ok=True)
-    if res:
-        final, n = res
-        utils.publish(final, out)  # scratch and store are separate filesystems
-        print(f"depare tile {stem}: {n} polygons")
-    else:
-        open(out, "w").close()
-        print(f"depare tile {stem}: empty")
-    if timeout:
-        signal.alarm(0)  # disarm on success
-    shutil.rmtree(tmp)
+    try:
+        _mark(None)
+        dem = mosaic.window_dem(stem, f"{tmp}/dem.tiff")
+        _mark("window-dem")
+        if not os.environ.get("SKIP_SMOOTH"):
+            smooth.smooth_tiff(dem)
+            _mark("smooth")
+        res = _depare_dem(dem, mercantile.Tile(x=x, y=y, z=z), tmp, stem)
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        if res:
+            final, n = res
+            utils.publish(final, out)  # scratch and store are separate filesystems
+            print(f"depare tile {stem}: {n} polygons")
+        else:
+            open(out, "w").close()
+            print(f"depare tile {stem}: empty")
+    finally:
+        # Always disarm + clean up: a body exception with the alarm still armed could fire during
+        # unwinding and mask the real error as exit 124, and would leak the tmp dir.
+        if timeout:
+            signal.alarm(0)
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ── bundle ───────────────────────────────────────────────────────────────────
