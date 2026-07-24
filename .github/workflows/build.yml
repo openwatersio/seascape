@@ -25,6 +25,10 @@ on:
         description: 'Bounding box "W,S,E,N" (empty = full planet)'
         required: false
         default: ""
+      depare:
+        description: "Build the DEPARE depth-area layer (default on). Uncheck for a raster-only build (sets SKIP_DEPARE=1)."
+        type: boolean
+        default: true
       force:
         description: "Force: -F on the build invocation (code changes are force-only by design)"
         type: boolean
@@ -51,9 +55,10 @@ env:
   # with these public URLs (mosaic.public_base); the serving pointer is never written from here.
   DATA_BUCKET: data
   PUBLIC_BASE: https://data.openwaters.io/bathymetry
-  # DEPARE stays out of builds until its dense-tile GEOS tail is bounded;
-  # docs/perf/optimization-backlog.md owns the re-enable work.
-  SKIP_DEPARE: "1"
+  # DEPARE is gated by the `depare` dispatch input, not a workflow-level env: the enable value
+  # must be EMPTY (build.smk treats any non-empty SKIP_DEPARE as skip), which a GitHub Actions
+  # `&& '' || '1'` ternary can't produce (empty is falsy → always yields '1'). So the build step
+  # exports SKIP_DEPARE=1 unless the input is set. See docs/perf/optimization-backlog.md.
 
 # One store-mutating workflow at a time, globally: builds, sources runs, and GC share this
 # group. NOTE: a second queued dispatch EVICTS the first — one dispatch at a time.
@@ -194,6 +199,15 @@ jobs:
             [ -n "$dev" ] || { echo "store volume device never appeared — attach step skipped or volume held elsewhere?" >&2; exit 1; }
             mkdir -p /mnt/seascape-store
             mount -o noatime "$dev" /mnt/seascape-store
+            # A Hetzner volume resize grows the block device, not the filesystem — grow it to
+            # match (idempotent: a no-op at full size). Without this the extra capacity is invisible
+            # and the headroom guard still trips at the old size.
+            if [ "$(blkid -o value -s TYPE "$dev" 2>/dev/null)" = xfs ]; then
+              command -v xfs_growfs >/dev/null || { apt-get update -qq && apt-get install -y -qq xfsprogs; }
+              xfs_growfs /mnt/seascape-store || true
+            else
+              resize2fs "$dev" || true  # ext4: online-grow to fill the resized device
+            fi
           fi
           STATE=/mnt/seascape-store
           # Merge-job tmp dirs are transient (each job recreates its own); a killed run
@@ -224,6 +238,7 @@ jobs:
           # Dispatch inputs reach the shell as env vars, never interpolated into a shell line.
           BBOX: ${{ github.event.inputs.bbox }}
           INPUT_FORCE: ${{ github.event.inputs.force }}
+          INPUT_DEPARE: ${{ github.event.inputs.depare }}
           INPUT_ARGS: ${{ github.event.inputs.snakemake_args }}
           GH_TOKEN: ${{ github.token }} # the progress-heartbeat gh api calls
           BOX_IP: ${{ needs.create-runner.outputs.ip }} # carried in the build status desc
@@ -242,6 +257,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$TMP"
+          # DEPARE gate: skip unless the depare input is set. docker.sh forwards SKIP_DEPARE via
+          # `-e SKIP_DEPARE`, so an unset var (depare=true) reaches the container as enabled.
+          if [ "$INPUT_DEPARE" != "true" ]; then export SKIP_DEPARE=1; fi
           # Disk headroom: the mosaic tiles live permanently on the volume (~360 G), so
           # planet runs are incremental — 100 G covers the index/planet-z8/scratch churn.
           # Refuse early rather than fill mid-run.
@@ -273,8 +291,14 @@ jobs:
           # Same knob sources.yml uses for its fetches (16 on 8 vCPUs).
           cores=$(( $(nproc) * 2 ))
           # Jobs declare disk_mb for their tmp working set; budget it against the volume's
-          # real free space (80%) so concurrent merge tmps can't overflow the store.
-          disk_budget_mb=$(( $(df -BM --output=avail /mnt/seascape-store | tail -1 | tr -dc '0-9') * 8 / 10 ))
+          # real free space (80%) so concurrent merge tmps can't overflow the store. A depare
+          # planet build accumulates ~50 G of NEW permanent FGBs while merges run — the merge
+          # tmp budget must leave room for that, or concurrent tmps over-commit and fill the
+          # volume mid-run. Reserve it up front (full-planet depare only; the fork rules don't
+          # budget disk, so this reserve is also their headroom).
+          avail_mb=$(df -BM --output=avail /mnt/seascape-store | tail -1 | tr -dc '0-9')
+          reserve_mb=0; [ "$INPUT_DEPARE" = "true" ] && [ -z "$BBOX" ] && reserve_mb=51200
+          disk_budget_mb=$(( (avail_mb - reserve_mb) * 8 / 10 ))
           echo "box: ${total_gb} GB RAM, --cores ${cores} -> budget ${budget_gb} GB (reserve ${reserve_gb} GB)"
           force=()
           if [ "$INPUT_FORCE" = "true" ]; then force=(-F); fi

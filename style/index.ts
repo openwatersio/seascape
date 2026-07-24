@@ -399,6 +399,8 @@ export function layers(
       paint: {
         "color-relief-color": depthRelief(flavor, { unit, safety }),
         "color-relief-opacity": 0.85,
+        // Linear resampling paints a light seam along every unknown-water boundary
+        resampling: "nearest",
       },
     },
     {

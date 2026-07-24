@@ -23,6 +23,9 @@
       border-radius: 6px;
       box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
       font: 13px/1.6 system-ui, sans-serif;
+      display: flex;
+      flex-direction: row-reverse;
+
     }
 
     #controls summary {
@@ -35,6 +38,7 @@
       justify-content: center;
       font-size: 22px;
       margin-left: auto;
+      z-index: 2;
     }
 
     #controls summary::-webkit-details-marker {
@@ -42,14 +46,39 @@
     }
 
     #controls-panel {
-      padding: 0 12px 8px;
+      padding: 8px 12px;
       display: flex;
       flex-direction: column;
-      gap: 4px;
+      gap: 1rem;
+      margin-right: -29px;
+      z-index: 1;
+    }
+
+    #controls section {
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
     }
 
     #controls label {
       cursor: pointer;
+      /* display: flex;
+      flex-direction: row;
+      gap: 0.5rem;
+      align-items: center; */
+    }
+
+    #controls label.row {
+      display: flex;
+      width: 100%;
+      flex-direction: row;
+      gap: 0.5rem;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    #controls input[type="checkbox"] {
+      margin-right: 0.5rem;
     }
 
     header {
@@ -121,55 +150,68 @@
     <details id="controls" class="maplibregl-ctrl">
       <summary title="Settings" aria-label="Settings" role="button">&#9881;</summary>
       <div id="controls-panel">
-        <label>
-          <input type="checkbox" id="toggle-osm" checked /> OSM base map
-        </label>
-        <label>
-          <input type="checkbox" id="toggle-depth" checked /> Depth shading
-        </label>
-        <label>
-          <input type="checkbox" id="toggle-hillshade" checked /> Hillshade
-        </label>
-        <label>
-          <input type="checkbox" id="toggle-land" checked /> Land relief
-        </label>
-        <label>
-          <input type="checkbox" id="toggle-contours" checked /> Contours
-        </label>
-        <label>
-          <input type="checkbox" id="toggle-labels" checked /> Labels
-        </label>
-        <label>
-          <input type="checkbox" id="toggle-soundings" checked /> Soundings
-        </label>
-        <!-- bands reads the DEPARE layer, absent from production builds while SKIP_DEPARE holds -->
-        <label id="shading-control" hidden
-          title="Smooth raster relief, or vector ENC depth bands (crisp isobath edges, safety snapped to a charted level)">Shading
-          <select id="shading-select">
-            <option value="relief">smooth</option>
-            <option value="bands">bands</option>
-          </select>
-        </label>
-        <label>Units
-          <select id="unit-select">
-            <option value="m">metres</option>
-            <option value="ft">feet</option>
-            <option value="fm">fathoms</option>
-          </select>
-        </label>
-        <label title="Draft + margin; water shallower than this is shaded as a hazard (0 = off)">
-          Safety
-          <input type="number" id="safety-depth" min="0" step="1" value="2" style="width: 3.5em" /> m
-        </label>
-        <label>
-          <input type="checkbox" id="toggle-sources" /> Source coverage
-        </label>
-        <label>
-          <input type="checkbox" id="toggle-tiles" /> Tile grid
-        </label>
-        <label title="Current viewport (W,S,E,N) — edit and press Enter to zoom there">
-          bbox <input type="text" id="bbox-input" spellcheck="false" style="width: 15em" />
-        </label>
+        <section>
+          <strong>Layers</strong>
+          <label>
+            <input type="checkbox" id="toggle-osm" checked /> OSM base map
+          </label>
+          <label>
+            <input type="checkbox" id="toggle-depth" checked /> Depth shading
+          </label>
+          <label>
+            <input type="checkbox" id="toggle-hillshade" checked /> Ocean relief
+          </label>
+          <label>
+            <input type="checkbox" id="toggle-land" checked /> Land relief
+          </label>
+          <label>
+            <input type="checkbox" id="toggle-contours" checked /> Contours
+          </label>
+          <label>
+            <input type="checkbox" id="toggle-labels" checked /> Labels
+          </label>
+          <label>
+            <input type="checkbox" id="toggle-soundings" checked /> Soundings
+          </label>
+          <label>
+            <input type="checkbox" id="toggle-sources" /> Source coverage
+          </label>
+          <label>
+            <input type="checkbox" id="toggle-tiles" /> Tile grid
+          </label>
+        </section>
+
+        <section>
+          <strong>Settings</strong>
+          <!-- bands reads the DEPARE layer, absent from production builds while SKIP_DEPARE holds -->
+          <label id="shading-control" hidden class="row"
+            title="Smooth raster relief, or vector ENC depth bands (crisp isobath edges, safety snapped to a charted level)">
+            <span>Shading</span>
+            <select id="shading-select">
+              <option value="relief">Relief (raster)</option>
+              <option value="bands">Bands (vector)</option>
+            </select>
+          </label>
+          <label class="row">Units
+            <select id="unit-select">
+              <option value="m">metres</option>
+              <option value="ft">feet</option>
+              <option value="fm">fathoms</option>
+            </select>
+          </label>
+          <label class="row" title="Draft + margin; water shallower than this is shaded as a hazard (0 = off)">
+            Safety
+            <div>
+              <input type="number" id="safety-depth" min="0" step="1" value="2" style="width: 3.5em" /> m
+            </div>
+          </label>
+        </section>
+        <section>
+          <label title="Current viewport (W,S,E,N) — edit and press Enter to zoom there">
+            <div><strong>Bounding Box</strong></div>
+            <input type="text" id="bbox-input" spellcheck="false" />
+          </label>
+        </section>
       </div>
     </details>
   </div>

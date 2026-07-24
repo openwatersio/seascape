@@ -97,6 +97,28 @@ DRYING_RANK = 2
 # a width/compactness gate is the targeted tool if thin ribbons ever appear. Env-tunable.
 SLIVER_MIN_PX = float(os.environ.get("SLIVER_MIN_PX", "4"))
 
+# Fixed-precision grid (metres) for overlays against multi-piece unions: GEOS 3.13's
+# float OverlayNG returns an empty overlay against some unions whose pairwise overlays are
+# correct (verified on 6-21-22-9; point-in-polygon arbitration); snap-rounded overlay is the
+# robust mode, and 1 µm moves no vertex cartographically.
+GRID = 1e-6
+
+
+_mark_last = None
+
+
+def _mark(label):
+    """DEPARE_TIMING=1: print wall seconds since the previous mark — the phase-1 profile's
+    section attribution (docs/plans/2026-07-21-depare-perf.md)."""
+    global _mark_last
+    if not os.environ.get("DEPARE_TIMING"):
+        return
+    import time
+    now = time.monotonic()
+    if _mark_last is not None and label:
+        print(f"depare-timing {label}: {now - _mark_last:.1f}s", flush=True)
+    _mark_last = now
+
 
 def _polys(geom):
     """Every non-empty Polygon inside a geometry, recursing into Multi/GeometryCollection and
@@ -108,6 +130,24 @@ def _polys(geom):
     if t in ("MultiPolygon", "GeometryCollection"):
         return [p for g in geom.geoms for p in _polys(g)]
     return []
+
+
+def _subdivide(geom, max_pts=512, depth=0):
+    """Bisect a polygon along its longer envelope axis until every piece is under max_pts
+    vertices (the ST_Subdivide pattern). Bounded pieces keep the nodata differences local in
+    DENSE windows, where every water feature truly intersects a harbor-wide band polygon."""
+    from shapely import get_num_coordinates, make_valid
+    from shapely.geometry import box
+    if get_num_coordinates(geom) <= max_pts or depth >= 16:
+        return [geom]
+    l, b, r, t = geom.bounds
+    m = (l + r) / 2 if r - l >= t - b else (b + t) / 2
+    halves = (box(l, b, m, t), box(m, b, r, t)) if r - l >= t - b else \
+             (box(l, b, r, m), box(l, m, r, t))
+    return [piece
+            for h in halves
+            for p in _polys(make_valid(geom.intersection(h)))
+            for piece in _subdivide(p, max_pts, depth + 1)]
 
 
 def valid_union(geoms):
@@ -131,7 +171,9 @@ def partitions(dem, levels, raw_fgb):
     contour_run._run(
         f"gdal_contour -q -p -amin amin -amax amax -fl {fl} -f FlatGeobuf {dem} {raw_fgb}",
         "gdal_contour -p")
+    _mark(f"gdal_contour[{os.path.basename(raw_fgb)}]")
     g = gpd.read_file(raw_fgb)
+    _mark(f"read[{os.path.basename(raw_fgb)}]")
     # Select on amax, NOT amin: GDAL 3.8's polygon mode writes a garbage amin (0) on the
     # deepest bucket, which then read as land and vanished — amax is correct on every version.
     # So drval1 keys off amax; drval2 (off amin) is right for the interior bands but unreliable
@@ -146,8 +188,10 @@ def _depare_dem(dem, tile_obj, tmp, label):
     rows. Returns (final_path, count) inside ``tmp``, or None when there is no water."""
     import geopandas as gpd
     import landmask
+    import shapely
     from shapely import make_valid
     from shapely.geometry import box
+    from shapely.strtree import STRtree
 
     clip = box(*mercantile.xy_bounds(tile_obj))  # unbuffered, tile-aligned (EPSG:3857)
     with rasterio.open(dem) as d:
@@ -165,6 +209,7 @@ def _depare_dem(dem, tile_obj, tmp, label):
     # subtracts; both ladders cover the same water pixels, so the metre union stands for it.
     coverage_geoms = []
     drying_geoms = []
+    _mark(None)
     for sys_tag, levels in (("m", config.DEPARE_LEVELS + [config.DRYING_CAP]),
                             ("ft", config.DEPARE_LEVELS_FT)):
         g = partitions(dem, levels, f"{tmp}/depare-raw-{sys_tag}.fgb")
@@ -175,13 +220,20 @@ def _depare_dem(dem, tile_obj, tmp, label):
             for p in _polys(make_valid(r.geometry).intersection(clip)):
                 rows.append({"geometry": p, "drval1": r.drval1, "drval2": r.drval2,
                              "sys": sys_tag, "rank": BAND_RANK})
+        _mark(f"bands-clip-{sys_tag}")
         if sys_tag == "m":
             coverage_geoms = list(bands.geometry)
             # The [0, DRYING_CAP] bucket, keyed on amax alone: 0 and the cap are discrete levels
             # and every other level is negative, so 0 < amax <= cap uniquely picks it regardless
             # of the garbage amin. Land above the cap (amax > cap) is dropped.
             drying_geoms = list(g[(g["amax"] > 0) & (g["amax"] <= config.DRYING_CAP)].geometry)
-    coverage = valid_union(coverage_geoms) if coverage_geoms else None
+    # Coverage stays a PARTS list (exploded to single polygons for tight envelopes), never one
+    # union: the nodata pass differences each water feature against only the parts its envelope
+    # intersects — identical output (a disjoint part is a no-op), bounded local work. The
+    # monolithic union made every feature pay the whole window's vertex count (the 8.9 h stems).
+    coverage_parts = [piece for g in coverage_geoms for p in _polys(make_valid(g))
+                      for piece in _subdivide(p)]
+    _mark("coverage-make-valid")
 
     # Inland-water feed, read once by bbox (the nodata pass iterates its features for `kind`; the
     # drying cut unions its geometry). Optional: absent -> no water term (today's land-only gate).
@@ -191,7 +243,11 @@ def _depare_dem(dem, tile_obj, tmp, label):
         w = gpd.read_file(water_src, bbox=bbox)
         if len(w):
             water = w.to_crs("EPSG:3857")
-    water_geom = valid_union(list(water.geometry)) if water is not None else None
+    _mark("water-read")
+    # Parts, same reason as coverage: the union's one consumer (the drying water term) only
+    # needs the parts near the bucket.
+    water_parts = [make_valid(g) for g in water.geometry] if water is not None else []
+    _mark("water-make-valid")
 
     # ── drying ── fold the [0, DRYING_CAP] foreshore in as DEPARE with a negative drval1. Cut the
     # landward side by EFFECTIVE land = OSM land ∖ OSM inland water — the load-bearing point: the
@@ -206,25 +262,40 @@ def _depare_dem(dem, tile_obj, tmp, label):
     drying_area = None
     if drying_geoms:
         bucket = valid_union(drying_geoms)
+        _mark("drying-bucket-union")
         land_src = landmask.path()
         land_geom = None
         if landmask._present(land_src):
             land = gpd.read_file(land_src, bbox=bbox)
             if len(land):
                 land_geom = valid_union(list(land.to_crs("EPSG:3857").geometry))
+        _mark("land-read-union")
         if land_geom is None:
             effective = bucket  # no land coverage here -> nothing to cut
         else:
             effective = bucket.difference(land_geom)
-            if water_geom is not None:
-                effective = valid_union([effective, bucket.intersection(water_geom)])
+            _mark("drying-diff-land")
+            if water_parts:
+                # Prune to water parts that truly intersect the bucket (predicate, like the nodata
+                # pass — cut drying-water-terms 63->17 s on 6-19-18-9), then ONE float intersection
+                # against their union: the window-spanning BUCKET is the unbounded operand, so
+                # pairwise would be quadratic (912 s+ measured). No GRID here — this shape measured
+                # byte-exact on every profile stem, and snap-rounding traded that for nothing.
+                near = [water_parts[i]
+                        for i in STRtree(water_parts).query(bucket, predicate="intersects")]
+                if near:
+                    effective = valid_union([effective, bucket.intersection(shapely.union_all(near))])
+                _mark("drying-water-terms")
         effective = make_valid(effective)
+        _mark("drying-make-valid")
         if not effective.is_empty:
             drying_area = effective  # subtracted from nodata below (over the buffered extent)
-            for p in _polys(effective.intersection(clip)):
-                if p.area >= min_area:
-                    rows.append({"geometry": p, "drval1": -config.DRYING_CAP, "drval2": 0.0,
-                                 "sys": None, "kind": None, "rank": DRYING_RANK})
+            for full in _polys(effective):  # gate the PRE-clip polygon so a seam sliver of a big flat survives both sides
+                if full.area >= min_area:
+                    for p in _polys(full.intersection(clip)):  # clip the survivors; no re-filter on the piece
+                        rows.append({"geometry": p, "drval1": -config.DRYING_CAP, "drval2": 0.0,
+                                     "sys": None, "kind": None, "rank": DRYING_RANK})
+            _mark("drying-emit")
 
     # ── nodata ── inland water we hold no depth for: the OSM water polygons (bbox-read, clipped to
     # the buffered tile) MINUS the water-coverage footprint (depth bands ∪ drying) — a #24-cleared
@@ -232,18 +303,31 @@ def _depare_dem(dem, tile_obj, tmp, label):
     # nets to slivers the min-area filter drops. No drval (absence is the encoding) + a `kind`
     # passthrough. Ocean has no water polygon, so it gains nothing. Skipped when no water feed.
     if water is not None:
-        subtract = [g for g in (coverage, drying_area) if g is not None]
-        subtract = valid_union(subtract) if subtract else None
+        parts = list(coverage_parts)
+        if drying_area is not None:
+            parts += [piece for p in _polys(drying_area) for piece in _subdivide(p)]
+        tree = STRtree(parts) if parts else None
+        _mark("nodata-tree")
         for r in water.itertuples():
             geom = make_valid(r.geometry).intersection(buffered)
-            if subtract is not None:
-                geom = geom.difference(subtract)
-            geom = geom.intersection(clip)  # same seam contract as the bands
+            if tree is not None and not geom.is_empty:
+                # predicate="intersects" (prepared), not bare envelope query: most inland lakes
+                # never truly touch coverage and skip the difference entirely. Parts are
+                # subdivided to bounded vertex counts so the local union stays small —
+                # differencing one window-wide union per feature was the original 8.9 h tail,
+                # and sequential pairwise differences are O(hits × |geom|) (31 min on the
+                # harbor stem). GRID makes the union-operand overlay robust (see GRID).
+                hits = tree.query(geom, predicate="intersects")
+                if len(hits):
+                    u = shapely.union_all([parts[i] for i in hits], grid_size=GRID)
+                    geom = shapely.difference(geom, u, grid_size=GRID)
             kind = getattr(r, "kind", None)
-            for p in _polys(geom):
-                if p.area >= min_area:
-                    rows.append({"geometry": p, "drval1": None, "drval2": None,
-                                 "sys": None, "kind": kind, "rank": NODATA_RANK})
+            for full in _polys(geom):  # gate the PRE-clip polygon (buffered window) so a seam sliver survives both sides
+                if full.area >= min_area:
+                    for p in _polys(full.intersection(clip)):  # then clip to the seam; no re-filter on the piece
+                        rows.append({"geometry": p, "drval1": None, "drval2": None,
+                                     "sys": None, "kind": kind, "rank": NODATA_RANK})
+        _mark("nodata-loop")
 
     if not rows:
         print(f"depare: no water in tile bbox for {label}")
@@ -254,6 +338,7 @@ def _depare_dem(dem, tile_obj, tmp, label):
     # encode that as an ABSENT MVT property — so nodata truly has no drval1, the fill's switch key.
     final = f"{tmp}/depare-final.fgb"
     gpd.GeoDataFrame(rows, crs="EPSG:3857").to_crs("EPSG:4326").to_file(final, driver="FlatGeobuf")
+    _mark("write-fgb")
     return final, len(rows)
 
 
@@ -263,46 +348,71 @@ def tile(stem):
     the land + water masks). A waterless tile writes a 0-byte sentinel; bundling filters empties by
     size."""
     import shutil
+    import signal
     import tempfile
 
     import mosaic
     import smooth
+    # DEPARE_TIMEOUT (seconds; unset = no bound): the backstop for the coarse-window GEOS tail —
+    # fail honestly at wall-clock rather than ship a silently-empty .fgb (docs/plans/2026-07-21).
+    timeout = int(os.environ.get("DEPARE_TIMEOUT", "0"))
+    if timeout:
+        def _alarm(*_):
+            print(f"depare tile {stem}: exceeded DEPARE_TIMEOUT={timeout}s — failing honestly",
+                  file=sys.stderr, flush=True)
+            sys.exit(124)
+        signal.signal(signal.SIGALRM, _alarm)
+        signal.alarm(timeout)
     z, x, y, child_z = (int(a) for a in stem.split("-"))
     out = f"store/depare/{stem}.fgb"
     tmp = tempfile.mkdtemp(prefix=f"depare-{stem}-")  # local scratch; publish crosses to the store
-    dem = mosaic.window_dem(stem, f"{tmp}/dem.tiff")
-    if not os.environ.get("SKIP_SMOOTH"):
-        smooth.smooth_tiff(dem)
-    res = _depare_dem(dem, mercantile.Tile(x=x, y=y, z=z), tmp, stem)
-    os.makedirs(os.path.dirname(out), exist_ok=True)
-    if res:
-        final, n = res
-        utils.publish(final, out)  # scratch and store are separate filesystems
-        print(f"depare tile {stem}: {n} polygons")
-    else:
-        open(out, "w").close()
-        print(f"depare tile {stem}: empty")
-    shutil.rmtree(tmp)
+    try:
+        _mark(None)
+        dem = mosaic.window_dem(stem, f"{tmp}/dem.tiff")
+        _mark("window-dem")
+        if not os.environ.get("SKIP_SMOOTH"):
+            smooth.smooth_tiff(dem)
+            _mark("smooth")
+        res = _depare_dem(dem, mercantile.Tile(x=x, y=y, z=z), tmp, stem)
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        if res:
+            final, n = res
+            utils.publish(final, out)  # scratch and store are separate filesystems
+            print(f"depare tile {stem}: {n} polygons")
+        else:
+            open(out, "w").close()
+            print(f"depare tile {stem}: empty")
+    finally:
+        # Always disarm + clean up: a body exception with the alarm still armed could fire during
+        # unwinding and mask the real error as exit 124, and would leak the tmp dir.
+        if timeout:
+            signal.alarm(0)
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ── bundle ───────────────────────────────────────────────────────────────────
 
 def _tippecanoe(fgbs, maxz, out):
     """tippecanoe the per-tile depare FGBs into `out` (layer `depare`, z MIN_ZOOM..maxz).
-    --detect-shared-borders keeps shared partition edges identical through per-zoom simplification
-    (no cracks between bands); --coalesce-smallest-as-needed, never --drop-densest: a dropped
+    --no-simplification-of-shared-nodes keeps shared partition edges identical through per-zoom
+    simplification (no cracks between bands); --coalesce-smallest-as-needed, never --drop-densest: a dropped
     partition is a tint hole, a coalesced one mis-tints a sub-pixel blob. drval1/drval2 are Real
     (numeric MVT; absent on nodata, the fill's switch key); rank is FlatGeobuf Integer64, so
     -T rank:int keeps it numeric (else it lands as a string, like the contour depth ints)."""
-    subprocess.run(
-        ["tippecanoe", "-o", out, "-f", "-l", "depare",
-         "-n", "Depth areas", "-A", utils.ATTRIBUTION,
-         "-Z", str(MIN_ZOOM), "-z", str(maxz), "-P", "-q",
-         "--detect-shared-borders", "--coalesce-smallest-as-needed",
-         "--simplification", os.environ.get("DEPARE_SIMPLIFICATION", "8"),
-         "-y", "drval1", "-y", "drval2", "-y", "sys", "-y", "kind", "-y", "rank",
-         "-T", "rank:int", *fgbs],
-        check=True)
+    args = ["tippecanoe", "-o", out, "-f", "-l", "depare",
+            "-n", "Depth areas", "-A", utils.ATTRIBUTION,
+            "-Z", str(MIN_ZOOM), "-z", str(maxz), "-P", "-q",
+            "--no-simplification-of-shared-nodes",
+            "--coalesce-smallest-as-needed",
+            "--simplification", os.environ.get("DEPARE_SIMPLIFICATION", "8"),
+            "-y", "drval1", "-y", "drval2", "-y", "sys", "-y", "kind", "-y", "rank",
+            "-T", "rank:int", *fgbs]
+    # --detect-shared-borders drives tippecanoe's wagyu exit-106 hole-placement crash on dense
+    # DEPARE geometry (mapbox/tippecanoe#761, unfixed in felt v2.80.0). Its documented successor
+    # --no-simplification-of-shared-nodes (above) keeps shared edges crack-free without the crash;
+    # this guard fails the build if the old flag is ever reintroduced.
+    assert "--detect-shared-borders" not in args, "DEPARE must not use --detect-shared-borders (wagyu exit-106)"
+    subprocess.run(args, check=True)
 
 
 def bundle_stable():
