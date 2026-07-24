@@ -13,7 +13,9 @@ its own sign flips (aggregation_merge), so no second, source-blind clamp runs af
 the merge to re-flatten trusted data by geography.
 
 Inland water: the mask subtracts an OSM-derived inland-water polygon layer (rivers,
-lakes, canals, reservoirs — not the ocean, which the land polygons already bound) so a
+lakes, canals, reservoirs — not the ocean, which the land polygons already bound, and not
+Overture's marine 'physical' polygons: bays/straits are drawn without island holes, so
+subtracting them erases real islands while opening nothing the coastline hasn't) so a
 flagged source keeps its genuine negative depths inside mapped water (EMODnet's Elbe
 fairway, GEBCO's Amazon channel) instead of flattening them to 0. Worst case inside a
 real water polygon is a coarse depth where water truly exists; the old worst case was
@@ -199,11 +201,14 @@ def prep_water(processes=8):
                 f"-nln water {merged} {t}", silent=True)
         # _water_tile's -clipsrc runs AFTER its polygon filter, so a clipped feature can
         # re-enter as a collection/empty; those crash tippecanoe's FlatGeobuf reader
-        # (exit 106) and leave the header untyped. Final conversion re-filters + types.
+        # (exit 106) and leave the header untyped. Final conversion re-filters + types,
+        # and re-drops 'physical' (marine bays/straits) in case the tile pass predates
+        # that filter.
         utils.run_command(
             f"ogr2ogr -f FlatGeobuf -overwrite -nln water -nlt PROMOTE_TO_MULTI "
             f"-dialect SQLITE -sql \"SELECT * FROM water WHERE "
-            f"GeometryType(geometry) LIKE '%POLYGON%' AND NOT ST_IsEmpty(geometry)\" "
+            f"GeometryType(geometry) LIKE '%POLYGON%' AND NOT ST_IsEmpty(geometry) "
+            f"AND kind <> 'physical'\" "
             f"{out} {merged}", silent=False)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -240,10 +245,14 @@ def tiles(out=LAND_TILES):
             # so sanitize through it: polygonal + non-empty only, header typed via promote.
             # land.fgb needs none of this: its header is typed Polygon, so nothing
             # non-conforming could have been written into it.
+            # kind <> 'physical': Overture's marine polygons (bays/straits/fjärdar) are
+            # drawn without island holes, so subtracting them erases real islands from
+            # the mask; genuine inland water is lake/pond/river/canal/reservoir.
             utils.run_command(
                 f"ogr2ogr -f FlatGeobuf -overwrite -nln water -nlt PROMOTE_TO_MULTI "
                 f"-dialect SQLITE -sql \"SELECT * FROM water WHERE "
-                f"GeometryType(geometry) LIKE '%POLYGON%' AND NOT ST_IsEmpty(geometry)\" "
+                f"GeometryType(geometry) LIKE '%POLYGON%' AND NOT ST_IsEmpty(geometry) "
+                f"AND kind <> 'physical'\" "
                 f"{tmp_water} {water}")
             layers += f" -L water:{tmp_water}"
         utils.run_command(
@@ -284,7 +293,7 @@ def _water_tile(job):
     utils.run_command(
         "AWS_NO_SIGN_REQUEST=YES AWS_DEFAULT_REGION=us-west-2 "
         f"ogr2ogr -f GPKG -overwrite -nln water_raw -lco SPATIAL_INDEX=NO "
-        f"-spat {w} {s} {e} {n} -where \"subtype <> 'ocean'\" {raw} {WATER_PARQUET_URL}",
+        f"-spat {w} {s} {e} {n} -where \"subtype NOT IN ('ocean','physical')\" {raw} {WATER_PARQUET_URL}",
         silent=True)
     if not os.path.isfile(raw):
         return None  # open ocean: the read selected nothing
@@ -349,8 +358,12 @@ def rasterize(bounds_3857, res, out_tif, src=None, water_src=None):
             f"-tr {res} {res} -co COMPRESS=DEFLATE -co TILED=YES -co SPARSE_OK=YES "
             f"{clip} {tmp_out}")
         if _present(water):
+            # kind <> 'physical': marine bays/straits are mapped without island holes, so
+            # burning them back to water would erase real islands (they can open nothing
+            # else — seaward of the coastline is already water). Inland kinds only.
             utils.run_command(
-                f"ogr2ogr -f GPKG -overwrite -spat {xmin} {ymin} {xmax} {ymax} {water_clip} {water}")
+                f"ogr2ogr -f GPKG -overwrite -where \"kind <> 'physical'\" "
+                f"-spat {xmin} {ymin} {xmax} {ymax} {water_clip} {water}")
             utils.run_command(f"gdal_rasterize -burn 0 {water_clip} {tmp_out}")
         os.replace(tmp_out, out_tif)  # atomic: out_tif only ever exists complete
     finally:
@@ -375,8 +388,11 @@ def rasterize_water(bounds_3857, res, out_tif, water_src=None):
     clip = out_tif + ".clip.gpkg"
     tmp_out = out_tif + ".tmp.tif"
     try:
+        # Same marine exclusion as rasterize(): a bay polygon over an island would key the
+        # #24 nodata clamp onto dry land.
         utils.run_command(
-            f"ogr2ogr -f GPKG -overwrite -spat {xmin} {ymin} {xmax} {ymax} {clip} {water}")
+            f"ogr2ogr -f GPKG -overwrite -where \"kind <> 'physical'\" "
+            f"-spat {xmin} {ymin} {xmax} {ymax} {clip} {water}")
         utils.run_command(
             f"gdal_rasterize -burn 1 -ot Byte -init 0 -te {xmin} {ymin} {xmax} {ymax} "
             f"-tr {res} {res} -co COMPRESS=DEFLATE -co TILED=YES -co SPARSE_OK=YES "
@@ -561,7 +577,12 @@ def _check():
     with open(wgj, "w") as f:
         json.dump({"type": "FeatureCollection", "features": [{"type": "Feature",
                    "properties": {"kind": "lake"}, "geometry": {"type": "Polygon", "coordinates":
-                                [[[1.4, 1.4], [1.6, 1.4], [1.6, 1.6], [1.4, 1.6], [1.4, 1.4]]]}}]}, f)
+                                [[[1.4, 1.4], [1.6, 1.4], [1.6, 1.6], [1.4, 1.6], [1.4, 1.4]]]}},
+                  # A marine bay overlapping the land box's corner — an "island" under a
+                  # holeless bay polygon. Must never subtract from the mask.
+                  {"type": "Feature", "properties": {"kind": "physical"},
+                   "geometry": {"type": "Polygon", "coordinates":
+                                [[[0.8, 0.8], [1.2, 0.8], [1.2, 1.2], [0.8, 1.2], [0.8, 0.8]]]}}]}, f)
     water_fgb = f"{d}/water.fgb"
     # -nlt GEOMETRY leaves the FGB header untyped like the published planet water.fgb,
     # so the tiles() sanitize pre-pass is genuinely exercised below.
@@ -617,6 +638,15 @@ def _check():
     assert (land[changed] == 1).all() and (lw[changed] == 0).all(), \
         "the water burn must only turn land->water, never water->land"
     assert not ((land == 0) & (lw == 1)).any(), "the water burn must not create land over water"
+
+    # The marine 'physical' bay overlapping the land corner must NOT subtract: probe a
+    # point inside both the land box and the bay box (lon/lat 1.1,1.1).
+    from rasterio.transform import rowcol
+    from rasterio.warp import transform as _tf
+    (bx,), (by,) = _tf("EPSG:4326", "EPSG:3857", [1.1], [1.1])
+    br, bc = rowcol(tr, bx, by)
+    assert land[br, bc] == 1 and lw[br, bc] == 1, \
+        "a marine 'physical' polygon must never erase land from the mask"
 
     # Seam determinism (with the water burn active): the same world cells rasterize identically
     # from a shifted (still grid-aligned) extent — the overlap is byte-identical, so tile halos
