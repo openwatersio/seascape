@@ -188,7 +188,9 @@ function inMaskBounds(
   x: number,
   y: number,
 ): boolean {
-  const n = 1 << z;
+  // 2 ** z, not 1 << z: shifts are 32-bit signed, so a junk z >= 31 in the URL would
+  // wrap n and mask/unmask arbitrarily; exponentiation matches the x/y range check.
+  const n = 2 ** z;
   const lonW = (x / n) * 360 - 180;
   const lonE = ((x + 1) / n) * 360 - 180;
   const latN = (Math.atan(Math.sinh(Math.PI * (1 - (2 * y) / n))) * 180) / Math.PI;
