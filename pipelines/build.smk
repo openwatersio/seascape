@@ -141,8 +141,28 @@ MERGE_CFG = json.dumps({
 MERGE_FACTOR = 1.5
 
 
-def tile_weight(wc, input=None, attempt=None):
-    return utils.weight(wc.stem, factor=MERGE_FACTOR)
+# Schedule order: heaviest-first, diluted so cumulative weight stays linear — each slot takes
+# from the heavy end of the weight-sorted covering while on/below the even-workload line, else
+# from the light end. The heavy:light interleave self-tunes to the covering's actual weight mix,
+# instead of an all-heavy memory-bound start and an all-light cpu-bound rest.
+_ORDER = {}
+
+
+def tile_priority(wc, input=None, attempt=None):
+    _, key = _covering_key()
+    if key not in _ORDER:
+        stems = sorted(covering_stems(), key=utils.weight, reverse=True)
+        n, avg = len(stems), sum(utils.weight(s) for s in stems) / len(stems)
+        order, hi, lo, cum = [], 0, n - 1, 0.0
+        for i in range(n):
+            if cum <= i * avg:
+                stem, hi = stems[hi], hi + 1
+            else:
+                stem, lo = stems[lo], lo - 1
+            cum += utils.weight(stem)
+            order.append(stem)
+        _ORDER[key] = {s: n - i for i, s in enumerate(order)}
+    return _ORDER[key][wc.stem]
 
 
 # One covering tile's merge, alone — the planet's memory hot spot, isolated in its own job.
@@ -158,7 +178,7 @@ rule mosaic_tile:
         sources=lambda wc: source_props(wc.stem),
         merge=MERGE_CFG,
         toolchain=utils.toolchain(),
-    priority: tile_weight  # heavy-first: shortens the tail; coastal tiles free stage-3 work first
+    priority: tile_priority  # interleaved heavy-first: evens the memory load over the build
     retries: 2
     resources:
         mem_gb=lambda wc, attempt: utils.weight(wc.stem, factor=MERGE_FACTOR) * attempt,
@@ -261,7 +281,7 @@ rule contour_tile:
         levels=json.dumps({"m": pipeline_config.CONTOUR_LEVELS, "ft": pipeline_config.CONTOUR_LEVELS_FT}),
         nav=contour_run.NAV_SMOOTH_MAX_M, deep=contour_run.DEEP_CUTOFF_M,
         ring=contour_run.MIN_RING_AREA_M2, smooth=SMOOTH_CFG,
-    priority: tile_weight  # heavy-first; greedy backfills lighter ready jobs into the rest of the budget
+    priority: tile_priority  # interleaved heavy-first: evens the memory load over the build
     retries: 2
     resources:
         mem_gb=_fork_gb(CONTOUR_GB, 3)
@@ -283,7 +303,7 @@ rule soundings_tile:
         version=1, # increment to force a rebuild
         cell=soundings_run.SOUND_CELL_PX, min_depth=soundings_run.SOUND_MIN_DEPTH_M,
         smooth=SMOOTH_CFG,
-    priority: tile_weight  # heavy-first; greedy backfills lighter ready jobs into the rest of the budget
+    priority: tile_priority  # interleaved heavy-first: evens the memory load over the build
     retries: 2
     resources:
         mem_gb=_fork_gb(SOUND_GB, 2)
@@ -307,7 +327,7 @@ rule depare_tile:
         version=1, # increment to force a rebuild
         levels=json.dumps({"m": pipeline_config.DEPARE_LEVELS, "ft": pipeline_config.DEPARE_LEVELS_FT}),
         drying=pipeline_config.DRYING_CAP, sliver=depare_run.SLIVER_MIN_PX, smooth=SMOOTH_CFG,
-    priority: tile_weight  # heavy-first; greedy backfills lighter ready jobs into the rest of the budget
+    priority: tile_priority  # interleaved heavy-first: evens the memory load over the build
     retries: 2
     resources:
         mem_gb=_fork_gb(DEPARE_GB, 3)
@@ -337,7 +357,7 @@ rule terrain_render:
         terrain_inputs
     output:
         "store/pmtiles/{stem}.pmtiles"
-    priority: tile_weight  # heavy-first; greedy backfills lighter ready jobs into the rest of the budget
+    priority: tile_priority  # interleaved heavy-first: evens the memory load over the build
     params:
         version=1, # increment to force a rebuild
         cfg=json.dumps(terrain_mod._config(), sort_keys=True),
