@@ -230,7 +230,12 @@ SMOOTH_CFG = json.dumps({} if os.environ.get("SKIP_SMOOTH") else {
 # deterministic (p95 == max), so reserve measured max + ~10%; retries escalate via `attempt`.
 CONTOUR_GB = {14: 10, 13: 4}
 SOUND_GB = {14: 6, 13: 3}
-DEPARE_GB = {14: 6, 13: 4}
+# depare peaks at BOTH ends: dense z14 (5.2 GB measured) and the coarse continent-window cz8/cz9
+# stems (5.3 GB measured on 5-9-9-9, run 30025132613 — the whole-window OSM land/water GEOS load).
+# cz8/cz9 = 4 is a deliberate under-reserve (light hedge): most coarse stems are cheap deep-ocean,
+# so it keeps concurrency high and leans on the box's 64 GB NVMe swap + `retries` for the rare
+# coastal-coarse peak. The first planet run measures cz10-12 / z4-anchored coarse to set these honestly.
+DEPARE_GB = {14: 6, 13: 4, 9: 4, 8: 4}
 
 
 def _fork_gb(table, default):
