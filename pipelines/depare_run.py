@@ -103,6 +103,78 @@ SLIVER_MIN_PX = float(os.environ.get("SLIVER_MIN_PX", "4"))
 # robust mode, and 1 µm moves no vertex cartographically.
 GRID = 1e-6
 
+# Deep-water DEM coarsening: below the threshold, band edges carry no navigational detail, but
+# source noise at fine child_z resolution makes gdal_contour -p's rings astronomically complex
+# (the deep-basin z14 stems burned 8.5 h+ of pure CPU; docs/plans/2026-07-21-depare-perf.md).
+# Pixels whose 8x-block mean is deeper than the threshold take that mean, so the deep interior
+# contours at ~8x resolution while everything shoaler keeps full detail. -250 m sits between
+# ladder levels (m: -200/-300; ft: -182.88/-365.76), so no level rides the transition. Only
+# fine windows (child_z >= 12) coarsen — coarse windows are already at or past 8x.
+DEEP_COARSEN_THRESHOLD_M = -250.0
+DEEP_COARSEN_FACTOR = 8
+DEEP_COARSEN_MIN_CHILD_Z = 12
+MERC_ORIGIN = 20037508.342789244  # EPSG:3857 half-extent; block grid anchors here (seam alignment)
+
+
+class ContourTimeout(Exception):
+    """A bounded gdal_contour invocation exceeded DEPARE_TIMEOUT."""
+
+
+def _run_bounded(cmd, what, timeout):
+    """contour_run._run with a coreutils-timeout bound; exit 124/137 -> ContourTimeout."""
+    if not timeout:
+        return contour_run._run(cmd, what)
+    try:
+        contour_run._run(f"timeout -k 30 {int(timeout)} {cmd}", what)
+    except Exception as e:
+        if "(exit 124)" in str(e) or "(exit 137)" in str(e):
+            raise ContourTimeout(f"{what} exceeded {timeout}s") from e
+        raise
+
+
+def _deep_coarsen(dem, threshold=DEEP_COARSEN_THRESHOLD_M, factor=DEEP_COARSEN_FACTOR):
+    """Rewrite `dem` in place with deep pixels replaced by their block mean. The block grid is
+    anchored to the EPSG:3857 origin, NOT the window, so overlapping windows (neighbor stems'
+    buffers) average identical blocks and band edges still match at macrotile seams. A pixel is
+    replaced only when it AND its block mean are below the threshold: shelf-edge blocks whose
+    mean dips deep keep their shallow pixels, and a deep canyon inside a shallow block stays
+    fine rather than taking a shallow mean. Nodata pixels are never touched (the nodata pass
+    reads this same raster), and nodata is excluded from block means."""
+    import numpy as np
+    with rasterio.open(dem, "r+") as d:
+        arr = d.read(1)
+        nd = d.nodata
+        res = abs(d.transform.a)
+        h, w = arr.shape
+        # Global block alignment: pad to the origin-anchored grid (pads land in the buffer).
+        col0 = round((d.transform.c + MERC_ORIGIN) / res)
+        row0 = round((MERC_ORIGIN - d.transform.f) / res)
+        padt, padl = row0 % factor, col0 % factor
+        padb, padr = (-(h + padt)) % factor, (-(w + padl)) % factor
+        p = np.pad(arr, ((padt, padb), (padl, padr)), mode="edge")
+        valid = p != nd
+        ph, pw = p.shape
+        vals = np.where(valid, p, 0.0)
+        bsum = vals.reshape(ph // factor, factor, pw // factor, factor).sum(axis=(1, 3))
+        bcnt = valid.reshape(ph // factor, factor, pw // factor, factor).sum(axis=(1, 3))
+        del p, vals, valid
+        bmean = (bsum / np.maximum(bcnt, 1)).astype(np.float32)
+        bmean[bcnt == 0] = nd
+        up = np.repeat(np.repeat(bmean, factor, 0), factor, 1)[padt:padt + h, padl:padl + w]
+        mask = (arr != nd) & (arr <= threshold) & (up != nd) & (up <= threshold)
+        arr[mask] = up[mask]
+        d.write(arr, 1)
+
+
+def _uniform_coarsen(dem, factor, out):
+    """Whole-window average downsample — the retry rescue when even the deep-coarsened window
+    times out (shallow-complexity stems the depth gate can't help). gdal_contour reads the small
+    raster directly; _depare_dem re-reads res per file, so the sliver gate adapts."""
+    contour_run._run(
+        f"gdal_translate -q -r average -outsize {100 // factor}% {100 // factor}% {dem} {out}",
+        "gdal_translate -r average")
+    return out
+
 
 _mark_last = None
 
@@ -160,7 +232,7 @@ def valid_union(geoms):
     return unary_union([make_valid(g) for g in geoms])
 
 
-def partitions(dem, levels, raw_fgb):
+def partitions(dem, levels, raw_fgb, timeout=0):
     """Water/foreshore partitions off `dem`: gdal_contour -p buckets the DEM between `levels`,
     tagging each bucket its range amin/amax -> drval1/drval2 (ENC: shallow/deep bound,
     positive-down metres). Returns the full bucketed GeoDataFrame in the DEM's CRS; the caller
@@ -168,9 +240,9 @@ def partitions(dem, levels, raw_fgb):
     drops land (amax above the shallowest positive level)."""
     import geopandas as gpd
     fl = " ".join(str(l) for l in levels)
-    contour_run._run(
+    _run_bounded(
         f"gdal_contour -q -p -amin amin -amax amax -fl {fl} -f FlatGeobuf {dem} {raw_fgb}",
-        "gdal_contour -p")
+        "gdal_contour -p", timeout)
     _mark(f"gdal_contour[{os.path.basename(raw_fgb)}]")
     g = gpd.read_file(raw_fgb)
     _mark(f"read[{os.path.basename(raw_fgb)}]")
@@ -183,7 +255,7 @@ def partitions(dem, levels, raw_fgb):
     return g
 
 
-def _depare_dem(dem, tile_obj, tmp, label):
+def _depare_dem(dem, tile_obj, tmp, label, timeout=0):
     """Partition any DEM covering the tile's buffered extent into depth-area / drying / nodata
     rows. Returns (final_path, count) inside ``tmp``, or None when there is no water."""
     import geopandas as gpd
@@ -212,7 +284,7 @@ def _depare_dem(dem, tile_obj, tmp, label):
     _mark(None)
     for sys_tag, levels in (("m", config.DEPARE_LEVELS + [config.DRYING_CAP]),
                             ("ft", config.DEPARE_LEVELS_FT)):
-        g = partitions(dem, levels, f"{tmp}/depare-raw-{sys_tag}.fgb")
+        g = partitions(dem, levels, f"{tmp}/depare-raw-{sys_tag}.fgb", timeout=timeout)
         if not len(g):
             continue
         bands = g[g["amax"] <= 0]  # water; amax > 0 is drying (m) or land, both handled below
@@ -353,16 +425,18 @@ def tile(stem):
 
     import mosaic
     import smooth
-    # DEPARE_TIMEOUT (seconds; unset = no bound): the backstop for the coarse-window GEOS tail —
-    # fail honestly at wall-clock rather than ship a silently-empty .fgb (docs/plans/2026-07-21).
+    # DEPARE_TIMEOUT (seconds; unset = no bound): each gdal_contour -p pass runs under this
+    # bound; on expiry the tile retries once on a uniform 4x-average window, then fails
+    # honestly. The SIGALRM backstop (8x: 2 ladders x 2 attempts x contour + GEOS slack) still
+    # bounds the whole tile so no phase can hang a run (docs/plans/2026-07-21-depare-perf.md).
     timeout = int(os.environ.get("DEPARE_TIMEOUT", "0"))
     if timeout:
         def _alarm(*_):
-            print(f"depare tile {stem}: exceeded DEPARE_TIMEOUT={timeout}s — failing honestly",
+            print(f"depare tile {stem}: exceeded {timeout * 8}s wall clock — failing honestly",
                   file=sys.stderr, flush=True)
             sys.exit(124)
         signal.signal(signal.SIGALRM, _alarm)
-        signal.alarm(timeout)
+        signal.alarm(timeout * 8)
     z, x, y, child_z = (int(a) for a in stem.split("-"))
     out = f"store/depare/{stem}.fgb"
     tmp = tempfile.mkdtemp(prefix=f"depare-{stem}-")  # local scratch; publish crosses to the store
@@ -373,7 +447,17 @@ def tile(stem):
         if not os.environ.get("SKIP_SMOOTH"):
             smooth.smooth_tiff(dem)
             _mark("smooth")
-        res = _depare_dem(dem, mercantile.Tile(x=x, y=y, z=z), tmp, stem)
+        if child_z >= DEEP_COARSEN_MIN_CHILD_Z:
+            _deep_coarsen(dem)
+            _mark("deep-coarsen")
+        tile_obj = mercantile.Tile(x=x, y=y, z=z)
+        try:
+            res = _depare_dem(dem, tile_obj, tmp, stem, timeout=timeout)
+        except ContourTimeout as e:
+            print(f"depare tile {stem}: {e} — retrying on a uniform 4x-average window",
+                  file=sys.stderr, flush=True)
+            dem = _uniform_coarsen(dem, 4, f"{tmp}/dem-4x.tiff")
+            res = _depare_dem(dem, tile_obj, tmp, stem, timeout=timeout)
         os.makedirs(os.path.dirname(out), exist_ok=True)
         if res:
             final, n = res
@@ -459,6 +543,51 @@ def _check():
     bowtie = Polygon([(0, 0), (2, 2), (2, 0), (0, 2), (0, 0)])
     assert not bowtie.is_valid and valid_union([bowtie]).is_valid, \
         "valid_union must make_valid before union (guards the contour side-location-conflict fix)"
+
+    # ContourTimeout mapping: a bounded command that exceeds its budget must surface as
+    # ContourTimeout (the tile's retry trigger), not a generic failure.
+    try:
+        _run_bounded("sleep 5", "sleep", timeout=1)
+        raise AssertionError("_run_bounded must raise on timeout")
+    except ContourTimeout:
+        pass
+
+    # _deep_coarsen: shallow and nodata pixels preserved; deep pixels take their block mean;
+    # and the block grid is origin-anchored, so two windows offset against the block grid
+    # produce identical values where they overlap (the macrotile-seam contract).
+    def _write_dem(path, arr, left, top, res_m):
+        with rasterio.open(path, "w", driver="GTiff", width=arr.shape[1], height=arr.shape[0],
+                           count=1, dtype="float32", nodata=-9999.0,
+                           transform=from_origin(left, top, res_m, res_m)) as dst:
+            dst.write(arr.astype(np.float32), 1)
+
+    dc = tempfile.mkdtemp()
+    f = DEEP_COARSEN_FACTOR
+    rng = np.random.default_rng(7)
+    big = (-400.0 + rng.uniform(-40, 40, (8 * f, 8 * f))).astype(np.float32)  # noisy deep field
+    big[:f, :] = -10.0            # one shallow block-row: must stay untouched
+    big[f, 0] = -9999.0           # a nodata pixel inside a deep block: preserved + excluded
+    left0, top0 = -MERC_ORIGIN, MERC_ORIGIN  # window A: block-aligned at the origin
+    _write_dem(f"{dc}/a.tiff", big, left0, top0, 10.0)
+    _deep_coarsen(f"{dc}/a.tiff", factor=f)
+    with rasterio.open(f"{dc}/a.tiff") as src:
+        a = src.read(1)
+    assert np.array_equal(a[:f, :], big[:f, :]), "shallow pixels must be untouched"
+    assert a[f, 0] == -9999.0, "nodata must be preserved"
+    blk = big[f:2 * f, :f]
+    want = blk[blk != -9999.0].mean()
+    got = a[2 * f - 1, f - 1]  # a deep pixel of that block (away from the nodata cell)
+    assert abs(got - want) < 1e-3, f"deep block mean: {got} != {want}"
+    # Window B: the same field cropped at a NON-block-aligned offset (3 px right/down). Values
+    # in the overlap must match window A exactly — the origin-anchored grid, not the window,
+    # defines the blocks. Interior only: A's edge blocks average pad-replicated pixels.
+    off = 3
+    _write_dem(f"{dc}/b.tiff", big[off:, off:], left0 + off * 10.0, top0 - off * 10.0, 10.0)
+    _deep_coarsen(f"{dc}/b.tiff", factor=f)
+    with rasterio.open(f"{dc}/b.tiff") as src:
+        b = src.read(1)
+    assert np.array_equal(a[f:7 * f, f:7 * f], b[f - off:7 * f - off, f - off:7 * f - off]), \
+        "overlapping windows must coarsen identically (seam alignment)"
 
     d = tempfile.mkdtemp()
     h = w = 60

@@ -137,3 +137,12 @@ All phase-2 "owed" items are done and phase 3 (box bbox validation) is complete.
 - Decimated/overview-cut depth areas (violates bias-shallow; named above as rejected).
 - Finer aggregation tiles (the backlog's named last-resort fallback; only if windowing + bounding both fail).
 - Bundling-pipeline restructuring beyond what re-enabling requires (per-layer archives is its own item).
+
+## Addendum (2026-07-25): deep-water DEM coarsening + gdal_contour bound
+
+The first full-planet run exposed a pathological family the bbox smokes never sampled: deep-basin z14 stems (Gulf of Mexico) where source noise at 9.5 m/px makes `gdal_contour -p`'s deep rings astronomically complex — 8.5 h+ of pure CPU per ladder, 4.6 GB RSS on the ft pass, with the run's benchmark distribution at p50 3 s / p99 39 min / max 5.5 h. Two changes in `depare_run.py`:
+
+- **Deep coarsening (supersedes the "no cartographic change" non-goal, deep water only):** after smoothing, pixels below −250 m (between ladder levels in both systems) take their 8×-block mean when the block mean is also below it — full detail above, ~8× resolution in the deep interior, where band edges carry no navigational content. The block grid anchors to the EPSG:3857 origin so overlapping neighbor windows coarsen identically (seam contract; self-checked). child_z ≥ 12 windows only — coarse windows are already at or past 8×.
+- **`DEPARE_TIMEOUT` (build.yml default 3600 s):** every `gdal_contour -p` runs under coreutils `timeout`; on expiry the tile retries once on a uniform 4×-average window (the rescue for shallow-complexity stems the depth gate can't help, e.g. the North Sea z12 stem), then fails honestly. The SIGALRM wall-clock backstop stays at 8× the step budget.
+
+Already-built tiles are untouched (no rule provenance changed); they carry fine deep edges until the next forced depare rebuild, so deep-band seams against freshly built neighbors can mismatch until then — bump the `depare_tile` version token when a consistent layer matters.

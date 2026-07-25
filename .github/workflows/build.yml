@@ -260,6 +260,10 @@ jobs:
           # DEPARE gate: skip unless the depare input is set. docker.sh forwards SKIP_DEPARE via
           # `-e SKIP_DEPARE`, so an unset var (depare=true) reaches the container as enabled.
           if [ "$INPUT_DEPARE" != "true" ]; then export SKIP_DEPARE=1; fi
+          # Per-gdal_contour bound for depare tiles: p99 of completed tiles is ~40 min, so only
+          # the pathological deep/complex stems hit this — they retry coarser instead of pinning
+          # a core for 8 h+ (depare_run.tile).
+          export DEPARE_TIMEOUT="${DEPARE_TIMEOUT:-3600}"
           # Disk headroom: the mosaic tiles (~360 G) live permanently on the volume, so a warm
           # volume only adds the lighter fork layers on resume — 50 G covers that churn on a
           # near-full volume. Refuse early rather than fill mid-run.
