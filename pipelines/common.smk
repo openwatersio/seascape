@@ -9,6 +9,9 @@ sys.path.insert(0, str(SCRIPTS))
 os.environ.setdefault("SOURCES_DIR", str(SCRIPTS.parent / "sources"))
 import config as pipeline_config
 
+import snakemake_patches
+snakemake_patches.apply()  # snakemake 9.23.1 benchmark timers leak monitor threads → scheduler stall
+
 SOURCES_DIR = Path(os.environ["SOURCES_DIR"])
 PY = f"uv run --project {SCRIPTS.parent} python {SCRIPTS}"
 
