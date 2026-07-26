@@ -242,21 +242,32 @@ jobs:
             esac
             extra+=("source=$INPUT_SOURCE")
           fi
-          # Re-register from warm raw without refetching: prep_source and register are the two
-          # catalog.json producers (local vs raw sources). Cold rebuild: -F via snakemake_args.
-          if [ "$INPUT_FORCE" = "true" ]; then extra+=(-R prep_source register); fi
           # Extra args reach the command as separate words; reject anything shell-active.
           case "$INPUT_ARGS" in *[!-A-Za-z0-9_=\ .]*) echo "invalid snakemake_args" >&2; exit 1 ;; esac
           read -r -a xargs <<<"$INPUT_ARGS"
           extra+=("${xargs[@]}")
-          # Two invocations: the forced re-enumeration first, alone — across the invocation
-          # boundary the engine's input checksums cure unchanged registrations, so the
-          # main invocation cascades (catalog → cover → coverage → publish) only on real
-          # drift. A re-listing that yields an unchanged items.txt (write-if-changed) leaves
-          # the whole downstream cured. A red refresh still lets the rest publish; the step
-          # exits red after. --cores 16 > vCPUs: width for IO-bound fetches; mem_gb caps the
-          # heavy jobs (28 = 32 GB - 4 reserved). Box-only — laptops keep cores:all as their cap.
+          # Invocations are the scoping tool: -R forces every job of a rule IN THE PLANNED DAG,
+          # and within one invocation every downstream job of a forced producer is scheduled at
+          # plan time even when the output comes out byte-identical — write-if-changed only cures
+          # across invocation boundaries. So a force always runs as its OWN invocation, and with
+          # source= it targets that one catalog.json (a single-source DAG -R can't reach past);
+          # the clean main invocation then cascades (catalog → polygon/cover → publish) only on
+          # real drift. A red invocation still lets the rest publish; the step exits red after.
+          # --cores 16 > vCPUs: width for IO-bound fetches; mem_gb caps the heavy jobs
+          # (28 = 32 GB - 4 reserved). Box-only — laptops keep cores:all as their cap.
           rc=0
+          if [ "$INPUT_FORCE" = "true" ]; then
+            # Re-register from warm raw without refetching: prep_source and register are the two
+            # catalog.json producers (disjoint wildcard constraints: local vs raw sources).
+            # Cold rebuild: -F via snakemake_args.
+            if [ -n "$INPUT_SOURCE" ]; then
+              force_target=("store/source/$INPUT_SOURCE/catalog.json")
+            else
+              force_target=(catalogs)  # global sweep: every registration + its downstream, deliberately
+            fi
+            ./docker.sh snakemake "${force_target[@]}" --keep-going --rerun-incomplete \
+              --cores 16 --resources mem_gb=28 -R prep_source register "${extra[@]}" || rc=$?
+          fi
           ./docker.sh snakemake refresh --keep-going --rerun-incomplete \
             --cores 16 --resources mem_gb=28 -R enumerate "${extra[@]}" || rc=$?
           ./docker.sh snakemake catalogs publish --keep-going --rerun-incomplete \
