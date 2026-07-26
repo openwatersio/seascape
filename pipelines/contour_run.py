@@ -187,6 +187,9 @@ def tile(stem):
     dem = mosaic.window_dem(stem, f"{tmp}/dem.tiff")
     if not os.environ.get("SKIP_SMOOTH"):
         smooth.smooth_tiff(dem)
+    # Deep isobaths must track the depth-area band edges, which come from this same coarsened surface.
+    if child_z >= smooth.DEEP_COARSEN_MIN_CHILD_Z:
+        smooth.deep_coarsen(dem)
     # After smoothing: it smears sea negatives back across clamp-flattened islands, and
     # the warp-time clamp's centre-sampled mask misses narrow rims — either puts
     # isobaths on land.
