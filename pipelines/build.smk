@@ -278,7 +278,7 @@ rule contour_tile:
     output:
         "store/contour/{stem}.fgb"
     params:
-        version=1, # increment to force a rebuild
+        version=2, # increment to force a rebuild
         levels=json.dumps({"m": pipeline_config.CONTOUR_LEVELS, "ft": pipeline_config.CONTOUR_LEVELS_FT}),
         nav=contour_run.NAV_SMOOTH_MAX_M, deep=contour_run.DEEP_CUTOFF_M,
         ring=contour_run.MIN_RING_AREA_M2, smooth=SMOOTH_CFG,
@@ -325,7 +325,7 @@ rule depare_tile:
     output:
         "store/depare/{stem}.fgb"
     params:
-        version=1, # increment to force a rebuild
+        version=2, # increment to force a rebuild
         levels=json.dumps({"m": pipeline_config.DEPARE_LEVELS, "ft": pipeline_config.DEPARE_LEVELS_FT}),
         drying=pipeline_config.DRYING_CAP, sliver=depare_run.SLIVER_MIN_PX, smooth=SMOOTH_CFG,
     priority: tile_priority  # interleaved heavy-first: evens the memory load over the build
