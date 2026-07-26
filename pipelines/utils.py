@@ -197,6 +197,10 @@ def write_if_changed(path, content):
                 return False
     with open(path + ".tmp", "w") as f:
         f.write(content)
+        # fsync before the rename: an unclean volume detach (a killed run) otherwise journals the
+        # rename but drops the unflushed data blocks, leaving a 0-byte file at the declared path.
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(path + ".tmp", path)
     return True
 

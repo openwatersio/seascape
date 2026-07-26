@@ -9,6 +9,7 @@ Ported from scripts/config.sh.
 import hashlib
 import json
 import os
+import sys
 from glob import glob
 
 SOURCES_DIR = os.environ.get("SOURCES_DIR", "../sources")
@@ -81,7 +82,13 @@ def load_catalog(source):
         item = None
         if os.path.isfile(path):
             with open(path) as f:
-                item = json.load(f)
+                try:
+                    item = json.load(f)
+                except json.JSONDecodeError as e:
+                    # A torn registration (e.g. an unclean volume detach) must name itself —
+                    # the bare decode error says nothing about which source to re-register.
+                    sys.exit(f"corrupt {path} ({e}) — re-register the source "
+                             f"(sources.yml with source={source} force=true)")
         _catalog_cache[ck] = item
     return _catalog_cache[ck]
 
@@ -261,6 +268,5 @@ def _check():
 
 
 if __name__ == "__main__":
-    import sys
     if sys.argv[1:2] == ["--check"]:
         _check()
