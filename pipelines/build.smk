@@ -166,6 +166,22 @@ def tile_priority(wc, input=None, attempt=None):
     return _ORDER[key][wc.stem]
 
 
+# The vector band: contour/soundings/depare tiles (and the vector bundle they feed) outrank
+# every terrain render, so the vector layers drain first and the bundle's low-parallelism
+# tippecanoe phases overlap the terrain fleet instead of running on an idle box after it. Set on
+# the vector tile rules directly — rule priorities do NOT propagate upstream (snakemake
+# dag.update_priority elevates dependency chains only for --prioritize targets), so a
+# high-priority bundle alone reorders nothing. An order-of-magnitude band above the stem range
+# (same idiom as the Snakefile's mask/registration bands) so no stem weight can cross it; the
+# per-stem interleave still orders jobs within the band, and the mosaic merges keep their own
+# interleave untouched.
+VECTOR_BAND = 1_000_000
+
+
+def vector_tile_priority(wc, input=None, attempt=None):
+    return VECTOR_BAND + tile_priority(wc, input, attempt)
+
+
 # One covering tile's merge, alone — the planet's memory hot spot, isolated in its own job.
 # utils.weight seeds the reservation (a geometric estimate the benchmarks re-fit); retries
 # escalate it. On a laptop the reservation is scheduling only (no kernel cap).
@@ -282,7 +298,7 @@ rule contour_tile:
         levels=json.dumps({"m": pipeline_config.CONTOUR_LEVELS, "ft": pipeline_config.CONTOUR_LEVELS_FT}),
         nav=contour_run.NAV_SMOOTH_MAX_M, deep=contour_run.DEEP_CUTOFF_M,
         ring=contour_run.MIN_RING_AREA_M2, smooth=SMOOTH_CFG,
-    priority: tile_priority  # interleaved heavy-first: evens the memory load over the build
+    priority: vector_tile_priority  # vector band: drain before terrain so the bundle overlaps it
     retries: 2
     resources:
         mem_gb=_fork_gb(CONTOUR_GB, 3)
@@ -304,7 +320,7 @@ rule soundings_tile:
         version=1, # increment to force a rebuild
         cell=soundings_run.SOUND_CELL_PX, min_depth=soundings_run.SOUND_MIN_DEPTH_M,
         smooth=SMOOTH_CFG,
-    priority: tile_priority  # interleaved heavy-first: evens the memory load over the build
+    priority: vector_tile_priority  # vector band: drain before terrain so the bundle overlaps it
     retries: 2
     resources:
         mem_gb=_fork_gb(SOUND_GB, 2)
@@ -328,7 +344,7 @@ rule depare_tile:
         version=2, # increment to force a rebuild
         levels=json.dumps({"m": pipeline_config.DEPARE_LEVELS, "ft": pipeline_config.DEPARE_LEVELS_FT}),
         drying=pipeline_config.DRYING_CAP, sliver=depare_run.SLIVER_MIN_PX, smooth=SMOOTH_CFG,
-    priority: tile_priority  # interleaved heavy-first: evens the memory load over the build
+    priority: vector_tile_priority  # vector band: drain before terrain so the bundle overlaps it
     retries: 2
     resources:
         mem_gb=_fork_gb(DEPARE_GB, 3)
@@ -426,6 +442,7 @@ rule vector_bundle:
         depare=lambda wc: expand("store/depare/{stem}.fgb", stem=depare_stems()),
     output:
         "store/bundle/vector.pmtiles"
+    priority: VECTOR_BAND  # above every terrain render, so the bundle starts the moment the layers drain
     params:
         bbox=os.environ.get("BBOX", ""),  # scope stamp — see mosaic_index
     benchmark:
