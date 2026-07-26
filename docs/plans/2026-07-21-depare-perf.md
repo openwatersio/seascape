@@ -127,7 +127,7 @@ All phase-2 "owed" items are done and phase 3 (box bbox validation) is complete.
 
 ## Interactions, named
 
-- **Per-layer archives** (the first post-migration change per the snakemake plan): when it lands, `depare.pmtiles` stops riding the tile-join and the Wagyu fixture stops gating the *combined* archive — but phase 2 resolves the fixture anyway, since the re-enable shouldn't wait on that refactor and a standalone depare archive hits the same tippecanoe.
+- **Per-layer archives: rejected (2026-07-26)** — `depare.pmtiles` stays an intermediate that rides the `vector.pmtiles` tile-join; the combined archive is the served contract.
 - **Drying-geometry / depth-below-water plans** touch the same `_depare_dem` sections. Perf fixes here keep semantics frozen; if either plan lands mid-stream, re-run the phase-2 gates on its diff rather than interleaving the changes.
 - **Windowed contours** (backlog): if H-B's subdivision work produces a shared bounded-mask helper, contours' reintroduction can reuse it — note it, don't couple the PRs.
 
@@ -136,7 +136,7 @@ All phase-2 "owed" items are done and phase 3 (box bbox validation) is complete.
 - Changing DEPARE levels, drying semantics, sliver thresholds, or any cartographic output — this is a performance pass with equivalence gates.
 - Decimated/overview-cut depth areas (violates bias-shallow; named above as rejected).
 - Finer aggregation tiles (the backlog's named last-resort fallback; only if windowing + bounding both fail).
-- Bundling-pipeline restructuring beyond what re-enabling requires (per-layer archives is its own item).
+- Bundling-pipeline restructuring beyond what re-enabling requires.
 
 ## Addendum (2026-07-25): deep-water DEM coarsening + gdal_contour bound
 

@@ -62,13 +62,12 @@ Run 29847332817 measured the whole chain end-to-end on a ccx63:
   so the weekly volatile refresh hits this every time. This is the steady-state cost, not a
   cold-build cost.
 
-Attack in this order:
+**Per-layer archives: rejected (2026-07-26).** Serving contours/depth-areas/soundings as
+independent pmtiles was evaluated repeatedly and is NOT happening — multiple archives per style
+is a bad consumer experience. `vector.pmtiles` stays the single served vector artifact; every
+optimization below works within that contract (shard/cache at build time, merge at publish).
 
-1. **Per-layer archives** (contours/depth-areas/soundings as independent pmtiles, first
-   post-migration change): deletes the 1 h 42 m tile-join outright and breaks the serial
-   dependency — the two tippecanoe runs become parallel rules, wall ≈ max(2 h 56 m, 2 h 53 m)
-   ≈ 3 h. Also removes the one ~20-core consumer, making the ccx33 default safe. **Wagyu
-   exit-106 — resolved 2026-07-23.** The regenerated fixture (Stockholm-archipelago stem FGB
+**Wagyu exit-106 — resolved 2026-07-23.** The regenerated fixture (Stockholm-archipelago stem FGB
    `store/depare/6-35-18-10.fgb`, 265 MB, 124k polygons) crashes stock tippecanoe 2.79 AND
    felt/tippecanoe main (v2.80.0 — the box's build) with `--detect-shared-borders`: a Wagyu
    hole-placement bug ([mapbox/tippecanoe#761](https://github.com/mapbox/tippecanoe/issues/761),
@@ -82,20 +81,24 @@ Attack in this order:
    large connected polygon mass, so spatial bisection stalls), so the assert is the regression
    guard rather than a CI fixture; the full fixture (kept locally / R2 if ever wanted) is a
    positive gate since it now builds clean.
-2. **`--read-parallel` / input format** for the ~80 min single-threaded read phase, and
+
+Attack in this order:
+
+1. **`--read-parallel` / input format** for the ~80 min single-threaded read phase, and
    **sharding** for the low-parallelism tiling phase (spatially partition into 4/8 balanced
    shards on NVMe, merge; adopt only with identical addressed tiles, per-layer counts, canonical
-   hashes). Target: each per-layer bundle under ~1 h.
-3. **Incremental bundling** — the end state that makes refresh builds minutes, not hours: keep
+   hashes). Target: each layer's tippecanoe pass under ~1 h.
+2. **Incremental bundling** — the end state that makes refresh builds minutes, not hours: keep
    per-shard (or per-cell, like `overlay_bundle`) archives cached in the store and rebuild only
-   dirty shards, merging cheaply at publish. The overlay bundles already prove the shape: 239 of
-   them rebuilt in ~2 min wall. Sketch after per-layer + sharding land, since shard boundaries
-   and the merge step are shared machinery.
+   dirty shards, merging cheaply into the served archives at publish. The overlay bundles already
+   prove the shape: 239 of them rebuilt in ~2 min wall. Sketch after sharding lands, since shard
+   boundaries and the merge step are shared machinery.
 
 Prior data points that still inform the work: unified invocation (contours + soundings in one
 named-layer tippecanoe) saved 22.8% at planet scale, semantically exact on the 16-stem sample —
-preferred command shape if a combined archive ever returns. Legacy baseline was 7 h 01 m / 62% of
-the 11 h 19 m build.
+the preferred command shape where layers' global tippecanoe flags are compatible (depare's
+no-drop/no-simplify partition policy is the incompatible one; it keeps its own pass + tile-join).
+Legacy baseline was 7 h 01 m / 62% of the 11 h 19 m build.
 
 **Publish hash pass:** `_HashCache` (mtime_ns+size keyed, store/mosaic/hash-cache.json) was in
 run 29847332817 but cold — `mosaic_publish` still read 376 GB in 30.6 min populating it. Expect
