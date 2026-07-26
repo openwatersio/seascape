@@ -87,7 +87,7 @@ Attack in this order:
 1. **`--read-parallel` / input format** for the ~80 min single-threaded read phase, and
    **sharding** for the low-parallelism tiling phase (spatially partition into 4/8 balanced
    shards on NVMe, merge; adopt only with identical addressed tiles, per-layer counts, canonical
-   hashes). Target: each layer's tippecanoe pass under ~1 h.
+   hashes). Target: the joint vector run under ~1 h.
 2. **Incremental bundling** — the end state that makes refresh builds minutes, not hours: keep
    per-shard (or per-cell, like `overlay_bundle`) archives cached in the store and rebuild only
    dirty shards, merging cheaply into the served archives at publish. The overlay bundles already
@@ -95,10 +95,11 @@ Attack in this order:
    boundaries and the merge step are shared machinery.
 
 Prior data points that still inform the work: unified invocation (contours + soundings in one
-named-layer tippecanoe) saved 22.8% at planet scale, semantically exact on the 16-stem sample —
-the preferred command shape where layers' global tippecanoe flags are compatible (depare's
-no-drop/no-simplify partition policy is the incompatible one; it keeps its own pass + tile-join).
-Legacy baseline was 7 h 01 m / 62% of the 11 h 19 m build.
+named-layer tippecanoe) saved 22.8% at planet scale, semantically exact on the 16-stem sample.
+The vector bundle is now ONE joint variable-depth run over all three layers — depare's no-drop
+partition policy became the invocation-wide `--coalesce-smallest-as-needed` (contours coalesce
+cleanly, gate-verified), and the tile-join is gone. Legacy baseline was 7 h 01 m / 62% of the
+11 h 19 m build.
 
 **Publish hash pass:** `_HashCache` (mtime_ns+size keyed, store/mosaic/hash-cache.json) was in
 run 29847332817 but cold — `mosaic_publish` still read 376 GB in 30.6 min populating it. Expect

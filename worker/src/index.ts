@@ -646,14 +646,13 @@ export default {
             // Depth-area partitions (ENC DEPARE): three feature kinds keyed by
             // attribute presence — depth bands (drval1/drval2 = shallow/deep
             // bound, positive-down m; sys tags the m/ft ladder), drying (negative
-            // drval1, no sys), and unknown-depth water (no drval1, `kind` carries
-            // the OSM water subtype). `rank` orders them within the fill.
+            // drval1, no sys), and unknown-depth water (no drval1).
+            // `rank` orders them within the fill.
             id: "depare",
             fields: {
               drval1: "Number",
               drval2: "Number",
               sys: "String",
-              kind: "String",
               rank: "Number",
             },
           },
