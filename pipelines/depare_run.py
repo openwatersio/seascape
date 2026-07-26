@@ -482,14 +482,18 @@ def _tippecanoe(fgbs, maxz, out):
     simplification (no cracks between bands); --coalesce-smallest-as-needed, never --drop-densest: a dropped
     partition is a tint hole, a coalesced one mis-tints a sub-pixel blob. drval1/drval2 are Real
     (numeric MVT; absent on nodata, the fill's switch key); rank is FlatGeobuf Integer64, so
-    -T rank:int keeps it numeric (else it lands as a string, like the contour depth ints)."""
+    -T rank:int keeps it numeric (else it lands as a string, like the contour depth ints).
+    kind stays OUT of the tiles: nothing reads it (the style keys on sys/drval1 presence, rank
+    sorts), and it measured -3.9% on the archive's dominant coarse-stem class. -d11 halves
+    max-zoom coordinate precision to ~1.2 m at z14 — still far under the DEM's 9.5 m/px, and
+    quantization is uniform per tile so the partition stays crack-free — for another ~8%."""
     args = ["tippecanoe", "-o", out, "-f", "-l", "depare",
             "-n", "Depth areas", "-A", utils.ATTRIBUTION,
-            "-Z", str(MIN_ZOOM), "-z", str(maxz), "-P", "-q",
+            "-Z", str(MIN_ZOOM), "-z", str(maxz), "-P", "-q", "-d11",
             "--no-simplification-of-shared-nodes",
             "--coalesce-smallest-as-needed",
             "--simplification", os.environ.get("DEPARE_SIMPLIFICATION", "8"),
-            "-y", "drval1", "-y", "drval2", "-y", "sys", "-y", "kind", "-y", "rank",
+            "-y", "drval1", "-y", "drval2", "-y", "sys", "-y", "rank",
             "-T", "rank:int", *fgbs]
     # --detect-shared-borders drives tippecanoe's wagyu exit-106 hole-placement crash on dense
     # DEPARE geometry (mapbox/tippecanoe#761, unfixed in felt v2.80.0). Its documented successor
