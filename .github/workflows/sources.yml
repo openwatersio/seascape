@@ -242,9 +242,9 @@ jobs:
             esac
             extra+=("source=$INPUT_SOURCE")
           fi
-          # Re-register from warm raw: fetch_asset is upstream of prep_source, so --forcerun
-          # re-runs prep + catalog (+ downstream) without refetching. Cold rebuild: -F via snakemake_args.
-          if [ "$INPUT_FORCE" = "true" ]; then extra+=(-R prep_source catalog_item); fi
+          # Re-register from warm raw without refetching: prep_source and register are the two
+          # catalog.json producers (local vs raw sources). Cold rebuild: -F via snakemake_args.
+          if [ "$INPUT_FORCE" = "true" ]; then extra+=(-R prep_source register); fi
           # Extra args reach the command as separate words; reject anything shell-active.
           case "$INPUT_ARGS" in *[!-A-Za-z0-9_=\ .]*) echo "invalid snakemake_args" >&2; exit 1 ;; esac
           read -r -a xargs <<<"$INPUT_ARGS"
