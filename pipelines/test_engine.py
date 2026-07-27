@@ -82,7 +82,14 @@ def snake(tmp, *args, env=None, check=True):
          "--config", f"workdir={tmp}", *args],
         cwd=PIPE, env=e, capture_output=True, text=True)
     if check and proc.returncode != 0:
-        raise AssertionError(f"snakemake {args} failed:\n{proc.stdout}\n{proc.stderr}")
+        # The tmp workdir vanishes with the test, so surface per-job stderr logs now.
+        logs = ""
+        for path in sorted(glob(os.path.join(tmp, "tmp", "logs", "**", "*.log"), recursive=True)):
+            with open(path) as f:
+                tail = f.read()[-2000:]
+            if tail.strip():
+                logs += f"\n--- {os.path.relpath(path, tmp)} ---\n{tail}"
+        raise AssertionError(f"snakemake {args} failed:\n{proc.stdout}\n{proc.stderr}{logs}")
     return proc
 
 

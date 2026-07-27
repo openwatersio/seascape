@@ -85,7 +85,8 @@ def _process_tree(root):
         try:
             fields = open(f"/proc/{name}/stat").read().rsplit(")", 1)[1].split()
             parents[int(name)] = int(fields[1])
-        except (FileNotFoundError, PermissionError, ValueError, IndexError):
+        # ProcessLookupError: the pid can exit between listdir and open
+        except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError, IndexError):
             pass
     tree = {root}
     while True:
@@ -113,7 +114,7 @@ def _process_metrics(root):
                         deleted += os.stat(path).st_size
                 except (FileNotFoundError, PermissionError, OSError):
                     pass
-        except (FileNotFoundError, PermissionError, ValueError, StopIteration):
+        except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError, StopIteration):
             pass
     return ticks, rss * 1024, read, written, deleted
 
