@@ -383,6 +383,50 @@ def check_shallow_minzoom_filter():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def check_covering_scope_independent():
+    """The covering (the per-stem aggregation CSVs) must be BBOX-INDEPENDENT: BBOX selects WHICH
+    stems a build processes, never a stem's CSV CONTENT. Build the covering at planet scope, then
+    under a bbox that CUTS ACROSS the broad `base` source (base extends past the window) while
+    EXCLUDING the finer `fine` source (fine ends at x=0.2, the window starts at x=0.25), and assert
+    every stem the two coverings share is BYTE-IDENTICAL — the invariant that keeps a scope change
+    from restamping a CSV and re-merging. Under the clip-clamp bug the bbox clamps source bounds to
+    the window, dropping fine from the boundary tiles that reach into it (here that also coarsens
+    the whole window to two z8 stems), so the coverings share nothing / differ — the check RED-fails
+    without the fix, GREEN-passes with it."""
+    tmp = tempfile.mkdtemp()
+    try:
+        make_source(tmp, "base", west=-0.5, north=0.5, deg=1.0, px=1024, value=-101, max_zoom=10)
+        make_source(tmp, "fine", west=-0.2, north=0.2, deg=0.4, px=4096, value=-51, max_zoom=11)
+        for sid in ("base", "fine"):
+            cli(tmp, "source_catalog.py", sid)
+
+        aggdir = f"{tmp}/store/aggregation"
+
+        def build_covering(bbox=None):
+            cli(tmp, "aggregation_covering.py", "--stable", env=({"BBOX": bbox} if bbox else None))
+            return {n: open(f"{aggdir}/{n}", "rb").read()
+                    for n in os.listdir(aggdir) if n.endswith("-aggregation.csv")}
+
+        planet = build_covering()
+        shutil.rmtree(aggdir)
+        bbox = build_covering("0.25,-0.5,0.5,0.5")  # cuts across base, excludes fine
+
+        shared = set(planet) & set(bbox)
+        assert shared, f"a base-cutting bbox must share stems with the planet covering: {sorted(bbox)}"
+        assert set(bbox) < set(planet), \
+            f"the bbox covering must be a strict subset of the planet covering: {sorted(set(bbox) - set(planet))}"
+        differing = [n for n in sorted(shared) if planet[n] != bbox[n]]
+        assert not differing, f"BBOX changed shared-stem CSV content — covering is scope-dependent: {differing}"
+        # the cut must actually exercise a boundary tile whose window part is base-only but reaches
+        # out into fine: with a scope-independent covering it keeps fine (child_z 11).
+        assert any(n.endswith("-11-aggregation.csv") for n in bbox), \
+            f"a boundary tile reaching into fine must keep child_z 11 in the bbox covering: {sorted(bbox)}"
+        print(f"covering scope-independence ok — {len(shared)} shared stems byte-identical across "
+              "planet and a base-cutting bbox")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     tmp = tempfile.mkdtemp()
     try:
@@ -544,28 +588,70 @@ def main():
         print(f"stage-split ok — CONTOUR_LEVELS reruns {counts.get('contour_tile')} contour_tile "
               f"+ vector_shallow + {n_cells} vector_cell + vector_join, 0 mosaic_tile, 0 terrain_render")
 
-        # ── scope transitions: a bbox build's regional aggregates must NOT read as current ──
-        # in a later planet build (the params scope stamp), and the planet build must rebuild
-        # ONLY aggregates — never re-merge or re-fork.
-        bbox = "-0.2,-0.2,0.2,0.2"  # the fine source's window: a strict stem subset
+        # ── scope transitions: a bbox build then a planet dry-run. The bbox CUTS ACROSS the base
+        # source (base extends past every window edge) and EXCLUDES the fine source (fine ends at
+        # x=0.2, the window starts at x=0.25) — the shape that made the covering-clip bug visible
+        # (byte-stability of the shared CSVs is proven directly by check_covering_scope_independent).
+        # Here the payoff is asserted end-to-end: the planet dry-run re-merges NOTHING (the mosaic
+        # tiles the first planet build wrote stay current), only the bbox-truncated fork
+        # neighborhoods heal, and every scope-stamped aggregate rebuilds.
+        import mosaic
+        bbox = "0.25,-0.5,0.5,0.5"  # right strip of base; fine (x<=0.2) is out of window
+        covering_path = f"{tmp}/store/aggregation/covering.txt"
+        os.environ["BBOX"] = bbox
+        try:
+            inwin = mosaic.covering_stems(covering_path)  # BBOX-scoped covering — the in-window stems
+        finally:
+            del os.environ["BBOX"]
+        n_inwin = len(inwin)
+        assert 0 < n_inwin < n_stems, f"bbox must select a strict subset of the covering: {n_inwin}/{n_stems}"
+        # a boundary stem reaching into fine must still carry fine (child_z 11), proving the covering
+        # kept the out-of-window source rather than clamping them away
+        assert any(s.endswith("-11") for s in inwin), \
+            f"a boundary stem reaching into fine must keep child_z 11: {inwin}"
+
+        # the heal set: in-window stems whose fork neighborhood reaches a stem OUTSIDE the window.
+        # The bbox build forks them with a bbox-truncated neighborhood; the planet build re-forks
+        # exactly these (input-set trigger). Interior in-window stems whose whole neighborhood is
+        # in-window do NOT change and stay current — so the heal count is < n_inwin here.
+        import aggregation_reproject
+        import mercantile
+        inwin_set = set(inwin)
+
+        def _neighbors(stem, pool):
+            z, x, y, _cz = (int(a) for a in stem.split("-"))
+            l, b, r, t = aggregation_reproject.buffered_bounds(
+                mercantile.Tile(x=x, y=y, z=z), mosaic.window_buffer_3857(stem))
+            hit = []
+            for s in pool:
+                sz, sx, sy, _c = (int(a) for a in s.split("-"))
+                sb = mercantile.xy_bounds(mercantile.Tile(x=sx, y=sy, z=sz))
+                if sb.left < r and sb.right > l and sb.bottom < t and sb.top > b:
+                    hit.append(s)
+            return hit
+
+        n_heal = sum(1 for s in inwin if any(n not in inwin_set for n in _neighbors(s, stems)))
+        assert 0 < n_heal < n_inwin, f"heal set must be a nonempty strict subset: {n_heal}/{n_inwin}"
+
         snake(tmp, "-c", "4", "bundles", env={"BBOX": bbox})   # real regional build
+
         dry = snake(tmp, "-c", "4", "-n", "bundles").stdout    # then a planet dry-run
         counts = _job_counts(dry)
+        # THE fix: byte-identical CSVs across scopes, so the planet mosaic tiles never look stale.
         assert counts.get("mosaic_tile", 0) == 0, f"scope change must never re-merge: {counts}"
-        # the bbox run re-forked its 4 in-window stems with TRUNCATED neighborhoods (their
-        # input set is bbox-scoped); the planet build must heal exactly those via the
-        # input-set trigger — and rebuild every scope-stamped aggregate.
-        assert counts.get("contour_tile", 0) == 4, f"planet must re-fork the 4 bbox-truncated stems: {counts}"
-        assert counts.get("soundings_tile", 0) == 4, f"soundings heal too: {counts}"
+        # the bbox run re-forked its in-window stems with TRUNCATED neighborhoods (input set is
+        # bbox-scoped); the planet build heals exactly the boundary stems via the input-set trigger.
+        assert counts.get("contour_tile", 0) == n_heal, f"planet must re-fork the {n_heal} bbox-truncated stems: {counts}"
+        assert counts.get("soundings_tile", 0) == n_heal, f"soundings heal too: {counts}"
+        assert counts.get("depare_tile", 0) == n_heal, f"depare heals too: {counts}"
         for agg in ("mosaic_index", "vector_shallow", "vector_join", "terrain_planet_bundle"):
             assert counts.get(agg, 0) == 1, f"{agg} must rebuild after a scope change: {counts}"
-        # only the cells the bbox run rebuilt carry its scope stamp (one per in-window stem at the
-        # stem-grid split); the other cells kept their planet-stamped outputs and stay current
-        assert counts.get("vector_cell", 0) == 4, \
-            f"the 4 bbox-stamped vector cells must rebuild after a scope change: {counts}"
+        # one bbox-stamped vector cell per in-window stem (stem-grid split); the rest kept planet stamps
+        assert counts.get("vector_cell", 0) == n_inwin, \
+            f"the {n_inwin} bbox-stamped vector cells must rebuild after a scope change: {counts}"
         snake(tmp, "-c", "4", "bundles")  # restore planet-scoped products for the checks below
-        print("scope-transition ok — bbox->planet re-merges nothing, heals 4 truncated forks, "
-              "rebuilds every aggregate")
+        print(f"scope-transition ok — bbox cutting across base re-merges nothing, heals {n_heal} of "
+              f"{n_inwin} in-window stems, rebuilds every aggregate")
 
         # ── staging inventory: a stale overlay file on disk must not ship or be advertised ──
         real = sorted(glob(f"{tmp}/store/bundle/overlay-*.pmtiles"))[0]
@@ -615,4 +701,5 @@ if __name__ == "__main__":
     check_pmtiles_reproducible()
     check_vector_selfcheck()
     check_shallow_minzoom_filter()
+    check_covering_scope_independent()
     main()
