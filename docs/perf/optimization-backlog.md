@@ -96,10 +96,12 @@ Attack in this order:
 
 Prior data points that still inform the work: unified invocation (contours + soundings in one
 named-layer tippecanoe) saved 22.8% at planet scale, semantically exact on the 16-stem sample.
-The vector bundle is now ONE joint variable-depth run over all three layers — depare's no-drop
-partition policy became the invocation-wide `--coalesce-smallest-as-needed` (contours coalesce
-cleanly, gate-verified), and the tile-join is gone. Legacy baseline was 7 h 01 m / 62% of the
-11 h 19 m build.
+The vector bundle is now SHARDED variable-depth runs (one dense shallow run + one run per
+stem-grid cell, all three layers joint per run — depare's no-drop partition policy became the
+invocation-wide `--coalesce-smallest-as-needed`, contours coalesce cleanly, gate-verified),
+tile-joined into the single served archive; the old per-layer tile-join fold is gone, and the
+shard-stitch tile-join is the `pmtiles merge` follow-up below. Legacy baseline was 7 h 01 m /
+62% of the 11 h 19 m build.
 
 **Publish hash pass:** `_HashCache` (mtime_ns+size keyed, store/mosaic/hash-cache.json) was in
 run 29847332817 but cold — `mosaic_publish` still read 376 GB in 30.6 min populating it. Expect
@@ -240,3 +242,19 @@ is a separate dense region). Weekly raw-source refreshes dirty these same tiles 
 steady-state, not a one-time cost. Densest stems by merge-input files: 8-73-99-14 (184),
 8-77-95-14 (171), 8-75-96-14 (158), 8-76-95-14 (157), 8-73-101-14 (141). Fresh per-tile peaks now
 come from the per-run `bench/mosaic/*.tsv` (the benchmark artifact) on every run.
+
+**Follow-up: replace tile-join with `pmtiles merge` (parked 2026-07-27).** The vector join's
+tile-join must MERGE boundary tiles (adjacent cells co-emit their shared fringe through
+tippecanoe's tile buffer), runs the felt PMTiles writer with its known corruption bug
+(felt/tippecanoe#278), and decodes/re-encodes where a byte copy would do. go-pmtiles
+`merge` is sequential I/O over clustered shards but requires STRICT disjointness (it errors
+on any overlapping tile), so the prerequisite is filtering each cell archive to its owned
+subtree — argued safe because per-stem fork inputs are pre-clipped at cell boundaries (a
+feature never enters a neighbor's tile extent, only its buffer, and the owning tile's own
+buffer covers rendering across the edge; needs one preview eyeball at a cell boundary).
+A working start (owned-subtree filter, pinned go-pmtiles in the Dockerfile, strict-disjoint
+ownership tests, plus switching soundings intermediates to line-delimited .geojsons for
+streaming reads — that piece is separable and can land alone) is parked in the
+native-resolution worktree stash "pmtiles-merge WIP"; known wrinkle from its first run: the
+pre-merge layer-set consistency assertion must tolerate cells that legitimately lack a
+layer (constant-depth regions emit no contours).
