@@ -258,3 +258,13 @@ streaming reads — that piece is separable and can land alone) is parked in the
 native-resolution worktree stash "pmtiles-merge WIP"; known wrinkle from its first run: the
 pre-merge layer-set consistency assertion must tolerate cells that legitimately lack a
 layer (constant-depth regions emit no contours).
+
+**Content-hash guard on `mosaic_tile` outputs (noted 2026-07-27).** The strip→NY-harbor scope
+transition showed a restamped covering CSV re-merging tiles into byte-identical outputs, whose
+fresh mtimes then rebuilt every downstream fork/render on the next invocation. Snakemake can't
+unschedule a planned cascade mid-run, but across invocations the repo's write_if_changed pattern
+cures it — extend it to the merge: after building a tile in scratch, hash-compare against the
+existing store tile (the publish _HashCache already computes these) and skip the replace when
+identical, preserving the mtime. Converts any future spurious-trigger class from "wasted build +
+full downstream cascade" to "wasted build, cascade dies at the merge." Belt on top of the
+scope-independent-covering fix, which removes the known trigger itself.
