@@ -47,9 +47,9 @@ Per tile: bands (gdal_contour -p at DEPARE_LEVELS / DEPARE_LEVELS_FT, drop land,
 (inland-water polygons minus the DEM's water coverage and the drying) -> clip to the
 unbuffered tile bbox in shapely (polygon-only by construction, see _polys) -> 4326 ->
 store/depare/{stem}.fgb. Same seam contract as contours: deterministic on the buffered grid,
-so neighbouring tiles' features abut exactly at the clip line. The vector bundle
-(contour_run.bundle_stable) folds these into the `depare` layer of the one joint run, gated at z6
-by a per-feature tippecanoe.minzoom (contour_run.DEPARE_MINZOOM).
+so neighbouring tiles' features abut exactly at the clip line. The vector bundle folds these into
+the `depare` layer of the sharded variable-depth run (contour_run), gated at z6 by a per-feature
+tippecanoe.minzoom (contour_run.DEPARE_MINZOOM).
 """
 
 import os

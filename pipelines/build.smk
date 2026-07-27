@@ -46,6 +46,7 @@ DEPARE = not os.environ.get("SKIP_DEPARE")
 # function, still before any job runs.
 _STEMS = {}
 _CELLS = {}
+_VCELLS = {}
 
 
 def _covering_key():
@@ -93,8 +94,19 @@ def cell_stems():
     return _CELLS[key]
 
 
+def vector_cells():
+    """cell -> [covering stems] for the sharded vector bundle, built once per DAG evaluation. The
+    vector cells group the covering stems (not the terrain render stems) by the same SPLIT_Z grid;
+    each populated cell is one variable-depth vector_cell job."""
+    _, key = _covering_key()
+    if key not in _VCELLS:
+        _VCELLS[key] = contour_run.vector_covering_cells(covering_stems())
+    return _VCELLS[key]
+
+
 wildcard_constraints:
-    stem=r"\d+-\d+-\d+-\d+"
+    stem=r"\d+-\d+-\d+-\d+",
+    cell=r"\d+-\d+-\d+"
 
 
 _TILE_SOURCES = {}
@@ -425,32 +437,75 @@ rule tiles:
         tile_inputs
 
 
-# ── vector bundle — ONE variable-depth tippecanoe run over all three layers ──
-# contour_run.bundle_stable reads the PLAIN per-stem outputs of all three layers (0-byte = an empty
-# tile, kept by size), asserts each covering is hole-free, and runs ONE
-# --generate-variable-depth-tile-pyramid over contours + soundings + depare → a sparse
-# vector.pmtiles the Worker overzooms. No tile-join, no separate soundings/depare archives: the
-# leaf decision is made per tile across every layer jointly (separately-tiled layers leaf at
-# different depths and a join then vanishes the shallower-leafing layer from deep tiles). All zoom
-# gating rides as per-feature tippecanoe.minzoom (contour tiers, depare's z6 floor, sounding pyramid
-# levels). depare rides only when SKIP_DEPARE is unset (DEPARE). Always rebuilds — Snakemake owns
-# freshness.
-rule vector_bundle:
+# ── vector bundle — cell-subtree sharded variable-depth tippecanoe + tile-join ──
+# The one joint variable-depth run is split three ways so the serial variable-depth tiler runs once
+# per cell concurrently, not once over all planet content (docs/plans/2026-07-14-native-resolution.md):
+#   vector_shallow — plain dense -Z0 -z(SPLIT_Z-1) over all three layers, features filtered to
+#     minzoom <= SPLIT_Z-1; owns every z < SPLIT_Z tile.
+#   vector_cell    — one variable-depth run per populated SPLIT_Z cell, -Z SPLIT_Z -z(cell child_z)
+#     over that cell's covering stems; owns the cell's z >= SPLIT_Z subtree. threads: 2 because the
+#     variable-depth walk is single-threaded (the rest of the run is not) — an honest reservation the
+#     scheduler backfills against. These are the long poles, so they ride VECTOR_BAND.
+#   vector_join    — tile-join the shallow + all cell archives into the served vector.pmtiles;
+#     ownership is disjoint so the join is pure concatenation (-pk).
+# Layers stay joint within every run (separately-tiled layers leaf at different depths and vanish the
+# shallower one). All zoom gating rides as per-feature tippecanoe.minzoom (contour tiers, depare's z6
+# floor, sounding pyramid levels). 0-byte per-tile inputs are empty tiles (kept by size); an
+# all-empty cell writes a 0-byte archive the join skips. depare rides only when SKIP_DEPARE is unset
+# (DEPARE). Always rebuilds — Snakemake owns freshness.
+rule vector_shallow:
     input:
         contours=lambda wc: expand("store/contour/{stem}.fgb", stem=covering_stems()),
         soundings=lambda wc: expand("store/soundings/{stem}.geojson", stem=covering_stems()),
         depare=lambda wc: expand("store/depare/{stem}.fgb", stem=depare_stems()),
     output:
-        "store/bundle/vector.pmtiles"
-    priority: VECTOR_BAND  # above every terrain render, so the bundle starts the moment the layers drain
+        "store/bundle/vector-shallow.pmtiles"
+    priority: VECTOR_BAND  # above every terrain render, so the shallow run starts as the layers drain
     params:
         bbox=os.environ.get("BBOX", ""),  # scope stamp — see mosaic_index
     benchmark:
-        f"{TMP}/bench/vector-bundle.tsv"
+        f"{TMP}/bench/vector-shallow.tsv"
     log:
-        f"{TMP}/logs/vector-bundle.log"
+        f"{TMP}/logs/vector-shallow.log"
     shell:
-        "{PY}/contour_run.py bundle --stable 2> {log}"
+        "{PY}/contour_run.py bundle-shallow --stable 2> {log}"
+
+
+rule vector_cell:
+    input:
+        contours=lambda wc: expand("store/contour/{stem}.fgb", stem=vector_cells().get(wc.cell, [])),
+        soundings=lambda wc: expand("store/soundings/{stem}.geojson", stem=vector_cells().get(wc.cell, [])),
+        depare=lambda wc: expand("store/depare/{stem}.fgb",
+                                 stem=(vector_cells().get(wc.cell, []) if DEPARE else [])),
+    output:
+        "store/bundle/vector-cell-{cell}.pmtiles"
+    priority: VECTOR_BAND  # a long pole in the band, so it overlaps the terrain fleet
+    threads: 2  # the variable-depth walk is single-threaded; reserve honestly for scheduler backfill
+    params:
+        bbox=os.environ.get("BBOX", ""),  # scope stamp — see mosaic_index
+    benchmark:
+        f"{TMP}/bench/vector-cell-{{cell}}.tsv"
+    log:
+        f"{TMP}/logs/vector-cell-{{cell}}.log"
+    shell:
+        "{PY}/contour_run.py bundle-cell {wildcards.cell} --stable 2> {log}"
+
+
+rule vector_join:
+    input:
+        shallow="store/bundle/vector-shallow.pmtiles",
+        cells=lambda wc: expand("store/bundle/vector-cell-{cell}.pmtiles", cell=sorted(vector_cells())),
+    output:
+        "store/bundle/vector.pmtiles"
+    priority: VECTOR_BAND  # the join finishes the vector band before terrain bundling
+    params:
+        bbox=os.environ.get("BBOX", ""),  # scope stamp — see mosaic_index
+    benchmark:
+        f"{TMP}/bench/vector-join.tsv"
+    log:
+        f"{TMP}/logs/vector-join.log"
+    shell:
+        "{PY}/contour_run.py bundle-join --stable 2> {log}"
 
 
 # ── terrain (raster) bundles — the planet base archive + one overlay per populated ──
@@ -471,10 +526,6 @@ rule terrain_planet_bundle:
         f"{TMP}/logs/planet-bundle.log"
     shell:
         "{PY}/bundle.py planet --stable 2> {log}"
-
-
-wildcard_constraints:
-    cell=r"\d+-\d+-\d+"
 
 
 rule overlay_bundle:

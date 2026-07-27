@@ -16,7 +16,7 @@ Per tile: read merged DEM (3857) in row strips -> a staggered-grid PYRAMID (one 
 grid per zoom level, each point valued by the shoalest wet pixel in its block) -> keep points in
 the unbuffered tile bbox -> reproject to 4326 -> store/soundings/{stem}.geojson (per-feature
 tippecanoe minzoom==maxzoom, so each zoom shows one even field, densifying inward). The vector
-bundle (contour_run.bundle_stable) folds these into the `soundings` layer of the one joint run.
+bundle folds these into the `soundings` layer of the sharded variable-depth run (contour_run).
 
 Chart-cartography grounding (shoal-bias, the radius method, SCAMIN, spacing rules) and the
 seamap fork this mirrors: ../docs/nautical-chart-references.md.

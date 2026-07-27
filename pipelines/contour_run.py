@@ -279,12 +279,28 @@ def _stems_maxz(stems):
 
 
 def _vector_maxz(own_max):
-    """The single run's -z: the covering's max child_z (native depth), so a variable-depth leaf can
+    """The join's -z: the covering's max child_z (native depth), so a variable-depth leaf can
     reach it, else the caller's own inputs' max. The covering is always present (Snakemake refuses
-    to run without it). Replaces the old shared bundle_maxz — one joint run, not a shared tile-join
-    maxzoom across three separately-tiled layers."""
+    to run without it)."""
     import mosaic
     return max(own_max, _stems_maxz(mosaic.covering_stems()))
+
+
+def vector_covering_cells(stems):
+    """{cell: [covering stems]} grouping the covering stems by their bundle.SPLIT_Z overlay cell —
+    the same grid the raster overlays use, but over the vector's covering stems (which root at
+    macrotile_z) rather than terrain render stems. Each covering stem roots at macrotile_z >=
+    SPLIT_Z, so it maps to exactly ONE cell; every stem also feeds the shallow run. build.smk
+    derives the vector_cell wildcard set (and each cell's member stems) from this."""
+    import bundle
+    if utils.macrotile_z < bundle.SPLIT_Z:
+        raise SystemExit(f"OVERLAY_SPLIT_Z ({bundle.SPLIT_Z}) exceeds macrotile_z "
+                         f"({utils.macrotile_z}) — covering stems root below the overlay grid")
+    cells = collections.defaultdict(list)
+    for s in stems:
+        z, x, y, _cz = (int(a) for a in s.split("-"))
+        cells[bundle.cell_of(z, x, y)].append(s)
+    return {c: sorted(cells[c]) for c in cells}
 
 
 # ── source coverage (provenance) layer ───────────────────────────────────────
@@ -381,14 +397,20 @@ def require_stable_complete(layer, stems, files):
             f"{' …' if len(missing) > 5 else ''}")
 
 
-# ── one variable-depth run: contours + soundings + depare → sparse vector.pmtiles ─────────────
-# ONE tippecanoe --generate-variable-depth-tile-pyramid over all three layers, leafing per-tile
-# across them jointly (separately-tiled layers leaf at different depths, and a tile-join then mints
-# deep tiles missing the shallower-leafing layer — the vanishing bug the old shared bundle_maxz
-# existed to prevent). All zoom gating rides as per-feature tippecanoe.minzoom: contour tiers via
-# contour_minzoom, depare's z6 floor as a uniform minzoom (the run-level -Z6 dies in a -Z0 joint
-# run whose soundings need z0), soundings' pyramid levels unchanged. The archive is SPARSE — the
-# Worker overzooms ancestors (Part 1); manifest.vector.max_zoom is what turns that on.
+# ── cell-subtree sharded vector bundle → sparse vector.pmtiles ─────────────────────────────────
+# The one joint --generate-variable-depth-tile-pyramid run is split into a global shallow run plus
+# one variable-depth run per populated bundle.SPLIT_Z cell, tile-joined into vector.pmtiles (the
+# serial variable-depth tiler then runs once per cell concurrently, not once over all content — see
+# the design note in docs/plans/2026-07-14-native-resolution.md):
+#   - shallow: plain dense -Z0 -z(SPLIT_Z-1) over all three layers, filtered to features whose
+#     tippecanoe.minzoom <= SPLIT_Z-1; owns every z < SPLIT_Z tile.
+#   - cell:    -Z SPLIT_Z -z(cell max child_z) with variable depth over that cell's covering stems;
+#     owns its z >= SPLIT_Z subtree. Layers stay joint within each run so the layer-vanishing bug
+#     (separately-tiled layers leafing at different depths) stays dead.
+# Tile ownership is disjoint by construction, so the join is pure concatenation (tile-join -pk).
+# All zoom gating rides as per-feature tippecanoe.minzoom: contour tiers via contour_minzoom,
+# depare's z6 floor as a uniform minzoom, soundings' pyramid levels unchanged. The archive is
+# SPARSE — the Worker overzooms ancestors (Part 1); manifest.vector.max_zoom is what turns that on.
 
 # Union of the three layers' MVT attributes; the FlatGeobuf/GeoJSON Integer64 columns need :int so
 # they don't land as strings. depth_m stays untyped (contours carry an int level, soundings a float
@@ -406,6 +428,14 @@ DEPARE_MINZOOM = 6  # depare's zoom floor, now per-feature (was depare_run's run
 # children, e.g. the 50% test case) clears it easily, while sub-band holes are caught by the id
 # completeness check. Not the 2% overlap tolerance, which is same-tile (no cross-zoom quantization).
 DEPARE_GAP_TOL = 0.10
+
+# Feature ids must be globally unique across the shallow run AND every per-cell run (each run is a
+# separate process, so no shared counter): the join concatenates all archives, and a collision would
+# let a dropped feature's completeness id be satisfied by an unrelated survivor. Each run gets a
+# disjoint [base, base + ID_STRIDE) block — shallow at base 0, cell i (sorted) at (i+1)*ID_STRIDE.
+# 2**40 (~1.1e12) dwarfs any single run's feature count; ~1024 z-cells * 2**40 stays well inside a
+# 64-bit id (tippecanoe preserves ids as unsigned 64-bit).
+ID_STRIDE = 1 << 40
 
 
 def _json_scalar(v):
@@ -449,14 +479,16 @@ def _survives_leaf(geom, min_deg):
     return geom.length >= min_deg
 
 
-def _fgb_to_seq(fgbs, cols, minzoom_fn, out_path, layer, identity_fn, id0, maxz):
+def _fgb_to_seq(fgbs, cols, minzoom_fn, out_path, layer, identity_fn, id0, maxz, max_minzoom=None):
     """Stream per-tile FGBs → one GeoJSONSeq (newline-delimited features) carrying a per-feature
-    tippecanoe.minzoom — FGB can't hold the tippecanoe extension, so the joint run reads GeoJSON
-    like soundings already do. One tile in memory at a time (macrotile-sized). Every feature gets a
-    unique GeoJSON id counting up from id0 (globally unique across layers) — tippecanoe preserves
-    ids, so the self-check proves each input survived. Returns (next_id, {id: identity} for the
-    completeness set) — only above-leaf-pixel features enter it (sub-pixel slivers are exempt, since
-    tippecanoe drops them legitimately), while EVERY feature (id included) is still written to tippecanoe."""
+    tippecanoe.minzoom — FGB can't hold the tippecanoe extension, so the run reads GeoJSON like
+    soundings already do. One tile in memory at a time (macrotile-sized). Every WRITTEN feature gets
+    a unique GeoJSON id counting up from id0 (disjoint per run/cell) — tippecanoe preserves ids, so
+    the self-check proves each input survived. When max_minzoom is set (the shallow run's -z), a
+    feature whose minzoom exceeds it is dropped at write time — it belongs to a deeper cell, never a
+    shallow tile; the explicit filter is what makes this our contract, not tippecanoe's clamp.
+    Returns (next_id, {id: identity} for the completeness set) — only above-leaf-pixel features enter
+    it (sub-pixel slivers are exempt, since tippecanoe drops them legitimately)."""
     import geopandas as gpd
     from shapely.geometry import mapping
     min_deg = COMPLETENESS_MIN_PX * _leaf_pixel_deg(maxz)
@@ -471,8 +503,11 @@ def _fgb_to_seq(fgbs, cols, minzoom_fn, out_path, layer, identity_fn, id0, maxz)
                     v = _json_scalar(getattr(r, c, None))
                     if v is not None:
                         props[c] = v
+                mz = minzoom_fn(props)
+                if max_minzoom is not None and mz > max_minzoom:
+                    continue
                 feat = {"type": "Feature", "id": fid,
-                        "tippecanoe": {"minzoom": minzoom_fn(props)},
+                        "tippecanoe": {"minzoom": mz},
                         "properties": props, "geometry": mapping(r.geometry)}
                 fh.write(json.dumps(feat))
                 fh.write("\n")
@@ -482,15 +517,19 @@ def _fgb_to_seq(fgbs, cols, minzoom_fn, out_path, layer, identity_fn, id0, maxz)
     return fid, ids
 
 
-def _soundings_to_seq(gjs, out_path, id0):
+def _soundings_to_seq(gjs, out_path, id0, max_minzoom=None):
     """Concatenate the per-tile sounding FeatureCollections into one GeoJSONSeq, features passed
     through untouched except a unique GeoJSON id (counting up from id0) for the completeness check —
-    each already carries its own tippecanoe.minzoom (pyramid level). Returns (next_id, {id: identity})."""
+    each already carries its own tippecanoe.minzoom (pyramid level). When max_minzoom is set (the
+    shallow run's -z), a sounding whose minzoom exceeds it is dropped at write time (it rides a
+    deeper cell). Returns (next_id, {id: identity})."""
     fid = id0
     ids = {}
     with open(out_path, "w") as fh:
         for gj in gjs:
             for ft in json.load(open(gj)).get("features", []):
+                if max_minzoom is not None and ft.get("tippecanoe", {}).get("minzoom", 0) > max_minzoom:
+                    continue
                 ft["id"] = fid
                 fh.write(json.dumps(ft))
                 fh.write("\n")
@@ -499,22 +538,27 @@ def _soundings_to_seq(gjs, out_path, id0):
     return fid, ids
 
 
-def _tippecanoe_joint(layers, maxz, out):
-    """ONE --generate-variable-depth-tile-pyramid run over the named layer seqs → out (sparse
-    pmtiles). Global --coalesce-smallest-as-needed (merges, never drops: a dropped depare polygon
-    is a partition hole; contours coalesce cleanly, proven by the STEP-0 gate) since every
-    as-needed strategy is invocation-wide. --no-simplification-of-shared-nodes keeps partition
-    seams crack-free through per-zoom simplification."""
-    cmd = ["tippecanoe", "-o", out, "-f", "--generate-variable-depth-tile-pyramid",
-           "-n", "Open Waters Bathymetry", "-A", utils.ATTRIBUTION,
-           "-Z", "0", "-z", str(maxz), "-P", "-q",
-           "--coalesce-smallest-as-needed", "--no-simplification-of-shared-nodes",
-           # -S alone ALSO applies at maxzoom (~76 m tolerance at z10), which cut isobaths across
-           # islands the DEM-level land clamp had already routed around — pin maxzoom near-lossless
-           # so leaf tiles keep the clamped shoreline. Env-tunable to dial on a re-bundle.
-           "--simplification", os.environ.get("VECTOR_SIMPLIFICATION", "8"),
-           "--simplification-at-maximum-zoom",
-           os.environ.get("VECTOR_SIMPLIFICATION_MAXZOOM", "1")]
+def _tippecanoe_run(layers, minz, maxz, out, variable_depth):
+    """ONE tippecanoe run over the named layer seqs → out (pmtiles). `variable_depth` adds
+    --generate-variable-depth-tile-pyramid (the per-cell runs; the shallow run stays a plain dense
+    pyramid). Every other flag is IDENTICAL across both run kinds so tile content at a given zoom
+    matches the old single joint run. Global --coalesce-smallest-as-needed (merges, never drops: a
+    dropped depare polygon is a partition hole; contours coalesce cleanly, proven by the STEP-0
+    gate) since every as-needed strategy is invocation-wide. --no-simplification-of-shared-nodes
+    keeps partition seams crack-free through per-zoom simplification. -q is dropped so tippecanoe's
+    progress rides the per-rule log (the joint run's 14 h of invisibility motivated this)."""
+    cmd = ["tippecanoe", "-o", out, "-f"]
+    if variable_depth:
+        cmd.append("--generate-variable-depth-tile-pyramid")
+    cmd += ["-n", "Open Waters Bathymetry", "-A", utils.ATTRIBUTION,
+            "-Z", str(minz), "-z", str(maxz), "-P",
+            "--coalesce-smallest-as-needed", "--no-simplification-of-shared-nodes",
+            # -S alone ALSO applies at maxzoom (~76 m tolerance at z10), which cut isobaths across
+            # islands the DEM-level land clamp had already routed around — pin maxzoom near-lossless
+            # so leaf tiles keep the clamped shoreline. Env-tunable to dial on a re-bundle.
+            "--simplification", os.environ.get("VECTOR_SIMPLIFICATION", "8"),
+            "--simplification-at-maximum-zoom",
+            os.environ.get("VECTOR_SIMPLIFICATION_MAXZOOM", "1")]
     # --detect-shared-borders drives tippecanoe's wagyu exit-106 hole-placement crash on dense
     # DEPARE geometry (mapbox/tippecanoe#761, unfixed in felt v2.80.0). Its documented successor
     # --no-simplification-of-shared-nodes (above) keeps shared edges crack-free without the crash;
@@ -526,71 +570,159 @@ def _tippecanoe_joint(layers, maxz, out):
         cmd += ["-T", t]
     for name, seq in layers:
         cmd += ["-L", f"{name}:{seq}"]
-    with utils.log_group(f"vector tippecanoe ({len(layers)} layers, z0-{maxz})"):
-        utils.run_monitored(cmd, "vector tippecanoe", out)
+    kind = "variable-depth" if variable_depth else "shallow"
+    with utils.log_group(f"vector tippecanoe {kind} ({len(layers)} layers, z{minz}-{maxz})"):
+        utils.run_monitored(cmd, f"vector tippecanoe {kind}", out)
 
 
-def bundle_stable():
-    """Vector bundle: ONE variable-depth tippecanoe run over all three per-stem layer sets
-    (contours + soundings + depare) → store/bundle/vector.pmtiles, a SPARSE pyramid the Worker
-    overzooms (Part 1). Replaces the old contour tippecanoe + tile-join fold of soundings/depare. A
-    0-byte per-tile file is a legitimately empty tile (filtered by size); a MISSING one is an
-    incomplete build (require_stable_complete, per layer, before the run). Snakemake decides when to
-    invoke, so this always rebuilds. Depare rides only when SKIP_DEPARE is unset (by CONFIGURATION,
-    never disk state), gated at z6 by a per-feature tippecanoe.minzoom (DEPARE_MINZOOM)."""
-    import mosaic
-    stems = mosaic.covering_stems()
+def _empty_archive(out):
+    """Declare an empty vector output: a 0-byte file, the same sentinel the per-tile forks use for
+    an empty tile — the join skips it by size, so an all-empty cell (or a shallow run with no
+    below-SPLIT_Z content) still satisfies the DAG without minting a spurious archive."""
+    utils.create_folder(os.path.dirname(out))
+    open(out, "w").close()
+
+
+def _build_seqs_and_run(stems, minz, maxz, id_base, variable_depth, out, max_minzoom=None):
+    """Build the three layer GeoJSONSeqs from `stems` (ids from a disjoint block at id_base), then
+    one tippecanoe run → out. Returns the {layer: {id: identity}} completeness map of the WRITTEN,
+    above-leaf-pixel features. An all-empty input writes a 0-byte `out` and returns empty maps.
+    require_stable_complete gates the caller; here 0-byte per-tile files are legitimately empty."""
+    depare_on = not os.environ.get("SKIP_DEPARE")
     cfiles = [f"store/contour/{s}.fgb" for s in stems]
     sfiles = [f"store/soundings/{s}.geojson" for s in stems]
-    require_stable_complete("contour", stems, cfiles)
-    require_stable_complete("soundings", stems, sfiles)
-    depare_on = not os.environ.get("SKIP_DEPARE")
     dfiles = [f"store/depare/{s}.fgb" for s in stems] if depare_on else []
-    if depare_on:
-        require_stable_complete("depare", stems, dfiles)
     cfgbs = [f for f in cfiles if os.path.getsize(f) > 0]
     sgjs = [f for f in sfiles if os.path.getsize(f) > 0]
     dfgbs = [f for f in dfiles if os.path.getsize(f) > 0]
 
-    vec = "store/bundle/vector.pmtiles"
-    utils.create_folder("store/bundle")
-    all_inputs = cfgbs + sgjs + dfgbs
-    own_max = max((int(os.path.basename(f).split(".")[0].rsplit("-", 1)[1]) for f in all_inputs),
-                  default=0)
-    maxz = _vector_maxz(own_max)
-
     cseq = utils.vector_scratch("contours.geojsons")
     sseq = utils.vector_scratch("soundings.geojsons")
     dseq = utils.vector_scratch("depare.geojsons")
-    nid = 1  # one running counter → feature ids globally unique across the three layers
+    nid = id_base
     cids = sids = dids = {}
     try:
         nid, cids = _fgb_to_seq(cfgbs, ("depth_m", "depth_abs_m", "sys", "depth_ft", "depth_fm"),
                                 lambda p: contour_minzoom(p["sys"], float(p["depth_m"])), cseq,
                                 "contour", lambda p: f"sys={p.get('sys')} depth_m={p.get('depth_m')}",
-                                nid, maxz)
-        nid, sids = _soundings_to_seq(sgjs, sseq, nid)
+                                nid, maxz, max_minzoom)
+        nid, sids = _soundings_to_seq(sgjs, sseq, nid, max_minzoom)
         nid, dids = _fgb_to_seq(dfgbs, ("drval1", "drval2", "sys", "rank"),
                                 lambda p: DEPARE_MINZOOM, dseq,
                                 "depare", lambda p: f"drval1={p.get('drval1')} sys={p.get('sys')}",
-                                nid, maxz)
-        nc, ns, nd = len(cids), len(sids), len(dids)
-        layers = []
-        if nc:
-            layers.append(("contours", cseq))
-        if ns:
-            layers.append(("soundings", sseq))
-        if nd:
-            layers.append(("depare", dseq))
-        if not layers:
-            raise SystemExit("vector bundle: no features in any layer for the covering")
-        _tippecanoe_joint(layers, maxz, vec)  # writes vector.pmtiles; Snakemake cleans a torn output
+                                nid, maxz, max_minzoom)
+        layers = [(name, seq) for name, seq, ids in
+                  (("contours", cseq, cids), ("soundings", sseq, sids), ("depare", dseq, dids)) if ids]
+        if layers:
+            _tippecanoe_run(layers, minz, maxz, out, variable_depth)
+        else:
+            _empty_archive(out)
     finally:
         for seq in (cseq, sseq, dseq):
             if os.path.exists(seq):
                 os.remove(seq)
-    _vector_selfcheck(vec, maxz, {"contours": cids, "soundings": sids, "depare": dids})
-    print(f"vector bundle (stable): {vec} (z0-{maxz}; contours={nc} soundings={ns} depare={nd})")
+    return {"contours": cids, "soundings": sids, "depare": dids}
+
+
+SHALLOW = "store/bundle/vector-shallow.pmtiles"
+
+
+def _cell_archive(cell):
+    return f"store/bundle/vector-cell-{cell}.pmtiles"
+
+
+def _cell_sidecar(cell):
+    return f"store/bundle/vector-cell-{cell}.ids.json"
+
+
+def bundle_shallow_stable():
+    """The global shallow vector run: plain dense -Z0 -z(SPLIT_Z-1) over all three layers, filtered
+    to features whose tippecanoe.minzoom <= SPLIT_Z-1 → store/bundle/vector-shallow.pmtiles. Owns
+    every z < SPLIT_Z tile of the join. require_stable_complete gates every covering stem first (a
+    MISSING per-tile file is an interrupted build; a 0-byte one is an empty tile). Snakemake owns
+    freshness. The shallow features are a subset of some cell's features, so their ids don't join the
+    completeness set — the join checks the per-cell sidecars."""
+    import bundle
+    import mosaic
+    stems = mosaic.covering_stems()
+    require_stable_complete("contour", stems, [f"store/contour/{s}.fgb" for s in stems])
+    require_stable_complete("soundings", stems, [f"store/soundings/{s}.geojson" for s in stems])
+    if not os.environ.get("SKIP_DEPARE"):
+        require_stable_complete("depare", stems, [f"store/depare/{s}.fgb" for s in stems])
+    utils.create_folder("store/bundle")
+    maxz = bundle.SPLIT_Z - 1
+    ids = _build_seqs_and_run(stems, 0, maxz, 0, False, SHALLOW, max_minzoom=maxz)
+    n = {k: len(v) for k, v in ids.items()}
+    print(f"vector shallow bundle (stable): {SHALLOW} (z0-{maxz}; {n})")
+
+
+def bundle_cell_stable(cell):
+    """One variable-depth vector run for a SPLIT_Z cell: -Z SPLIT_Z -z(cell max child_z) over the
+    cell's covering stems → store/bundle/vector-cell-<cell>.pmtiles, plus a sidecar of its expected
+    completeness ids the join collects. Owns the cell's z >= SPLIT_Z subtree. An all-empty cell
+    writes a 0-byte archive + empty sidecar (the join skips it). The id base is a disjoint block from
+    a stable sort of the covering's cells, so ids never collide with the shallow run or another
+    cell."""
+    import bundle
+    import mosaic
+    covering = mosaic.covering_stems()
+    cells = vector_covering_cells(covering)
+    if cell not in cells:
+        raise SystemExit(f"vector cell {cell}: not a populated cell of the covering")
+    stems = cells[cell]
+    require_stable_complete("contour", stems, [f"store/contour/{s}.fgb" for s in stems])
+    require_stable_complete("soundings", stems, [f"store/soundings/{s}.geojson" for s in stems])
+    if not os.environ.get("SKIP_DEPARE"):
+        require_stable_complete("depare", stems, [f"store/depare/{s}.fgb" for s in stems])
+    utils.create_folder("store/bundle")
+    id_base = (sorted(cells).index(cell) + 1) * ID_STRIDE
+    cell_maxz = _stems_maxz(stems)
+    ids = _build_seqs_and_run(stems, bundle.SPLIT_Z, cell_maxz, id_base, True, _cell_archive(cell))
+    with open(_cell_sidecar(cell), "w") as f:
+        json.dump(ids, f)
+    n = {k: len(v) for k, v in ids.items()}
+    print(f"vector cell bundle (stable): {_cell_archive(cell)} (z{bundle.SPLIT_Z}-{cell_maxz}; {n})")
+
+
+def bundle_join_stable():
+    """tile-join the shallow archive + every populated cell archive → store/bundle/vector.pmtiles,
+    the single served sparse pyramid the Worker overzooms (Part 1). Tile ownership is disjoint
+    (shallow owns z < SPLIT_Z, each cell its z >= SPLIT_Z subtree), so the join is pure
+    concatenation — -pk keeps every tile (per-cell runs already enforced size limits; tile-join must
+    not silently skip). The completeness self-check runs on the FINAL archive against the union of
+    the per-cell sidecars' expected ids."""
+    import mosaic
+    covering = mosaic.covering_stems()
+    cells = sorted(vector_covering_cells(covering))
+    if not os.path.exists(SHALLOW):
+        raise SystemExit(f"vector join: missing {SHALLOW} — run the shallow bundle first")
+    archives = [SHALLOW] if os.path.getsize(SHALLOW) > 0 else []
+    expected = {"contours": {}, "soundings": {}, "depare": {}}
+    for c in cells:
+        arch = _cell_archive(c)
+        if not os.path.exists(arch):
+            raise SystemExit(f"vector join: missing cell archive {arch} — run the cell bundles first")
+        if os.path.getsize(arch) == 0:
+            continue  # empty cell (0-byte sentinel) — no tiles, no expected ids
+        archives.append(arch)
+        with open(_cell_sidecar(c)) as f:
+            for layer, m in json.load(f).items():
+                expected[layer].update((int(k), v) for k, v in m.items())
+    if not archives:
+        raise SystemExit("vector join: no vector features in any shallow or cell archive")
+
+    vec = "store/bundle/vector.pmtiles"
+    utils.create_folder("store/bundle")
+    cmd = ["tile-join", "-o", vec, "-f", "-pk",
+           "-n", "Open Waters Bathymetry", "-A", utils.ATTRIBUTION, *archives]
+    with utils.log_group(f"vector tile-join ({len(archives)} archives)"):
+        utils.run_monitored(cmd, "vector tile-join", vec)
+
+    maxz = _vector_maxz(0)
+    expected = {k: v for k, v in expected.items() if v}
+    _vector_selfcheck(vec, maxz, expected)
+    print(f"vector bundle (stable): {vec} (z0-{maxz}; {len(archives)} archives, "
+          f"{sum(len(v) for v in expected.values())} ids)")
 
 
 def _decode_tile(vec, z, x, y):
@@ -735,6 +867,18 @@ def _check():
     assert _drop_small_rings(LineString([(0, 0), (5e3, 0), (1e4, 5e3)]), MIN_RING_AREA_M2) is not None  # open line kept
     # the run's -z reads child_z off covering stems
     assert _stems_maxz({"4-5-6-8", "11-300-400-13"}) == 13
+    # cell grouping: covering stems route to their SPLIT_Z overlay cell; a cell's child_z drives -z.
+    import bundle
+    sz = bundle.SPLIT_Z
+    a_stem, b_stem = f"{utils.macrotile_z}-0-0-{utils.macrotile_z}", f"{utils.macrotile_z}-100-100-{utils.macrotile_z + 3}"
+    cells = vector_covering_cells([a_stem, b_stem])
+    assert all(c.startswith(f"{sz}-") for c in cells), cells
+    assert cells[bundle.cell_of(utils.macrotile_z, 100, 100)] == [b_stem]
+    assert _stems_maxz(cells[bundle.cell_of(utils.macrotile_z, 100, 100)]) == utils.macrotile_z + 3
+    # id blocks are disjoint: shallow at 0, cell i (sorted) at (i+1)*STRIDE — no block overlaps
+    order = sorted(vector_covering_cells([a_stem, b_stem]))
+    bases = [0] + [(i + 1) * ID_STRIDE for i in range(len(order))]
+    assert all(b2 - b1 >= ID_STRIDE for b1, b2 in zip(bases, bases[1:])), bases
     # navigable-band contours skip Chaikin (never bow a shoal deeper); deeper ones smooth
     assert _chaikin_iters(10) == 0 and _chaikin_iters(NAV_SMOOTH_MAX_M) == 0
     assert _chaikin_iters(NAV_SMOOTH_MAX_M + 1) == CHAIKIN_ITERATIONS
@@ -756,11 +900,16 @@ if __name__ == "__main__":
     a = sys.argv[1:]
     if a[:1] == ["tile"] and len(a) == 2:
         tile(a[1])
-    elif a == ["bundle", "--stable"]:
-        bundle_stable()
+    elif a == ["bundle-shallow", "--stable"]:
+        bundle_shallow_stable()
+    elif a[:1] == ["bundle-cell"] and len(a) == 3 and a[2] == "--stable":
+        bundle_cell_stable(a[1])
+    elif a == ["bundle-join", "--stable"]:
+        bundle_join_stable()
     elif a[:1] == ["coverage"]:
         coverage_bundle()
     elif a[:1] == ["check"]:
         _check()
     else:
-        sys.exit("usage: contour_run.py tile <stem> | bundle --stable | coverage | check")
+        sys.exit("usage: contour_run.py tile <stem> | bundle-shallow --stable | "
+                 "bundle-cell <cell> --stable | bundle-join --stable | coverage | check")

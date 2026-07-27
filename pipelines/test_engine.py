@@ -13,13 +13,15 @@ checkpoint that gates stage 2/3 (``snakemake bundles``) — and asserts:
   - the bundle split: planet.pmtiles caps at macrotile_z and the deeper fine tiles
     land in one overlay-{cell}.pmtiles per populated OVERLAY_SPLIT_Z grid cell;
   - a no-op rerun schedules ZERO jobs (engine provenance, no covering diff);
-  - a CONTOUR_LEVELS change reruns contour_tile + the vector bundle but ZERO
-    mosaic_tile and ZERO terrain_render (the stage split's payoff — no re-merge,
-    no re-render — proven by a dry run's rerun table);
-  - the vector bundle is ONE variable-depth run: contours + soundings + depare fold
-    into a single sparse vector.pmtiles (no separate soundings/depare archives), and
-    its self-check invariants hold (no depare below z6, no contour below its tier
-    minzoom, depare m-bands disjoint, soundings present); the manifest carries
+  - a CONTOUR_LEVELS change reruns contour_tile + the vector shallow/cell/join rules
+    but ZERO mosaic_tile and ZERO terrain_render (the stage split's payoff — no
+    re-merge, no re-render — proven by a dry run's rerun table);
+  - the sharded vector bundle: a global shallow run (z < SPLIT_Z, minzoom-filtered) +
+    one variable-depth run per SPLIT_Z cell, tile-joined into a single sparse
+    vector.pmtiles (no separate soundings/depare archives); tile ownership is disjoint
+    (shallow below SPLIT_Z, cells at/above it), and the joined archive's self-check
+    invariants hold (no depare below z6, no contour below its tier minzoom, depare
+    m-bands disjoint, soundings present, every input id survives); the manifest carries
     vector.max_zoom = the covering's max child_z (the Worker's serving depth);
   - scope transitions: a bbox build re-merges nothing, and the next planet build
     heals the bbox-truncated forks (input-set trigger) and rebuilds every
@@ -128,9 +130,10 @@ def decode_bundles(tmp):
 
     by_zoom = {}
     for path in sorted(glob(f"{tmp}/store/bundle/*.pmtiles")):
-        if os.path.basename(path) in ("vector.pmtiles", "soundings.pmtiles", "depare.pmtiles",
-                                      "coverage.pmtiles"):
-            continue  # vector layers, not terrain rasters
+        base = os.path.basename(path)
+        if base.startswith("vector") or base in ("soundings.pmtiles", "depare.pmtiles",
+                                                 "coverage.pmtiles"):
+            continue  # vector layers (vector.pmtiles + its shallow/cell shards), not terrain rasters
         with open(path, "r+b") as f:
             for (z, x, y), tile_bytes in all_tiles(Reader(MmapSource(f)).get_bytes):
                 elev = encode.decode(imagecodecs.webp_decode(tile_bytes).astype("float32"))
@@ -239,8 +242,8 @@ def check_vector_selfcheck():
     tmp = tempfile.mkdtemp()
 
     # Plain tiling (every zoom materialized) makes these fixtures deterministic — the completeness
-    # mechanism (id survival) is agnostic to how a tile subdivided, and a real variable-depth joint
-    # run is exercised end-to-end by main()'s bundle_stable. (A sparse synthetic archive leafs above
+    # mechanism (id survival) is agnostic to how a tile subdivided, and the real sharded
+    # variable-depth run is exercised end-to-end by main(). (A sparse synthetic archive leafs above
     # a depare feature's minzoom and never emits it — realistic only at production density.)
     def build(layers, maxz):
         vec = f"{tmp}/v.pmtiles"
@@ -339,6 +342,47 @@ def check_vector_selfcheck():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def check_shallow_minzoom_filter():
+    """The shallow vector run drops features whose tippecanoe.minzoom exceeds its -z (SPLIT_Z-1) at
+    SEQ-WRITE time — an explicit filter, not a trust in tippecanoe's clamp. Prove _fgb_to_seq and
+    _soundings_to_seq honor max_minzoom: only the below-cut features are written, ids and all."""
+    import geopandas as gpd
+    from shapely.geometry import LineString
+    sys.path.insert(0, PIPE)
+    import contour_run as cr
+    tmp = tempfile.mkdtemp()
+    try:
+        deep, shoal, cut = -4000, -2, 3  # minzoom("m",-4000)==0 <= cut < native+ minzoom("m",-2)
+        assert cr.contour_minzoom("m", deep) <= cut < cr.contour_minzoom("m", shoal)
+        fgb = f"{tmp}/c.fgb"
+        gpd.GeoDataFrame(
+            {"depth_m": [deep, shoal], "sys": ["m", "m"]},
+            geometry=[LineString([(0, 0), (0.1, 0.1)]), LineString([(0, 0.2), (0.1, 0.3)])],
+            crs="EPSG:4326").to_file(fgb, driver="FlatGeobuf")
+        seq = f"{tmp}/c.geojsons"
+        cr._fgb_to_seq([fgb], ("depth_m", "sys"),
+                       lambda p: cr.contour_minzoom(p["sys"], float(p["depth_m"])),
+                       seq, "contour", lambda p: str(p.get("depth_m")), 0, 10, max_minzoom=cut)
+        written = [json.loads(l) for l in open(seq)]
+        assert len(written) == 1 and written[0]["properties"]["depth_m"] == deep, \
+            f"only the minzoom<=cut contour survives the shallow filter: {written}"
+
+        gj = f"{tmp}/s.geojson"
+        with open(gj, "w") as f:
+            json.dump({"type": "FeatureCollection", "features": [
+                {"type": "Feature", "tippecanoe": {"minzoom": 0}, "properties": {"depth_m": 5},
+                 "geometry": {"type": "Point", "coordinates": [0, 0]}},
+                {"type": "Feature", "tippecanoe": {"minzoom": cut + 5}, "properties": {"depth_m": 9},
+                 "geometry": {"type": "Point", "coordinates": [0.1, 0.1]}}]}, f)
+        cr._soundings_to_seq([gj], f"{tmp}/s.geojsons", 0, max_minzoom=cut)
+        swritten = [json.loads(l) for l in open(f"{tmp}/s.geojsons")]
+        assert len(swritten) == 1 and swritten[0]["properties"]["depth_m"] == 5, \
+            f"only minzoom<=cut soundings survive the shallow filter: {swritten}"
+        print("shallow minzoom-filter ok — seq builders drop features above the shallow -z")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     tmp = tempfile.mkdtemp()
     try:
@@ -372,29 +416,85 @@ def main():
         assert overlays, "the z11 fine tiles must produce at least one overlay archive"
         vec = f"{tmp}/store/bundle/vector.pmtiles"
         assert os.path.exists(vec), "missing vector.pmtiles"
-        # soundings/depare are NOT separate archives — the one joint run folds them into vector.pmtiles.
+        # soundings/depare are NOT separate archives — the sharded run folds them into vector.pmtiles.
         for gone in ("soundings.pmtiles", "depare.pmtiles"):
             assert not os.path.exists(f"{tmp}/store/bundle/{gone}"), \
                 f"{gone} must not exist as a separate archive (folded into vector.pmtiles)"
 
-        # ── the joint variable-depth run's safety invariants (Verification 3,4,5): one archive,
-        # three layers, all zoom gating per-feature. _vector_selfcheck asserts no depare below z6,
-        # no contour below its tier minzoom, depare m-bands disjoint, soundings present — it ran
-        # in-build; re-run it here so the test OWNS the invariant, not just the build. ──
         sys.path.insert(0, PIPE)
+        import bundle
         import contour_run
+        SPLIT_Z = bundle.SPLIT_Z
         maxz = contour_run._stems_maxz(stems)
+
+        # ── tile ownership (Verification): the shallow archive owns EVERY z < SPLIT_Z tile and each
+        # cell archive owns its z >= SPLIT_Z subtree — an EXACT split by zoom, so shallow and cells
+        # never collide. Across cells the split is home-cell-by-address, but tippecanoe's per-tile
+        # edge buffer bleeds a boundary feature one tile into the neighbouring cell, so adjacent
+        # cells legitimately co-emit the shared boundary tile — the same buffered abut that keeps
+        # today's per-stem seams crack-free, and tile-join MERGES those (not a byte-concat). Assert
+        # the exact zoom split, and that every cross-cell overlap is a boundary fringe (mutually
+        # adjacent cells), which catches a mis-sharded stem (its tiles would land far from home). ──
+        import collections as _c
+        shallow_arch = f"{tmp}/store/bundle/vector-shallow.pmtiles"
+        assert os.path.exists(shallow_arch), "missing vector-shallow.pmtiles"
+        cell_archs = sorted(glob(f"{tmp}/store/bundle/vector-cell-*.pmtiles"))
+        assert cell_archs, "the covering must produce at least one vector cell archive"
+        if os.path.getsize(shallow_arch) > 0:
+            for z in _pm_tiles(shallow_arch):
+                assert z < SPLIT_Z, f"shallow archive emitted z{z} >= SPLIT_Z ({SPLIT_Z})"
+        emitters = _c.defaultdict(set)  # (z,x,y) -> {cell (cx,cy)} for z >= SPLIT_Z
+        for ca in cell_archs:
+            if os.path.getsize(ca) == 0:
+                continue  # 0-byte = an empty cell; the join skips it
+            cx, cy = (int(v) for v in os.path.basename(ca)[len("vector-cell-"):-len(".pmtiles")].split("-")[1:])
+            for z, xys in _pm_tiles(ca).items():
+                assert z >= SPLIT_Z, f"cell archive emitted z{z} < SPLIT_Z ({SPLIT_Z})"
+                for x, y in xys:
+                    emitters[(z, x, y)].add((cx, cy))
+        dups = {k: v for k, v in emitters.items() if len(v) > 1}
+        for (z, x, y), cs in dups.items():
+            cs = sorted(cs)
+            for (ax, ay), (bx, by) in zip(cs, cs[1:]):
+                assert abs(ax - bx) <= 1 and abs(ay - by) <= 1, \
+                    f"z{z} {x}/{y} emitted by non-adjacent cells {cs} — a mis-sharded stem"
+        assert len(dups) < len(emitters), "every z>=SPLIT_Z tile is a cross-cell overlap — the shard split is degenerate"
+        print(f"vector tile-ownership ok — shallow z<{SPLIT_Z}, {len(cell_archs)} cell archive(s) "
+              f"z>={SPLIT_Z}; {len(emitters)} tiles, {len(dups)} boundary-fringe overlaps (tile-join merged)")
+
+        # ── shallow minzoom filter on the built archive: no feature whose minzoom exceeds SPLIT_Z-1
+        # may ride a shallow tile. depare's z6 floor is above SPLIT_Z-1, so no depare appears; any
+        # contour present must satisfy contour_minzoom <= SPLIT_Z-1. (The seq-level filter is proven
+        # directly by check_shallow_minzoom_filter; this guards the end-to-end archive.) ──
+        if os.path.getsize(shallow_arch) > 0:
+            for z, xys in _pm_tiles(shallow_arch).items():
+                for x, y in xys[:4]:
+                    L = contour_run._decode_tile(shallow_arch, z, x, y)
+                    assert not L.get("depare"), \
+                        f"depare (minzoom {contour_run.DEPARE_MINZOOM}) must not ride shallow z{z}"
+                    for feat in L.get("contours", []):
+                        p = feat["properties"]
+                        d, s = p.get("depth_m"), p.get("sys")
+                        if d is not None and s:
+                            assert contour_run.contour_minzoom(s, float(d)) <= SPLIT_Z - 1, \
+                                f"contour depth_m={d} minzoom exceeds shallow -z at z{z}"
+
+        # ── the joined archive's safety invariants (Verification 3,4,5): one served archive, three
+        # layers, all zoom gating per-feature. _vector_selfcheck asserts no depare below z6, no
+        # contour below its tier minzoom, depare m-bands disjoint, soundings present, every input id
+        # survives — it ran in-build; re-run it here so the test OWNS the invariant, not just the
+        # build. ──
         layers = set()
-        for z in (max(child_zs), 6, 5):  # leaf zoom, the depare floor, just below it
+        for z in (max(child_zs), 6, 5):  # leaf zoom, the depare floor, at SPLIT_Z
             for x, y in _pm_tiles(vec).get(z, [])[:4]:
                 layers |= set(contour_run._decode_tile(vec, z, x, y))
                 if z < 6:
                     assert "depare" not in contour_run._decode_tile(vec, z, x, y), \
                         f"depare must not appear below z6 (z{z} {x}/{y})"
         assert {"contours", "soundings", "depare"} <= layers, \
-            f"the joint run must carry all three layers: {sorted(layers)}"
+            f"the joined archive must carry all three layers: {sorted(layers)}"
         contour_run._vector_selfcheck(vec, maxz)  # raises SystemExit on any invariant violation
-        print(f"vector joint-run ok — one sparse archive, layers {sorted(layers)}, self-check passed")
+        print(f"vector joined-run ok — one sparse archive, layers {sorted(layers)}, self-check passed")
 
         by_zoom = decode_bundles(tmp)
         assert by_zoom, "no tiles in any terrain bundle"
@@ -421,15 +521,19 @@ def main():
         # ── a CONTOUR_LEVELS change reruns contour + vector bundle, NOT mosaic/terrain ──
         levels = ("-10000 -8000 -6000 -5000 -4000 -3000 -2000 -1000 -500 -300 -200 "
                   "-100 -50 -30 -20 -10 -5")  # default ladder minus -2
+        n_cells = len(contour_run.vector_covering_cells(stems))
         dry = snake(tmp, "-c", "4", "-n", "bundles", env={"CONTOUR_LEVELS": levels}).stdout
         counts = _job_counts(dry)
         assert counts.get("mosaic_tile", 0) == 0, f"a contour-config change must NOT re-merge: {counts}"
         assert counts.get("terrain_render", 0) == 0, f"a contour-config change must NOT re-render: {counts}"
         assert counts.get("contour_tile", 0) == n_stems, \
             f"a contour-config change must rerun every contour tile: {counts}"
-        assert counts.get("vector_bundle", 0) == 1, f"the vector bundle must rerun: {counts}"
+        assert counts.get("vector_shallow", 0) == 1, f"the shallow vector run must rerun: {counts}"
+        assert counts.get("vector_cell", 0) == n_cells, \
+            f"every vector cell ({n_cells}) must rerun: {counts}"
+        assert counts.get("vector_join", 0) == 1, f"the vector join must rerun: {counts}"
         print(f"stage-split ok — CONTOUR_LEVELS reruns {counts.get('contour_tile')} contour_tile "
-              f"+ vector_bundle, 0 mosaic_tile, 0 terrain_render")
+              f"+ vector_shallow + {n_cells} vector_cell + vector_join, 0 mosaic_tile, 0 terrain_render")
 
         # ── scope transitions: a bbox build's regional aggregates must NOT read as current ──
         # in a later planet build (the params scope stamp), and the planet build must rebuild
@@ -444,8 +548,10 @@ def main():
         # input-set trigger — and rebuild every scope-stamped aggregate.
         assert counts.get("contour_tile", 0) == 4, f"planet must re-fork the 4 bbox-truncated stems: {counts}"
         assert counts.get("soundings_tile", 0) == 4, f"soundings heal too: {counts}"
-        for agg in ("mosaic_index", "vector_bundle", "terrain_planet_bundle"):
+        for agg in ("mosaic_index", "vector_shallow", "vector_join", "terrain_planet_bundle"):
             assert counts.get(agg, 0) == 1, f"{agg} must rebuild after a scope change: {counts}"
+        assert counts.get("vector_cell", 0) == n_cells, \
+            f"every vector cell ({n_cells}) must rebuild after a scope change: {counts}"
         snake(tmp, "-c", "4", "bundles")  # restore planet-scoped products for the checks below
         print("scope-transition ok — bbox->planet re-merges nothing, heals 4 truncated forks, "
               "rebuilds every aggregate")
@@ -478,12 +584,12 @@ def main():
         victim = sorted(glob(f"{tmp}/store/contour/*.fgb"))[0]
         os.remove(victim)
         proc = subprocess.run(
-            [sys.executable, os.path.join(PIPE, "contour_run.py"), "bundle", "--stable"],
+            [sys.executable, os.path.join(PIPE, "contour_run.py"), "bundle-shallow", "--stable"],
             cwd=tmp, env=_base_env(tmp, {"SOURCES_DIR": "sources"}),
             capture_output=True, text=True)
         assert proc.returncode != 0 and "contour incomplete" in (proc.stderr + proc.stdout), \
             f"the hole-free gate must refuse a missing per-tile file:\n{proc.stdout}\n{proc.stderr}"
-        print(f"hole-free gate ok — bundle --stable refused the missing {os.path.basename(victim)}")
+        print(f"hole-free gate ok — bundle-shallow --stable refused the missing {os.path.basename(victim)}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -497,4 +603,5 @@ if __name__ == "__main__":
     check_priority()
     check_pmtiles_reproducible()
     check_vector_selfcheck()
+    check_shallow_minzoom_filter()
     main()
