@@ -30,7 +30,11 @@ preview bbox="-74.30,40.40,-73.75,40.80":
     export WATERMASK="${WATERMASK:-/vsicurl/https://data.openwaters.io/bathymetry/landmask/water.fgb}"
     # One invocation: the `cover` checkpoint runs inside the bundles build (streamed sources),
     # then the DAG re-evaluates into the per-stem mosaic/fork/terrain jobs.
-    uv run snakemake -s ../Snakefile bundles --config stream=1 --cores 8
+    # mem_gb budget from the actual environment (the Docker VM's memory, not the host's), minus
+    # a 2 GB reserve — without it snakemake admits concurrent heavy forks the VM OOM-kills (137).
+    # A dense-harbor z14 contour reserves ~10 GB: give the Docker Desktop VM >=16 GB for those.
+    mem_gb=$(free -g 2>/dev/null | awk 'NR==2{print $2}' || sysctl -n hw.memsize | awk '{print int($1/1073741824)}')
+    uv run snakemake -s ../Snakefile bundles --config stream=1 --cores 8 --resources mem_gb=$((mem_gb > 4 ? mem_gb - 2 : mem_gb))
     # seed.sh needs manifest.json; stage_build writes it locally (publish is a separate, box-only step)
     uv run python -c "import bundle; bundle.stage_build()"
     ../worker/seed.sh
