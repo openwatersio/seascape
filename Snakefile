@@ -252,6 +252,7 @@ checkpoint cover:
     output:
         "store/aggregation/covering.txt"
     params:
+        version=2, # increment to force a re-derivation
         bbox=os.environ.get("BBOX", ""),
         max_child_z=pipeline_config.MAX_CHILD_Z,  # ceiling changes re-derive the covering
     log:
