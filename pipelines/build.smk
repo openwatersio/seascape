@@ -443,9 +443,8 @@ rule tiles:
 #   vector_shallow — plain dense -Z0 -z(SPLIT_Z-1) over all three layers, features filtered to
 #     minzoom <= SPLIT_Z-1; owns every z < SPLIT_Z tile.
 #   vector_cell    — one variable-depth run per populated SPLIT_Z cell, -Z SPLIT_Z -z(cell child_z)
-#     over that cell's covering stems; owns the cell's z >= SPLIT_Z subtree. threads: 2 because the
-#     variable-depth walk is single-threaded (the rest of the run is not) — an honest reservation the
-#     scheduler backfills against. These are the long poles, so they ride VECTOR_BAND.
+#     over that cell's covering stems; owns the cell's z >= SPLIT_Z subtree. These are the long
+#     poles, so they ride VECTOR_BAND.
 #   vector_join    — tile-join the shallow + all cell archives into the served vector.pmtiles;
 #     ownership is disjoint so the join is pure concatenation (-pk).
 # Layers stay joint within every run (separately-tiled layers leaf at different depths and vanish the
@@ -480,7 +479,9 @@ rule vector_cell:
     output:
         "store/bundle/vector-cell-{cell}.pmtiles"
     priority: VECTOR_BAND  # a long pole in the band, so it overlaps the terrain fleet
-    threads: 2  # the variable-depth walk is single-threaded; reserve honestly for scheduler backfill
+    # No threads/mem reservation: the box deliberately oversubscribes CPU (--cores 2x vCPUs) and
+    # binds on RAM, and a cell run has no honest single thread count (serial walk, parallel
+    # read/write). Set mem_gb from the per-cell benchmarks once the first sharded run measures them.
     params:
         bbox=os.environ.get("BBOX", ""),  # scope stamp — see mosaic_index
     benchmark:
