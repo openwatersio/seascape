@@ -36,19 +36,15 @@ ENV GDAL_HTTP_MAX_RETRY=5 \
   GDAL_HTTP_RETRY_DELAY=1 \
   GDAL_HTTP_USERAGENT="seascape/1.0 (+https://github.com/openwatersio/seascape)"
 
-# tippecanoe + tile-join (Felt fork) — vector tiles. Pinned at felt/tippecanoe#397 (variable-depth
-# pyramids must honor per-feature tippecanoe.minzoom; the vector bundle depends on it), plus
-# patches/: #397's leaf guard misses the minzoom == leaf_z + 1 boundary AND the early-stop child
-# pruning ignores the pending flag entirely — excluded features land in no tile (upstream follow-up
-# pending; drop the patch once merged). A pin or patches/ change must bump `version` on the
+# tippecanoe + tile-join (Felt fork) — vector tiles. Pinned at felt/tippecanoe#399 (variable-depth
+# pyramids must honor per-feature tippecanoe.minzoom and never prune children a pending minzoom
+# still needs; the vector bundle depends on both). A pin change must bump `version` on the
 # vector_* rules and landmask (build.smk).
-COPY patches/ /tmp/patches/
 RUN git init -q /tmp/tippecanoe \
   && cd /tmp/tippecanoe \
-  && git fetch -q --depth 1 https://github.com/felt/tippecanoe.git 0dc1e00eee8efa68b7d1a1834a59910dedddf903 \
+  && git fetch -q --depth 1 https://github.com/felt/tippecanoe.git 0badb242bea6f77c8e388898868801f3f3a9088b \
   && git checkout -q FETCH_HEAD \
-  && git apply /tmp/patches/*.patch \
-  && make -j"$(nproc)" && make install && rm -rf /tmp/tippecanoe /tmp/patches
+  && make -j"$(nproc)" && make install && rm -rf /tmp/tippecanoe
 
 # just (task runner) + uv (Python env manager) — the pipeline's two entrypoints.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh \
