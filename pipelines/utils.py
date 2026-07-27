@@ -415,6 +415,10 @@ def publish(tmp_path, final_path):
     copy to a temp beside the final path first, then rename there — the final name only ever appears
     complete, and a crash leaves a temp no freshness check considers."""
     os.makedirs(os.path.dirname(final_path), exist_ok=True)
+    # fsync before rename: the box dies by power cut (runner teardown), and a durable
+    # rename over unflushed data leaves a truncated file at the final name.
+    with open(tmp_path, "rb") as f:
+        os.fsync(f.fileno())
     try:
         os.replace(tmp_path, final_path)
     except OSError as error:
@@ -422,6 +426,8 @@ def publish(tmp_path, final_path):
             raise
         destination_tmp = final_path + ".tmp"
         shutil.copyfile(tmp_path, destination_tmp)
+        with open(destination_tmp, "rb") as f:
+            os.fsync(f.fileno())
         os.replace(destination_tmp, final_path)
         os.remove(tmp_path)
 
