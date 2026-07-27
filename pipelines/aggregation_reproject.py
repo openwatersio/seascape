@@ -171,7 +171,9 @@ def translate(in_filepath, out_filepath):
     # ZSTD (no predictor — ADD_ALPHA makes this Float32 + a Byte alpha band, and
     # PREDICTOR=3 is float-only) + NUM_THREADS. The merge reads these per-source COGs and
     # inherits the profile into the merged DEM, so compressing here propagates downstream.
-    _run("GDAL_CACHEMAX=512 gdal_translate -of COG -co BIGTIFF=IF_NEEDED -co ADD_ALPHA=YES "
+    # IF_SAFER, not IF_NEEDED: with compression IF_NEEDED never fires, and z15 grids
+    # whose ZSTD output still crosses 4 GB die mid-write in TIFFAppendToStrip.
+    _run("GDAL_CACHEMAX=512 gdal_translate -of COG -co BIGTIFF=IF_SAFER -co ADD_ALPHA=YES "
          "-co OVERVIEWS=NONE -co SPARSE_OK=YES -co BLOCKSIZE=512 "
          f"-co COMPRESS=ZSTD -co NUM_THREADS=ALL_CPUS {in_filepath} {out_filepath}",
          f"gdal_translate {in_filepath}")

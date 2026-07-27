@@ -137,7 +137,8 @@ def _translate(filepath, tmp_folder):
     utils.run_command(
         f"GDAL_CACHEMAX=512 gdal_translate -q -of COG -b 1 -ot Float32 -a_nodata {NODATA} "
         f"-srcwin {buffer_pixels} {buffer_pixels} {w} {h} "
-        "-co COMPRESS=ZSTD -co PREDICTOR=3 -co BLOCKSIZE=512 "
+        # IF_SAFER: IF_NEEDED never fires on compressed output, and >4 GB kills the write
+        "-co BIGTIFF=IF_SAFER -co COMPRESS=ZSTD -co PREDICTOR=3 -co BLOCKSIZE=512 "
         "-co RESAMPLING=AVERAGE -co OVERVIEW_RESAMPLING=AVERAGE -co NUM_THREADS=ALL_CPUS "
         f"{merged} {tmp_cog}")
     return tmp_cog
@@ -528,7 +529,8 @@ def window_dem(stem, out_tif):
     utils.run_command(f"gdalbuildvrt -overwrite -te {l} {b} {r} {t} -tr {res} {res} "
                       f"-r bilinear {vrt} {tiles}")
     utils.run_command(f"GDAL_CACHEMAX=512 gdal_translate -q -ot Float32 -a_nodata {NODATA} "
-                      "-co TILED=YES -co BLOCKSIZE=512 -co COMPRESS=ZSTD -co PREDICTOR=3 "
+                      "-co TILED=YES -co BIGTIFF=IF_SAFER -co BLOCKSIZE=512 "
+                      "-co COMPRESS=ZSTD -co PREDICTOR=3 "
                       f"{vrt} {out_tif}")
     os.remove(vrt)
     return out_tif
