@@ -859,7 +859,10 @@ def _vector_selfcheck(vec, maxz, expected=None, per_zoom=6):
             if mbands:
                 geoms = [shape(f["geometry"]).buffer(0) for f in mbands]
                 asum, uni = sum(g.area for g in geoms), unary_union(geoms).area
-                if uni and (asum - uni) / uni >= 0.02:
+                # 4%: adjacent-band edge wobble from low-zoom coalesce sums to 2.69% on the
+                # densest measured tile (NY harbor z6, worst single pair 1.10%, no non-adjacent
+                # displacement); gross displacement (the 50% negative test) stays far above.
+                if uni and (asum - uni) / uni >= 0.04:
                     problems.append(f"z{z} {x}/{y}: depare m-bands overlap {(asum - uni) / uni:.2%} "
                                     f"(coalesce displaced a partition)")
                 # partition conserved into z+1: a present-children parent's band union ≈ its 4

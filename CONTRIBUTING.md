@@ -29,7 +29,7 @@ The toolchain is heavy native tooling. There are two routes to get it running:
    - **[uv](https://docs.astral.sh/uv/)** — Python env for `pipelines/` (synced automatically on the first `uv run`).
    - **[just](https://github.com/casey/just)** — task runner.
    - **GDAL CLI** — `gdalwarp`, `gdal_translate`, `gdal_contour`, `ogr2ogr`, `gdalbuildvrt`, `ogrinfo`. Use a recent release (the container pins 3.13): 3.8-era polygon-contour mode mis-writes the deepest depth-area bucket's `amin`.
-   - **tippecanoe** — vector tiles. Must include felt/tippecanoe#397 (per-feature `tippecanoe.minzoom` survives `--generate-variable-depth-tile-pyramid`); the Docker image pins a commit past it. A brew install older than v2.81 silently drops minzoom-gated features under variable depth.
+   - **tippecanoe** — vector tiles. Must include felt/tippecanoe#397 AND the `patches/` follow-up (leaf pruning must respect pending per-feature `tippecanoe.minzoom`, including the minzoom == leaf_z + 1 boundary); the Docker image pins the #397 commit and applies `patches/` on top. NO released or brew tippecanoe has both fixes yet — any unpatched binary silently drops minzoom-gated features under variable depth (a local `just preview` will then fail the vector self-check). Build from the pin + patches, or run previews through `./docker.sh`.
    - **[actionlint](https://github.com/rhysd/actionlint)** + **shellcheck** — workflow lint (`test-workflows`).
    - **Node + npm** — the viewer, style, and Worker are one npm workspace; a single `npm install` at the root covers all three (including `wrangler`).
 
