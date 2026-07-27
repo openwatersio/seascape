@@ -268,3 +268,36 @@ existing store tile (the publish _HashCache already computes these) and skip the
 identical, preserving the mtime. Converts any future spurious-trigger class from "wasted build +
 full downstream cascade" to "wasted build, cascade dies at the merge." Belt on top of the
 scope-independent-covering fix, which removes the known trigger itself.
+
+## Toolchain-evaluation intake (2026-07-27)
+
+From docs/plans/2026-07-27-toolchain-evaluation.md, ranked cheapest/easiest first, cross-referenced
+against this branch: already done or in flight there — the cell-sharded bundle measurement, the
+nodata pre-simplification, the pmtiles-merge stitch (parked above with WIP), and skip-if-identical
+merge outputs (the mosaic_tile content-hash guard above).
+
+1. **Soundings intermediates → line-delimited `.geojsons`** so the bundle passthrough streams
+   lines instead of json.load-ing FeatureCollections (the ~80 min single-threaded read at planet).
+   Small and separable; a working start sits in the "pmtiles-merge WIP" stash.
+2. **Shallow-bias audit via `gdal raster mosaic --pixel-function max`** (GDAL 3.12+): diff
+   shallowest-wins vs priority-wins per pixel over a sample of stems — a free chart-safety check,
+   one command, no pipeline change.
+3. **Trial `--drop-by-attribute-as-needed`** (felt, Mar 2026) on the vector cell runs: drop by
+   depth-band importance instead of geometry density, env-gated, gate-verified before adoption.
+4. **Split staleness keys**: per-stage toolchain fingerprints (a tippecanoe bump must not
+   invalidate mosaic tiles — utils.toolchain() currently would), scope MASKS to intersecting
+   tiles. Same trigger-hygiene family as the scope-independent covering fix.
+5. **Serial-tail box right-sizing**: the vector phase measured 6–9 GiB at 1–6 cores — a CX53
+   (€0.047/hr) instead of the ccx63 (€1.37/hr post-reprice) if the tail survives sharding.
+   Measure the sharded tail first; may be moot.
+6. **`ST_CoverageSimplify` prototype on the Stockholm fixture** — elevated by the 2026-07-27
+   profiling: wagyu hole placement measured 60–99% of bundle CPU on ring-dense tiles, so a
+   coverage-safe pre-generalization per zoom tier attacks the dominant remaining cost. Batch step
+   feeding the existing FGB → tippecanoe path; no serving change.
+7. Bigger or gated, in order: LERC_ZSTD mosaic re-encode (~halves the store; needs the shallow
+   pre-bias to keep charted ≤ true), pre-baked overzoom leaves (traffic-gated Worker CPU-ms cut),
+   Planetiler spike on one dense cell's depare (insurance against the felt fork's bus factor),
+   maplibre-contour (chart-grade smoothing/bias questions unresolved).
+
+Ops note, not build work: apply for Cloudflare Project Alexandria credits (likely qualifies;
+removes the serving-cost question).
