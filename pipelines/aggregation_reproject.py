@@ -119,7 +119,8 @@ def warp_mixed(inputs, out_tif, zoom, aggregation_tile, buffer):
     # uncompressed) and the I/O writing it.
     _run(f"GDAL_CACHEMAX=512 gdalwarp -overwrite -t_srs EPSG:3857 -tr {res} {res} "
          f"-te {left} {bottom} {right} {top} -r {RESAMPLE} -dstnodata {NODATA} "
-         "-co TILED=YES -co SPARSE_OK=YES -co COMPRESS=ZSTD -co PREDICTOR=3 -co NUM_THREADS=ALL_CPUS "
+         "-co TILED=YES -co BIGTIFF=IF_SAFER -co SPARSE_OK=YES "
+         "-co COMPRESS=ZSTD -co PREDICTOR=3 -co NUM_THREADS=ALL_CPUS "
          f"{' '.join(inputs)} {out_tif}",
          f"gdalwarp(mixed) {out_tif}")
 
