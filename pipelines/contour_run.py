@@ -286,20 +286,22 @@ def _vector_maxz(own_max):
     return max(own_max, _stems_maxz(mosaic.covering_stems()))
 
 
-# The vector shard grid. Defaults to the macrotile grid itself — one covering stem per cell, the
-# finest seam-safe grain, so the worst cell job is one stem's content (the raster overlays' coarser
-# OVERLAY_SPLIT_Z grid would swallow a whole dense region into one serial cell run). Env-overridable
-# for experiments; must stay <= macrotile_z so every stem maps into exactly one cell.
+# The vector shard "grid" is the covering itself: aggregation tiles are a quadtree PARTITION of
+# the plane (roots from seed_z up to macrotile_z — coarse ocean stems root shallower than z8), so
+# each stem's own root tile is its cell. One stem per cell, the finest seam-safe grain: worst cell
+# job = worst stem, and ownership below the shallow band is disjoint because the roots partition.
+# VECTOR_SPLIT_Z caps the SHALLOW run (z0..SPLIT-1) and floors the cell runs' -Z; env-overridable.
 VECTOR_SPLIT_Z = int(os.environ.get("VECTOR_SPLIT_Z", "0")) or utils.macrotile_z
 
 
 def _vector_cell_of(z, x, y):
-    return f"{VECTOR_SPLIT_Z}-{x >> (z - VECTOR_SPLIT_Z)}-{y >> (z - VECTOR_SPLIT_Z)}"
+    if z >= VECTOR_SPLIT_Z:
+        return f"{VECTOR_SPLIT_Z}-{x >> (z - VECTOR_SPLIT_Z)}-{y >> (z - VECTOR_SPLIT_Z)}"
+    return f"{z}-{x}-{y}"  # a coarse root IS its cell (the covering partitions, so it's unique)
 
 
 def vector_covering_cells(stems):
-    """{cell: [covering stems]} grouping the covering stems by their VECTOR_SPLIT_Z cell. Each
-    covering stem roots at macrotile_z >= VECTOR_SPLIT_Z, so it maps to exactly ONE cell; every
+    """{cell: [covering stems]} — each covering stem's root tile is its own cell (1:1); every
     stem also feeds the shallow run. build.smk derives the vector_cell wildcard set (and each
     cell's member stems) from this."""
     if utils.macrotile_z < VECTOR_SPLIT_Z:
@@ -901,6 +903,8 @@ def _check():
     a_stem, b_stem = f"{utils.macrotile_z}-0-0-{utils.macrotile_z}", f"{utils.macrotile_z}-100-100-{utils.macrotile_z + 3}"
     cells = vector_covering_cells([a_stem, b_stem])
     assert all(c.startswith(f"{sz}-") for c in cells), cells
+    # a coarse root (shallower than the split) is its own cell, verbatim
+    assert list(vector_covering_cells([f"{max(sz - 2, 0)}-3-3-{sz}"])) == [f"{max(sz - 2, 0)}-3-3"]
     assert cells[_vector_cell_of(utils.macrotile_z, 100, 100)] == [b_stem]
     assert _stems_maxz(cells[_vector_cell_of(utils.macrotile_z, 100, 100)]) == utils.macrotile_z + 3
     # id blocks are disjoint: shallow at 0, cell i (sorted) at (i+1)*STRIDE — no block overlaps
