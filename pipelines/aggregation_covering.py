@@ -94,6 +94,14 @@ def _registered_sources():
     return result
 
 
+def resolved_maxzoom(native, cap):
+    """A file's build depth: native overzoom, the source's own cap, then the global ceiling —
+    the ONE derivation both the covering rows and source_maxzooms use."""
+    if cap is not None:
+        native = min(native, cap)
+    return min(native, config.MAX_CHILD_Z)
+
+
 def source_maxzooms():
     """Resolved native/capped maxzoom per registered source, from its catalog seascape:files."""
     resolutions = get_mercator_resolutions(0, 32)
@@ -101,10 +109,8 @@ def source_maxzooms():
     for source in _registered_sources():
         cap = config.source_property(source, "max_zoom")
         for _filename, left, bottom, right, top, width, height in config.source_files(source):
-            zoom = get_smallest_overzoom(left, bottom, right, top, width, height, resolutions)
-            if cap is not None:
-                zoom = min(zoom, cap)
-            zoom = min(zoom, config.MAX_CHILD_Z)
+            zoom = resolved_maxzoom(
+                get_smallest_overzoom(left, bottom, right, top, width, height, resolutions), cap)
             result[source] = max(result.get(source, 0), zoom, utils.macrotile_z)
     return result
 
@@ -152,9 +158,8 @@ def get_macrotile_map():
             if clip is not None and not bounds_intersect(bounds, clip):
                 continue
 
-            maxzoom = get_smallest_overzoom(left, bottom, right, top, width, height, mercator_resolutions)
-            if cap is not None:
-                maxzoom = min(maxzoom, cap)
+            maxzoom = resolved_maxzoom(
+                get_smallest_overzoom(left, bottom, right, top, width, height, mercator_resolutions), cap)
             # Floor to macrotile_z so aggregation-tile zoom never exceeds a
             # tile's content zoom (the cap can't go below this universal floor).
             maxzoom = max(maxzoom, utils.macrotile_z)
@@ -297,8 +302,16 @@ def main(stable=False):
 
 
 def _check():
-    """Offline: write_if_changed leaves mtimes alone on identical content, and the
-    stable covering prunes a stale in-window tile while keeping an out-of-window one."""
+    """Offline: write_if_changed leaves mtimes alone on identical content, the
+    stable covering prunes a stale in-window tile while keeping an out-of-window one,
+    and MAX_CHILD_Z binds in the row derivation (not just source_maxzooms)."""
+    # The shared derivation binds the ceiling: a file registering deeper than MAX_CHILD_Z
+    # lands at the ceiling, a source cap below it still wins.
+    resolutions = get_mercator_resolutions(0, 32)
+    native = get_smallest_overzoom(0, 0, 10, 10, 4096, 4096, resolutions)
+    assert native > config.MAX_CHILD_Z, f"fixture must exceed the ceiling (native {native})"
+    assert resolved_maxzoom(native, None) == config.MAX_CHILD_Z
+    assert resolved_maxzoom(native, config.MAX_CHILD_Z - 2) == config.MAX_CHILD_Z - 2
     import shutil
     import tempfile
     import time
