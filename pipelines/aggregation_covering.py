@@ -104,6 +104,7 @@ def source_maxzooms():
             zoom = get_smallest_overzoom(left, bottom, right, top, width, height, resolutions)
             if cap is not None:
                 zoom = min(zoom, cap)
+            zoom = min(zoom, config.MAX_CHILD_Z)
             result[source] = max(result.get(source, 0), zoom, utils.macrotile_z)
     return result
 

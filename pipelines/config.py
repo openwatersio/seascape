@@ -39,6 +39,11 @@ CONTOUR_LEVELS = [int(x) for x in os.environ.get("CONTOUR_LEVELS", _CONTOUR_LEVE
 # the published raster carries category codes (0/1/2), never the cap itself.
 DRYING_CAP = float(os.environ.get("DRYING_CAP", "16"))
 
+# Global build-depth ceiling over every source's native/capped zoom: z16 measured unaffordable
+# (the one z16 stem's merge alone ran 1h+ for the last zoom of a single lake); lift per zoom as
+# sparse minting/merging lands. Applied at covering derivation, so no re-registration needed.
+MAX_CHILD_Z = int(os.environ.get("MAX_CHILD_Z", "15"))
+
 # Feet/fathom isobaths: a second contour set at the classic fathom curves. Friendly feet depths
 # (6, 12, 18, 30, 60, 120, 180, 300, 600 ft …) are exactly whole fathoms in feet, so one geometry
 # labels as either — the viewer picks feet or fathoms. In metres (negative, positive-down) for
