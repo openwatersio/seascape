@@ -206,7 +206,6 @@ rule mosaic_tile:
         version=1, # increment to force a rebuild
         sources=lambda wc: source_props(wc.stem),
         merge=MERGE_CFG,
-        toolchain=utils.toolchain(),
     priority: tile_priority  # interleaved heavy-first: evens the memory load over the build
     retries: 2
     resources:

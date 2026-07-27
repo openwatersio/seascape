@@ -1,6 +1,6 @@
 """Shared helpers: PMTiles archive writing, the aggregation covering store, the
 z7-sharded pmtiles layout, terrarium tile encode, priority-grouped source items,
-the merge-weight estimate, and the publish-time file hash / toolchain identity.
+the merge-weight estimate, and the publish-time file hash.
 
 Vendored from mapterhorn (BSD-3, (c) 2025 mapterhorn; see LICENSE.mapterhorn).
 """
@@ -383,26 +383,11 @@ def weight(stem, budget_gb=0, factor=DEFAULT_FACTOR):
     return w
 
 
-# ── publish-time file hash + toolchain identity ──────────────────────────────────────────────────
+# ── publish-time file hash ───────────────────────────────────────────────────────────────────────
 # The mosaic publish content-addresses the finished plain COGs by hashing their bytes; build.smk's
-# mosaic_tile carries the toolchain tag as a rerun param. Both are R2-agnostic — no bucket names here.
+# R2-agnostic — no bucket names here.
 
 @lru_cache(maxsize=1)
-def toolchain():
-    """The toolchain identity: TOOLCHAIN (the workflow passes the GHCR image tag, which pins one
-    GDAL/tippecanoe) when set, else the local GDAL version so a laptop stays honest about GDAL
-    skew. A GDAL bump correctly invalidates the world."""
-    t = os.environ.get("TOOLCHAIN")
-    if t:
-        return t
-    for cmd in (["gdal-config", "--version"], ["gdalinfo", "--version"]):
-        try:
-            out = subprocess.run(cmd, capture_output=True, text=True)
-        except (FileNotFoundError, OSError):
-            continue
-        if out.returncode == 0 and out.stdout.strip():
-            return out.stdout.strip().splitlines()[0]
-    return "no-toolchain"
 
 
 @lru_cache(maxsize=None)

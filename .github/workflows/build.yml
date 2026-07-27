@@ -339,6 +339,8 @@ jobs:
           # A hard teardown can strand unreadable tiles that look done (mtime valid, data lost);
           # drop them so the engine re-merges instead of poisoning downstream VRT reads.
           # cd /app/state: docker.sh starts in /app; only snakemake chdirs to the state mount
+          # Tool versions into the run log: toolchain skew is diagnosable, never a rerun trigger.
+          ./docker.sh run sh -c "gdal-config --version; tippecanoe --version 2>&1 | head -1" || true
           ./docker.sh run sh -c "cd /app/state && uv run --project /app /app/pipelines/mosaic.py verify"
           # ONE invocation, one DAG: the `cover` checkpoint runs first, then the build
           # re-evaluates into bundles + the mosaic publish (publish_mosaic — `publish` is the

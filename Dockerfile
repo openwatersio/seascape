@@ -1,4 +1,6 @@
-# Use Official OSGeo image (Ubuntu 24.04 + current GDAL with the HDF5/BAG drivers)
+# Use Official OSGeo image (Ubuntu 24.04 + current GDAL with the HDF5/BAG drivers).
+# Bumping it (GDAL/GEOS/PROJ) must bump `version` on mosaic_tile, the fork rules, and
+# terrain_render (build.smk) — tools are not rule inputs.
 FROM ghcr.io/osgeo/gdal:ubuntu-full-3.13.1
 
 LABEL org.opencontainers.image.source="https://github.com/openwatersio/seascape"
@@ -38,7 +40,8 @@ ENV GDAL_HTTP_MAX_RETRY=5 \
 # pyramids must honor per-feature tippecanoe.minzoom; the vector bundle depends on it), plus
 # patches/: #397's leaf guard misses the minzoom == leaf_z + 1 boundary AND the early-stop child
 # pruning ignores the pending flag entirely — excluded features land in no tile (upstream follow-up
-# pending; drop the patch once merged).
+# pending; drop the patch once merged). A pin or patches/ change must bump `version` on the
+# vector_* rules and landmask (build.smk).
 COPY patches/ /tmp/patches/
 RUN git init -q /tmp/tippecanoe \
   && cd /tmp/tippecanoe \
