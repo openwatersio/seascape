@@ -699,8 +699,7 @@ def bundle_cell_stable(cell):
     cell_maxz = _stems_maxz(stems)
     ids = _build_seqs_and_run(stems, VECTOR_SPLIT_Z, cell_maxz, id_base, True, _cell_archive(cell),
                               min_minzoom=VECTOR_SPLIT_Z)
-    with open(_cell_sidecar(cell), "w") as f:
-        json.dump(ids, f)
+    utils.write_if_changed(_cell_sidecar(cell), json.dumps(ids))
     n = {k: len(v) for k, v in ids.items()}
     print(f"vector cell bundle (stable): {_cell_archive(cell)} (z{VECTOR_SPLIT_Z}-{cell_maxz}; {n})")
 

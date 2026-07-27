@@ -477,7 +477,9 @@ rule vector_cell:
         depare=lambda wc: expand("store/depare/{stem}.fgb",
                                  stem=(vector_cells().get(wc.cell, []) if DEPARE else [])),
     output:
-        "store/bundle/vector-cell-{cell}.pmtiles"
+        archive="store/bundle/vector-cell-{cell}.pmtiles",
+        # the completeness evidence the join consumes; declared so a lost sidecar reruns the cell
+        sidecar="store/bundle/vector-cell-{cell}.ids.json",
     priority: VECTOR_BAND  # a long pole in the band, so it overlaps the terrain fleet
     # No threads/mem reservation: the box deliberately oversubscribes CPU (--cores 2x vCPUs) and
     # binds on RAM, and a cell run has no honest single thread count (serial walk, parallel
@@ -496,6 +498,7 @@ rule vector_join:
     input:
         shallow="store/bundle/vector-shallow.pmtiles",
         cells=lambda wc: expand("store/bundle/vector-cell-{cell}.pmtiles", cell=sorted(vector_cells())),
+        sidecars=lambda wc: expand("store/bundle/vector-cell-{cell}.ids.json", cell=sorted(vector_cells())),
     output:
         "store/bundle/vector.pmtiles"
     priority: VECTOR_BAND  # the join finishes the vector band before terrain bundling
