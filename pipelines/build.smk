@@ -96,8 +96,8 @@ def cell_stems():
 
 def vector_cells():
     """cell -> [covering stems] for the sharded vector bundle, built once per DAG evaluation. The
-    vector cells group the covering stems (not the terrain render stems) by the same SPLIT_Z grid;
-    each populated cell is one variable-depth vector_cell job."""
+    vector cells group the covering stems by the VECTOR_SPLIT_Z grid (default: the macrotile grid,
+    one covering stem per cell); each populated cell is one variable-depth vector_cell job."""
     _, key = _covering_key()
     if key not in _VCELLS:
         _VCELLS[key] = contour_run.vector_covering_cells(covering_stems())
@@ -440,10 +440,11 @@ rule tiles:
 # ── vector bundle — cell-subtree sharded variable-depth tippecanoe + tile-join ──
 # The one joint variable-depth run is split three ways so the serial variable-depth tiler runs once
 # per cell concurrently, not once over all planet content (docs/plans/2026-07-14-native-resolution.md):
-#   vector_shallow — plain dense -Z0 -z(SPLIT_Z-1) over all three layers, features filtered to
-#     minzoom <= SPLIT_Z-1; owns every z < SPLIT_Z tile.
-#   vector_cell    — one variable-depth run per populated SPLIT_Z cell, -Z SPLIT_Z -z(cell child_z)
-#     over that cell's covering stems; owns the cell's z >= SPLIT_Z subtree. These are the long
+#   vector_shallow — plain dense -Z0 -z(VECTOR_SPLIT_Z-1) over all three layers, features filtered
+#     to minzoom <= VECTOR_SPLIT_Z-1; owns every z < VECTOR_SPLIT_Z tile.
+#   vector_cell    — one variable-depth run per populated VECTOR_SPLIT_Z cell (default: the
+#     macrotile grid — one covering stem per cell, so the worst cell job is one stem's content),
+#     -Z VECTOR_SPLIT_Z -z(cell child_z); owns the cell's z >= VECTOR_SPLIT_Z subtree. These are the long
 #     poles, so they ride VECTOR_BAND.
 #   vector_join    — tile-join the shallow + all cell archives into the served vector.pmtiles;
 #     ownership is disjoint so the join is pure concatenation (-pk).

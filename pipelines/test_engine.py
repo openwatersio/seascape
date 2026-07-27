@@ -422,9 +422,11 @@ def main():
                 f"{gone} must not exist as a separate archive (folded into vector.pmtiles)"
 
         sys.path.insert(0, PIPE)
-        import bundle
         import contour_run
-        SPLIT_Z = bundle.SPLIT_Z
+        # the vector split the SUBPROCESSES used: VECTOR_SPLIT_Z defaults to the macrotile grid,
+        # and the fixtures pin MACROTILE_Z in _base_env (this process's own import saw the ambient one)
+        env = _base_env(tmp)
+        SPLIT_Z = int(env.get("VECTOR_SPLIT_Z", "0")) or int(env["MACROTILE_Z"])
         maxz = contour_run._stems_maxz(stems)
 
         # ── tile ownership (Verification): the shallow archive owns EVERY z < SPLIT_Z tile and each
@@ -454,24 +456,29 @@ def main():
                     emitters[(z, x, y)].add((cx, cy))
         dups = {k: v for k, v in emitters.items() if len(v) > 1}
         for (z, x, y), cs in dups.items():
-            cs = sorted(cs)
-            for (ax, ay), (bx, by) in zip(cs, cs[1:]):
-                assert abs(ax - bx) <= 1 and abs(ay - by) <= 1, \
-                    f"z{z} {x}/{y} emitted by non-adjacent cells {cs} — a mis-sharded stem"
+            hx, hy = x >> (z - SPLIT_Z), y >> (z - SPLIT_Z)  # the tile's home cell
+            for (cx, cy) in cs:
+                assert abs(cx - hx) <= 1 and abs(cy - hy) <= 1, \
+                    f"z{z} {x}/{y} emitted by cell {cx}-{cy}, not adjacent to home {hx}-{hy} — a mis-sharded stem"
         assert len(dups) < len(emitters), "every z>=SPLIT_Z tile is a cross-cell overlap — the shard split is degenerate"
         print(f"vector tile-ownership ok — shallow z<{SPLIT_Z}, {len(cell_archs)} cell archive(s) "
               f"z>={SPLIT_Z}; {len(emitters)} tiles, {len(dups)} boundary-fringe overlaps (tile-join merged)")
 
         # ── shallow minzoom filter on the built archive: no feature whose minzoom exceeds SPLIT_Z-1
-        # may ride a shallow tile. depare's z6 floor is above SPLIT_Z-1, so no depare appears; any
-        # contour present must satisfy contour_minzoom <= SPLIT_Z-1. (The seq-level filter is proven
-        # directly by check_shallow_minzoom_filter; this guards the end-to-end archive.) ──
+        # may ride a shallow tile — depare (floor DEPARE_MINZOOM) appears iff its floor fits the
+        # shallow band. (The seq-level filter is proven directly by check_shallow_minzoom_filter;
+        # this guards the end-to-end archive.) ──
         if os.path.getsize(shallow_arch) > 0:
+            depare_fits_shallow = contour_run.DEPARE_MINZOOM <= SPLIT_Z - 1
             for z, xys in _pm_tiles(shallow_arch).items():
                 for x, y in xys[:4]:
                     L = contour_run._decode_tile(shallow_arch, z, x, y)
-                    assert not L.get("depare"), \
-                        f"depare (minzoom {contour_run.DEPARE_MINZOOM}) must not ride shallow z{z}"
+                    if not depare_fits_shallow:
+                        assert not L.get("depare"), \
+                            f"depare (minzoom {contour_run.DEPARE_MINZOOM}) must not ride shallow z{z}"
+                    elif z < contour_run.DEPARE_MINZOOM:
+                        assert not L.get("depare"), \
+                            f"depare (minzoom {contour_run.DEPARE_MINZOOM}) rode shallow z{z} below its floor"
                     for feat in L.get("contours", []):
                         p = feat["properties"]
                         d, s = p.get("depth_m"), p.get("sys")
@@ -521,7 +528,9 @@ def main():
         # ── a CONTOUR_LEVELS change reruns contour + vector bundle, NOT mosaic/terrain ──
         levels = ("-10000 -8000 -6000 -5000 -4000 -3000 -2000 -1000 -500 -300 -200 "
                   "-100 -50 -30 -20 -10 -5")  # default ladder minus -2
-        n_cells = len(contour_run.vector_covering_cells(stems))
+        # group at the SUBPROCESS split (this process's contour_run imported the ambient macrotile)
+        n_cells = len({(int(s.split("-")[1]) >> (int(s.split("-")[0]) - SPLIT_Z),
+                        int(s.split("-")[2]) >> (int(s.split("-")[0]) - SPLIT_Z)) for s in stems})
         dry = snake(tmp, "-c", "4", "-n", "bundles", env={"CONTOUR_LEVELS": levels}).stdout
         counts = _job_counts(dry)
         assert counts.get("mosaic_tile", 0) == 0, f"a contour-config change must NOT re-merge: {counts}"
@@ -550,8 +559,10 @@ def main():
         assert counts.get("soundings_tile", 0) == 4, f"soundings heal too: {counts}"
         for agg in ("mosaic_index", "vector_shallow", "vector_join", "terrain_planet_bundle"):
             assert counts.get(agg, 0) == 1, f"{agg} must rebuild after a scope change: {counts}"
-        assert counts.get("vector_cell", 0) == n_cells, \
-            f"every vector cell ({n_cells}) must rebuild after a scope change: {counts}"
+        # only the cells the bbox run rebuilt carry its scope stamp (one per in-window stem at the
+        # stem-grid split); the other cells kept their planet-stamped outputs and stay current
+        assert counts.get("vector_cell", 0) == 4, \
+            f"the 4 bbox-stamped vector cells must rebuild after a scope change: {counts}"
         snake(tmp, "-c", "4", "bundles")  # restore planet-scoped products for the checks below
         print("scope-transition ok — bbox->planet re-merges nothing, heals 4 truncated forks, "
               "rebuilds every aggregate")
