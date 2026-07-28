@@ -284,10 +284,13 @@ SMOOTH_CFG = json.dumps({} if os.environ.get("SKIP_SMOOTH") else {
 # scales with the window; flat until the first streamed-run benchmarks say otherwise.
 CONTOUR_GB = {}
 SOUND_GB = {15: 19, 14: 8, 13: 3}
-# depare cz8/cz9 = 4 is a deliberate under-reserve (light hedge): the class max (6.5 GB,
-# a continent window) is a single outlier over a cheap deep-ocean majority, so reserving
-# it for all would starve concurrency; the hedge leans on swap + `retries` instead.
-DEPARE_GB = {15: 73, 14: 27, 13: 7, 12: 4, 10: 4, 9: 4, 8: 4}
+# depare reads partition buckets one at a time and writes rows incrementally, so its peak
+# is the biggest band + coverage parts, not the window's whole set: z15/z14 entries are
+# PROVISIONAL post-streaming estimates — tighten from the first streamed-run benchmarks.
+# cz8/cz9 = 4 is a deliberate under-reserve (light hedge): the class max (6.5 GB, a
+# continent window) is a single outlier over a cheap deep-ocean majority, so reserving it
+# for all would starve concurrency; the hedge leans on swap + `retries` instead.
+DEPARE_GB = {15: 24, 14: 10, 13: 7, 12: 4, 10: 4, 9: 4, 8: 4}
 
 
 def _fork_gb(table, default):

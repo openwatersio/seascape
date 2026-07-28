@@ -196,24 +196,65 @@ def valid_union(geoms):
 def partitions(dem, levels, raw_fgb, timeout=0):
     """Water/foreshore partitions off `dem`: gdal_contour -p buckets the DEM between `levels`,
     tagging each bucket its range amin/amax -> drval1/drval2 (ENC: shallow/deep bound,
-    positive-down metres). Returns the full bucketed GeoDataFrame in the DEM's CRS; the caller
-    selects depth bands (amax <= 0), the [0, DRYING_CAP] drying bucket (0 < amax <= cap), and
-    drops land (amax above the shallowest positive level)."""
-    import geopandas as gpd
+    positive-down metres). Writes the bucketed FGB and returns its path; read it back
+    bucket-at-a-time with read_bucket — a z15 window's full partition set does not fit in RAM.
+    Callers select depth bands (amax <= 0), the [0, DRYING_CAP] drying bucket
+    (0 < amax <= cap), and drop land (amax above the shallowest positive level)."""
     fl = " ".join(str(l) for l in levels)
     _run_bounded(
         f"gdal_contour -q -p -amin amin -amax amax -fl {fl} -f FlatGeobuf {dem} {raw_fgb}",
         "gdal_contour -p", timeout)
     _mark(f"gdal_contour[{os.path.basename(raw_fgb)}]")
-    g = gpd.read_file(raw_fgb)
-    _mark(f"read[{os.path.basename(raw_fgb)}]")
-    # Select on amax, NOT amin: GDAL 3.8's polygon mode writes a garbage amin (0) on the
-    # deepest bucket, which then read as land and vanished — amax is correct on every version.
-    # So drval1 keys off amax; drval2 (off amin) is right for the interior bands but unreliable
-    # on that deepest bucket, and the drying emit uses a literal drval2 = 0 anyway.
-    g["drval1"] = 0.0 - g["amax"]  # 0.0 - keeps the shoalest bound 0.0, not -0.0
-    g["drval2"] = 0.0 - g["amin"]
+    return raw_fgb
+
+
+def read_bucket(raw_fgb, where):
+    """One bucket (attribute-filtered) of a partitions() FGB, with drval1/drval2 derived.
+    Select on amax, NOT amin: GDAL 3.8's polygon mode writes a garbage amin (0) on the
+    deepest bucket, which then read as land and vanished — amax is correct on every version.
+    So drval1 keys off amax; drval2 (off amin) is right for the interior bands but unreliable
+    on that deepest bucket, and the drying emit uses a literal drval2 = 0 anyway."""
+    import geopandas as gpd
+    g = gpd.read_file(raw_fgb, where=where)
+    if len(g):
+        g["drval1"] = 0.0 - g["amax"]  # 0.0 - keeps the shoalest bound 0.0, not -0.0
+        g["drval2"] = 0.0 - g["amin"]
     return g
+
+
+class _RowSink:
+    """Incremental depare-row writer: batches of {geometry (3857), drval1, drval2, sys, kind,
+    rank} append to a GeoJSONSeq in 4326; finish() converts to the final FGB. Absent values are
+    None -> JSON null -> FGB NULL, which tippecanoe encodes as an ABSENT MVT property — so
+    nodata truly has no drval1, the fill's switch key."""
+
+    FLUSH = 50_000
+
+    def __init__(self, seq):
+        self.seq = seq
+        self.count = 0
+        self.pending = []
+
+    def write(self, rows, flush=True):
+        self.pending += rows
+        if flush or len(self.pending) >= self.FLUSH:
+            self.flush()
+
+    def flush(self):
+        if not self.pending:
+            return
+        import geopandas as gpd
+        gdf = gpd.GeoDataFrame(self.pending, crs="EPSG:3857").to_crs("EPSG:4326")
+        gdf.to_file(self.seq, driver="GeoJSONSeq", mode="a" if self.count else "w")
+        self.count += len(self.pending)
+        self.pending = []
+
+    def finish(self, final_fgb):
+        self.flush()
+        contour_run._run(f"ogr2ogr -f FlatGeobuf -overwrite {final_fgb} {self.seq}",
+                         "ogr2ogr depare")
+        os.remove(self.seq)
+        return self.count
 
 
 def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0):
@@ -233,40 +274,44 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0):
     buffered = box(*bbox)
     min_area = SLIVER_MIN_PX * res * res       # slivers where a vector edge meets the raster shore
     nodata_tol = NODATA_SIMPLIFY_PX * get_resolution(child_z)  # generalize nodata to the stem's resolution
-    rows = []
+    sink = _RowSink(f"{tmp}/depare-rows.geojsons")
 
     # ── depth bands + drying ── the metre + fathom partition ladders, each off one gdal_contour -p
-    # pass, clipped in shapely (not ogr2ogr -clipsrc — the GDAL-3.8 GeometryCollection trap). The
-    # metre pass carries DRYING_CAP as an extra positive level, so it ALSO yields the [0, cap]
-    # drying bucket, whose 0 m seaward edge is the same ring as the shoal band's amax=0 edge. The
-    # metre bands' pre-clip (buffered) union is the water-coverage footprint the nodata pass
-    # subtracts; both ladders cover the same water pixels, so the metre union stands for it.
-    coverage_geoms = []
+    # pass, read back one BUCKET at a time (amax == a ladder level, exactly what gdal_contour
+    # wrote) so peak memory is the biggest band, not the window's whole partition set. Clip in
+    # shapely (not ogr2ogr -clipsrc — the GDAL-3.8 GeometryCollection trap). The metre pass
+    # carries DRYING_CAP as an extra positive level, so it ALSO yields the [0, cap] drying
+    # bucket, whose 0 m seaward edge is the same ring as the shoal band's amax=0 edge. The metre
+    # bands' pre-clip (buffered) coverage parts are the water footprint the nodata pass subtracts;
+    # both ladders cover the same water pixels, so the metre parts stand for it.
+    coverage_parts = []
     drying_geoms = []
     _mark(None)
     for sys_tag, levels in (("m", config.DEPARE_LEVELS + [config.DRYING_CAP]),
                             ("ft", config.DEPARE_LEVELS_FT)):
-        g = partitions(dem, levels, f"{tmp}/depare-raw-{sys_tag}.fgb", timeout=timeout)
-        if not len(g):
-            continue
-        bands = g[g["amax"] <= 0]  # water; amax > 0 is drying (m) or land, both handled below
-        for r in bands.itertuples():
-            for p in _polys(make_valid(r.geometry).intersection(clip)):
-                rows.append({"geometry": p, "drval1": r.drval1, "drval2": r.drval2,
-                             "sys": sys_tag, "rank": BAND_RANK})
+        raw = partitions(dem, levels, f"{tmp}/depare-raw-{sys_tag}.fgb", timeout=timeout)
+        for lvl in [l for l in levels if l <= 0]:
+            bucket = read_bucket(raw, f"amax = {lvl}")
+            rows = []
+            for r in bucket.itertuples():
+                valid = make_valid(r.geometry)
+                if sys_tag == "m":
+                    coverage_parts += [piece for p in _polys(valid) for piece in _subdivide(p)]
+                for p in _polys(valid.intersection(clip)):
+                    rows.append({"geometry": p, "drval1": r.drval1, "drval2": r.drval2,
+                                 "sys": sys_tag, "kind": None, "rank": BAND_RANK})
+            sink.write(rows)
         _mark(f"bands-clip-{sys_tag}")
         if sys_tag == "m":
-            coverage_geoms = list(bands.geometry)
             # The [0, DRYING_CAP] bucket, keyed on amax alone: 0 and the cap are discrete levels
             # and every other level is negative, so 0 < amax <= cap uniquely picks it regardless
             # of the garbage amin. Land above the cap (amax > cap) is dropped.
-            drying_geoms = list(g[(g["amax"] > 0) & (g["amax"] <= config.DRYING_CAP)].geometry)
+            drying_geoms = list(read_bucket(
+                raw, f"amax > 0 AND amax <= {config.DRYING_CAP}").geometry)
     # Coverage stays a PARTS list (exploded to single polygons for tight envelopes), never one
     # union: the nodata pass differences each water feature against only the parts its envelope
     # intersects — identical output (a disjoint part is a no-op), bounded local work. The
     # monolithic union made every feature pay the whole window's vertex count (the 8.9 h stems).
-    coverage_parts = [piece for g in coverage_geoms for p in _polys(make_valid(g))
-                      for piece in _subdivide(p)]
     _mark("coverage-make-valid")
 
     # Inland-water feed, read once by bbox (the nodata pass iterates its features for `kind`; the
@@ -324,11 +369,14 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0):
         _mark("drying-make-valid")
         if not effective.is_empty:
             drying_area = effective  # subtracted from nodata below (over the buffered extent)
+            drying_rows = []
             for full in _polys(effective):  # gate the PRE-clip polygon so a seam sliver of a big flat survives both sides
                 if full.area >= min_area:
                     for p in _polys(full.intersection(clip)):  # clip the survivors; no re-filter on the piece
-                        rows.append({"geometry": p, "drval1": -config.DRYING_CAP, "drval2": 0.0,
-                                     "sys": None, "kind": None, "rank": DRYING_RANK})
+                        drying_rows.append({"geometry": p, "drval1": -config.DRYING_CAP,
+                                            "drval2": 0.0, "sys": None, "kind": None,
+                                            "rank": DRYING_RANK})
+            sink.write(drying_rows)
             _mark("drying-emit")
 
     # ── nodata ── inland water we hold no depth for: the OSM water polygons (bbox-read, clipped to
@@ -366,22 +414,19 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0):
                         s = p.simplify(nodata_tol, preserve_topology=True)
                         if s.is_empty:
                             continue
-                        for sp in _polys(s):
-                            rows.append({"geometry": sp, "drval1": None, "drval2": None,
-                                         "sys": None, "kind": kind, "rank": NODATA_RANK})
+                        sink.write([{"geometry": sp, "drval1": None, "drval2": None,
+                                     "sys": None, "kind": kind, "rank": NODATA_RANK}
+                                    for sp in _polys(s)], flush=False)
         _mark("nodata-loop")
 
-    if not rows:
+    if not sink.count and not sink.pending:
         print(f"depare: no water in tile bbox for {label}")
         return None
 
-    # A mixed schema across the three kinds: a row omits a key it doesn't carry, geopandas writes
-    # the gap as NULL (NaN for float drval, None for str sys/kind), and FlatGeobuf -> tippecanoe
-    # encode that as an ABSENT MVT property — so nodata truly has no drval1, the fill's switch key.
     final = f"{tmp}/depare-final.fgb"
-    gpd.GeoDataFrame(rows, crs="EPSG:3857").to_crs("EPSG:4326").to_file(final, driver="FlatGeobuf")
+    n = sink.finish(final)
     _mark("write-fgb")
-    return final, len(rows)
+    return final, n
 
 
 def tile(stem):
@@ -515,9 +560,9 @@ def _check():
                        nodata=-9999, crs="EPSG:3857", transform=tr) as dst:
         dst.write(dem, 1)
 
-    g = partitions(p, levels_m, f"{d}/raw.fgb")
-    bands = g[g["amax"] <= 0]
-    drying = g[(g["amax"] > 0) & (g["amax"] <= cap)]
+    raw = partitions(p, levels_m, f"{d}/raw.fgb")
+    bands = read_bucket(raw, "amax <= 0")
+    drying = read_bucket(raw, f"amax > 0 AND amax <= {cap}")
     assert len(bands) and (bands["drval1"] >= 0).all(), "water bands must have drval1 >= 0"
     assert (bands["drval1"] < bands["drval2"]).all(), "drval1 must be the shallow bound"
 
@@ -549,12 +594,14 @@ def _check():
         f"bands must tile the water ({union.area:.0f} vs {water:.0f})"
 
     # Fathom-curve set (no cap — drying rides the metre ladder only): -7 m sits between 3 fm and 5 fm.
-    gft = partitions(p, config.DEPARE_LEVELS_FT, f"{d}/raw-ft.fgb")
-    d1, d2 = bucket_at(gft[gft["amax"] <= 0], 35)
+    gft_bands = read_bucket(partitions(p, config.DEPARE_LEVELS_FT, f"{d}/raw-ft.fgb"),
+                            "amax <= 0")
+    d1, d2 = bucket_at(gft_bands, 35)
     assert abs(d1 - 3 * 1.8288) < 1e-6 and abs(d2 - 5 * 1.8288) < 1e-6, (d1, d2)
 
     # Deterministic: same DEM -> byte-identical buckets (the drying bucket included).
-    g2 = partitions(p, levels_m, f"{d}/raw2.fgb")
+    g2 = read_bucket(partitions(p, levels_m, f"{d}/raw2.fgb"), "amax IS NOT NULL")
+    g = read_bucket(raw, "amax IS NOT NULL")
     assert sorted(x.wkb for x in g.geometry) == sorted(x.wkb for x in g2.geometry), \
         "partitions not deterministic"
 
@@ -568,11 +615,11 @@ def _check():
     with rasterio.open(fp, "w", driver="GTiff", height=h, width=w, count=1, dtype="float32",
                        nodata=-9999, crs="EPSG:3857", transform=tr) as dst:
         dst.write(flat, 1)
-    flat_g = partitions(fp, levels_m, f"{d}/flat-raw.fgb")
-    assert len(flat_g[flat_g["amax"] <= 0]) == 0, \
+    flat_g = read_bucket(partitions(fp, levels_m, f"{d}/flat-raw.fgb"), "amax <= 0")
+    assert len(flat_g) == 0, \
         "a uniform-0 surface must produce no depth band (it's the drying bucket, not a shoal tint)"
     print(f"depare_run self-check ok ({len(bands)} m-bands, {len(drying)} drying, "
-          f"{len(gft[gft['amax'] <= 0])} ft-bands)")
+          f"{len(gft_bands)} ft-bands)")
 
 
 if __name__ == "__main__":

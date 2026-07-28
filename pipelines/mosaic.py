@@ -528,9 +528,11 @@ def window_dem(stem, out_tif):
     vrt = out_tif + ".vrt"
     utils.run_command(f"gdalbuildvrt -overwrite -te {l} {b} {r} {t} -tr {res} {res} "
                       f"-r bilinear {vrt} {tiles}")
+    # NUM_THREADS=4, not ALL_CPUS: dozens of windows materialize concurrently, and 48
+    # compressor threads each just thrash the box.
     utils.run_command(f"GDAL_CACHEMAX=512 gdal_translate -q -ot Float32 -a_nodata {NODATA} "
                       "-co TILED=YES -co BIGTIFF=IF_SAFER -co BLOCKSIZE=512 "
-                      "-co COMPRESS=ZSTD -co PREDICTOR=3 "
+                      "-co COMPRESS=ZSTD -co PREDICTOR=3 -co NUM_THREADS=4 "
                       f"{vrt} {out_tif}")
     os.remove(vrt)
     return out_tif
