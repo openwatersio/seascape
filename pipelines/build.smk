@@ -280,9 +280,10 @@ SMOOTH_CFG = json.dumps({} if os.environ.get("SKIP_SMOOTH") else {
 # 30320876479 / 30348364325 benchmark corpus, no pad — footprints are window-geometry-
 # deterministic (p50 == max within a class), and the rare over-peak is covered by
 # `attempt` escalation on retry plus the box's 64 GB swap.
-# contour refines in feature batches (contour_run.STREAM_BATCH), so its footprint no longer
-# scales with the window; flat until the first streamed-run benchmarks say otherwise.
-CONTOUR_GB = {}
+# contour refines in feature batches (contour_run.STREAM_BATCH); run 30360226622 measured
+# 4.7 GB at z14 (batch + gdal_contour child). z15 provisional: features carry more vertices,
+# so the same batch count weighs more.
+CONTOUR_GB = {15: 7, 14: 5}
 SOUND_GB = {15: 19, 14: 8, 13: 3}
 # depare reads partition buckets one at a time and writes rows incrementally, so its peak
 # is the biggest band + coverage parts, not the window's whole set: z15/z14 entries are
