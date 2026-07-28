@@ -314,7 +314,7 @@ rule fork_window:
     priority: vector_tile_priority
     retries: 2
     resources:
-        mem_gb=2
+        mem_gb=3
     benchmark:
         f"{TMP}/bench/window/{{stem}}.tsv"
     log:

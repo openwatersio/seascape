@@ -137,28 +137,40 @@ def deep_coarsen(dem, threshold=DEEP_COARSEN_THRESHOLD_M, factor=DEEP_COARSEN_FA
     fine rather than taking a shallow mean. Nodata pixels are never touched (the nodata pass
     reads this same raster), and nodata is excluded from block means."""
     with rasterio.open(dem, "r+") as d:
-        arr = d.read(1)
         nd = d.nodata
         res = abs(d.transform.a)
-        h, w = arr.shape
+        h, w = d.height, d.width
         # Global block alignment: pad to the origin-anchored grid (pads land in the buffer).
         col0 = round((d.transform.c + MERC_ORIGIN) / res)
         row0 = round((MERC_ORIGIN - d.transform.f) / res)
         padt, padl = row0 % factor, col0 % factor
-        padb, padr = (-(h + padt)) % factor, (-(w + padl)) % factor
-        p = np.pad(arr, ((padt, padb), (padl, padr)), mode="edge")
-        valid = p != nd
-        ph, pw = p.shape
-        vals = np.where(valid, p, 0.0)
-        bsum = vals.reshape(ph // factor, factor, pw // factor, factor).sum(axis=(1, 3))
-        bcnt = valid.reshape(ph // factor, factor, pw // factor, factor).sum(axis=(1, 3))
-        del p, vals, valid
-        bmean = (bsum / np.maximum(bcnt, 1)).astype(np.float32)
-        bmean[bcnt == 0] = nd
-        up = np.repeat(np.repeat(bmean, factor, 0), factor, 1)[padt:padt + h, padl:padl + w]
-        mask = (arr != nd) & (arr <= threshold) & (up != nd) & (up <= threshold)
-        arr[mask] = up[mask]
-        d.write(arr, 1)
+        padr = (-(w + padl)) % factor
+        # Strip-streamed on block-row boundaries: a z15 window is 17 GB as one array, and
+        # blocks never straddle an aligned strip, so per-strip means equal the whole-array
+        # ones. Vertical edge pads repeat the strip's own edge row — the same rows the
+        # full-array pad used.
+        step = max(factor, (2048 // factor) * factor)
+        y = -padt
+        while y < h:
+            y0, y1 = max(0, y), min(h, y + step)
+            arr = d.read(1, window=Window(0, y0, w, y1 - y0))
+            spt = y0 - y                    # top pad only on the first (origin-cut) strip
+            spb = (-(arr.shape[0] + spt)) % factor
+            p = np.pad(arr, ((spt, spb), (padl, padr)), mode="edge")
+            valid = p != nd
+            ph, pw = p.shape
+            vals = np.where(valid, p, 0.0)
+            bsum = vals.reshape(ph // factor, factor, pw // factor, factor).sum(axis=(1, 3))
+            bcnt = valid.reshape(ph // factor, factor, pw // factor, factor).sum(axis=(1, 3))
+            del p, vals, valid
+            bmean = (bsum / np.maximum(bcnt, 1)).astype(np.float32)
+            bmean[bcnt == 0] = nd
+            up = np.repeat(np.repeat(bmean, factor, 0), factor, 1)[spt:spt + arr.shape[0],
+                                                                   padl:padl + w]
+            mask = (arr != nd) & (arr <= threshold) & (up != nd) & (up <= threshold)
+            arr[mask] = up[mask]
+            d.write(arr, 1, window=Window(0, y0, w, y1 - y0))
+            y += step
 
 
 def _check():
