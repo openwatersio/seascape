@@ -278,14 +278,17 @@ SMOOTH_CFG = json.dumps({} if os.environ.get("SKIP_SMOOTH") else {
 
 # Fork reservations by child_z, fitted to the benchmark corpus (11k rows): footprints are
 # deterministic (p95 == max), so reserve measured max + ~10%; retries escalate via `attempt`.
-CONTOUR_GB = {14: 10, 13: 4}
-SOUND_GB = {14: 6, 13: 3}
-# depare peaks at BOTH ends: dense z14 (5.2 GB measured) and the coarse continent-window cz8/cz9
-# stems (5.3 GB measured on 5-9-9-9, run 30025132613 — the whole-window OSM land/water GEOS load).
-# cz8/cz9 = 4 is a deliberate under-reserve (light hedge): most coarse stems are cheap deep-ocean,
-# so it keeps concurrency high and leans on the box's 64 GB NVMe swap + `retries` for the rare
-# coastal-coarse peak. The first planet run measures cz10-12 / z4-anchored coarse to set these honestly.
-DEPARE_GB = {14: 6, 13: 4, 9: 4, 8: 4}
+# z13/z14 from run 30311420659 (contour 6.1/22.2 GB, depare 6.5/23.0, soundings 2.3/7.0 —
+# that run OOM-killed a 192 GB box on the old 4-10 GB z14 entries). z15 is UNMEASURED:
+# entries project the observed ~3.6x/zoom window scaling, protectively high; tighten from
+# the first z15 fork benchmarks.
+CONTOUR_GB = {15: 85, 14: 25, 13: 7}
+SOUND_GB = {15: 26, 14: 8, 13: 3}
+# depare also peaks on the coarse continent-window cz8/cz9 stems (5.3 GB measured on 5-9-9-9,
+# run 30025132613 — the whole-window OSM land/water GEOS load). cz8/cz9 = 4 is a deliberate
+# under-reserve (light hedge): most coarse stems are cheap deep-ocean, so it keeps concurrency
+# high and leans on the box's 64 GB NVMe swap + `retries` for the rare coastal-coarse peak.
+DEPARE_GB = {15: 90, 14: 26, 13: 7, 9: 4, 8: 4}
 
 
 def _fork_gb(table, default):
