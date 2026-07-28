@@ -101,8 +101,12 @@ def smooth_tiff(path, block=None):
     # sources but Int16 where GEBCO dominates, and PREDICTOR=3 is float-only.
     dt = profile["dtype"]
     predictor = 3 if dt in ("float32", "float64") else 2 if "int" in dt else 1
+    # BIGTIFF: a z15 window compresses under 4 GB, but the later in-place land clamp
+    # appends rewritten blocks past the classic-TIFF offset limit; IF_SAFER sizes by
+    # the uncompressed estimate so the clamp always has room.
     profile.update(driver="GTiff", count=1, tiled=True, blockxsize=512, blockysize=512,
-                   compress="zstd", predictor=predictor, num_threads="all_cpus")
+                   compress="zstd", predictor=predictor, num_threads="all_cpus",
+                   BIGTIFF="IF_SAFER")
     tmp = path + ".smooth.tif"
     with rasterio.open(path) as src, rasterio.open(tmp, "w", **profile) as dst:
         for row in range(0, h_total, block):

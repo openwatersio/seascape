@@ -362,7 +362,8 @@ def rasterize(bounds_3857, res, out_tif, src=None, water_src=None, all_touched=F
             f"ogr2ogr -f GPKG -overwrite -spat {xmin} {ymin} {xmax} {ymax} {clip} {src}")
         utils.run_command(
             f"gdal_rasterize {at}-burn 1 -ot Byte -init 0 -te {xmin} {ymin} {xmax} {ymax} "
-            f"-tr {res} {res} -co COMPRESS=DEFLATE -co TILED=YES -co SPARSE_OK=YES "
+            f"-tr {res} {res} -co COMPRESS=DEFLATE -co BIGTIFF=IF_SAFER -co TILED=YES "
+            "-co SPARSE_OK=YES "
             f"{clip} {tmp_out}")
         if _present(water):
             # kind <> 'physical': marine bays/straits are mapped without island holes, so
@@ -402,7 +403,8 @@ def rasterize_water(bounds_3857, res, out_tif, water_src=None):
             f"-spat {xmin} {ymin} {xmax} {ymax} {clip} {water}")
         utils.run_command(
             f"gdal_rasterize -burn 1 -ot Byte -init 0 -te {xmin} {ymin} {xmax} {ymax} "
-            f"-tr {res} {res} -co COMPRESS=DEFLATE -co TILED=YES -co SPARSE_OK=YES "
+            f"-tr {res} {res} -co COMPRESS=DEFLATE -co BIGTIFF=IF_SAFER -co TILED=YES "
+            "-co SPARSE_OK=YES "
             f"{clip} {tmp_out}")
         os.replace(tmp_out, out_tif)
     finally:
