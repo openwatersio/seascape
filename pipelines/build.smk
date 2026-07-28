@@ -148,8 +148,15 @@ MERGE_CFG = json.dumps({
 }, sort_keys=True)
 
 
-# The merge job holds only the merged array + reprojected sources, not the vector forks:
-# corpus max 6.5 GB on a 4.3 GB-weight z14, so 1.5x reserves 6.75 GB; retries escalate.
+def _fork_gb(table, default):
+    return lambda wc, attempt: table.get(int(wc.stem.split("-")[3]), default) * attempt
+
+
+# The merge streams block-wise, so its footprint never scales with window size the way
+# weight() assumes: ceil(measured max) per child_z over the 2026-07-28 corpora (z15 8.4 GB
+# vs the 27 GB weight-based reserve that admitted 5 merges where 17 fit). disk_mb stays
+# weight-based — scratch (the -tmp reprojected tiffs) does scale with the window.
+MOSAIC_GB = {15: 9, 14: 7, 13: 3, 12: 2, 11: 2, 10: 2}
 MERGE_FACTOR = 1.5
 
 
@@ -209,7 +216,7 @@ rule mosaic_tile:
     priority: tile_priority  # interleaved heavy-first: evens the memory load over the build
     retries: 2
     resources:
-        mem_gb=lambda wc, attempt: utils.weight(wc.stem, factor=MERGE_FACTOR) * attempt,
+        mem_gb=_fork_gb(MOSAIC_GB, 3),
         # real scratch: the -tmp folder of per-source reprojected tiffs, ~tile-sized
         disk_mb=lambda wc: utils.weight(wc.stem, factor=MERGE_FACTOR) * 1024,
     benchmark:
@@ -292,10 +299,6 @@ SOUND_GB = {15: 12, 14: 8, 13: 3}
 # continent window) is a single outlier over a cheap deep-ocean majority, so reserving it
 # for all would starve concurrency; the hedge leans on swap + `retries` instead.
 DEPARE_GB = {15: 24, 14: 7, 13: 3, 12: 4, 10: 4, 9: 4, 8: 4}
-
-
-def _fork_gb(table, default):
-    return lambda wc, attempt: table.get(int(wc.stem.split("-")[3]), default) * attempt
 
 
 def fork_inputs(wc):
