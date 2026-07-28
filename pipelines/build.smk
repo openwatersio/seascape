@@ -491,6 +491,8 @@ rule vector_shallow:
     output:
         "store/bundle/vector-shallow.pmtiles"
     priority: VECTOR_BAND  # above every terrain render, so the shallow run starts as the layers drain
+    resources:
+        mem_gb=20  # UNMEASURED singleton running amid the terrain flood; protective, costs one slot
     params:
         bbox=os.environ.get("BBOX", ""),  # scope stamp — see mosaic_index
     benchmark:
@@ -533,6 +535,8 @@ rule vector_join:
     output:
         "store/bundle/vector.pmtiles"
     priority: VECTOR_BAND  # the join finishes the vector band before terrain bundling
+    resources:
+        mem_gb=20  # UNMEASURED singleton running amid the terrain flood; protective, costs one slot
     params:
         bbox=os.environ.get("BBOX", ""),  # scope stamp — see mosaic_index
     benchmark:
