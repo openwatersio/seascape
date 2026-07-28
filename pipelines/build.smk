@@ -283,8 +283,8 @@ SMOOTH_CFG = json.dumps({} if os.environ.get("SKIP_SMOOTH") else {
 # contour refines in feature batches (contour_run.STREAM_BATCH); run 30360226622 measured
 # 4.7 GB at z14 (batch + gdal_contour child). z15 provisional: features carry more vertices,
 # so the same batch count weighs more.
-CONTOUR_GB = {15: 7, 14: 5}
-SOUND_GB = {15: 19, 14: 8, 13: 3}
+CONTOUR_GB = {15: 10, 14: 5}
+SOUND_GB = {15: 12, 14: 8, 13: 3}
 # depare reads partition buckets one at a time and writes rows incrementally, so its peak
 # is the biggest band + coverage parts, not the window's whole set: z15/z14 entries are
 # PROVISIONAL post-streaming estimates — tighten from the first streamed-run benchmarks.
@@ -318,7 +318,7 @@ rule fork_window:
     priority: vector_tile_priority
     retries: 2
     resources:
-        mem_gb=3
+        mem_gb=4
     benchmark:
         f"{TMP}/bench/window/{{stem}}.tsv"
     log:
