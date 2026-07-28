@@ -291,7 +291,7 @@ SOUND_GB = {15: 12, 14: 8, 13: 3}
 # cz8/cz9 = 4 is a deliberate under-reserve (light hedge): the class max (6.5 GB, a
 # continent window) is a single outlier over a cheap deep-ocean majority, so reserving it
 # for all would starve concurrency; the hedge leans on swap + `retries` instead.
-DEPARE_GB = {15: 24, 14: 10, 13: 7, 12: 4, 10: 4, 9: 4, 8: 4}
+DEPARE_GB = {15: 24, 14: 7, 13: 3, 12: 4, 10: 4, 9: 4, 8: 4}
 
 
 def _fork_gb(table, default):
