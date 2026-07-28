@@ -38,13 +38,18 @@ ENV GDAL_HTTP_MAX_RETRY=5 \
 
 # tippecanoe + tile-join (Felt fork) — vector tiles. Pinned at felt/tippecanoe#399 (variable-depth
 # pyramids must honor per-feature tippecanoe.minzoom and never prune children a pending minzoom
-# still needs; the vector bundle depends on both). A pin change must bump `version` on the
-# vector_* rules and landmask (build.smk).
+# still needs; the vector bundle depends on both). patches/ carries fixes not yet upstream:
+# wagyu-drop-unplaceable-hole drops an orphan hole ring instead of aborting the run
+# (mapbox/tippecanoe#761; only changes tiles that previously crashed). A pin or patches/
+# change must bump `version` on the vector_* rules and landmask (build.smk) unless the
+# change provably leaves previously-built tiles byte-identical.
+COPY patches /tmp/patches
 RUN git init -q /tmp/tippecanoe \
   && cd /tmp/tippecanoe \
   && git fetch -q --depth 1 https://github.com/felt/tippecanoe.git 0badb242bea6f77c8e388898868801f3f3a9088b \
   && git checkout -q FETCH_HEAD \
-  && make -j"$(nproc)" && make install && rm -rf /tmp/tippecanoe
+  && git apply /tmp/patches/*.patch \
+  && make -j"$(nproc)" && make install && rm -rf /tmp/tippecanoe /tmp/patches
 
 # just (task runner) + uv (Python env manager) — the pipeline's two entrypoints.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh \
