@@ -109,3 +109,73 @@ Two costs make this a follow-on, not part of the main line: **(a)** synthesized 
 ## Rollout
 
 Part 1 is a Worker-only deploy, inert until sparse archives exist. Part 2 ships tiles + Worker together (a sparse archive needs the synthesis live; old dense archives remain servable — the synthesis path only fires on misses, which dense archives don't produce). The npm style package is unchanged in schema but the release CHANGELOG documents the direct-consumer client requirement (`pmtiles` ≥ 4.1 + `errorOnMissingTile`). Part 3 rolls source-by-source, but each step is two-phase operationally: the registration republish (so the source's `catalog.json` drops the cap — it's what builds read) must complete before the planet build that uncaps it; the content keys handle the rest.
+
+## Status and handoff (2026-07-28)
+
+**Where the plan stands.** Part 1 (Worker vector overzoom) is implemented on this
+branch. Part 2 shipped as the cell-subtree sharded bundle (the design note above,
+promoted from escape hatch to the architecture): `vector_shallow` (dense z0–7) + one
+variable-depth run per covering root cell + `vector_join` into the single served
+`vector.pmtiles`, with per-feature minzoom replacing every `$zoom` filter, nodata
+pre-simplification landed, and tippecanoe pinned past felt#397/#399 plus a local wagyu
+patch (`patches/wagyu-drop-unplaceable-hole.patch`, drops an unparentable hole instead
+of aborting — mapbox/tippecanoe#761; upstream PR not yet opened). Part 3 is live:
+per-source caps are deleted, a global `MAX_CHILD_Z=15` ceiling exists in
+`pipelines/config.py` (z16 Swiss-lake data is held at 15 pending sparse minting),
+registration republished, and the covering is 3,286 stems (110 at z15, 92 at z14).
+Part 4 is not started.
+
+**What the build campaign (16 takes, 2026-07-28) fixed — all commits on this branch:**
+the z15 scale-up broke every constant fitted at z14: classic-TIFF 4 GB limits in six
+GDAL/rasterio writers (fixed: `BIGTIFF=IF_SAFER` everywhere output scales with tile
+size); whole-window RAM processing (fixed: contour refine streams 100k-feature batches,
+72→10 GB; depare reads partition buckets per level and writes rows incrementally,
+72→11 GB; deep_coarsen strip-streams, 10→<2 GB; all byte-identical by differential
+test); GDAL's 5%-of-RAM in-process cache default (fixed: `Env(GDAL_CACHEMAX)` caps);
+a shared `fork_window` rule builds each stem's smoothed window once instead of three
+times (temp() artifact); merge scratch moved off the store volume to box NVMe; every
+memory reservation is now a measured per-child_z table (no pads; `attempt` escalation
+covers the tail); `--prioritize mosaic_index` unblocks the terrain flood; the store
+volume was resized to 2 TB after filling at 1.26 TB. Process fixes: `utils.publish`
+fsyncs before rename (a cancelled box is a power cut — one truncated file poisoned
+three runs), and failed-build auto-restart is standing policy.
+
+**Measured state (warm on the volume):** ~75–80% of a complete z15 planet is banked.
+All z≤14 merges and forks; ~60–70 of 110 z15 merges (729 GB of mosaic tiles at last
+count); every fork class measured under the streamed code (z15: window 38 min/3.7 GB,
+contour 6–9 min/9.9 GB, soundings 3 min, depare 5–11 min/11 GB; merges 9.3 GB at
+17-wide); ~2,300 of 2,465 vector cells cached. Never run at planet scale: planet-z8 +
+GTI index (blocked behind the z15 merge tail all day), the ~9k GTI-reading terrain
+renders, `vector_join`, and publish.
+
+**Projected final assets:** mosaic COGs ~1 TB; joined `vector.pmtiles` 25–35 GB;
+terrain bundles ~40 GB; volume ~1.5 of 2 TB; shipped to R2 ~1.1 TB ≈ $16/month, egress
+free, all range-read. Size does not threaten shipping.
+
+**Uncommitted working-tree batch (suite-green, needs a commit):** per-file NVMe
+bind-mounts for the landmask FGBs via `nsenter -t 1 -m` (the runner service's private
+mount namespace made a directory bind invisible to docker, and the directory form
+crashed take-16 on a subdirectory); `--s3-chunk-size 64M` on `bundle.py` uploads
+(default chunking caps objects at 48 GB); 20 GB reservations on
+`vector_shallow`/`vector_join` (unreserved singletons that overlap the terrain flood).
+
+**Recommended next steps, in order:**
+1. Commit the pending batch; add the LERC_ZSTD mosaic re-encode to
+   `docs/perf/optimization-backlog.md` as a ranked item (halves the ~1 TB store; needs
+   the shallow-bias check; sequenced after the first complete build).
+2. Small-bbox validation run (~1–2 h) over one UK z15 macrotile + neighbors,
+   exercising the full chain INCLUDING index, terrain, shallow, cells, join, publish —
+   the never-run-at-scale phases. Gate: green + per-class RSS within reservations.
+3. One planet dispatch: ~45 merges → index → terrain flood → last cells + shallow →
+   join → publish; projected 12–18 h. Diagnose offline on failure; fixes are cheap now
+   that every known class is measured.
+4. Verification before merge: in-build self-checks, preview transects (§Verification
+   items 7–8: ICW/Elbe/Boston z15 vs z14, unchanged GEBCO-only ocean, cell-boundary
+   eyeball), then the release flow per docs/build-validation.md.
+
+**Open risks:** the planet-scale `vector_join` + completeness self-check have never
+run (memory/wall unmeasured; 20 GB reservation is protective, not fitted); the wagyu
+patch is local-only until upstreamed; `infomar_25m`'s cap still binds (1 file, z12 vs
+native 12 — re-check with `infomar_10m` shadowing before uncapping); z16 sources wait
+on sparse minting (§Part 3); the 31 GB of pre-sharding archives in `store/bundle`
+(`depare.pmtiles`, `land.pmtiles`, `soundings.pmtiles`) are dead and can be deleted.
