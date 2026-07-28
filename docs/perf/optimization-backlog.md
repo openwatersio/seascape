@@ -333,7 +333,15 @@ merge outputs (the mosaic_tile content-hash guard above).
    Planetiler spike on one dense cell's depare (insurance against the felt fork's bus factor),
    maplibre-contour (chart-grade smoothing/bias questions unresolved).
 
-8. **Single-pass dual-ladder gdal_contour** (noted 2026-07-28): contour runs two full-window
+8. **fork_window outputs → NVMe scratch** (noted 2026-07-28, deliberately parked): the
+   `temp()` window artifacts live at `store/window/` on the volume — ~17 GB of Ceph
+   round-trip per z15 stem for files with zero persistence value. Moving the rule output
+   under TMP is a three-line change, BUT the fork rules' input path changes with it, and
+   "input set changed" reruns EVERY fork + cell + shallow + join (~half a day of box for
+   byte-identical outputs). Ride it along with the next change that invalidates the forks
+   anyway — never land it alone. (The read-side twin, the landmask NVMe bind-mount, landed
+   2026-07-28 with no DAG impact: identical paths + mtimes.)
+9. **Single-pass dual-ladder gdal_contour** (noted 2026-07-28): contour runs two full-window
    `gdal_contour` passes (metre + feet ladders); one combined-level pass with features
    duplicated onto both `sys` tags at shared levels saves ~2–4 min per z15 stem of raster
    scanning. Fiddly level-membership mapping; only worth it if the window band stays the
