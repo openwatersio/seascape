@@ -119,20 +119,50 @@ def _lines(geom):
     return []
 
 
-def _clip_to_bbox(in_fgb, out_fgb, clip):
-    """Clip the smoothed contours to the tile bbox in shapely (EPSG:3857), keeping only line pieces
-    — ogr2ogr -clipsrc emits a GeometryCollection here that the FlatGeobuf write rejects (the GDAL
-    GeometryCollection trap, same as depare's shapely clip). Returns the surviving feature count."""
+STREAM_BATCH = 100_000  # features per refine batch; a z15 window's set doesn't fit in RAM
+
+
+def _refine_stream(sources, out_fgb, tol, clip):
+    """Enrich, Chaikin-smooth, deep ring-drop, and bbox-clip the raw contour sets, one feature
+    batch at a time, appending to a GeoJSONSeq (4326) that a final ogr2ogr converts to the
+    multi-promoted FGB. Clip in shapely, keeping only line pieces — ogr2ogr -clipsrc emits a
+    GeometryCollection here that the FlatGeobuf write rejects (the GDAL GeometryCollection trap,
+    same as depare's shapely clip). Returns the written feature count."""
     import geopandas as gpd
     from shapely import make_valid
     from shapely.geometry import MultiLineString
-    gdf = gpd.read_file(in_fgb)
-    clipped = [MultiLineString(parts) if parts else None  # PROMOTE_TO_MULTI: uniform line layer
-               for parts in (_lines(make_valid(g).intersection(clip)) for g in gdf.geometry)]
-    gdf["geometry"] = clipped
-    gdf = gdf[gdf.geometry.notna() & ~gdf.geometry.is_empty]
-    gdf.to_file(out_fgb, driver="FlatGeobuf")
-    return len(gdf)
+
+    seq = out_fgb + ".geojsons"
+    written = 0
+    for fgb, sys_tag in sources:
+        total = feature_count(fgb)
+        for off in range(0, total, STREAM_BATCH):
+            g = gpd.read_file(fgb, rows=slice(off, min(off + STREAM_BATCH, total)))
+            g["sys"] = sys_tag
+            g["depth_abs_m"] = (-g["depth_m"]).round().astype(int)
+            g["depth_ft"] = (-g["depth_m"] / 0.3048).round().astype(int)
+            g["depth_fm"] = (-g["depth_m"] / 1.8288).round().astype(int)
+            g["geometry"] = [_smooth_geom(geom, tol, _chaikin_iters(d))
+                             for geom, d in zip(g.geometry, g["depth_abs_m"])]
+            deep = g["depth_abs_m"] >= DEEP_CUTOFF_M
+            if deep.any():
+                g.loc[deep, "geometry"] = [_drop_small_rings(geom, MIN_RING_AREA_M2)
+                                           for geom in g.loc[deep, "geometry"]]
+            g = g[g.geometry.notna() & ~g.geometry.is_empty]
+            if len(g):
+                g["geometry"] = [MultiLineString(parts) if parts else None
+                                 for parts in (_lines(make_valid(geom).intersection(clip))
+                                               for geom in g.geometry)]
+                g = g[g.geometry.notna() & ~g.geometry.is_empty]
+            if len(g) == 0:
+                continue
+            g.to_crs(4326).to_file(seq, driver="GeoJSONSeq", mode="a" if written else "w")
+            written += len(g)
+    if written:
+        _run(f"ogr2ogr -f FlatGeobuf -overwrite -nlt PROMOTE_TO_MULTI {out_fgb} {seq}",
+             "ogr2ogr contours")
+        os.remove(seq)
+    return written
 
 
 def _drop_small_rings(geom, min_area):
@@ -147,52 +177,19 @@ def _drop_small_rings(geom, min_area):
     return kept[0] if len(kept) == 1 else MultiLineString(kept)
 
 
-def smooth_and_enrich(sources, out_fgb, tol):
-    """Concatenate the metre + feet contour sets (each `(fgb, sys)`), tag `sys`, Chaikin-smooth
-    (in 3857, nav-band skip so smoothing never understates a shoal), drop deep micro-loop stipple,
-    and add depth_abs_m / depth_ft / depth_fm. Feet features sit on whole-fathom depths so their
-    depth_ft/depth_fm round clean; the viewer labels metre features in metres, feet features in
-    feet or fathoms."""
-    import geopandas as gpd
-    import pandas as pd
-    parts = []
-    for fgb, sys in sources:
-        g = gpd.read_file(fgb)
-        g["sys"] = sys
-        parts.append(g)
-    gdf = gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), crs=parts[0].crs)
-    gdf["depth_abs_m"] = (-gdf["depth_m"]).round().astype(int)
-    gdf["depth_ft"] = (-gdf["depth_m"] / 0.3048).round().astype(int)
-    gdf["depth_fm"] = (-gdf["depth_m"] / 1.8288).round().astype(int)
-    gdf["geometry"] = [_smooth_geom(g, tol, _chaikin_iters(d))
-                       for g, d in zip(gdf.geometry, gdf["depth_abs_m"])]
-    deep = gdf["depth_abs_m"] >= DEEP_CUTOFF_M
-    if deep.any():
-        gdf.loc[deep, "geometry"] = [_drop_small_rings(g, MIN_RING_AREA_M2)
-                                     for g in gdf.loc[deep, "geometry"]]
-        gdf = gdf[gdf.geometry.notna() & ~gdf.geometry.is_empty]
-    gdf.to_file(out_fgb, driver="FlatGeobuf")
-
-
 def tile(stem):
     """The per-stem Snakemake job: contour one stem from a BUFFERED mosaic window, smoothed at read
     with the one shared f(depth, zoom), output at store/contour/<stem>.fgb. A featureless tile
     writes a 0-byte sentinel so the engine sees a complete output; bundling filters empties by
     size."""
-    import mosaic
-    import smooth
     z, x, y, child_z = (int(a) for a in stem.split("-"))
     out = f"store/contour/{stem}.fgb"
     tmp = tempfile.mkdtemp(prefix=f"contour-{stem}-")  # local scratch; publish crosses to the store
-    dem = mosaic.window_dem(stem, f"{tmp}/dem.tiff")
-    if not os.environ.get("SKIP_SMOOTH"):
-        smooth.smooth_tiff(dem)
-    # Deep isobaths must track the depth-area band edges, which come from this same coarsened surface.
-    if child_z >= smooth.DEEP_COARSEN_MIN_CHILD_Z:
-        smooth.deep_coarsen(dem)
-    # After smoothing: it smears sea negatives back across clamp-flattened islands, and
-    # the warp-time clamp's centre-sampled mask misses narrow rims — either puts
-    # isobaths on land.
+    # Private copy of the shared smoothed window: the clamp mutates in place, and the
+    # smoothing already smeared sea negatives back across islands — without the re-cut,
+    # isobaths land on shore.
+    dem = f"{tmp}/dem.tiff"
+    shutil.copyfile(f"store/window/{stem}.tif", dem)
     landmask.clamp_dem_to_land(dem)
     final = _contour_dem(dem, mercantile.Tile(x=x, y=y, z=z), child_z, tmp, stem)
     os.makedirs(os.path.dirname(out), exist_ok=True)
@@ -224,20 +221,13 @@ def _contour_dem(dem, tile_obj, child_z, tmp, label):
         print(f"contour: no ocean features for {label}")
         return None
 
-    smoothed = f"{tmp}/contour-smooth.fgb"
-    smooth_and_enrich(sources, smoothed, tol=get_resolution(child_z))
-
     from shapely.geometry import box
     b = mercantile.xy_bounds(tile_obj)  # unbuffered, tile-aligned (EPSG:3857)
-    clipped = f"{tmp}/contour-clip.fgb"
-    if _clip_to_bbox(smoothed, clipped, box(b.left, b.bottom, b.right, b.top)) == 0:
+    final = f"{tmp}/contour-final.fgb"
+    if _refine_stream(sources, final, get_resolution(child_z),
+                      box(b.left, b.bottom, b.right, b.top)) == 0:
         print(f"contour: no features in tile bbox for {label}")
         return None
-
-    # Reproject inside tmp; the caller owns the atomic move into its lane's name.
-    final = f"{tmp}/contour-final.fgb"
-    _run(f"ogr2ogr -f FlatGeobuf -overwrite -nlt PROMOTE_TO_MULTI -t_srs EPSG:4326 {final} {clipped}",
-         "ogr2ogr reproject")
     return final
 
 

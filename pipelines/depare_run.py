@@ -393,8 +393,6 @@ def tile(stem):
     import signal
     import tempfile
 
-    import mosaic
-    import smooth
     # DEPARE_TIMEOUT (seconds; unset = no bound): each gdal_contour -p pass runs under this
     # bound; on expiry the tile retries once on a uniform 4x-average window, then fails
     # honestly. The SIGALRM backstop (8x: 2 ladders x 2 attempts x contour + GEOS slack) still
@@ -412,14 +410,10 @@ def tile(stem):
     tmp = tempfile.mkdtemp(prefix=f"depare-{stem}-")  # local scratch; publish crosses to the store
     try:
         _mark(None)
-        dem = mosaic.window_dem(stem, f"{tmp}/dem.tiff")
+        # The shared smoothed window is read-only; the timeout fallback derives its
+        # coarsened copy in tmp rather than touching it.
+        dem = f"store/window/{stem}.tif"
         _mark("window-dem")
-        if not os.environ.get("SKIP_SMOOTH"):
-            smooth.smooth_tiff(dem)
-            _mark("smooth")
-        if child_z >= smooth.DEEP_COARSEN_MIN_CHILD_Z:
-            smooth.deep_coarsen(dem)
-            _mark("deep-coarsen")
         tile_obj = mercantile.Tile(x=x, y=y, z=z)
         try:
             res = _depare_dem(dem, tile_obj, child_z, tmp, stem, timeout=timeout)

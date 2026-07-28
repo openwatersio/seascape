@@ -175,16 +175,13 @@ def tile(stem):
     import shutil
     import tempfile
 
-    import mosaic
-    import smooth
     z, x, y, child_z = (int(a) for a in stem.split("-"))
     out = f"store/soundings/{stem}.geojson"
     tmp = tempfile.mkdtemp(prefix=f"soundings-{stem}-")  # local scratch; publish crosses to the store
-    dem = mosaic.window_dem(stem, f"{tmp}/dem.tiff")
-    if not os.environ.get("SKIP_SMOOTH"):
-        smooth.smooth_tiff(dem)
-    # Same post-smooth land clamp as contour_tile: without it, smeared/rim negatives
-    # under the land mask mint soundings on islands.
+    # Private copy of the shared smoothed window; the land clamp mutates in place, and
+    # without it smeared/rim negatives under the land mask mint soundings on islands.
+    dem = f"{tmp}/dem.tiff"
+    shutil.copyfile(f"store/window/{stem}.tif", dem)
     landmask.clamp_dem_to_land(dem)
     res = _sound_dem(dem, mercantile.Tile(x=x, y=y, z=z), z, child_z, tmp, stem)
     os.makedirs(os.path.dirname(out), exist_ok=True)

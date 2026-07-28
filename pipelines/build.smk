@@ -280,7 +280,9 @@ SMOOTH_CFG = json.dumps({} if os.environ.get("SKIP_SMOOTH") else {
 # 30320876479 / 30348364325 benchmark corpus, no pad — footprints are window-geometry-
 # deterministic (p50 == max within a class), and the rare over-peak is covered by
 # `attempt` escalation on retry plus the box's 64 GB swap.
-CONTOUR_GB = {15: 73, 14: 27, 13: 7}
+# contour refines in feature batches (contour_run.STREAM_BATCH), so its footprint no longer
+# scales with the window; flat until the first streamed-run benchmarks say otherwise.
+CONTOUR_GB = {}
 SOUND_GB = {15: 19, 14: 8, 13: 3}
 # depare cz8/cz9 = 4 is a deliberate under-reserve (light hedge): the class max (6.5 GB,
 # a continent window) is a single outlier over a cheap deep-ocean majority, so reserving
@@ -298,9 +300,32 @@ def fork_inputs(wc):
     return [f"store/mosaic/tiles/{s}.tif" for s in mosaic_mod.intersecting_tiles(wc.stem)]
 
 
-rule contour_tile:
+# The forks' shared read surface, built once per stem instead of three times: the buffered
+# window materialized, smoothed, and deep-coarsened. temp() — a z15 window is 4.3 GB and
+# only in-flight stems need theirs on disk. Consumers treat it as read-only.
+rule fork_window:
     input:
         fork_inputs,
+    output:
+        temp("store/window/{stem}.tif")
+    params:
+        version=1, # increment to force a rebuild
+        smooth=SMOOTH_CFG,
+    priority: vector_tile_priority
+    retries: 2
+    resources:
+        mem_gb=2
+    benchmark:
+        f"{TMP}/bench/window/{{stem}}.tsv"
+    log:
+        f"{TMP}/logs/window/{{stem}}.log"
+    shell:
+        "{PY}/smooth.py prepare-window {wildcards.stem} {output} 2> {log}"
+
+
+rule contour_tile:
+    input:
+        window="store/window/{stem}.tif",
         masks=MASKS,
     output:
         "store/contour/{stem}.fgb"
@@ -308,7 +333,7 @@ rule contour_tile:
         version=2, # increment to force a rebuild
         levels=json.dumps({"m": pipeline_config.CONTOUR_LEVELS, "ft": pipeline_config.CONTOUR_LEVELS_FT}),
         nav=contour_run.NAV_SMOOTH_MAX_M, deep=contour_run.DEEP_CUTOFF_M,
-        ring=contour_run.MIN_RING_AREA_M2, smooth=SMOOTH_CFG,
+        ring=contour_run.MIN_RING_AREA_M2,
     priority: vector_tile_priority  # vector band: drain before terrain so the bundle overlaps it
     retries: 2
     resources:
@@ -323,14 +348,13 @@ rule contour_tile:
 
 rule soundings_tile:
     input:
-        fork_inputs,
+        window="store/window/{stem}.tif",
         masks=MASKS,
     output:
         "store/soundings/{stem}.geojson"
     params:
         version=1, # increment to force a rebuild
         cell=soundings_run.SOUND_CELL_PX, min_depth=soundings_run.SOUND_MIN_DEPTH_M,
-        smooth=SMOOTH_CFG,
     priority: vector_tile_priority  # vector band: drain before terrain so the bundle overlaps it
     retries: 2
     resources:
@@ -347,14 +371,14 @@ rule soundings_tile:
 # tail is bounded — STRtree + subdivision + snap-round difference (docs/plans/2026-07-21-depare-perf.md).
 rule depare_tile:
     input:
-        fork_inputs,
+        window="store/window/{stem}.tif",
         masks=MASKS,
     output:
         "store/depare/{stem}.fgb"
     params:
         version=2, # increment to force a rebuild
         levels=json.dumps({"m": pipeline_config.DEPARE_LEVELS, "ft": pipeline_config.DEPARE_LEVELS_FT}),
-        drying=pipeline_config.DRYING_CAP, sliver=depare_run.SLIVER_MIN_PX, smooth=SMOOTH_CFG,
+        drying=pipeline_config.DRYING_CAP, sliver=depare_run.SLIVER_MIN_PX,
     priority: vector_tile_priority  # vector band: drain before terrain so the bundle overlaps it
     retries: 2
     resources:

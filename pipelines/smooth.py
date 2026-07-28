@@ -244,5 +244,28 @@ def _check():
     print("smooth.py self-check ok")
 
 
+def prepare_window(stem, out_tif):
+    """The forks' shared read surface: the stem's buffered window materialized once,
+    smoothed, and deep-coarsened. Consumers must treat it as read-only — contour and
+    soundings clamp a private copy; depare reads it directly."""
+    import mosaic
+    child_z = int(stem.split("-")[3])
+    os.makedirs(os.path.dirname(out_tif), exist_ok=True)
+    tmp = out_tif + ".tmp.tif"  # keep the extension: gdal_translate infers the driver from it
+    mosaic.window_dem(stem, tmp)
+    if not os.environ.get("SKIP_SMOOTH"):
+        smooth_tiff(tmp)
+    if child_z >= DEEP_COARSEN_MIN_CHILD_Z:
+        deep_coarsen(tmp)
+    with open(tmp, "rb") as f:
+        os.fsync(f.fileno())  # teardown is a power cut; a rename must not outlive its data
+    os.replace(tmp, out_tif)
+    print(f"fork window {stem}: {out_tif}")
+
+
 if __name__ == "__main__":
-    _check()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "prepare-window":
+        prepare_window(sys.argv[2], sys.argv[3])
+    else:
+        _check()
