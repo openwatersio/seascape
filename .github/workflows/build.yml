@@ -241,14 +241,18 @@ jobs:
         # copy; the sync-back step below persists them to the volume.
         run: |
           src=/mnt/seascape-store/store/landmask
-          if [ -d "$src" ] && ls "$src"/*.fgb >/dev/null 2>&1; then
-            mkdir -p /var/tmp/seascape-landmask
-            cp -p "$src"/* /var/tmp/seascape-landmask/
-            mount --bind /var/tmp/seascape-landmask "$src"
-            echo "landmask masks served from NVMe ($(du -sh /var/tmp/seascape-landmask | cut -f1))"
-          else
-            echo "no local masks to hot-copy"
-          fi
+          mkdir -p /var/tmp/seascape-landmask
+          # Per-FILE binds, not a directory shadow: the dir also holds the landmask rule's
+          # inputs (e.g. land-polygons-split-4326/), which must stay reachable. nsenter into
+          # PID 1's mount namespace: the runner service has its own, and a bind made there
+          # is invisible to the docker daemon (and thus every container).
+          for f in "$src"/*.fgb; do
+            [ -f "$f" ] || continue
+            cp -p "$f" /var/tmp/seascape-landmask/
+            nsenter -t 1 -m mount --bind "/var/tmp/seascape-landmask/$(basename "$f")" "$f"
+            nsenter -t 1 -m mountpoint -q "$f" || { echo "bind failed for $f" >&2; exit 1; }
+            echo "serving $(basename "$f") from NVMe"
+          done
       - name: Build the mosaic (Snakemake)
         env:
           # Dispatch inputs reach the shell as env vars, never interpolated into a shell line.
@@ -376,10 +380,12 @@ jobs:
         # cp -pu persists only files the run actually rebuilt (newer mtime); a no-op else.
         run: |
           src=/mnt/seascape-store/store/landmask
-          if mountpoint -q "$src"; then
-            umount "$src"
-            cp -pu /var/tmp/seascape-landmask/* "$src"/ 2>/dev/null || true
-          fi
+          for f in "$src"/*.fgb; do
+            if nsenter -t 1 -m mountpoint -q "$f" 2>/dev/null; then
+              nsenter -t 1 -m umount "$f"
+              cp -pu "/var/tmp/seascape-landmask/$(basename "$f")" "$f" 2>/dev/null || true
+            fi
+          done
       - name: Publish build status
         if: success()
         env:
