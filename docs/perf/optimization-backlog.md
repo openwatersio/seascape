@@ -67,7 +67,15 @@ independent pmtiles was evaluated repeatedly and is NOT happening — multiple a
 is a bad consumer experience. `vector.pmtiles` stays the single served vector artifact; every
 optimization below works within that contract (shard/cache at build time, merge at publish).
 
-**Wagyu exit-106 — resolved 2026-07-23.** The regenerated fixture (Stockholm-archipelago stem FGB
+**Update 2026-07-28 — the serial chain is gone.** The bundle is now `vector_shallow` (dense
+z0..SPLIT-1) + one `vector_cell` per covering root cell + `vector_join`, all Snakemake rules:
+cells build as their stems finish (observed overlapping the fork band mid-run), cache in the
+store, and only dirty cells rebuild on refresh — the "incremental bundling" end state below is
+structurally in place. Measured: the old joint run took 14.5 h single-threaded; a dense NYC
+harbor cell now builds in 2 m 47 s. Attack items 1–2 below are superseded; the remaining
+stitch-cost work is the `pmtiles merge` follow-up (parked, see below).
+
+**Wagyu exit-106 (shared-borders variant) — resolved 2026-07-23.** The regenerated fixture (Stockholm-archipelago stem FGB
    `store/depare/6-35-18-10.fgb`, 265 MB, 124k polygons) crashes stock tippecanoe 2.79 AND
    felt/tippecanoe main (v2.80.0 — the box's build) with `--detect-shared-borders`: a Wagyu
    hole-placement bug ([mapbox/tippecanoe#761](https://github.com/mapbox/tippecanoe/issues/761),
@@ -81,6 +89,13 @@ optimization below works within that contract (shard/cache at build time, merge 
    large connected polygon mass, so spatial bisection stalls), so the assert is the regression
    guard rather than a CI fixture; the full fixture (kept locally / R2 if ever wanted) is a
    positive gate since it now builds clean.
+
+**Wagyu exit-106 (coalesce variant) — patched 2026-07-28.** `--coalesce-smallest-as-needed`
+drop passes stack identical tiny-polygon placeholder squares into multipolygons whose holes
+wagyu cannot parent, and the vendored wagyu aborts the whole run. Cell 8-34-83 reproduced
+deterministically; `patches/wagyu-drop-unplaceable-hole.patch` drops the orphan hole instead
+(the fix the tippecanoe maintainer endorsed in mapbox/tippecanoe#761 but never implemented).
+Only tiles that previously crashed change bytes. Upstream PR to felt/tippecanoe pending.
 
 Attack in this order:
 
@@ -154,13 +169,17 @@ One real pre-existing seam mismatch (NOT caused by this work) is deferred:
   distinct mechanism — grazing coverage vs. per-window smoothing — and only the depare side is
   fixed; contours keep `ON_EDGE_PIXELS` because a line crosses the seam at a point.)
 
-### Reintroduce windowed contours
+### Reintroduce windowed contours — resolved 2026-07-28, different mechanism
 
-Now unblocked: the engine lane has no contour cache keys to preserve (plain names, force-only
-code), which was the sole reason the working implementation was reverted. It reduced the dense
-contour subprocess from ~14 GiB to ~1 GiB per block at ~1.4× CPU; the implementation is in git
-history (`6e5fb55`, reverted by `48e4d77`). Success: bounded memory on the densest contour tile, no
-seam gaps or fragment kinks. Effort: small. Risk: medium (seam verification).
+The memory problem moved and was fixed where it actually lived: the peak was never the
+gdal_contour subprocess (scanline-streamed) but the post-extraction GeoDataFrame phase holding
+three full copies of the window's contour set (72 GB measured on z15 UK stems). The refine
+(enrich → Chaikin → ring-drop → clip) now streams in 100k-feature batches to an appended
+GeoJSONSeq; measured 9.9 GB / 6–9 min at z15 (was 72 GB / 24 min). The shared `fork_window`
+rule additionally builds each stem's smoothed+coarsened window once instead of three times
+(deep_coarsen strip-streamed, byte-identical by differential test; in-process GDAL block cache
+capped — its 5%-of-RAM default was the last hidden multi-GB term). The `6e5fb55` block-windowed
+gdal_contour idea is moot.
 
 ### Publish overlap and large-object upload tuning
 
@@ -182,7 +201,24 @@ seam gaps or fragment kinks. Effort: small. Risk: medium (seam verification).
 rows are already fresh — no cross-run stale rows to filter. Per-job kernel caps (cgroup /
 `docker run --memory` per job) land once reservations are benchmark-backed — a cap equal to the
 reservation turns a wrong estimate into one retried job instead of a box OOM. Price reservations
-from the densest measured tile, never an average.
+from the densest measured tile, never an average — and reserve exactly the measured ceiling, no
+pad: fork footprints are window-geometry-deterministic (p50 == max within a class), and
+`attempt` escalation plus the box swapfile already cover the tail. As of 2026-07-28 every fork
+class (window/contour/soundings/depare × child_z) is measured under the streamed
+implementations; two re-fits are owed from accumulating samples: depare z15 (24 reserved vs
+11 measured) and the coarse depare classes (z8–z12 entries predate bucket streaming).
+
+Two hard-won invariants to keep enforcing:
+
+- **GDAL writers: `BIGTIFF=IF_SAFER` on every writer whose output scales with tile size.**
+  `IF_NEEDED` never engages on compressed output; five separate writers (reproject translate,
+  merge, merged→COG, smooth rewrite + clamp interaction, rasterized masks) each hit the 4 GB
+  classic-TIFF wall at z15, one dispatch at a time. A lint-style suite check that greps for
+  gdal/rasterio writers lacking the option would make the sixth impossible — small, not yet
+  written.
+- **Long-lived rasterio processes: cap `GDAL_CACHEMAX`.** The in-process default is 5% of box
+  RAM; any block-streamed loop silently balloons to ~file size without an `Env` cap. Audit
+  other in-process raster loops (terrain render, encode) for the same latent term.
 
 ### Split mosaic-index subphases if the benchmark says so
 
@@ -225,23 +261,20 @@ rasters) remain the escape hatch if windowing ever proves insufficient. Changes 
 overview registration, and the serving pyramid — last resort. The stage-3 CLIs already treat their
 tile id as a window id, so a finer stage-3 grid is a parameter change.
 
-## Workload shape (planet covering, 2026-07-15)
+## Workload shape (planet covering, 2026-07-28, MAX_CHILD_Z=15)
 
 Kept for reservation fitting and bbox selection (regenerate via `aggregation_covering.py`):
 
 | metric | value |
 | --- | --- |
-| tiles total | 3163 |
-| child_z histogram | z8:1079 · z9:735 · z10:758 · z11:81 · z12:151 · z13:181 · **z14:178** |
-| files/tile | max **184** · p99 86 · median 2 |
-| distinct sources/tile | max 6 · median 2 |
+| tiles total | 3286 |
+| child_z histogram | z8:1138 · z9:753 · z10:758 · z11:81 · z12:159 · z13:195 · z14:92 · **z15:110** |
 
-~84% of tiles are cheap; the heavy tail is the 178 z14 coastal macrotiles, clustered on the US
-NE/mid-Atlantic coast (S-102 + CUDEM stacks, bbox `-77.344,36.598,-70.312,42.033`; `8-128-85-14`
-is a separate dense region). Weekly raw-source refreshes dirty these same tiles — the heavy tail is
-steady-state, not a one-time cost. Densest stems by merge-input files: 8-73-99-14 (184),
-8-77-95-14 (171), 8-75-96-14 (158), 8-76-95-14 (157), 8-73-101-14 (141). Fresh per-tile peaks now
-come from the per-run `bench/mosaic/*.tsv` (the benchmark artifact) on every run.
+The former z14 tail split: S-102/CUDEM/nz_coastal stems promoted to native z15 (110 stems,
+capped by `MAX_CHILD_Z`), leaving 92 at z14. The heavy tail remains the US NE/mid-Atlantic
+coast plus the UK surf zone; weekly raw-source refreshes dirty these same tiles — the heavy
+tail is steady-state, not a one-time cost. Fresh per-tile peaks come from the per-run
+`bench/*/**.tsv` benchmark artifact on every run.
 
 **Follow-up: replace tile-join with `pmtiles merge` (parked 2026-07-27).** The vector join's
 tile-join must MERGE boundary tiles (adjacent cells co-emit their shared fringe through
@@ -284,9 +317,10 @@ merge outputs (the mosaic_tile content-hash guard above).
    one command, no pipeline change.
 3. **Trial `--drop-by-attribute-as-needed`** (felt, Mar 2026) on the vector cell runs: drop by
    depth-band importance instead of geometry density, env-gated, gate-verified before adoption.
-4. **Split staleness keys**: per-stage toolchain fingerprints (a tippecanoe bump must not
-   invalidate mosaic tiles — utils.toolchain() currently would), scope MASKS to intersecting
-   tiles. Same trigger-hygiene family as the scope-independent covering fix.
+4. **Split staleness keys — mostly landed 2026-07-27**: `utils.toolchain()` is deleted; tools
+   are not rule inputs, and deliberate Dockerfile changes bump the affected rules' `version`
+   params (mapping documented in the Dockerfile stanzas). Remaining: scope MASKS to
+   intersecting tiles.
 5. **Serial-tail box right-sizing**: the vector phase measured 6–9 GiB at 1–6 cores — a CX53
    (€0.047/hr) instead of the ccx63 (€1.37/hr post-reprice) if the tail survives sharding.
    Measure the sharded tail first; may be moot.
@@ -298,6 +332,12 @@ merge outputs (the mosaic_tile content-hash guard above).
    pre-bias to keep charted ≤ true), pre-baked overzoom leaves (traffic-gated Worker CPU-ms cut),
    Planetiler spike on one dense cell's depare (insurance against the felt fork's bus factor),
    maplibre-contour (chart-grade smoothing/bias questions unresolved).
+
+8. **Single-pass dual-ladder gdal_contour** (noted 2026-07-28): contour runs two full-window
+   `gdal_contour` passes (metre + feet ladders); one combined-level pass with features
+   duplicated onto both `sys` tags at shared levels saves ~2–4 min per z15 stem of raster
+   scanning. Fiddly level-membership mapping; only worth it if the window band stays the
+   per-stem long pole.
 
 Ops note, not build work: apply for Cloudflare Project Alexandria credits (likely qualifies;
 removes the serving-cost question).
