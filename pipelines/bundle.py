@@ -318,7 +318,7 @@ def stage_build_publish():
     uploads, manifest_path = stage_build()
     dest = f"{_BUILD_DEST}/$SHA"
     for fp in uploads:
-        utils.run_command(f"rclone copyto {fp} {dest}/{os.path.basename(fp)} "
+        utils.run_command(f"rclone copyto --s3-chunk-size 64M {fp} {dest}/{os.path.basename(fp)} "
                           "--retries 5 --stats 30s --stats-one-line", silent=False)
     utils.run_command(f"rclone copyto {manifest_path} {dest}/manifest.json --retries 5", silent=False)
     print(f"stage-build: {len(uploads)} archive(s) + manifest.json → {dest}", flush=True)
