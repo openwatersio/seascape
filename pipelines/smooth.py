@@ -265,10 +265,13 @@ def prepare_window(stem, out_tif):
     os.makedirs(os.path.dirname(out_tif), exist_ok=True)
     tmp = out_tif + ".tmp.tif"  # keep the extension: gdal_translate infers the driver from it
     mosaic.window_dem(stem, tmp)
-    if not os.environ.get("SKIP_SMOOTH"):
-        smooth_tiff(tmp)
-    if child_z >= DEEP_COARSEN_MIN_CHILD_Z:
-        deep_coarsen(tmp)
+    # Cap the in-process GDAL block cache: its default is 5% of RAM, so the strip loops'
+    # read+dirty blocks otherwise accumulate until RSS ~= the window size.
+    with rasterio.env.Env(GDAL_CACHEMAX=256):
+        if not os.environ.get("SKIP_SMOOTH"):
+            smooth_tiff(tmp)
+        if child_z >= DEEP_COARSEN_MIN_CHILD_Z:
+            deep_coarsen(tmp)
     with open(tmp, "rb") as f:
         os.fsync(f.fileno())  # teardown is a power cut; a rename must not outlive its data
     os.replace(tmp, out_tif)
