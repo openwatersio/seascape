@@ -164,6 +164,17 @@ def vector_scratch(name):
     return os.path.join(root, f"seascape-{os.getpid()}-{name}")
 
 
+def merge_scratch(csv_path):
+    """The merge's per-stem scratch folder (reprojected per-source COGs + the merged DEM),
+    on box-local scratch — transient data never belongs on the persistent store volume,
+    where it competes with real outputs for space and Ceph bandwidth."""
+    root = os.environ.get("MERGE_SCRATCH", tempfile.gettempdir())
+    stem_tmp = os.path.basename(csv_path).replace("-aggregation.csv", "-tmp")
+    path = os.path.join(root, "seascape-merge", stem_tmp)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return path
+
+
 def run_command(command, silent=True, env=None):
     """Run a shell command and return (stdout, stderr). Raise on non-zero exit — don't
     silently swallow failures."""

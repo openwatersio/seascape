@@ -150,16 +150,14 @@ def tile(filepath):
     this tile back through windowed VRTs). The tmp folder is cleared first so a retried job never
     reuses a half-written reproject."""
     stem = _stem(filepath)
-    tmp_folder = filepath.replace("-aggregation.csv", "-tmp")
+    tmp_folder = utils.merge_scratch(filepath)
     shutil.rmtree(tmp_folder, ignore_errors=True)
     aggregation_reproject.reproject(filepath)
     aggregation_merge.merge(filepath)
     tmp_cog = _translate(filepath, tmp_folder)
     os.makedirs(tiles_dir(), exist_ok=True)
     out = tile_artifact(stem)
-    with open(tmp_cog, "rb") as f:
-        os.fsync(f.fileno())  # rename is metadata-only; a hard box teardown must not strand garbage
-    os.replace(tmp_cog, out)       # atomic: the stable name only ever appears complete
+    utils.publish(tmp_cog, out)  # scratch (NVMe) and the store volume are separate filesystems
     if not os.environ.get("KEEP_TMP"):  # KEEP_TMP=1 preserves the merged DEM for debugging
         shutil.rmtree(tmp_folder)
     print(f"mosaic tile {stem}: {out}", flush=True)

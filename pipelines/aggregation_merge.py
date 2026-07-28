@@ -26,7 +26,7 @@ NODATA = -9999
 def merge(filepath):
     filename = filepath.split("/")[-1]
     z, x, y, child_z = (int(a) for a in filename.replace("-aggregation.csv", "").split("-"))
-    tmp_folder = filepath.replace("-aggregation.csv", "-tmp")  # beside the CSV
+    tmp_folder = utils.merge_scratch(filepath)
 
     done_filepath = f"{tmp_folder}/merge-done"
     if os.path.isfile(done_filepath):

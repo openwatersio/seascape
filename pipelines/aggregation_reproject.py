@@ -201,7 +201,7 @@ def reproject(filepath):
     aggregation_tile = mercantile.Tile(x=x, y=y, z=z)
 
     # Beside the CSV.
-    tmp_folder = filepath.replace("-aggregation.csv", "-tmp")
+    tmp_folder = utils.merge_scratch(filepath)
     utils.create_folder(tmp_folder)
     metadata_filepath = f"{tmp_folder}/reprojection.json"
     if os.path.isfile(metadata_filepath):
