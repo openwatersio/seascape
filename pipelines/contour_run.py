@@ -422,13 +422,17 @@ VECTOR_ATTRS = ["depth_m", "depth_abs_m", "sys", "depth_ft", "depth_fm",
                 "drval1", "drval2", "rank"]
 VECTOR_TYPES = ["depth_abs_m:int", "depth_ft:int", "depth_fm:int", "rank:int"]
 DEPARE_MINZOOM = 6  # depare's zoom floor, now per-feature (was depare_run's run-level -Z)
-# Down-zoom partition-gap tolerance: a parent tile quantizes geometry to the same 4096-cell grid over
-# 4× the area of each child, so band-union areas differ by a few percent (measured ≤2.7% either way)
-# purely from that. The gap check is one-sided (only a SHRINK — children covering less than the parent
-# — is a hole) with margin over that noise; a gross partition hole (a whole band missing from the
-# children, e.g. the 50% test case) clears it easily, while sub-band holes are caught by the id
-# completeness check. Not the 2% overlap tolerance, which is same-tile (no cross-zoom quantization).
-DEPARE_GAP_TOL = 0.10
+# Geometric self-check thresholds, calibrated on the NY-harbor archive (2026-07-29). Decoded tiles
+# include their buffer ring, and a parent's ring spans 2× its children's in shared-map units, so
+# band content living only in the parent's ring (the next-deeper band just past the tile edge)
+# reads as a huge down-zoom "gap"; parent and child zooms also quantize/simplify the same edge
+# differently. So every comparison clips to the unbuffered tile extent, erodes past the wobble,
+# and flags residual BLOBS rather than area ratios. Measured noise floor after clip+erode:
+# gap 8.1k child-px², overlap 103 px²; a real defect (a displaced or lost band polygon — the 50%
+# negative fixture is ~33M px²) sits orders of magnitude above these.
+DEPARE_ERODE_PX = 2.0          # erosion before differencing, in child-tile grid units
+DEPARE_GAP_MAX_PX2 = 32_768    # residual blob ≥ ~181×181 child px (0.2% of a tile) is a hole
+DEPARE_OVERLAP_MAX_PX2 = 512   # eroded pairwise band intersection ≥ this is a displacement
 
 # Feature ids must be globally unique across the shallow run AND every per-cell run (each run is a
 # separate process, so no shared counter): the join concatenates all archives, and a collision would
@@ -805,10 +809,13 @@ def _vector_selfcheck(vec, maxz, expected=None, per_zoom=6):
     that only coalesces at a low zoom still appears at its full-detail native leaf; one present
     nowhere is a real drop). Plus the sampled complementary checks: no depare below its z6 floor, no
     contour below its tier minzoom, soundings present, depare m-bands pairwise disjoint (coalesce
-    displaced nothing), and the partition conserved down-zoom (a parent m-band union ≈ its 4
-    children's — a shrink means a gap opened deeper; whole missing polygons are already caught above)."""
+    displaced nothing), and the partition conserved down-zoom (no interior blob of a parent's m-band
+    union uncovered by its 4 children — a hole opened deeper; whole missing polygons are already
+    caught above). Geometric comparisons clip to the unbuffered tile extent and erode before
+    differencing — see the DEPARE_*_PX2 calibration note."""
+    import mercantile
     from pmtiles.reader import Reader, MmapSource, all_tiles
-    from shapely.geometry import shape
+    from shapely.geometry import shape, box
     from shapely.ops import unary_union
     byz = collections.defaultdict(list)
     with open(vec, "r+b") as f:
@@ -828,12 +835,22 @@ def _vector_selfcheck(vec, maxz, expected=None, per_zoom=6):
                 problems.append(f"{layer}: {len(missing)} of {len(idmap)} input features dropped "
                                 f"(present in no tile) — e.g. {sample}")
 
-    def mband_area(feats):
+    def tile_box(z, x, y):
+        b = mercantile.bounds(x, y, z)
+        return box(b.west, b.south, b.east, b.north)
+
+    def mband_union(feats, clip):
         geoms = [shape(f["geometry"]).buffer(0) for f in _mbands(feats)]
-        return unary_union(geoms).area if geoms else 0.0
+        return unary_union(geoms).intersection(clip) if geoms else None
+
+    def blob_px2(geom, px):
+        """Largest single part of `geom`, in px² of the given grid unit — blobs, not ribbons."""
+        parts = getattr(geom, "geoms", [geom])
+        return max((p.area for p in parts if not p.is_empty), default=0.0) / px ** 2
 
     for z in sorted(byz):
         ts = byz[z]
+        px = 360.0 / 2 ** z / 4096  # one tile grid unit in degrees (conservative on finer leaves)
         for x, y in ts[:: max(1, len(ts) // per_zoom)]:
             L = _decode_tile(vec, z, x, y)
             n_soundings += len(L.get("soundings", []))
@@ -848,24 +865,33 @@ def _vector_selfcheck(vec, maxz, expected=None, per_zoom=6):
                     break
             mbands = _mbands(L.get("depare", []))
             if mbands:
-                geoms = [shape(f["geometry"]).buffer(0) for f in mbands]
-                asum, uni = sum(g.area for g in geoms), unary_union(geoms).area
-                # 4%: adjacent-band edge wobble from low-zoom coalesce sums to 2.69% on the
-                # densest measured tile (NY harbor z6, worst single pair 1.10%, no non-adjacent
-                # displacement); gross displacement (the 50% negative test) stays far above.
-                if uni and (asum - uni) / uni >= 0.04:
-                    problems.append(f"z{z} {x}/{y}: depare m-bands overlap {(asum - uni) / uni:.2%} "
-                                    f"(coalesce displaced a partition)")
-                # partition conserved into z+1: a present-children parent's band union ≈ its 4
-                # children's combined union; a one-sided SHRINK (children covering less) is a gap that
-                # opened at the deeper zoom (a grow is just finer-grid quantization, not a hole).
+                clip = tile_box(z, x, y)
+                eroded = [g for g in (shape(f["geometry"]).buffer(0).intersection(clip)
+                                      .buffer(-1.5 * px) for f in mbands) if not g.is_empty]
+                for i in range(len(eroded)):
+                    for j in range(i + 1, len(eroded)):
+                        if not eroded[i].intersects(eroded[j]):
+                            continue
+                        ov = blob_px2(eroded[i].intersection(eroded[j]), px)
+                        if ov >= DEPARE_OVERLAP_MAX_PX2:
+                            problems.append(f"z{z} {x}/{y}: depare m-bands overlap in a {ov:.0f} px² "
+                                            f"blob (coalesce displaced a partition)")
+                # partition conserved into z+1: every interior blob of the parent's band union must
+                # be covered by its 4 children's — an uncovered blob is a hole (gap) opened deeper.
                 kids = [(2 * x, 2 * y), (2 * x + 1, 2 * y), (2 * x, 2 * y + 1), (2 * x + 1, 2 * y + 1)]
-                if z + 1 <= maxz and uni and all(k in present.get(z + 1, ()) for k in kids):
-                    child = sum(mband_area(_decode_tile(vec, z + 1, kx, ky).get("depare", []))
-                                for kx, ky in kids)
-                    if (uni - child) / uni >= DEPARE_GAP_TOL:
-                        problems.append(f"z{z} {x}/{y}: depare band area {uni:.3g} shrank to children "
-                                        f"{child:.3g} ({(uni - child) / uni:.2%} gap opened deeper)")
+                if z + 1 <= maxz and all(k in present.get(z + 1, ()) for k in kids):
+                    childpx = px / 2
+                    pu = mband_union(mbands, clip)
+                    resid = pu.buffer(-DEPARE_ERODE_PX * childpx) if pu is not None else None
+                    if resid is not None and not resid.is_empty:
+                        ku = [g for g in (mband_union(_decode_tile(vec, z + 1, kx, ky).get("depare", []),
+                                                      clip) for kx, ky in kids) if g is not None]
+                        if ku:
+                            resid = resid.difference(unary_union(ku))
+                        hole = blob_px2(resid, childpx)
+                        if hole >= DEPARE_GAP_MAX_PX2:
+                            problems.append(f"z{z} {x}/{y}: depare band coverage lost in a "
+                                            f"{hole:.0f} child-px² blob (gap opened deeper)")
     if n_soundings == 0:
         problems.append("no soundings in any sampled tile (the layer vanished)")
     if problems:
