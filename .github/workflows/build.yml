@@ -369,10 +369,11 @@ jobs:
           # bbox run stages under build/<sha>-bbox (see SHA above), so the regional archives
           # are previewable but can never be promoted by release.yml.
           targets=(bundles publish_mosaic stage_build)
-          # --prioritize propagates UPSTREAM (rule priority does not): the index gates every
-          # GTI-reading terrain render, so its merge chain must outrank the vector band.
+          # No --prioritize: it flattens the index's whole merge chain to one priority, which
+          # lets the scheduler pack small merges ahead of the heavy ones. build.smk's explicit
+          # priority bands (index > merges > vector > terrain) order the chain instead.
           ./docker.sh snakemake "${targets[@]}" "${extra[@]}" "${force[@]}" \
-            --keep-going --rerun-incomplete --prioritize mosaic_index \
+            --keep-going --rerun-incomplete \
             --cores "$cores" --resources mem_gb="$budget_gb" disk_mb="$disk_budget_mb" \
             --config workdir=/app/state tmp=/app/tmp 2>&1 | tee "$buildlog"
       # Close the `build` status to success so it never lingers at pending, pointing at the

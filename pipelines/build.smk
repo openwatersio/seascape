@@ -185,16 +185,23 @@ def tile_priority(wc, input=None, attempt=None):
     return _ORDER[key][wc.stem]
 
 
-# The vector band: contour/soundings/depare tiles (and the vector bundle they feed) outrank
-# every terrain render, so the vector layers drain first and the bundle's low-parallelism
-# tippecanoe phases overlap the terrain fleet instead of running on an idle box after it. Set on
-# the vector tile rules directly — rule priorities do NOT propagate upstream (snakemake
-# dag.update_priority elevates dependency chains only for --prioritize targets), so a
-# high-priority bundle alone reorders nothing. An order-of-magnitude band above the stem range
-# (same idiom as the Snakefile's mask/registration bands) so no stem weight can cross it; the
-# per-stem interleave still orders jobs within the band, and the mosaic merges keep their own
-# interleave untouched.
+# Priority bands, highest first: the mosaic index and the merges it gates, then the vector
+# layers, then terrain. Each band sits an order of magnitude above the per-stem interleave
+# range so no stem's rank can cross a band, and the interleave still orders jobs WITHIN a
+# band. Every rule carries its band explicitly because rule priority does NOT propagate
+# upstream (snakemake's dag.update_priority elevates dependency chains only for --prioritize
+# targets) — and `--prioritize mosaic_index`, the alternative, is actively harmful: it
+# flattens the whole merge chain to ONE priority, and the scheduler then maximizes the sum of
+# priorities admitted under the memory budget, so swarms of small coarse merges pack ahead of
+# the few 9 GB z15 merges. Measured (run 30417069133): the last z15 merge landed 2.5 h in,
+# its fork chain trailed behind it, and the build ended with a ~2.5 h low-load z15 tail.
+INDEX_BAND = 3_000_000
+MOSAIC_BAND = 2_000_000
 VECTOR_BAND = 1_000_000
+
+
+def mosaic_tile_priority(wc, input=None, attempt=None):
+    return MOSAIC_BAND + tile_priority(wc, input, attempt)
 
 
 def vector_tile_priority(wc, input=None, attempt=None):
@@ -213,7 +220,7 @@ rule mosaic_tile:
         version=1, # increment to force a rebuild
         sources=lambda wc: source_props(wc.stem),
         merge=MERGE_CFG,
-    priority: tile_priority  # interleaved heavy-first: evens the memory load over the build
+    priority: mosaic_tile_priority  # mosaic band, interleaved heavy-first within it
     retries: 2
     resources:
         mem_gb=_fork_gb(MOSAIC_GB, 3),
@@ -242,6 +249,7 @@ rule mosaic_index:
         index="store/mosaic/index/covering.parquet",
         planet="store/mosaic/planet-z8.tif",
         gti="store/mosaic/mosaic.gti",
+    priority: INDEX_BAND  # it gates every GTI-reading terrain render: run the moment it is ready
     benchmark:
         f"{TMP}/bench/mosaic-index.tsv"
     log:

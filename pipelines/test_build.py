@@ -47,6 +47,21 @@ def job_counts(out):
     return counts
 
 
+def job_priorities(out):
+    """Snakemake's dry-run job blocks -> {rule: priority}. Each block names its rule then
+    (for rules that set one) a `priority: N` line before the next rule block starts."""
+    prios, rule = {}, None
+    for line in out.splitlines():
+        m = re.match(r"^\s*(?:local)?(?:rule|checkpoint)\s+([a-z_]+):", line)
+        if m:
+            rule = m.group(1)
+            continue
+        m = re.match(r"^\s*priority:\s*(\S+)\s*$", line)
+        if m and rule:
+            prios[rule] = m.group(1)
+    return prios
+
+
 def store_tree(store):
     out = {}
     for root, _dirs, files in os.walk(store):
@@ -122,6 +137,16 @@ def main():
         assert counts.get("mosaic_tile") == 2, f"expected 2 mosaic_tile jobs: {counts}\n{p.stdout}"
         assert counts.get("mosaic_index") == 1, f"expected 1 mosaic_index job: {counts}"
         assert counts.get("cover", 0) == 0, f"a warm covering must NOT reschedule cover: {counts}"
+
+        # Scheduling bands: the index outranks the merges it gates, and the merges outrank
+        # the vector band (build.smk INDEX_BAND/MOSAIC_BAND/VECTOR_BAND). A numeric priority
+        # per rule is also the guard against `--prioritize`, which reports "highest" for a
+        # whole dependency chain and destroys the within-band heavy-first interleave.
+        prios = job_priorities(p.stdout)
+        assert prios.get("mosaic_index", "").isdigit() and prios.get("mosaic_tile", "").isdigit(), \
+            f"merge/index priorities must be numeric, not flattened by --prioritize: {prios}"
+        assert int(prios["mosaic_index"]) > int(prios["mosaic_tile"]) > 1_000_000, \
+            f"bands must be index > merges > vector(1e6): {prios}"
         for stage1 in ("enumerate", "fetch_item", "prep_source", "register", "catalog_item",
                        "fetch_catalog", "landmask", "watermask", "coverage"):
             assert counts.get(stage1, 0) == 0, f"stage-1 rule {stage1} scheduled: {counts}"
