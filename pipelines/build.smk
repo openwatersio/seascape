@@ -401,7 +401,9 @@ rule depare_tile:
 
 
 # Weight like the merge: a native z14 window is the same array size; overview stems are tiny.
-TERRAIN_FACTOR = 2.0  # native renders unproven at scale (corpus n=1); keep the wide margin
+# 1.3 = 20% over the measured z15 ceiling (n=4 Solent renders, 18.3-18.7 GB, a 2% spread —
+# pixel-count-dominated, weight()'s 17.3 GB base estimate + 8%); `attempt` covers the tail.
+TERRAIN_FACTOR = 1.3
 
 
 def terrain_inputs(wc):
