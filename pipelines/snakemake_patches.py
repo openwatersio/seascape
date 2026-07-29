@@ -102,7 +102,11 @@ def apply():
 
     async def missing_output(self, requested):
         bench_file = self.benchmark
-        if bench_file is not None:
+        # Only when the rule has real outputs: an output-LESS benchmarked rule (publish_mosaic,
+        # stage_build) has the benchmark as its sole product, and its absence is what fires the
+        # rule each run — filtering it there would silently skip publishing (caught by
+        # test_build's stage_build assertion).
+        if bench_file is not None and self.output:
             requested = [f for f in requested if f != bench_file]
         async for f in _orig_missing_output(self, requested):
             yield f
