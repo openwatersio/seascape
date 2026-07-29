@@ -18,8 +18,8 @@ PY = f"uv run --project {SCRIPTS.parent} python {SCRIPTS}"
 # store/ paths are cwd-relative; the box relocates with --config workdir=<volume>
 workdir: config.get("workdir", str(SCRIPTS))
 
-# Per-run scratch for logs/benchmarks; defaults to ephemeral tmp/ (local) but the box points
-# it at local disk (tmp=/app/tmp) so nothing crosses the network volume or persists.
+# Per-run scratch for logs; defaults to ephemeral tmp/ (local) but the box points it at local
+# disk (tmp=/app/tmp) so nothing crosses the network volume or persists.
 TMP = config.get("tmp", "tmp")
 
 
