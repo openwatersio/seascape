@@ -201,9 +201,16 @@ def partitions(dem, levels, raw_fgb, timeout=0):
     Callers select depth bands (amax <= 0), the [0, DRYING_CAP] drying bucket
     (0 < amax <= cap), and drop land (amax above the shallowest positive level)."""
     fl = " ".join(str(l) for l in levels)
-    _run_bounded(
-        f"gdal_contour -q -p -amin amin -amax amax -fl {fl} -f FlatGeobuf {dem} {raw_fgb}",
-        "gdal_contour -p", timeout)
+    # DEPARE_CONTOUR_BIN=contour-p swaps in the patched-appender tool (Dockerfile;
+    # patches/gdal-polygon-ring-appender-quadratic.patch): exact-geometry-equivalent to
+    # gdal_contour -p but near-linear where marsh-coast ring counts make stock quadratic
+    # (60-90 min stems -> minutes). Equivalence proven, so flipping the env forces nothing.
+    bin_ = os.environ.get("DEPARE_CONTOUR_BIN", "gdal_contour")
+    if bin_ == "gdal_contour":
+        cmd = f"gdal_contour -q -p -amin amin -amax amax -fl {fl} -f FlatGeobuf {dem} {raw_fgb}"
+    else:
+        cmd = f"{bin_} {dem} {raw_fgb} {fl}"
+    _run_bounded(cmd, f"{bin_} -p", timeout)
     _mark(f"gdal_contour[{os.path.basename(raw_fgb)}]")
     return raw_fgb
 

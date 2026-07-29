@@ -48,8 +48,29 @@ RUN git init -q /tmp/tippecanoe \
   && cd /tmp/tippecanoe \
   && git fetch -q --depth 1 https://github.com/felt/tippecanoe.git 0badb242bea6f77c8e388898868801f3f3a9088b \
   && git checkout -q FETCH_HEAD \
-  && git apply /tmp/patches/*.patch \
-  && make -j"$(nproc)" && make install && rm -rf /tmp/tippecanoe /tmp/patches
+  && git apply /tmp/patches/wagyu-drop-unplaceable-hole.patch \
+  && make -j"$(nproc)" && make install && rm -rf /tmp/tippecanoe
+
+# contour-p — the DEPARE partition pass's polygon-contour tool. GDAL's
+# PolygonRingAppender is quadratic in disjoint ring count (OSGeo/gdal#1750, #2241;
+# unfixed post-#2908), so marsh-coast z15 stems spent 60-90 min per gdal_contour -p
+# ladder. The patch (ring bboxes + spatial grid + point-in-polygon index) is
+# exact-geometry-equivalent — three-way A/B vs gdal_contour 3.13.1 on synthetic marsh
+# and a real z14 window, 2026-07-29 — and near-linear (85x on the marsh case).
+# Headers are fetched at the BASE IMAGE's GDAL commit; a base-image bump must re-pin
+# GDAL_MS_COMMIT and re-verify the patch applies. depare_run selects the tool via
+# DEPARE_CONTOUR_BIN (default stays gdal_contour until the box validation flips it).
+ARG GDAL_MS_COMMIT=b2e6057d1d0f2cb4c11bfdf79ab1a61def0ce9ca
+COPY tools/contour-p /tmp/contour-p
+RUN cd /tmp/contour-p && mkdir ms \
+  && for f in point.h square.h utility.h level_generator.h segment_merger.h \
+              contour_generator.h polygon_ring_appender.h; do \
+       curl -fsSL "https://raw.githubusercontent.com/OSGeo/gdal/${GDAL_MS_COMMIT}/alg/marching_squares/$f" -o "ms/$f" || exit 1; \
+     done \
+  && git apply --directory=ms -p3 /tmp/patches/gdal-polygon-ring-appender-quadratic.patch \
+  && g++ -O2 -std=c++17 -I. $(gdal-config --cflags) contour-p.cpp -o /usr/local/bin/contour-p $(gdal-config --libs) \
+  && contour-p 2>&1 | grep -q usage \
+  && rm -rf /tmp/contour-p /tmp/patches
 
 # just (task runner) + uv (Python env manager) — the pipeline's two entrypoints.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh \
