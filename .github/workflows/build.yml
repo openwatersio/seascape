@@ -402,18 +402,15 @@ jobs:
             "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
             -d "{\"state\":\"success\",\"context\":\"build\",\"description\":\"$desc\",\"target_url\":\"$url\"}" \
             >/dev/null
-      # Per-job wall/CPU/max-RSS from the benchmark: directives, plus per-job stderr logs.
-      # Benchmarks live on the VOLUME (snakemake counts them among a job's products, so a
-      # scratch-resident bench file re-runs current jobs on every fresh box); the artifact is
-      # therefore cumulative across runs — filter by mtime when analyzing one run. Logs stay
-      # in box scratch.
+      # Per-job wall/CPU/max-RSS from the benchmark: directives, plus per-job stderr logs —
+      # both live in the box's local-disk scratch (TMP), the durable home is this artifact.
       - name: Upload snakemake benchmarks + logs
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: snakemake-bench-${{ github.run_id }}
           path: |
-            /mnt/seascape-store/store/bench/
+            /var/tmp/seascape-tmp/bench/
             /var/tmp/seascape-tmp/logs/
           if-no-files-found: ignore
           retention-days: 90

@@ -220,9 +220,7 @@ rule mosaic_tile:
         # real scratch: the -tmp folder of per-source reprojected tiffs, ~tile-sized
         disk_mb=lambda wc: utils.weight(wc.stem, factor=MERGE_FACTOR) * 1024,
     benchmark:
-        # store/bench (all rules), never {TMP}: snakemake counts the benchmark among a job's
-        # products, so a scratch-resident bench re-runs an otherwise-current job on every fresh box.
-        f"store/bench/mosaic/{{stem}}.tsv"
+        f"{TMP}/bench/mosaic/{{stem}}.tsv"
     log:
         f"{TMP}/logs/mosaic/{{stem}}.log"
     shell:
@@ -245,7 +243,7 @@ rule mosaic_index:
         planet="store/mosaic/planet-z8.tif",
         gti="store/mosaic/mosaic.gti",
     benchmark:
-        f"store/bench/mosaic-index.tsv"
+        f"{TMP}/bench/mosaic-index.tsv"
     log:
         f"{TMP}/logs/mosaic-index.log"
     shell:
@@ -267,7 +265,7 @@ rule publish_mosaic:
     input:
         rules.mosaic_index.output
     benchmark:
-        f"store/bench/mosaic-publish.tsv"
+        f"{TMP}/bench/mosaic-publish.tsv"
     log:
         f"{TMP}/logs/mosaic-publish.log"
     shell:
@@ -325,7 +323,7 @@ rule fork_window:
     resources:
         mem_gb=4
     benchmark:
-        f"store/bench/window/{{stem}}.tsv"
+        f"{TMP}/bench/window/{{stem}}.tsv"
     log:
         f"{TMP}/logs/window/{{stem}}.log"
     shell:
@@ -348,7 +346,7 @@ rule contour_tile:
     resources:
         mem_gb=_fork_gb(CONTOUR_GB, 3)
     benchmark:
-        f"store/bench/contour/{{stem}}.tsv"
+        f"{TMP}/bench/contour/{{stem}}.tsv"
     log:
         f"{TMP}/logs/contour/{{stem}}.log"
     shell:
@@ -369,7 +367,7 @@ rule soundings_tile:
     resources:
         mem_gb=_fork_gb(SOUND_GB, 2)
     benchmark:
-        f"store/bench/soundings/{{stem}}.tsv"
+        f"{TMP}/bench/soundings/{{stem}}.tsv"
     log:
         f"{TMP}/logs/soundings/{{stem}}.log"
     shell:
@@ -393,7 +391,7 @@ rule depare_tile:
     resources:
         mem_gb=_fork_gb(DEPARE_GB, 3)
     benchmark:
-        f"store/bench/depare/{{stem}}.tsv"
+        f"{TMP}/bench/depare/{{stem}}.tsv"
     log:
         f"{TMP}/logs/depare/{{stem}}.log"
     shell:
@@ -428,7 +426,7 @@ rule terrain_render:
         mem_gb=lambda wc, attempt: utils.weight(wc.stem, factor=TERRAIN_FACTOR) * attempt,
         disk_mb=lambda wc: utils.weight(wc.stem, factor=TERRAIN_FACTOR) * 1024,
     benchmark:
-        f"store/bench/terrain/{{stem}}.tsv"
+        f"{TMP}/bench/terrain/{{stem}}.tsv"
     log:
         f"{TMP}/logs/terrain/{{stem}}.log"
     shell:
@@ -500,7 +498,7 @@ rule vector_shallow:
     params:
         bbox=os.environ.get("BBOX", ""),  # scope stamp — see mosaic_index
     benchmark:
-        f"store/bench/vector-shallow.tsv"
+        f"{TMP}/bench/vector-shallow.tsv"
     log:
         f"{TMP}/logs/vector-shallow.log"
     shell:
@@ -524,7 +522,7 @@ rule vector_cell:
     params:
         bbox=os.environ.get("BBOX", ""),  # scope stamp — see mosaic_index
     benchmark:
-        f"store/bench/vector-cell-{{cell}}.tsv"
+        f"{TMP}/bench/vector-cell-{{cell}}.tsv"
     log:
         f"{TMP}/logs/vector-cell-{{cell}}.log"
     shell:
@@ -544,7 +542,7 @@ rule vector_join:
     params:
         bbox=os.environ.get("BBOX", ""),  # scope stamp — see mosaic_index
     benchmark:
-        f"store/bench/vector-join.tsv"
+        f"{TMP}/bench/vector-join.tsv"
     log:
         f"{TMP}/logs/vector-join.log"
     shell:
@@ -564,7 +562,7 @@ rule terrain_planet_bundle:
     params:
         bbox=os.environ.get("BBOX", ""),  # scope stamp — see mosaic_index
     benchmark:
-        f"store/bench/planet-bundle.tsv"
+        f"{TMP}/bench/planet-bundle.tsv"
     log:
         f"{TMP}/logs/planet-bundle.log"
     shell:
@@ -579,7 +577,7 @@ rule overlay_bundle:
     params:
         bbox=os.environ.get("BBOX", ""),  # scope stamp — see mosaic_index
     benchmark:
-        f"store/bench/overlay-{{cell}}.tsv"
+        f"{TMP}/bench/overlay-{{cell}}.tsv"
     log:
         f"{TMP}/logs/overlay-{{cell}}.log"
     shell:
@@ -611,7 +609,7 @@ rule stage_build:
     input:
         bundle_inputs
     benchmark:
-        f"store/bench/stage-build.tsv"
+        f"{TMP}/bench/stage-build.tsv"
     log:
         f"{TMP}/logs/stage-build.log"
     shell:
