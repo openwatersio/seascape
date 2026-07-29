@@ -333,14 +333,13 @@ merge outputs (the mosaic_tile content-hash guard above).
    Planetiler spike on one dense cell's depare (insurance against the felt fork's bus factor),
    maplibre-contour (chart-grade smoothing/bias questions unresolved).
 
-8. **fork_window outputs → NVMe scratch** (noted 2026-07-28, deliberately parked): the
-   `temp()` window artifacts live at `store/window/` on the volume — ~17 GB of Ceph
-   round-trip per z15 stem for files with zero persistence value. Moving the rule output
-   under TMP is a three-line change, BUT the fork rules' input path changes with it, and
-   "input set changed" reruns EVERY fork + cell + shallow + join (~half a day of box for
-   byte-identical outputs). Ride it along with the next change that invalidates the forks
-   anyway — never land it alone. (The read-side twin, the landmask NVMe bind-mount, landed
-   2026-07-28 with no DAG impact: identical paths + mtimes.)
+8. **fork_window outputs → NVMe scratch** (parked; mechanism settled 2026-07-29): do it as a
+   directory bind like the landmask masks — build.yml bind-mounts a box-local dir over
+   `store/window/` before the build — NOT as a path change. The bind keeps the canonical
+   path, so the DAG is untouched and it can land at any time without a rebuild; the dir dies
+   with the box, and a resumed run re-derives windows for stems whose forks hadn't finished
+   (pure derivations, ≤~38 min each). Parked because the per-run saving is small outside a
+   full fork rebuild, and each extra mount is a setup failure mode on long runs.
 9. **Single-pass dual-ladder gdal_contour** (noted 2026-07-28): contour runs two full-window
    `gdal_contour` passes (metre + feet ladders); one combined-level pass with features
    duplicated onto both `sys` tags at shared levels saves ~2–4 min per z15 stem of raster
