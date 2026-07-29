@@ -20,6 +20,30 @@ chain on an otherwise idle 48-core box. No clean cold planet number exists yet: 
 attempt reached 82% of 3,244 tiles in ~35 minutes on a ccx63 before an fd-limit crash. The
 dominant costs are spurious rebuild triggers, vector bundling, and the pathological DEPARE tail.
 
+### Marsh-coast depare: the post-contour GEOS pass is the new bottleneck
+
+`contour-p` (patched GDAL ring appender, 2026-07-29) removed the polygon-contour
+pathology; the remaining cost on marsh stems is everything downstream of it. Measured on
+Gulf-wetland z15 stems (run 30482927526, ccx33):
+
+- `contour-p` full m-ladder on `8-64-105-15`: **206 s**, emitting a **730 MB** partition
+  FGB (stock `gdal_contour -p` never finished this pass — it hit the 3600 s timeout, then
+  the 4x-coarsened rescue, then failed).
+- Whole `depare_tile`: ~3,150–3,770 s. So both ladders' contour work is ~7 min of ~63 min
+  and **~89% is the post-contour pass**: bucket reads of a 730 MB partition set, band
+  clipping, the drying algebra, the nodata differencing, and the FGB write — over geometry
+  with 40k+ parts per band (vs. NY harbor's few thousand).
+- Peak RSS 19.5 GB on `8-62-105-15` — inside the 24 GB reservation but nearly the whole
+  28 GB budget of a ccx33; it is the argument for keeping `DEPARE_GB[15]` generous until
+  this pass is bounded, and against re-fitting it from pre-fix corpora.
+
+These stems now COMPLETE (they never did before), so this is an optimization, not a
+blocker. Where to look first: the nodata differencing and drying algebra scale with band
+part count, and the 2026-07-21 fix (STRtree + subdivision + snap-rounded overlay) was
+tuned on harbor geometry, not 40k-part marsh bands. Profile with `DEPARE_TIMING=1` on the
+preserved windows (`store/profile/depare-pathology/`, plus the Gulf windows on the volume)
+before choosing a mechanism.
+
 ### Stop false planet rebuilds — trigger hygiene
 
 Run 29847332817 rebuilt the world off a metadata artifact, not data: `mosaic_index`,
