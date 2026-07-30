@@ -111,6 +111,22 @@ NODATA_SIMPLIFY_PX = float(os.environ.get("NODATA_SIMPLIFY_PX", "1"))
 # robust mode, and 1 µm moves no vertex cartographically.
 GRID = 1e-6
 
+# Preformatted so the MemoryError path in tile() need not allocate to report itself.
+_OOM_NOTE = (b"depare tile %s: MemoryError - the kernel refused an allocation "
+             b"(peak RSS %d kB). Needs a bigger box or a bounded partition pass.\n")
+
+
+def _rss_kb():
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmHWM:"):
+                    return int(line.split()[1])
+    except Exception:
+        pass
+    return -1
+
+
 class ContourTimeout(Exception):
     """A bounded gdal_contour invocation exceeded DEPARE_TIMEOUT."""
 
@@ -474,6 +490,14 @@ def tile(stem):
                   file=sys.stderr, flush=True)
             dem = _uniform_coarsen(dem, 4, f"{tmp}/dem-4x.tiff")
             res = _depare_dem(dem, tile_obj, child_z, tmp, stem, timeout=timeout)
+        except MemoryError:
+            # An allocation the kernel refused (overcommit says no when a single request
+            # exceeds free RAM+swap) — no OOM kill, and formatting a traceback at that point
+            # can itself fail, so a bare MemoryError otherwise exits 1 with an EMPTY log.
+            # Report the phase and footprint from a preallocated string: this path must not
+            # allocate. Marsh stems are the ones that get here (see the perf backlog).
+            os.write(2, _OOM_NOTE % (stem.encode(), _rss_kb()))
+            raise
         os.makedirs(os.path.dirname(out), exist_ok=True)
         if res:
             final, n = res
