@@ -37,6 +37,27 @@ Gulf-wetland z15 stems (run 30482927526, ccx33):
   28 GB budget of a ccx33; it is the argument for keeping `DEPARE_GB[15]` generous until
   this pass is bounded, and against re-fitting it from pre-fix corpora.
 
+**Reservation consequence, and the mechanism to fix it.** Fixing the contour stage MOVED
+the memory ceiling up: pre-fix these stems died in `gdal_contour -p` and never reached the
+GEOS phase, so every depare RSS number on record (mean 10.5, max 13.7, later 19.5 GB) came
+from stems that were never the expensive ones. Measured now: `8-63-105-15` peaked ~29 GB
+RSS + 3.8 GB swapped against `DEPARE_GB[15]` = 24 — a breach, and at 6-wide on a 161 GB
+budget that projects to ~198 GB against 192 GB physical. So `DEPARE_GB[15]` must go UP,
+fitted from the post-fix peak (this reverses the earlier "re-fit 24 -> ~15" note above,
+which was derived from the pre-fix corpus).
+
+Better than a bigger constant: **reserve from the window's file size.** `input.size_mb` in
+a resource callable is evaluated lazily, after the producing job runs (verified 2026-07-29
+on a scratch Snakefile: the callable saw the real size at execution; dry runs skip it), and
+a COMPRESSED window's size tracks its geometric detail — which is what drives the GEOS
+peak. Marsh coastlines compress worst and cost most. Paired data so far is too thin to fit
+(6.0 GB window -> 9.7 GB peak = 1.6x; 9.94 GB -> ~29 GB = 2.8x, i.e. superlinear), so
+`depare_run.tile` now logs the window size next to its polygon count: one planet run yields
+~110 paired z15 points, and the fit can replace the child_z table. Keep the table as a FLOOR
+so the change can never reserve less than today. The named end state is still a per-job
+kernel cap (see "Memory reservation upkeep"), which turns a wrong estimate into one retried
+job instead of a swapping box.
+
 These stems now COMPLETE (they never did before), so this is an optimization, not a
 blocker. Where to look first: the nodata differencing and drying algebra scale with band
 part count, and the 2026-07-21 fix (STRtree + subdivision + snap-rounded overlay) was

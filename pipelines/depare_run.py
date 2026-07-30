@@ -478,7 +478,11 @@ def tile(stem):
         if res:
             final, n = res
             utils.publish(final, out)  # scratch and store are separate filesystems
-            print(f"depare tile {stem}: {n} polygons")
+            # Window bytes alongside the polygon count: a COMPRESSED window's size tracks its
+            # geometric detail, which is what drives this rule's peak RSS (marsh coastlines
+            # compress worst and cost most). Pairs with the benchmark row so DEPARE_GB can be
+            # fitted against it instead of child_z alone — see the backlog.
+            print(f"depare tile {stem}: {n} polygons, window {os.path.getsize(dem) / 1e9:.2f} GB")
         else:
             open(out, "w").close()
             print(f"depare tile {stem}: empty")
