@@ -93,6 +93,33 @@ from the single-DAG migration. Everything else cascaded by mtime: `mosaic_index`
 Success: a build with no changed inputs finishes in minutes, and any planet-scale re-run is
 deliberate. Effort: small. Risk: low.
 
+### A bbox run must not add work to the next planet run
+
+Requirement, not a preference: validating on a window should cost only that window. Today it
+also taxes the next planet build. Measured on run 30506340413, dispatched right after the Gulf
+marsh bbox: **179 `terrain_render` jobs re-ran**, every one with reason *"Set of input files has
+changed since last execution"*, and the stems cluster exactly on the bbox's cells
+(`8-61-105`, `8-61-106`, `8-62-106`, `8-63-106`, `8-64-106`) plus their coarse ancestors.
+
+Mechanism: `terrain_inputs` for a cz>=8 stem is `terrain_mod.window_tiles(stem)` — the
+halo-buffered NEIGHBOURHOOD of mosaic tiles — and `window_tiles` reads the BBOX-scoped
+covering. Under a bbox, stems at the window edge see a truncated neighbour set; at planet
+scope the neighbours return, the input set differs, and every affected stem re-renders.
+
+This is also a CORRECTNESS bug, which is why the rerun is the pipeline healing itself rather
+than pure waste: those bbox-scope renders were written to the shared store with an incomplete
+halo, so keeping them would leave seams at the window edge. Any fix must preserve that
+property — either by making the input set scope-independent, or by keeping scope-truncated
+artifacts out of the shared store.
+
+Direction (unprescribed): the covering already went scope-independent per-stem
+(`store/aggregation/<stem>-aggregation.csv`); the remaining scope-dependent surface is the
+neighbourhood derivation, which could read the full on-disk covering instead of the scoped
+stem list. Same class as the trigger-hygiene item above, different trigger (input SET, not
+params or mtime). Effort: small. Risk: low — a dry-run assertion (bbox run, then planet dry
+run schedules zero terrain) is the natural gate, and `test_engine`'s scope-transition check is
+where it belongs.
+
 ### Vector bundling — the dominant cost, now fully measured
 
 Run 29847332817 measured the whole chain end-to-end on a ccx63:
