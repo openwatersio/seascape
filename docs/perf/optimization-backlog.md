@@ -37,6 +37,13 @@ Gulf-wetland z15 stems (run 30482927526, ccx33):
   28 GB budget of a ccx33; it is the argument for keeping `DEPARE_GB[15]` generous until
   this pass is bounded, and against re-fitting it from pre-fix corpora.
 
+**Simplify the geometry instead of just tolerating it** — stub plan at
+[../plans/2026-07-30-shallow-coarsening.md](../plans/2026-07-30-shallow-coarsening.md).
+Block-max coarsening of the shallow bands (bias-shallow by construction; channels survive
+pixel-exactly), mirroring `deep_coarsen` at the other end of the ladder. Approved in principle
+2026-07-30, mechanism sketched, parameters and gates NOT settled. This is the lever that makes
+marsh stems cheap; `OGR_GEOJSON_MAX_OBJ_SIZE` only stops them failing.
+
 **Reservation consequence, and the mechanism to fix it.** Fixing the contour stage MOVED
 the memory ceiling up: pre-fix these stems died in `gdal_contour -p` and never reached the
 GEOS phase, so every depare RSS number on record (mean 10.5, max 13.7, later 19.5 GB) came
