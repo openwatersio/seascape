@@ -156,6 +156,26 @@ anything: `DEPARE_GB` is a `resources:` value, priority bands are `priority:`, t
 inputs. No job re-ran with "Code has changed" and no rule re-ran on a params change except
 `cover`. The provenance design behaved as intended; the reruns are all scope and mtime.
 
+### Failed jobs must leave a readable error
+
+A rule's `2> {log}` redirect TRUNCATES when snakemake starts the retry, so a failed attempt's
+stderr is destroyed within a second of being written and the job looks like it failed in
+silence. This cost real time on 2026-07-29/30: two depare failures (`8-63-105-15`,
+`8-63-106-15`) were both read as "exit 1, empty log", and the empty log was taken as evidence
+for a memory diagnosis that the second failure then contradicted (116 GB free, `oom_kill 0`,
+and it failed in 4 minutes rather than 2.5 hours). The premise was a measurement artifact.
+
+Fixed for depare in `depare_run.tile`: any exception also appends its traceback to
+`store/depare/<stem>.err`, which retries cannot erase. **Deliberately NOT fixed by changing
+the redirect to `2>>`** — `Persistence._code(rule)` returns `rule.shellcmd`, so editing a
+rule's shell string is a CODE change and re-runs every job of that rule (3,286 depare tiles
+for one character). Verified by reading snakemake's source, after an inconclusive dry-run
+test.
+
+Owed: the same treatment for the other long rules (contour, soundings, terrain, the vector
+bundles) — same one-helper pattern, same reason. Any future change to a rule's `shell:`
+string, however cosmetic, must be treated as a full-rule rebuild.
+
 ### Vector bundling — the dominant cost, now fully measured
 
 Run 29847332817 measured the whole chain end-to-end on a ccx63:

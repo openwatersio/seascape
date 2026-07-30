@@ -116,6 +116,20 @@ _OOM_NOTE = (b"depare tile %s: MemoryError - the kernel refused an allocation "
              b"(peak RSS %d kB). Needs a bigger box or a bounded partition pass.\n")
 
 
+def _save_traceback(stem):
+    """Append the current exception to store/depare/<stem>.err — retry-proof, unlike the
+    rule's truncating `2> {log}` redirect."""
+    try:
+        import time
+        import traceback
+        os.makedirs("store/depare", exist_ok=True)
+        with open(f"store/depare/{stem}.err", "a") as fh:
+            fh.write("--- %s\n" % time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+            traceback.print_exc(file=fh)
+    except Exception:
+        pass
+
+
 def _rss_kb():
     try:
         with open("/proc/self/status") as f:
@@ -274,7 +288,14 @@ class _RowSink:
 
     def finish(self, final_fgb):
         self.flush()
-        contour_run._run(f"ogr2ogr -f FlatGeobuf -overwrite {final_fgb} {self.seq}",
+        # --config OGR_GEOJSON_MAX_OBJ_SIZE 0 disables GDAL's 200 MB per-feature ceiling in the
+        # GeoJSONSeq reader (ogrgeojsonseqdriver.cpp: the limit is only enforced while
+        # m_nMaxObjectSize > 0, and the option parses to 0). A marsh stem's depth band is one
+        # MultiPolygon of 40k+ parts and exceeds it: 8-63-105-15 and 8-63-106-15 both died here,
+        # after the full partition pass had already run. Keep the band ONE feature — splitting it
+        # would change feature counts and ids, i.e. the partition contract.
+        contour_run._run(f"ogr2ogr --config OGR_GEOJSON_MAX_OBJ_SIZE 0 "
+                         f"-f FlatGeobuf -overwrite {final_fgb} {self.seq}",
                          "ogr2ogr depare")
         os.remove(self.seq)
         return self.count
@@ -497,6 +518,15 @@ def tile(stem):
             # Report the phase and footprint from a preallocated string: this path must not
             # allocate. Marsh stems are the ones that get here (see the perf backlog).
             os.write(2, _OOM_NOTE % (stem.encode(), _rss_kb()))
+            _save_traceback(stem)
+            raise
+        except BaseException:
+            # The rule redirects stderr with `2> {log}`, which TRUNCATES when snakemake starts the
+            # retry, so a failed attempt's traceback is destroyed within a second of being written
+            # and the job looks like it failed silently. Keep a copy beside the output, where a
+            # retry cannot erase it. (Changing the redirect to `2>>` would edit the rule's
+            # shellcmd, which snakemake hashes as rule CODE — that re-runs every depare tile.)
+            _save_traceback(stem)
             raise
         os.makedirs(os.path.dirname(out), exist_ok=True)
         if res:

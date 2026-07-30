@@ -159,7 +159,10 @@ def _refine_stream(sources, out_fgb, tol, clip):
             g.to_crs(4326).to_file(seq, driver="GeoJSONSeq", mode="a" if written else "w")
             written += len(g)
     if written:
-        _run(f"ogr2ogr -f FlatGeobuf -overwrite -nlt PROMOTE_TO_MULTI {out_fgb} {seq}",
+        # Same 200 MB per-feature GeoJSON ceiling as the depare sink (see _RowSink.finish):
+        # a dense stem's isobath can exceed it.
+        _run(f"ogr2ogr --config OGR_GEOJSON_MAX_OBJ_SIZE 0 "
+             f"-f FlatGeobuf -overwrite -nlt PROMOTE_TO_MULTI {out_fgb} {seq}",
              "ogr2ogr contours")
         os.remove(seq)
     return written
