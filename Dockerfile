@@ -51,15 +51,15 @@ RUN git init -q /tmp/tippecanoe \
   && git apply /tmp/patches/wagyu-drop-unplaceable-hole.patch \
   && make -j"$(nproc)" && make install && rm -rf /tmp/tippecanoe
 
-# contour-p — the DEPARE partition pass's polygon-contour tool. GDAL's
-# PolygonRingAppender is quadratic in disjoint ring count (OSGeo/gdal#1750, #2241;
-# unfixed post-#2908), so marsh-coast z15 stems spent 60-90 min per gdal_contour -p
-# ladder. The patch (ring bboxes + spatial grid + point-in-polygon index) is
-# exact-geometry-equivalent — three-way A/B vs gdal_contour 3.13.1 on synthetic marsh
-# and a real z14 window, 2026-07-29 — and near-linear (85x on the marsh case).
-# Headers are fetched at the BASE IMAGE's GDAL commit; a base-image bump must re-pin
-# GDAL_MS_COMMIT and re-verify the patch applies. depare_run selects the tool via
-# DEPARE_CONTOUR_BIN (default stays gdal_contour until the box validation flips it).
+# contour-p — the DEPARE partition pass's polygon-contour tool: GDAL's marching_squares
+# headers at the base image's commit, plus the patch in patches/. GDAL's
+# PolygonRingAppender attaches rings in O(rings^2 x vertices), so a marsh coastline's
+# ~100k disjoint 0 m rings never finished a gdal_contour -p ladder (measured on a z15
+# wetland window: 4839 s stock, 121 s patched, byte-identical bands). Upstream as
+# OSGeo/gdal#14983 (after #1750/#2241, unfixed post-#2908) — when it lands in the base
+# image, delete this stanza and DEPARE_CONTOUR_BIN with it.
+# Headers are fetched at the BASE IMAGE's GDAL commit: a base-image bump must re-pin
+# GDAL_MS_COMMIT and re-verify the patch applies.
 ARG GDAL_MS_COMMIT=b2e6057d1d0f2cb4c11bfdf79ab1a61def0ce9ca
 COPY tools/contour-p /tmp/contour-p
 RUN cd /tmp/contour-p && mkdir ms \
