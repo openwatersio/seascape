@@ -96,29 +96,65 @@ deliberate. Effort: small. Risk: low.
 ### A bbox run must not add work to the next planet run
 
 Requirement, not a preference: validating on a window should cost only that window. Today it
-also taxes the next planet build. Measured on run 30506340413, dispatched right after the Gulf
-marsh bbox: **179 `terrain_render` jobs re-ran**, every one with reason *"Set of input files has
-changed since last execution"*, and the stems cluster exactly on the bbox's cells
-(`8-61-105`, `8-61-106`, `8-62-106`, `8-63-106`, `8-64-106`) plus their coarse ancestors.
+taxes the next planet build, and the tax is most of that build's job count.
 
-Mechanism: `terrain_inputs` for a cz>=8 stem is `terrain_mod.window_tiles(stem)` — the
-halo-buffered NEIGHBOURHOOD of mosaic tiles — and `window_tiles` reads the BBOX-scoped
-covering. Under a bbox, stems at the window edge see a truncated neighbour set; at planet
-scope the neighbours return, the input set differs, and every affected stem re-renders.
+Full accounting of run 30506340413 (planet, dispatched straight after the Gulf marsh bbox run
+30482927526). Of the ~210 jobs it had started at the 200-step mark, **~197 are attributable to
+the bbox->planet transition** and ~13 are genuine work:
 
-This is also a CORRECTNESS bug, which is why the rerun is the pipeline healing itself rather
-than pure waste: those bbox-scope renders were written to the shared store with an incomplete
-halo, so keeping them would leave seams at the window edge. Any fix must preserve that
-property — either by making the input set scope-independent, or by keeping scope-truncated
-artifacts out of the shared store.
+| rule | jobs | reason snakemake gave |
+| --- | --- | --- |
+| `terrain_render` | 179 | Set of input files has changed |
+| `contour_tile` | 7 | Input files updated by another job |
+| `soundings_tile` | 5 | Input files updated by another job |
+| `fork_window` | 4 | Set of input files has changed |
+| `fork_window` | 4 | Missing output files (temp() consumed by the bbox run) |
+| `depare_tile` | 3 | Missing output files (the 26 that never completed) |
+| `depare_tile` | 1 | Input files updated by another job |
+| `vector_cell` | 2 | Missing output files |
+| `mosaic_index` | 1 | Set of input files has changed |
+| `cover` | 1 | **Params have changed** — `'-94.0,28.5,-88.8,30.6'` -> `''` |
 
-Direction (unprescribed): the covering already went scope-independent per-stem
-(`store/aggregation/<stem>-aggregation.csv`); the remaining scope-dependent surface is the
-neighbourhood derivation, which could read the full on-disk covering instead of the scoped
-stem list. Same class as the trigger-hygiene item above, different trigger (input SET, not
-params or mtime). Effort: small. Risk: low — a dry-run assertion (bbox run, then planet dry
-run schedules zero terrain) is the natural gate, and `test_engine`'s scope-transition check is
-where it belongs.
+The chain, in order:
+
+1. **Root**: `cover`'s bbox param differs, so the checkpoint re-runs and rewrites the covering.
+2. **First order — scope-dependent input SETS.** Any rule whose inputs come from
+   `covering_stems()` sees a different set at planet scope than under a window:
+   `mosaic_index` (the whole covering — 5 stems under the bbox, 3,286 now, which also rewrites
+   planet-z8 + the GTI), `terrain_render` (`terrain_inputs` -> `window_tiles(stem)`, the
+   halo-buffered neighbourhood), `fork_window` (`fork_inputs` -> `intersecting_tiles(stem)`,
+   the same neighbourhood).
+3. **Second order — the fork cascade, previously undocumented.** `fork_window` has no content
+   guard, so a scope-triggered window rebuild restamps `store/window/<stem>.tif` and every
+   consumer of that window re-runs on mtime alone: `contour_tile` + `soundings_tile` +
+   `depare_tile`, 13 jobs here. The window itself is ~38 min at z15; the forks it drags are
+   the expensive part (contour ~9 min, soundings ~3 min, depare 20–60 min), so ONE spurious
+   window rebuild costs roughly an hour of core time downstream.
+
+Two fixes, independent:
+
+- **Make the input sets scope-independent** (removes causes 1–2). The covering already went
+  scope-independent per-stem (`store/aggregation/<stem>-aggregation.csv`); the remaining
+  surfaces are the neighbourhood derivations, which could read the full on-disk covering
+  rather than the scoped stem list. Note this is also a CORRECTNESS fix, not only a cost one:
+  the bbox run wrote those terrain tiles into the SHARED store with a truncated halo, so the
+  reruns are the pipeline healing itself. Any fix must either make the set scope-independent
+  or keep scope-truncated artifacts out of the shared store — suppressing the rerun alone
+  would ship the bad tiles.
+- **Extend the `mosaic_tile` content-hash guard (below) to `fork_window`** (removes cause 3
+  regardless of why a window rebuilds). A window rebuilt to byte-identical content must not
+  restamp its mtime, or it cascades into three forks per stem. Arguably higher value here
+  than on the merge, since depare is the build's most expensive rule.
+
+Gate: a bbox run followed by a planet DRY RUN should schedule zero terrain and zero forks.
+That belongs in `test_engine`'s scope-transition check, which already asserts the healing
+half of this behaviour.
+
+**Not implicated, verified from the same log.** None of the 2026-07-29 changes triggered
+anything: `DEPARE_GB` is a `resources:` value, priority bands are `priority:`, the
+`contour-p` selection is an env var, and code + the Dockerfile are deliberately not rule
+inputs. No job re-ran with "Code has changed" and no rule re-ran on a params change except
+`cover`. The provenance design behaved as intended; the reruns are all scope and mtime.
 
 ### Vector bundling — the dominant cost, now fully measured
 
