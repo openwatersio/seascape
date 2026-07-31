@@ -19,12 +19,16 @@ for ((i = 0; i < count; i++)); do
   base=${contour##*/}
   stem=${base%-*}
   ln -s "/planet-store/contour/$base" "$bench_store/contour/$base"
-  sounding=("$source_store/soundings/$stem-"*.geojson)
+  sounding=("$source_store/soundings/$stem-"*.geojsons)
   if [[ -f "${sounding[0]}" ]]; then
     sbase=${sounding[0]##*/}
     ln -s "/planet-store/soundings/$sbase" "$bench_store/soundings/$sbase"
     ((linked_soundings += 1))
   fi
 done
+
+# Every contour stem has a soundings twin (0-byte when empty), so a sample that links none
+# means a stale store layout — the benchmark would silently measure a contours-only workload.
+((linked_soundings > 0)) || { echo "no soundings matched any sampled stem in $source_store" >&2; exit 1; }
 
 echo "vector benchmark: $count/${#contours[@]} contour inputs, $linked_soundings matching soundings"
