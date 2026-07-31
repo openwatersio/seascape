@@ -269,12 +269,20 @@ def repaired_parts(geoms):
     union of every part, and on a marsh drying bucket (88,997 parts / 20.7 M vertices on
     8-63-105-15) that does not finish in an hour — while exactly 1 of those parts is invalid. One
     gdal_contour -p bucket's parts are disjoint by construction, so per-part repair is equivalent
-    and linear."""
+    and linear.
+
+    method="structure", not the linework default: linework re-nodes the whole boundary at
+    n^1.9-2.7, and a low-coast drying part can be enormous (a Dutch-coast [0, DRYING_CAP]
+    bucket carries one 5.7 M-vertex, 350k-hole polygon — 71 s structure vs a wedged-for-hours
+    linework). Structure mode differs from linework only on hole-outside-shell crumbs
+    (measured <= 2,556 m2 across 173 real invalid parts, area agreement 7e-6), which the land
+    cut deletes anyway."""
     import shapely
     from shapely import make_valid
     parts = [p for g in geoms for p in _polys(g)]
     return [q for p, ok in zip(parts, shapely.is_valid(parts))
-            for q in ([p] if ok else _polys(make_valid(p)))]
+            for q in ([p] if ok else _polys(make_valid(p, method="structure",
+                                                       keep_collapsed=True)))]
 
 
 def repaired_multi(geoms):
