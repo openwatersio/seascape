@@ -665,31 +665,40 @@ def _filter_owned_subtree(archive, cell):
     fork inputs are pre-clipped at cell boundaries, so a feature's EXTENT never crosses into a
     neighbour's tile — only its render buffer does, and the owning tile's own buffer already covers
     the shared edge. Preserves the source header's tile type/compression/bounds + the tippecanoe
-    layer-schema metadata; the pmtiles Writer recomputes the zoom bounds from the surviving tiles."""
+    layer-schema metadata; the pmtiles Writer recomputes the zoom bounds from the surviving tiles.
+    Streams tile-by-tile — a dense cell's tile bytes can run to GBs, so nothing is buffered; the
+    Writer needs ascending tile ids, which a clustered archive (tippecanoe's output) yields."""
     from pmtiles.reader import Reader, MmapSource, all_tiles
     from pmtiles.writer import Writer
     from pmtiles.tile import zxy_to_tileid
     cz, cx, cy = (int(a) for a in cell.split("-"))
-    with open(archive, "r+b") as f:
-        reader = Reader(MmapSource(f))
-        header, metadata = reader.header(), reader.metadata()
-        owned = [(zxy_to_tileid(z, x, y), data)
-                 for (z, x, y), data in all_tiles(reader.get_bytes)
-                 if z >= cz and (x >> (z - cz)) == cx and (y >> (z - cz)) == cy]
-    if not owned:
-        # A non-empty cell always owns the tiles its features live in; nothing owned means every tile
-        # was fringe — a mis-sharded stem. Investigate, don't paper over (per the PR contract).
-        raise SystemExit(f"vector cell {cell}: no tiles in its own subtree after the fringe filter "
-                         "— a mis-sharded stem")
     tmp = archive + ".owned"
-    with open(tmp, "wb") as f:
-        writer = Writer(f)
-        for tid, data in sorted(owned):
+    written = 0
+    with open(archive, "r+b") as src, open(tmp, "wb") as dst:
+        reader = Reader(MmapSource(src))
+        header, metadata = reader.header(), reader.metadata()
+        writer = Writer(dst)
+        last_tid = -1
+        for (z, x, y), data in all_tiles(reader.get_bytes):
+            if z < cz or (x >> (z - cz)) != cx or (y >> (z - cz)) != cy:
+                continue
+            tid = zxy_to_tileid(z, x, y)
+            if tid <= last_tid:
+                raise SystemExit(f"vector cell {cell}: archive is not clustered (tile ids out of "
+                                 "order) — cannot stream the fringe filter")
             writer.write_tile(tid, data)
+            last_tid = tid
+            written += 1
         hdr = {k: header[k] for k in ("tile_type", "tile_compression",
                                       "min_lon_e7", "min_lat_e7", "max_lon_e7", "max_lat_e7",
                                       "center_zoom", "center_lon_e7", "center_lat_e7")}
         writer.finalize(hdr, metadata)  # recomputes min/max_zoom from the surviving tiles
+    if not written:
+        # A non-empty cell always owns the tiles its features live in; nothing owned means every tile
+        # was fringe — a mis-sharded stem. Investigate, don't paper over (per the PR contract).
+        os.remove(tmp)
+        raise SystemExit(f"vector cell {cell}: no tiles in its own subtree after the fringe filter "
+                         "— a mis-sharded stem")
     os.replace(tmp, archive)
 
 

@@ -51,10 +51,20 @@ SOUND_CELL_PX = int(os.environ.get("SOUND_CELL_PX", "64"))
 SOUND_MIN_DEPTH_M = float(os.environ.get("SOUND_MIN_DEPTH_M", "1.0"))
 # Depth-tiered thinning: at/beyond each cutoff a sounding rides a 2^shift coarser lattice at every
 # zoom, so deep water reads sparse (chart practice: dense over banks, sparse over the abyss) while
-# navigational depths keep full density. "depth_m:shift" pairs, ascending. Env-tunable on a re-run.
-SOUND_THIN_TIERS = [(float(d), int(s)) for d, s in
-                    (t.split(":") for t in
-                     os.environ.get("SOUND_THIN_TIERS", "200:1,1000:2").split(",") if t)]
+# navigational depths keep full density. "depth_m:shift" pairs. Env-tunable on a re-run.
+
+
+def _parse_thin_tiers(spec):
+    # Sorted so _thin_shift's last-match-wins scan is correct whatever order the env string uses.
+    try:
+        return sorted((float(d), int(s)) for d, s in
+                      (t.split(":") for t in spec.split(",") if t.strip()))
+    except ValueError:
+        raise SystemExit(f"SOUND_THIN_TIERS {spec!r}: expected comma-separated depth_m:shift pairs, "
+                         'e.g. "200:1,1000:2"')
+
+
+SOUND_THIN_TIERS = _parse_thin_tiers(os.environ.get("SOUND_THIN_TIERS", "200:1,1000:2"))
 
 
 def _thin_shift(depth_pos):
@@ -279,6 +289,14 @@ def _check():
 
     # depth-tiered thinning: the tier a depth falls in, at and just under each cutoff
     assert [_thin_shift(d) for d in (0, 99, 199.9, 200, 999, 1000, 5000)] == [0, 0, 0, 1, 1, 2, 2]
+
+    # tier parsing: order-insensitive (sorted for the last-match-wins scan), loud on malformed input
+    assert _parse_thin_tiers("1000:2, 200:1") == [(200.0, 1), (1000.0, 2)]
+    try:
+        _parse_thin_tiers("200")
+        raise AssertionError("malformed SOUND_THIN_TIERS must exit")
+    except SystemExit as e:
+        assert "depth_m:shift" in str(e)
 
     def uniform_field(depth_m, z, child_z, n=1024, px=100):
         """{display_zoom: point count} over a uniformly depth_m-deep n x n DEM."""
