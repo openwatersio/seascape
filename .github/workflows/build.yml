@@ -287,6 +287,9 @@ jobs:
           # Patched-appender polygon contour tool (Dockerfile; exact-geometry-equivalent to
           # gdal_contour -p, near-linear on marsh-coast ring counts that make stock quadratic).
           export DEPARE_CONTOUR_BIN="${DEPARE_CONTOUR_BIN:-contour-p}"
+          # Per-phase wall marks in every depare log (depare_run._mark) — ~17 lines per stem,
+          # and the only way to attribute a slow stem to its phase without a local reproduction.
+          export DEPARE_TIMING="${DEPARE_TIMING:-1}"
           # Disk headroom: warn-only — the disk_mb budget below is the admission control that
           # actually bounds concurrent tmp usage to real free space, and a rebuild that rewrites
           # layers in place can legitimately start below the comfortable floor.
