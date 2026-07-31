@@ -289,6 +289,18 @@ def coverage_union(geoms):
         u = shapely.coverage_union_all(parts)
         if abs(u.area - total) <= 1e-9 * total and u.is_valid:
             return u
+        if abs(u.area - total) <= 1e-9 * total:
+            # Every observed guard trip (12 of 2,170 stems, run 30634360224) preserves the area
+            # to ~1e-15 and fails only validity: members of the dissolve touch along an edge or a
+            # ring self-touches at a pinch. Re-union the DISSOLVE OUTPUT, not the input — the
+            # dissolve already merged the interior, so this unions a handful of mostly-disjoint
+            # regions instead of re-noding every input part (the 89k-part marsh bucket's full
+            # union costs 22 min; this path is seconds).
+            r = unary_union(list(shapely.get_parts(u)))
+            if abs(r.area - total) <= 1e-9 * total and r.is_valid:
+                print(f"depare: coverage dissolve of {len(parts)} parts re-noded from "
+                      f"{shapely.get_num_geometries(u)} dissolved regions", flush=True)
+                return r
         why = f"area {u.area!r} vs parts {total!r}, valid {u.is_valid}"
     except shapely.errors.GEOSException as e:
         why = str(e)
@@ -780,6 +792,14 @@ def _check():
     assert not bowtie.is_valid and valid_union([bowtie]).is_valid, \
         "valid_union must make_valid before union (guards the contour side-location-conflict fix)"
     assert coverage_union([bowtie]).is_valid, "coverage_union must repair before dissolving"
+
+    # The second chance: parts sharing an edge segment dissolve into an INVALID multi with the
+    # area preserved (the shape of every guard trip in run 30634360224). Re-noding the dissolve
+    # output must return valid geometry without paying for the full input union.
+    from shapely.geometry import box as _box
+    _u = coverage_union([_box(0, 0, 2, 1), _box(1, 1, 3, 2)])
+    assert _u.is_valid and abs(_u.area - 4.0) < 1e-9, \
+        "coverage_union second chance must re-node an edge-sharing dissolve"
 
     # coverage_union dissolves a true coverage along its shared edges, and its result gate must
     # catch input that is not one: overlapping parts come back unmerged with an area sum that
