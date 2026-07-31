@@ -15,6 +15,7 @@
 # input functions — those only run when a job is instantiated, which is after the checkpoint.
 
 import json
+import math
 
 import aggregation_reproject
 import bundle
@@ -316,6 +317,19 @@ SOUND_GB = {15: 12, 14: 8, 13: 3}
 # for all would starve concurrency; the hedge leans on swap + `retries` instead.
 DEPARE_GB = {15: 36, 14: 7, 13: 3, 12: 4, 10: 4, 9: 4, 8: 4}
 
+# Per-stem depare reservation from the stem's own mosaic tile size — a constant per child_z
+# reserves the class's worst case for every member (36 GB held four cz15 jobs to a 161 GB
+# budget while their live RSS summed to ~12). Fit over run 30634360224's 2,170 rows:
+# rss_GB = 0.28 + 1.805 x tile_GB (p99 residual 0.40 GB; only 7 cz15 anchors, hence the
+# 4 GB pad and the `attempt` escalation carrying the tail). The rows are pre-pond-fill
+# code, which only shrinks depare, so the fit is an upper bound. The tile is absent on a
+# fresh store (DAG evaluation precedes the merges) — fall back to the DEPARE_GB constants.
+def depare_gb(wc, attempt):
+    try:
+        gb = 0.28 + 1.805 * os.path.getsize(f"store/mosaic/tiles/{wc.stem}.tif") / 1e9 + 4
+    except OSError:
+        gb = DEPARE_GB.get(int(wc.stem.split("-")[3]), 3)
+    return max(3, math.ceil(gb)) * attempt
 
 
 def fork_inputs(wc):
@@ -407,7 +421,7 @@ rule depare_tile:
     priority: vector_tile_priority  # vector band: drain before terrain so the bundle overlaps it
     retries: 2
     resources:
-        mem_gb=_fork_gb(DEPARE_GB, 3)
+        mem_gb=depare_gb
     benchmark:
         f"{TMP}/bench/depare/{{stem}}.tsv"
     log:
