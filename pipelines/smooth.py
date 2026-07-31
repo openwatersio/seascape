@@ -25,7 +25,7 @@ import os
 import numpy as np
 import rasterio
 from rasterio.windows import Window
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import binary_dilation, find_objects, gaussian_filter, label
 
 NODATA = -9999
 
@@ -51,6 +51,34 @@ DEEP_COARSEN_THRESHOLD_M = -250.0
 DEEP_COARSEN_FACTOR = 8
 DEEP_COARSEN_MIN_CHILD_Z = 12
 MERC_ORIGIN = 20037508.342789244  # EPSG:3857 half-extent; block grid anchors here (seam alignment)
+
+# Enclosed sub-legible water is filled to the shoalest elevation around it. A marsh pond the chart
+# cannot draw at compilation scale holds an outline and no depth (interior Barataria water: 14
+# unique values, p50 = p95 = 0.10 m) while each one costs its own ring in the shoalest bands — 81%
+# of a marsh crop's parts sit under 4 mm². What may be filled is decided topologically, enclosed vs
+# connected, because no value-based operator tells a pond from a channel: filling an enclosed pond
+# is licensed practice (USGS NHD breaks marsh for clearings >= 0.05 in; S-57 UOC 4.7.3 puts
+# QUAPOS = 4 on the marsh coastline) while closing a channel is forbidden. 16 mm² measured 11.6x
+# fewer parts for 1.4% water loss with the channel network intact (2026-07-30-shallow-coarsening).
+# Inland water the DEM holds no depth for is untouched by any of this: it ships through depare's
+# nodata layer, the OSM water polygons minus the DEM's water coverage, which this operator never
+# reads or writes.
+POND_FILL_MM2 = float(os.environ.get("SMOOTH_POND_FILL_MM2", "16"))  # 0 disables
+# Bounding-box diagonal cap, EPSG:3857 metres, doing two jobs. It excludes what the area gate
+# cannot see — a 1-px-wide 900 m channel fragment is sub-legible by area and must never be filled —
+# and it is the seam guarantee: a candidate plus its 1-px ring fits inside the halo both
+# neighbouring windows share, so adjacent stems see it whole and classify it identically. In
+# metres, not pixels, so a stem's child_z cannot inflate what counts as compact.
+POND_FILL_EXTENT_M = float(os.environ.get("SMOOTH_POND_FILL_EXTENT_M", "75"))
+# The determinacy argument only ever held for the 0-2 m band, where a marsh pond measures p50 = p95
+# = 0.10 m. An enclosed basin genuinely surveyed deeper than this — a marina with a pinched
+# entrance, a quarry lake inside a lidar tile — carries real navigational information, so a
+# component is spared as soon as its DEEPEST pixel reaches this depth.
+POND_FILL_MAX_DEPTH_M = float(os.environ.get("SMOOTH_POND_FILL_MAX_DEPTH_M", "2.0"))
+# The part explosion is a native-resolution pathology, and mm-at-scale areas inflate to km² over a
+# coarse stem, which would widen the fill set into true-lake territory for no cost benefit.
+POND_FILL_MIN_CHILD_Z = 14
+MM_PER_PX = 0.28  # a rendering pixel at compilation scale, as depare_run.MM_PER_PX
 
 
 def halo_px():
@@ -173,6 +201,88 @@ def deep_coarsen(dem, threshold=DEEP_COARSEN_THRESHOLD_M, factor=DEEP_COARSEN_FA
             y += step
 
 
+def _pond_fill_array(arr, nd, max_area_px, max_diag_px, max_depth_m=POND_FILL_MAX_DEPTH_M):
+    """Fill enclosed sub-legible water in `arr` in place; returns the number of components filled.
+
+    A component qualifies only if it is enclosed — it does not touch the array edge, which is where
+    the water network leaves — and passes every gate. It is filled to the maximum over its own 1-px
+    ring, which is monotone-shoaling by construction: labelling is 8-connected, so no ring pixel can
+    be water, and every filled pixel therefore rises from negative to at least 0. 8-connectivity is
+    also what protects a diagonal thread of water; under 4-connectivity each link of one would be
+    its own sub-legible pond and the channel would be erased a pixel at a time."""
+    water = (arr != nd) & (arr < 0)
+    if not water.any():
+        return 0
+    lab, n = label(water, structure=np.ones((3, 3), bool))
+    if n == 0:
+        return 0
+    sizes = np.bincount(lab.ravel(), minlength=n + 1)
+    connected = np.zeros(n + 1, bool)
+    connected[np.unique(np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]]))] = True
+    connected[0] = True
+    filled = 0
+    for i, sl in enumerate(find_objects(lab), start=1):
+        if connected[i] or sl is None or sizes[i] > max_area_px:
+            continue
+        h, w = sl[0].stop - sl[0].start, sl[1].stop - sl[1].start
+        if h * h + w * w > max_diag_px * max_diag_px:
+            continue
+        # The ring is in bounds because the component does not touch the array edge.
+        sub = arr[sl[0].start - 1:sl[0].stop + 1, sl[1].start - 1:sl[1].stop + 1]
+        m = lab[sl[0].start - 1:sl[0].stop + 1, sl[1].start - 1:sl[1].stop + 1] == i
+        if sub[m].min() < -max_depth_m:  # a surveyed basin, not an outline without a depth
+            continue
+        ring = sub[binary_dilation(m, np.ones((3, 3), bool)) & ~m]
+        if (ring == nd).any():  # unsurveyed neighbours cannot establish enclosure
+            continue
+        sub[m] = ring.max()
+        filled += 1
+    return filled
+
+
+def pond_fill(dem, child_z=POND_FILL_MIN_CHILD_Z, mm2=None, extent_m=None, block=None):
+    """Rewrite `dem` in place with enclosed sub-legible water filled, in overlapping blocks so peak
+    memory is one padded block rather than the whole window — a z15 window would want 17 GB for the
+    label array alone.
+
+    No union-find merge table is needed, because the extent gate bounds every candidate: a
+    component that reaches a block's read edge while touching its core spans more than the halo, so
+    it is already too big to fill, and one that qualifies is therefore whole inside the read with
+    its ring. Excluding every component that touches the read edge is thus exactly the whole-array
+    rule (asserted in _check). The pass is in place and blocks read halos their neighbours may
+    already have written, which changes nothing: a filled pond leaves the water set entirely and
+    carries the same ring maximum its remainder would compute, and two distinct 8-connected
+    components are never in each other's rings."""
+    mm2 = POND_FILL_MM2 if mm2 is None else mm2
+    if mm2 <= 0 or child_z < POND_FILL_MIN_CHILD_Z:
+        return 0
+    extent_m = POND_FILL_EXTENT_M if extent_m is None else extent_m
+    block = block or BLOCK
+    with rasterio.open(dem, "r+") as d:
+        nd = d.nodata
+        res = abs(d.transform.a)
+        h_total, w_total = d.height, d.width
+        max_area_px = mm2 / (MM_PER_PX ** 2)  # a pixel IS MM_PER_PX at scale, so this is zoom-free
+        # Never wider than the window halo neighbouring stems share: the seam contract outranks
+        # the dial, and one pixel is left over for the ring.
+        max_diag_px = min(extent_m / res, halo_px() - 1)
+        halo = int(np.ceil(max_diag_px)) + 1
+        total = 0
+        for row in range(0, h_total, block):
+            for col in range(0, w_total, block):
+                h = min(block, h_total - row)
+                w = min(block, w_total - col)
+                r0, c0 = max(0, row - halo), max(0, col - halo)
+                r1, c1 = min(h_total, row + h + halo), min(w_total, col + w + halo)
+                arr = d.read(1, window=Window(c0, r0, c1 - c0, r1 - r0))
+                filled = _pond_fill_array(arr, nd, max_area_px, max_diag_px)
+                if filled:
+                    d.write(arr[row - r0:row - r0 + h, col - c0:col - c0 + w], 1,
+                            window=Window(col, row, w, h))
+                    total += filled
+        return total
+
+
 def _check():
     """Deep flat smooths harder than shallow; shallow stays denoised; a steep step is preserved."""
     rng = np.random.default_rng(0)
@@ -253,13 +363,55 @@ def _check():
     assert np.array_equal(a[f:7 * f, f:7 * f], b[f - off:7 * f - off, f - off:7 * f - off]), \
         "overlapping windows must coarsen identically (seam alignment)"
 
+    # pond fill: an enclosed sub-legible pond takes its shoalest surrounding value, while the
+    # channel, a thin long fragment, an over-area pond, a diagonal thread and a pond against
+    # nodata all survive — and the blocked pass equals the whole-array reference on components
+    # that straddle block boundaries.
+    res = 2.3886571  # cz15 EPSG:3857 m/px: the gates land on 204 px of area, 31.4 px of diagonal
+    pond = np.full((200, 200), 1.0, np.float32)
+    pond[:, 100:103] = -3.0        # a channel spanning the array: reaches the edge, connected
+    pond[60:66, 60:66] = -1.0      # enclosed, 36 px, 8.5 px diagonal: fills
+    pond[59, 62] = 2.0             # the shoalest ring pixel, so the value the fill must take
+    pond[30, 10:80] = -0.5         # 70 px of area but 70 px of extent: the extent gate keeps it
+    pond[62:68, 126:132] = -1.0    # straddles a block boundary once blocked
+    pond[150:170, 150:170] = -1.0  # 400 px: over the area gate
+    pond[80:84, 40:44] = -3.0      # small and enclosed, but surveyed past the depth ceiling
+    for i in range(40):
+        pond[20 + i, 150 + i] = -1.0  # a diagonal thread: ONE 8-connected component, too long
+    pond[95, 150] = NODATA
+    pond[96:99, 149:152] = -1.0    # enclosure is not established against unsurveyed neighbours
+
+    ref = pond.copy()
+    n = _pond_fill_array(ref, NODATA, POND_FILL_MM2 / MM_PER_PX ** 2, POND_FILL_EXTENT_M / res)
+    assert (ref >= pond).all(), "pond fill must never deepen"
+    assert (ref[60:66, 60:66] == 2.0).all(), ref[60:66, 60:66]
+    assert (ref[:, 100:103] == -3.0).all(), "the channel must survive"
+    assert (ref[30, 10:80] == -0.5).all(), "a thin long fragment must survive the area gate"
+    assert (ref[150:170, 150:170] == -1.0).all(), "an over-area pond must survive"
+    assert ref[59, 189] == -1.0, "a diagonal thread is one component and too long to fill"
+    assert (ref[96:99, 149:152] == -1.0).all(), "a pond against nodata must survive"
+    assert (ref[80:84, 40:44] == -3.0).all(), "a pond deeper than the ceiling must survive"
+    assert n == 2, f"expected the two enclosed sub-legible ponds, filled {n}"
+
+    pf = f"{d}/pond.tif"
+    _write_dem(pf, pond, -MERC_ORIGIN, MERC_ORIGIN, res)
+    pond_fill(pf, block=64)  # 64-px cores force candidates across block boundaries
+    with rasterio.open(pf) as src:
+        assert np.array_equal(src.read(1), ref), "blocked pond fill must equal the whole array"
+    for kw in ({"mm2": 0}, {"child_z": POND_FILL_MIN_CHILD_Z - 1}):
+        _write_dem(pf, pond, -MERC_ORIGIN, MERC_ORIGIN, res)
+        assert pond_fill(pf, block=64, **kw) == 0, kw
+        with rasterio.open(pf) as src:
+            assert np.array_equal(src.read(1), pond), f"{kw} must disable the pass"
+
     print("smooth.py self-check ok")
 
 
 def prepare_window(stem, out_tif):
     """The forks' shared read surface: the stem's buffered window materialized once,
-    smoothed, and deep-coarsened. Consumers must treat it as read-only — contour and
-    soundings clamp a private copy; depare reads it directly."""
+    smoothed, deep-coarsened, and pond-filled. Consumers must treat it as read-only — contour and
+    soundings clamp a private copy; depare reads it directly. Every generalization lives here so
+    bands, contour lines and soundings stay coincident."""
     import mosaic
     child_z = int(stem.split("-")[3])
     os.makedirs(os.path.dirname(out_tif), exist_ok=True)
@@ -272,10 +424,11 @@ def prepare_window(stem, out_tif):
             smooth_tiff(tmp)
         if child_z >= DEEP_COARSEN_MIN_CHILD_Z:
             deep_coarsen(tmp)
+        ponds = pond_fill(tmp, child_z)
     with open(tmp, "rb") as f:
         os.fsync(f.fileno())  # teardown is a power cut; a rename must not outlive its data
     os.replace(tmp, out_tif)
-    print(f"fork window {stem}: {out_tif}")
+    print(f"fork window {stem}: {out_tif} ({ponds} ponds filled)")
 
 
 if __name__ == "__main__":

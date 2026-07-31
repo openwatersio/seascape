@@ -293,7 +293,11 @@ SMOOTH_CFG = json.dumps({} if os.environ.get("SKIP_SMOOTH") else {
     "depth_smooth": smooth.DEPTH_SMOOTH, "block": smooth.BLOCK,
     "deep_coarsen_threshold_m": smooth.DEEP_COARSEN_THRESHOLD_M,
     "deep_coarsen_factor": smooth.DEEP_COARSEN_FACTOR,
-    "deep_coarsen_min_child_z": smooth.DEEP_COARSEN_MIN_CHILD_Z}, sort_keys=True)
+    "deep_coarsen_min_child_z": smooth.DEEP_COARSEN_MIN_CHILD_Z,
+    "pond_fill_mm2": smooth.POND_FILL_MM2,
+    "pond_fill_extent_m": smooth.POND_FILL_EXTENT_M,
+    "pond_fill_max_depth_m": smooth.POND_FILL_MAX_DEPTH_M,
+    "pond_fill_min_child_z": smooth.POND_FILL_MIN_CHILD_Z}, sort_keys=True)
 
 
 # Fork reservations by child_z: ceil(measured max RSS) over the runs 30311420659 /
@@ -307,18 +311,11 @@ CONTOUR_GB = {15: 10, 14: 5}
 SOUND_GB = {15: 12, 14: 8, 13: 3}
 # depare reads partition buckets one at a time and writes rows incrementally, so its peak
 # is the biggest band + coverage parts, not the window's whole set.
-# z15 = 36 covers the MARSH class, whose cost only became visible once contour-p let those
-# stems past gdal_contour -p at all (pre-fix they timed out there, so every earlier depare
-# RSS number came from stems that were never the expensive ones). Measured 2026-07-29 on the
-# Gulf wetland cluster: 2.5 / 2.7 / 8.2 / 19.5 GB for four stems, and 29 GB + 3.8 GB swapped
-# for the 9.9 GB window of 8-63-105-15, which then died on an allocation a 32 GB box refused
-# (MemoryError, no OOM kill — see depare_run's MemoryError path). 36 = that peak + headroom,
-# admitting 4 concurrently in a 161 GB budget. Most z15 stems need ~12, so the real fix is a
-# per-stem reservation from the window's compressed size (perf backlog), not a bigger constant.
 # cz8/cz9 = 4 is a deliberate under-reserve (light hedge): the class max (6.5 GB, a
 # continent window) is a single outlier over a cheap deep-ocean majority, so reserving it
 # for all would starve concurrency; the hedge leans on swap + `retries` instead.
 DEPARE_GB = {15: 36, 14: 7, 13: 3, 12: 4, 10: 4, 9: 4, 8: 4}
+
 
 
 def fork_inputs(wc):

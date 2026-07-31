@@ -81,7 +81,9 @@ def provenance():
         # which is a different algorithm, so a timed-out run is not comparable to a clean one.
         "env": {k: os.environ.get(k, "") for k in
                 ("DEPARE_CONTOUR_BIN", "DEPARE_TIMEOUT", "SLIVER_MIN_PX", "NODATA_SIMPLIFY_PX",
-                 "LANDMASK", "WATERMASK", "GDAL_CACHEMAX", "SKIP_SMOOTH")},
+                 "LANDMASK", "WATERMASK", "GDAL_CACHEMAX", "SKIP_SMOOTH",
+                 "SMOOTH_POND_FILL_MM2", "SMOOTH_POND_FILL_EXTENT_M",
+                 "SMOOTH_POND_FILL_MAX_DEPTH_M")},
     }
 
 
