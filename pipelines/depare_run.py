@@ -34,13 +34,14 @@ needs no duplication. Halves their feature bytes vs a per-sys copy for identical
 Drying rides the metre pass only (the cap is a metre level) and is emitted once.
 
 gdal_contour -p buckets the same merged, smoothed DEM the contour lines trace, with the
-same contour generator — band edges and contour lines coincide by construction. Geometry
-stays raw — no Chaikin, no shapely simplify: adjacent partitions share edges, and
-per-feature smoothing treats the shared chain differently in each polygon, opening
-see-through cracks between bands. tippecanoe --detect-shared-borders simplifies shared
-borders identically per zoom instead. (Shoal band edges still match the drawn contour
-lines, which skip Chaikin in the navigable band; deep lines smooth away from the raw
-edge by design — an invisible sliver between near-white deep tints.)
+same contour generator — band edges and contour lines coincide by construction. No Chaikin
+and no per-feature shapely simplify: adjacent partitions share edges, and per-feature
+smoothing treats the shared chain differently in each polygon, opening see-through cracks
+between bands. Generalization is COVERAGE simplification instead (simplify_coverage), which
+simplifies each shared edge once, for both its owners, at the S-58 vertex floor. It selects a
+subset of the contour's own vertices, so the drawn line and the band edge stay pinned to the
+same points and part company by at most the tolerance — 1.1 m measured at cz15, against the
+1 MVT pixel tippecanoe already spends on every zoom below the leaf.
 
 Per tile: bands (gdal_contour -p at DEPARE_LEVELS / DEPARE_LEVELS_FT, drop land, drval/sys)
 + drying (the metre ladder's [0, DRYING_CAP] bucket ∩ effective water, drval1 < 0) + nodata
@@ -97,12 +98,21 @@ DRYING_RANK = 2
 # a width/compactness gate is the targeted tool if thin ribbons ever appear. Env-tunable.
 SLIVER_MIN_PX = float(os.environ.get("SLIVER_MIN_PX", "4"))
 
+# S-58 Ed. 7.0.0 check 571 caps ENC vertex density at 0.3 mm at compilation scale — the only hard
+# numeric geometry rule in the standards, and a raw gdal_contour partition carries ~5x more than it
+# allows. A rendering pixel is 0.28 mm, so the floor is 0.3/0.28 of the stem's own pixel, applied in
+# EPSG:3857 where the projected scale IS the compilation scale (2.56 projected units at cz15 = 2.23
+# ground metres at 29.5degN). Set to 0 to emit raw geometry. NOAA compiles at 0.4 mm to guarantee
+# 0.3 mm on output; this pipeline's own tile-time simplification is the 1 px = 0.28 mm below.
+SIMPLIFY_MM = float(os.environ.get("DEPARE_SIMPLIFY_MM", "0.3"))
+MM_PER_PX = 0.28
+
 # Nodata outlines are full-detail OSM geometry regardless of the stem's real resolution, so under
 # the variable-depth pyramid coarse inland tiles would keep subdividing to carry vertices no coarse
 # stem can resolve. Generalizing nodata rows to the stem's child_z resolution (this many MVT pixels)
 # is what lets those tiles leaf early (measured −54% at 1 px / −67% at 2 px on a cz8 stem; 21.5 M →
-# 1.4 M vertices, sub-resolution features dropping out naturally). Bands and drying are left raw —
-# their shared edges must stay bit-identical for the crack-free partition.
+# 1.4 M vertices, sub-resolution features dropping out naturally). Bands and drying take SIMPLIFY_MM
+# through coverage simplification instead, which is what keeps their shared edges bit-identical.
 NODATA_SIMPLIFY_PX = float(os.environ.get("NODATA_SIMPLIFY_PX", "1"))
 
 # Fixed-precision grid (metres) for overlays against multi-piece unions: GEOS 3.13's
@@ -131,6 +141,8 @@ def _save_traceback(stem):
 
 
 def _rss_kb():
+    """Peak RSS of this process in kB. /proc's VmHWM is preferred (it survives a child's exit);
+    getrusage is the fallback, and the only source on macOS, where local profiling runs."""
     try:
         with open("/proc/self/status") as f:
             for line in f:
@@ -138,7 +150,13 @@ def _rss_kb():
                     return int(line.split()[1])
     except Exception:
         pass
-    return -1
+    try:
+        import resource
+        import sys as _sys
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return peak // 1024 if _sys.platform == "darwin" else peak  # bytes on macOS, kB on Linux
+    except Exception:
+        return -1
 
 
 class ContourTimeout(Exception):
@@ -217,17 +235,155 @@ def valid_union(geoms):
     """unary_union after make_valid per input. gdal_contour's polygon mode can emit a
     self-touching ring (GEOS raises "side location conflict" on a raw union of it); make_valid
     splits it into valid parts first. A no-op on already-valid geometry (bands are make_valid'd
-    per feature; this guards the bucket / coverage / mask unions)."""
+    per feature; this guards the coverage / mask unions)."""
     from shapely import make_valid
     from shapely.ops import unary_union
     return unary_union([make_valid(g) for g in geoms])
+
+
+def repaired_parts(geoms):
+    """Every part of `geoms`, make_valid'd only where shapely.is_valid rejects it.
+
+    NEVER make_valid a whole bucket: GEOS routes a MultiPolygon through BuildArea, i.e. a cascaded
+    union of every part, and on a marsh drying bucket (88,997 parts / 20.7 M vertices on
+    8-63-105-15) that does not finish in an hour — while exactly 1 of those parts is invalid. One
+    gdal_contour -p bucket's parts are disjoint by construction, so per-part repair is equivalent
+    and linear."""
+    import shapely
+    from shapely import make_valid
+    parts = [p for g in geoms for p in _polys(g)]
+    return [q for p, ok in zip(parts, shapely.is_valid(parts))
+            for q in ([p] if ok else _polys(make_valid(p)))]
+
+
+def repaired_multi(geoms):
+    """repaired_parts as ONE MultiPolygon. No union: a bucket's parts are already disjoint, so
+    collecting them is the whole job — this is the make_valid a partition read actually needs."""
+    import shapely
+    from shapely.geometry import MultiPolygon
+    parts = repaired_parts(geoms)
+    return shapely.multipolygons(parts) if parts else MultiPolygon()
+
+
+def coverage_union(geoms):
+    """Dissolve a polygonal COVERAGE — parts with disjoint interiors, which the parts of one
+    gdal_contour -p bucket are by construction. Exploding to those parts (repaired_parts) is what
+    makes a marsh drying bucket tractable, twice over: the per-part repair above, and
+    coverage_union_all merging along shared edges instead of running the full overlay, 194 s
+    against unary_union's 1,310 s on the same parts.
+
+    coverage_union_all is silently wrong on input that is not a coverage, so the RESULT is what
+    gets checked; the input cannot be, since coverage_is_valid does not finish in 33 min on that
+    bucket. Both failure modes surface in the result anyway: parts that overlap or share only
+    part of an edge come back unmerged, and members that overlap or touch along a line make the
+    output MultiPolygon invalid, while geometry dropped outright breaks the area identity. That
+    identity alone proves nothing — .area sums a MultiPolygon's members, so unmerged overlaps
+    still add up to the same total. Either way, fall back to unary_union and say so."""
+    import shapely
+    from shapely.ops import unary_union
+    parts = repaired_parts(geoms)
+    if not parts:
+        return unary_union(parts)
+    total = float(shapely.area(parts).sum())
+    try:
+        u = shapely.coverage_union_all(parts)
+        if abs(u.area - total) <= 1e-9 * total and u.is_valid:
+            return u
+        why = f"area {u.area!r} vs parts {total!r}, valid {u.is_valid}"
+    except shapely.errors.GEOSException as e:
+        why = str(e)
+    print(f"depare: {len(parts)} parts are not a valid polygonal coverage ({why}) - "
+          "falling back to unary_union", flush=True)
+    return unary_union(parts)
+
+
+# A ring this short (EPSG:3857 metres) cannot be written: _RowSink rounds to 1e-9 degrees, which
+# is 1.1e-4 m, so a smaller ring loses points and lands in the FGB as an invalid "too few points"
+# component. Coverage simplification collapses holes to exactly this scale — it must keep every
+# ring to preserve the coverage's topology, so it shrinks them instead of deleting them. Only
+# rings below the write grid may be dropped: a hole in a depth band is where the NEXT band sits,
+# so dropping a representable one would open an overlap.
+MIN_RING_M = 1e-3
+
+# How much of a ladder's area coverage simplification may move before the result is rejected —
+# see simplify_coverage for why an exact identity is not on offer.
+AREA_GUARD = 1e-3
+
+
+def _drop_subgrid_rings(geom):
+    """`geom` with any hole shorter than MIN_RING_M removed. Vectorized over parts, and returns
+    the input untouched when nothing qualifies, so the marsh's hole-free parts cost one C call."""
+    import numpy as np
+    import shapely
+    from shapely.geometry import Polygon
+    parts = shapely.get_parts(geom)
+    holes = shapely.get_num_interior_rings(parts)
+    changed = False
+    for i in np.nonzero(holes > 0)[0]:
+        p = parts[i]
+        keep = [r for r in p.interiors if r.length >= MIN_RING_M]
+        if len(keep) != holes[i]:
+            parts[i] = Polygon(p.exterior, keep)
+            changed = True
+    if not changed:
+        return geom
+    return shapely.multipolygons(parts) if geom.geom_type == "MultiPolygon" else parts[0]
+
+
+def simplify_coverage(geoms, tol):
+    """Simplify one ladder's partition to the S-58 vertex floor, keeping it a partition.
+
+    Per-geometry simplify is what the crack warning in this module's docstring forbids: it moves
+    a shared chain differently in each polygon it belongs to. Coverage simplification takes the
+    whole ladder at once, decomposes it into the edges between its polygons, and simplifies each
+    edge ONCE — so adjacent bands come back sharing the identical polyline (measured: every vertex
+    of a shared chain is present in both members, no pair overlaps, and the coverage's total area
+    holds to 5e-15). It also never invents a vertex, which is what keeps the drawn contour lines
+    pinned to the band edges they trace: every surviving band vertex is still a vertex of the line.
+
+    The algorithm is Visvalingam-Whyatt, so `tol` bounds the area of what it removes rather than
+    the displacement; measure the displacement, don't assert it (perf/gates.py gate 5). It is also
+    LOCAL enough that two neighbouring stems simplify their shared geometry identically — the seam
+    contract holds by measurement (0.00 m of per-band seam sym-diff across a simulated seam), not
+    by construction, which is why seam_check is the gate on it.
+
+    Silently wrong on input that is not a coverage, like every coverage_* entry point. The input
+    IS one by construction — one gdal_contour -p pass, verified offline with
+    coverage_invalid_edges (0 invalid edges on all four fixtures and on 8-63-105-15's 52.5 M-vertex
+    metre ladder, 173 s), which is too expensive to spend per tile. What runs here is the cheap
+    result gate: every member still valid, and no geometry gone. AREA_GUARD is what "gone" means —
+    an exact identity is not available, because simplifying the coverage's outer boundary trades
+    area across it; the theoretical bound, tol x boundary length, is ~1% of a marsh coverage's area
+    and so is no gate at all, while the measured drift is 1.5e-6 (30,375 m2 over 90,464 km of
+    boundary — 0.3 mm of mean displacement). This sits between: tighter than the bound, and loose
+    enough that only a member that VANISHED trips it."""
+    import shapely
+    geoms = list(geoms)
+    if not geoms or tol <= 0:
+        return geoms
+    before = float(shapely.area(geoms).sum())
+    try:
+        out = [_drop_subgrid_rings(g)
+               for g in shapely.coverage_simplify(geoms, tol, simplify_boundary=True)]
+        after = float(shapely.area(out).sum())
+        if abs(after - before) <= AREA_GUARD * before and bool(shapely.is_valid(out).all()):
+            return out
+        why = f"area {after!r} vs {before!r}, valid {bool(shapely.is_valid(out).all())}"
+    except MemoryError:
+        raise                      # the tile's own MemoryError path reports the footprint
+    except Exception as e:
+        # Not only GEOSException: an invalid ring reaches the simplifier as a ZeroDivisionError.
+        why = f"{type(e).__name__}: {e}"
+    print(f"depare: {len(geoms)} partitions did not simplify as a coverage ({why}) - "
+          "keeping raw geometry", flush=True)
+    return geoms
 
 
 def partitions(dem, levels, raw_fgb, timeout=0):
     """Water/foreshore partitions off `dem`: gdal_contour -p buckets the DEM between `levels`,
     tagging each bucket its range amin/amax -> drval1/drval2 (ENC: shallow/deep bound,
     positive-down metres). Writes the bucketed FGB and returns its path; read it back
-    bucket-at-a-time with read_bucket — a z15 window's full partition set does not fit in RAM.
+    bucket-at-a-time with read_bucket, so nothing holds both ladders at once.
     Callers select depth bands (amax <= 0), the [0, DRYING_CAP] drying bucket
     (0 < amax <= cap), and drop land (amax above the shallowest positive level)."""
     fl = " ".join(str(l) for l in levels)
@@ -266,6 +422,9 @@ class _RowSink:
     nodata truly has no drval1, the fill's switch key."""
 
     FLUSH = 50_000
+    # Decimal degrees kept on write: 1e-9 deg is 0.11 mm, four orders below the S-58 vertex floor
+    # and below anything the pipeline's own geometry means.
+    COORD_DECIMALS = 9
 
     def __init__(self, seq):
         self.seq = seq
@@ -281,9 +440,35 @@ class _RowSink:
         if not self.pending:
             return
         import geopandas as gpd
+        import numpy as np
+        import shapely
         gdf = gpd.GeoDataFrame(self.pending, crs="EPSG:3857").to_crs("EPSG:4326")
-        gdf.to_file(self.seq, driver="GeoJSONSeq", mode="a" if self.count else "w")
-        self.count += len(self.pending)
+        # Round to the write grid HERE, not in the driver, so what gets validated below is what
+        # lands in the FGB. COORD_DECIMALS beats the driver's default 7 (~1.1 cm) because that
+        # rounds each ROW independently: a vertex one row carries mid-segment and its neighbour
+        # does not (an overlay node on a shared chain) lands off that segment, opening a hairline
+        # sliver the length of the segment — and a generalized band's segments are long. Measured
+        # worst-pair band overlap: 3.9 m2 raw, 18.9 m2 simplified at 7 decimals, 0.2 m2 at 9.
+        geoms = shapely.set_coordinates(
+            gdf.geometry.values.copy(),
+            np.round(shapely.get_coordinates(gdf.geometry.values), self.COORD_DECIMALS))
+        # A ring valid in metres can fold on itself once reprojected and rounded — the transform is
+        # non-linear in y and the grid is finite (measured: 12 of 243,265 pieces on 8-63-105-15,
+        # none of them invalid in EPSG:3857). Repair those rather than ship an invalid ring into
+        # tippecanoe's wagyu: is_valid over a batch is ~18 s at 243k rows, make_valid seconds on
+        # the largest offender. Exploding keeps the layer uniformly polygon (FlatGeobuf rejects a
+        # mixed one), since make_valid can return a MultiPolygon or a collection.
+        ok = shapely.is_valid(geoms)
+        if not ok.all():
+            geoms = [g if v else shapely.make_valid(g) for g, v in zip(geoms, ok)]
+        gdf = gdf.set_geometry(gpd.GeoSeries(geoms, index=gdf.index, crs="EPSG:4326"))
+        if not ok.all():
+            gdf = gdf.explode(index_parts=False)
+            gdf = gdf[gdf.geom_type == "Polygon"]
+            print(f"depare: repaired {int((~ok).sum())} row(s) the 4326 write folded", flush=True)
+        gdf.to_file(self.seq, driver="GeoJSONSeq", mode="a" if self.count else "w",
+                    COORDINATE_PRECISION=self.COORD_DECIMALS)
+        self.count += len(gdf)   # rows WRITTEN: a repair can split one row into parts
         self.pending = []
 
     def finish(self, final_fgb):
@@ -317,46 +502,65 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0):
     bbox = (b.left, b.bottom, b.right, b.top)  # the DEM's full (buffered) extent, EPSG:3857
     buffered = box(*bbox)
     min_area = SLIVER_MIN_PX * res * res       # slivers where a vector edge meets the raster shore
-    nodata_tol = NODATA_SIMPLIFY_PX * get_resolution(child_z)  # generalize nodata to the stem's resolution
+    stem_res = get_resolution(child_z)          # the stem's own MVT pixel, EPSG:3857 metres
+    nodata_tol = NODATA_SIMPLIFY_PX * stem_res  # generalize nodata to the stem's resolution
+    band_tol = SIMPLIFY_MM / MM_PER_PX * stem_res  # the S-58 vertex floor at this stem's scale
     sink = _RowSink(f"{tmp}/depare-rows.geojsons")
 
     # ── depth bands + drying ── the metre + fathom partition ladders, each off one gdal_contour -p
-    # pass, read back one BUCKET at a time (amax == a ladder level, exactly what gdal_contour
-    # wrote) so peak memory is the biggest band, not the window's whole partition set. Clip in
-    # shapely (not ogr2ogr -clipsrc — the GDAL-3.8 GeometryCollection trap). The metre pass
-    # carries DRYING_CAP as an extra positive level, so it ALSO yields the [0, cap] drying
-    # bucket, whose 0 m seaward edge is the same ring as the shoal band's amax=0 edge. The metre
-    # bands' pre-clip (buffered) coverage parts are the water footprint the nodata pass subtracts;
-    # both ladders cover the same water pixels, so the metre parts stand for it.
+    # pass, read back bucket by bucket (amax == a ladder level, exactly what gdal_contour wrote).
+    # Clip in shapely (not ogr2ogr -clipsrc — the GDAL-3.8 GeometryCollection trap). The metre pass
+    # carries DRYING_CAP as an extra positive level, so it ALSO yields the [0, cap] drying bucket,
+    # whose 0 m seaward edge is the same ring as the shoal band's amax=0 edge. The metre bands'
+    # pre-clip (buffered) coverage parts are the water footprint the nodata pass subtracts; both
+    # ladders cover the same water pixels, so the metre parts stand for it.
+    #
+    # A ladder is simplified as ONE coverage before anything else touches it — simplify first and
+    # the clip, the subdivision, the nodata differences and the write all run on 5x less geometry.
+    # The DRYING BUCKET is a member of BOTH ladders' coverages even though only the metre pass
+    # emits it: it is the shoal band's neighbour along the 0 m ring in each ladder, and if only one
+    # ladder simplified it the other's shoalest band would part company with the drying that ships
+    # (measured: with the raw bucket in both, the two ladders simplify it to within 0-1.64 m and
+    # 66 m2; without, 2-3x that, plus overlaps). m and ft can never be ONE coverage — they cover the
+    # same water by design.
     coverage_parts = []
-    drying_geoms = []
+    drying_raw = []       # the bucket as contoured — the ft ladder's coverage member
+    drying_geoms = []     # the same bucket simplified with the metre ladder — what ships
     _mark(None)
     for sys_tag, levels in (("m", config.DEPARE_LEVELS + [config.DRYING_CAP]),
                             ("ft", config.DEPARE_LEVELS_FT)):
         raw = partitions(dem, levels, f"{tmp}/depare-raw-{sys_tag}.fgb", timeout=timeout)
+        drvals, bands = [], []
         for lvl in [l for l in levels if l <= 0]:
-            bucket = read_bucket(raw, f"amax = {lvl}")
-            rows = []
-            for r in bucket.itertuples():
-                valid = make_valid(r.geometry)
-                if sys_tag == "m":
-                    coverage_parts += [piece for p in _polys(valid) for piece in _subdivide(p)]
-                for p in _polys(valid.intersection(clip)):
-                    rows.append({"geometry": p, "drval1": r.drval1, "drval2": r.drval2,
-                                 "sys": sys_tag, "kind": None, "rank": BAND_RANK})
-            sink.write(rows)
-        _mark(f"bands-clip-{sys_tag}")
+            for r in read_bucket(raw, f"amax = {lvl}").itertuples():
+                drvals.append((r.drval1, r.drval2))
+                bands.append(repaired_multi([r.geometry]))
         if sys_tag == "m":
             # The [0, DRYING_CAP] bucket, keyed on amax alone: 0 and the cap are discrete levels
             # and every other level is negative, so 0 < amax <= cap uniquely picks it regardless
             # of the garbage amin. Land above the cap (amax > cap) is dropped.
-            drying_geoms = list(read_bucket(
+            bucket = repaired_multi(read_bucket(
                 raw, f"amax > 0 AND amax <= {config.DRYING_CAP}").geometry)
+            drying_raw = [] if bucket.is_empty else [bucket]
+        _mark(f"bands-read-{sys_tag}")
+        simplified = simplify_coverage(bands + drying_raw, band_tol)
+        bands = simplified[:len(drvals)]
+        if sys_tag == "m":
+            drying_geoms = simplified[len(drvals):]
+        _mark(f"bands-simplify-{sys_tag}")
+        for (drval1, drval2), geom in zip(drvals, bands):
+            if sys_tag == "m":
+                coverage_parts += [piece for p in _polys(geom) for piece in _subdivide(p)]
+            # flush=False: the sink batches at its own FLUSH, so one band's rows are not one
+            # GeoDataFrame conversion of the whole ladder.
+            sink.write([{"geometry": p, "drval1": drval1, "drval2": drval2,
+                         "sys": sys_tag, "kind": None, "rank": BAND_RANK}
+                        for p in _polys(geom.intersection(clip))], flush=False)
+        _mark(f"bands-clip-{sys_tag}")
     # Coverage stays a PARTS list (exploded to single polygons for tight envelopes), never one
     # union: the nodata pass differences each water feature against only the parts its envelope
     # intersects — identical output (a disjoint part is a no-op), bounded local work. The
     # monolithic union made every feature pay the whole window's vertex count (the 8.9 h stems).
-    _mark("coverage-make-valid")
 
     # Inland-water feed, read once by bbox (the nodata pass iterates its features for `kind`; the
     # drying cut unions its geometry). Optional: absent -> no water term (today's land-only gate).
@@ -380,11 +584,12 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0):
     # OR water, so drying = bucket.difference(land) ∪ bucket.intersection(water) — matching the
     # raster gate (rasterize burns land=1 then water=0) without materialising land ∖ water. Absent
     # land.fgb -> no landward cut (degrade; land.fgb is effectively always present); absent
-    # water.fgb -> effective_water = NOT land (the union term is empty). Geometry stays RAW like the
-    # bands so the shared 0 m edge aligns; clip in shapely; the min-area filter drops seam slivers.
+    # water.fgb -> effective_water = NOT land (the union term is empty). The bucket arrives
+    # simplified in the SAME coverage pass as the bands, which is what keeps the shared 0 m edge
+    # aligned; clip in shapely; the min-area filter drops seam slivers.
     drying_area = None
     if drying_geoms:
-        bucket = valid_union(drying_geoms)
+        bucket = coverage_union(drying_geoms)
         _mark("drying-bucket-union")
         land_src = landmask.path()
         land_geom = None
@@ -574,6 +779,63 @@ def _check():
     bowtie = Polygon([(0, 0), (2, 2), (2, 0), (0, 2), (0, 0)])
     assert not bowtie.is_valid and valid_union([bowtie]).is_valid, \
         "valid_union must make_valid before union (guards the contour side-location-conflict fix)"
+    assert coverage_union([bowtie]).is_valid, "coverage_union must repair before dissolving"
+
+    # coverage_union dissolves a true coverage along its shared edges, and its result gate must
+    # catch input that is not one: overlapping parts come back unmerged with an area sum that
+    # still matches, so only the validity half of the gate sees them.
+    from shapely.geometry import box as _box
+    assert coverage_union([_box(0, 0, 1, 1), _box(1, 0, 2, 1)]).equals(_box(0, 0, 2, 1)), \
+        "coverage_union must merge along shared edges"
+    assert coverage_union([_box(0, 0, 2, 1), _box(1, 0, 3, 1)]).equals(_box(0, 0, 3, 1)), \
+        "coverage_union must fall back to unary_union when the parts overlap"
+
+    # Coverage simplification is the whole partition contract in one call: two bands sharing a
+    # dense chain must come back sharing the IDENTICAL chain — same vertices, in both members —
+    # while shedding vertices, holding the area, and inventing no point the raw geometry lacked
+    # (the contour lines are pinned to those points). A per-geometry simplify is what fails this.
+    import shapely
+    _nc = shapely.get_num_coordinates
+    xs = np.linspace(0.0, 400.0, 2000)
+    chain = [(float(x), 200.0 + 0.8 * np.sin(x / 3.0) + 0.5 * np.sin(x)) for x in xs]
+    upper = Polygon(chain + [(400.0, 400.0), (0.0, 400.0)])
+    lower = Polygon(chain + [(400.0, 0.0), (0.0, 0.0)])
+    tol_mm = SIMPLIFY_MM / MM_PER_PX * get_resolution(15)
+    up, lo = simplify_coverage([upper, lower], tol_mm)
+    assert _nc(up) + _nc(lo) < (_nc(upper) + _nc(lower)) / 2, "coverage simplify must shed vertices"
+    raw_pts = {tuple(p) for p in shapely.get_coordinates([upper, lower])}
+    assert not {tuple(p) for p in shapely.get_coordinates([up, lo])} - raw_pts, \
+        "coverage simplify must not invent vertices (the contour lines are pinned to them)"
+    shared = shapely.intersection(up, lo)
+    up_pts = {tuple(p) for p in shapely.get_coordinates(up)}
+    lo_pts = {tuple(p) for p in shapely.get_coordinates(lo)}
+    assert {tuple(p) for p in shapely.get_coordinates(shared)} <= (up_pts & lo_pts), \
+        "simplified adjacent bands must share an identical boundary chain (no crack)"
+    assert shapely.intersection(up, lo).area == 0 and up.is_valid and lo.is_valid, \
+        "simplified bands must stay a partition"
+    # The result gate rejects a non-coverage rather than shipping a silent crack. Both ways in:
+    # members whose "shared" chain does not match lose area to the simplifier, and an invalid ring
+    # either loses area or raises out of it as a ZeroDivisionError, not a GEOSException.
+    off = Polygon([(x, y + 1.0) for x, y in chain] + [(400.0, 0.0), (0.0, 0.0)])
+    assert all(a is b for a, b in zip(simplify_coverage([upper, off], 100.0), [upper, off])), \
+        "a broken coverage must fall back to raw geometry"
+    assert simplify_coverage([bowtie], tol_mm) == [bowtie], \
+        "a ring the simplifier cannot handle must fall back, not fail the tile"
+
+    # The sink must not write an invalid ring: the 3857 -> 4326 reprojection folds a small number
+    # of generalized rings, so it repairs whatever comes back invalid and keeps the layer polygon.
+    import geopandas as gpd
+    d0 = tempfile.mkdtemp()
+    sink = _RowSink(f"{d0}/rows.geojsons")
+    sink.write([{"geometry": bowtie, "drval1": 0.0, "drval2": 2.0, "sys": "m",
+                 "kind": None, "rank": BAND_RANK}])
+    n = sink.finish(f"{d0}/out.fgb")
+    written = gpd.read_file(f"{d0}/out.fgb")
+    assert n == len(written) and len(written), f"sink count {n} vs {len(written)} rows written"
+    assert bool(shapely.is_valid(written.geometry.values).all()), \
+        "the sink must repair rows the 4326 write leaves invalid"
+    assert set(written.geom_type) == {"Polygon"}, \
+        f"the layer must stay uniformly polygon, got {set(written.geom_type)}"
 
     # ContourTimeout mapping: a bounded command that exceeds its budget must surface as
     # ContourTimeout (the tile's retry trigger), not a generic failure.
@@ -586,7 +848,6 @@ def _check():
     # nodata simplification: a dense OSM-style outline generalizes to the stem's resolution,
     # shedding vertices while its area barely moves — and the post-clip, per-piece simplify
     # never pushes a piece's boundary outward across the clip line (the seam contract).
-    from shapely.geometry import box as _box
     from shapely import get_num_coordinates
     tol = NODATA_SIMPLIFY_PX * get_resolution(14)
     ring = [(1000.0 * np.cos(t) + 0.37 * tol * np.sin(60 * t),

@@ -283,12 +283,17 @@ rule publish_mosaic:
 # ── stage 3 (cartographic products): every consumer reads windows of the persisted ──
 # ── mosaic, as a separate job rather than riding inside the merge                    ──
 
-# The one shared f(depth, zoom) — a knob change reruns stage 3 only, never a merge.
+# The one shared f(depth, zoom) — a knob change reruns stage 3 only, never a merge. Every dial
+# prepare_window applies must appear here, coarsening included: a dial missing from this hash
+# leaves the window artifact fresh, so a sweep silently re-measures the previous surface.
 SMOOTH_CFG = json.dumps({} if os.environ.get("SKIP_SMOOTH") else {
     "sigma": smooth.DEM_SIGMA, "sigma_deep": smooth.DEM_SIGMA_DEEP,
     "mask_sigma": smooth.MASK_SIGMA, "slope_low": smooth.SLOPE_LOW,
     "slope_high": smooth.SLOPE_HIGH, "depth_full": smooth.DEPTH_FULL,
-    "depth_smooth": smooth.DEPTH_SMOOTH, "block": smooth.BLOCK}, sort_keys=True)
+    "depth_smooth": smooth.DEPTH_SMOOTH, "block": smooth.BLOCK,
+    "deep_coarsen_threshold_m": smooth.DEEP_COARSEN_THRESHOLD_M,
+    "deep_coarsen_factor": smooth.DEEP_COARSEN_FACTOR,
+    "deep_coarsen_min_child_z": smooth.DEEP_COARSEN_MIN_CHILD_Z}, sort_keys=True)
 
 
 # Fork reservations by child_z: ceil(measured max RSS) over the runs 30311420659 /
@@ -401,6 +406,7 @@ rule depare_tile:
         version=2, # increment to force a rebuild
         levels=json.dumps({"m": pipeline_config.DEPARE_LEVELS, "ft": pipeline_config.DEPARE_LEVELS_FT}),
         drying=pipeline_config.DRYING_CAP, sliver=depare_run.SLIVER_MIN_PX,
+        simplify_mm=depare_run.SIMPLIFY_MM,
     priority: vector_tile_priority  # vector band: drain before terrain so the bundle overlaps it
     retries: 2
     resources:
