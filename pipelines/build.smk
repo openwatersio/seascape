@@ -434,7 +434,9 @@ rule depare_tile:
     log:
         f"{TMP}/logs/depare/{{stem}}.log"
     shell:
-        "{PY}/depare_run.py tile {wildcards.stem} 2> {log}"
+        # stdout carries the timing marks and the per-minute heartbeat; both belong in the
+        # per-stem log so a live job is observable with tail -f, not host forensics.
+        "{PY}/depare_run.py tile {wildcards.stem} > {log} 2>&1"
 
 
 # Weight like the merge: a native z14 window is the same array size; overview stems are tiny.

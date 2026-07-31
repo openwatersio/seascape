@@ -97,7 +97,8 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 WORKDIR /app
 COPY pyproject.toml uv.lock /app/
-RUN uv sync --frozen --no-install-project
+RUN uv sync --frozen --no-install-project \
+  && /opt/venv/bin/pip install --no-cache-dir py-spy  # stack-dump any wedged job via docker exec
 ENV PATH="/opt/venv/bin:${PATH}"
 
 # The build is one Snakemake DAG (docker.sh fronts it). e.g.

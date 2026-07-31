@@ -186,12 +186,13 @@ def _uniform_coarsen(dem, factor, out):
 
 
 _mark_last = None
+_mark_label = None  # the last COMPLETED phase — the heartbeat names the one after it
 
 
 def _mark(label):
     """DEPARE_TIMING=1: print wall seconds since the previous mark — the phase-1 profile's
     section attribution (docs/plans/2026-07-21-depare-perf.md)."""
-    global _mark_last
+    global _mark_last, _mark_label
     if not os.environ.get("DEPARE_TIMING"):
         return
     import time
@@ -199,6 +200,26 @@ def _mark(label):
     if _mark_last is not None and label:
         print(f"depare-timing {label}: {now - _mark_last:.1f}s", flush=True)
     _mark_last = now
+    _mark_label = label
+
+
+def _heartbeat(stem, interval=60):
+    """A daemon thread that names the live phase and the process RSS once a minute, so a
+    wedged tile identifies itself in its own log. Marks print on phase COMPLETION, so the
+    running phase is the one after _mark_label."""
+    import threading
+    import time
+
+    def beat():
+        t0 = time.monotonic()
+        while True:
+            time.sleep(interval)
+            since = time.monotonic() - (_mark_last or t0)
+            print(f"depare {stem} alive: {time.monotonic() - t0:.0f}s total, "
+                  f"{since:.0f}s past mark '{_mark_label or 'start'}', "
+                  f"rss {_rss_kb() // 1024} MB", flush=True)
+
+    threading.Thread(target=beat, daemon=True).start()
 
 
 def _polys(geom):
@@ -711,6 +732,8 @@ def tile(stem):
             sys.exit(124)
         signal.signal(signal.SIGALRM, _alarm)
         signal.alarm(timeout * 8)
+    if os.environ.get("DEPARE_TIMING"):
+        _heartbeat(stem)
     z, x, y, child_z = (int(a) for a in stem.split("-"))
     out = f"store/depare/{stem}.fgb"
     tmp = tempfile.mkdtemp(prefix=f"depare-{stem}-")  # local scratch; publish crosses to the store
