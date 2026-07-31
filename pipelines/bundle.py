@@ -373,7 +373,7 @@ def _check():
         assert names == {"planet.pmtiles", "vector.pmtiles", "overlay-5-1-1.pmtiles",
                          "coverage.pmtiles", "land.pmtiles"}, f"upload set {names}"
         assert not any("soundings" in n or "depare" in n for n in names), \
-            "soundings/depare tile-join into vector.pmtiles — never shipped separately"
+            "soundings/depare fold into vector.pmtiles — never shipped separately"
         assert "manifest.json" not in names and manifest_path.endswith("/manifest.json"), \
             "manifest.json is returned separately so the publisher sends it LAST"
 

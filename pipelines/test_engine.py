@@ -17,9 +17,10 @@ checkpoint that gates stage 2/3 (``snakemake bundles``) — and asserts:
     but ZERO mosaic_tile and ZERO terrain_render (the stage split's payoff — no
     re-merge, no re-render — proven by a dry run's rerun table);
   - the sharded vector bundle: a global shallow run (z < SPLIT_Z, minzoom-filtered) +
-    one variable-depth run per SPLIT_Z cell, tile-joined into a single sparse
-    vector.pmtiles (no separate soundings/depare archives); tile ownership is disjoint
-    (shallow below SPLIT_Z, cells at/above it), and the joined archive's self-check
+    one variable-depth run per SPLIT_Z cell (each fringe-filtered to its owned subtree),
+    `pmtiles merge`d into a single sparse vector.pmtiles (no separate soundings/depare
+    archives); tile ownership is STRICTLY disjoint (shallow below SPLIT_Z, cells at/above
+    it with zero cross-cell overlap), and the merged archive's self-check
     invariants hold (no depare below z6, no contour below its tier minzoom, depare
     m-bands disjoint, soundings present, every input id survives); the manifest carries
     vector.max_zoom = the covering's max child_z (the Worker's serving depth);
@@ -374,13 +375,14 @@ def check_shallow_minzoom_filter():
         assert len(written) == 1 and written[0]["properties"]["depth_m"] == deep, \
             f"only the minzoom<=cut contour survives the shallow filter: {written}"
 
-        gj = f"{tmp}/s.geojson"
+        gj = f"{tmp}/s-in.geojsons"  # line-delimited features, the per-stem soundings format
         with open(gj, "w") as f:
-            json.dump({"type": "FeatureCollection", "features": [
+            for feat in [
                 {"type": "Feature", "tippecanoe": {"minzoom": 0}, "properties": {"depth_m": 5},
                  "geometry": {"type": "Point", "coordinates": [0, 0]}},
                 {"type": "Feature", "tippecanoe": {"minzoom": cut + 5}, "properties": {"depth_m": 9},
-                 "geometry": {"type": "Point", "coordinates": [0.1, 0.1]}}]}, f)
+                 "geometry": {"type": "Point", "coordinates": [0.1, 0.1]}}]:
+                f.write(json.dumps(feat) + "\n")
         cr._soundings_to_seq([gj], f"{tmp}/s.geojsons", 0, max_minzoom=cut)
         swritten = [json.loads(l) for l in open(f"{tmp}/s.geojsons")]
         assert len(swritten) == 1 and swritten[0]["properties"]["depth_m"] == 5, \
@@ -481,13 +483,12 @@ def main():
         maxz = contour_run._stems_maxz(stems)
 
         # ── tile ownership (Verification): the shallow archive owns EVERY z < SPLIT_Z tile and each
-        # cell archive owns its z >= SPLIT_Z subtree — an EXACT split by zoom, so shallow and cells
-        # never collide. Across cells the split is home-cell-by-address, but tippecanoe's per-tile
-        # edge buffer bleeds a boundary feature one tile into the neighbouring cell, so adjacent
-        # cells legitimately co-emit the shared boundary tile — the same buffered abut that keeps
-        # today's per-stem seams crack-free, and tile-join MERGES those (not a byte-concat). Assert
-        # the exact zoom split, and that every cross-cell overlap is a boundary fringe (mutually
-        # adjacent cells), which catches a mis-sharded stem (its tiles would land far from home). ──
+        # cell archive owns EXACTLY its z >= SPLIT_Z subtree. The owned-subtree filter (bundle_cell_stable)
+        # dropped every fringe tile a neighbour's edge buffer bled in, so cross-cell overlap is now ZERO
+        # by construction — the tiles are STRICTLY disjoint, which is what lets `pmtiles merge` (refuses
+        # overlapping inputs) concatenate them. Assert the exact zoom split, that every cell tile sits
+        # in its OWN home subtree (a mis-sharded stem would land far from home), and that no tile is
+        # emitted by two cells. ──
         import collections as _c
         shallow_arch = f"{tmp}/store/bundle/vector-shallow.pmtiles"
         assert os.path.exists(shallow_arch), "missing vector-shallow.pmtiles"
@@ -504,16 +505,15 @@ def main():
             for z, xys in _pm_tiles(ca).items():
                 assert z >= SPLIT_Z, f"cell archive emitted z{z} < SPLIT_Z ({SPLIT_Z})"
                 for x, y in xys:
+                    # after the fringe filter, every tile a cell emits must sit in its OWN subtree
+                    assert (x >> (z - SPLIT_Z), y >> (z - SPLIT_Z)) == (cx, cy), \
+                        f"z{z} {x}/{y} emitted by cell {cx}-{cy} is outside its own subtree — fringe not filtered"
                     emitters[(z, x, y)].add((cx, cy))
-        dups = {k: v for k, v in emitters.items() if len(v) > 1}
-        for (z, x, y), cs in dups.items():
-            hx, hy = x >> (z - SPLIT_Z), y >> (z - SPLIT_Z)  # the tile's home cell
-            for (cx, cy) in cs:
-                assert abs(cx - hx) <= 1 and abs(cy - hy) <= 1, \
-                    f"z{z} {x}/{y} emitted by cell {cx}-{cy}, not adjacent to home {hx}-{hy} — a mis-sharded stem"
-        assert len(dups) < len(emitters), "every z>=SPLIT_Z tile is a cross-cell overlap — the shard split is degenerate"
+        dups = {k: sorted(v) for k, v in emitters.items() if len(v) > 1}
+        assert not dups, \
+            f"cell archives must be STRICTLY disjoint after the owned-subtree filter, got overlaps: {dict(list(dups.items())[:5])}"
         print(f"vector tile-ownership ok — shallow z<{SPLIT_Z}, {len(cell_archs)} cell archive(s) "
-              f"z>={SPLIT_Z}; {len(emitters)} tiles, {len(dups)} boundary-fringe overlaps (tile-join merged)")
+              f"z>={SPLIT_Z}; {len(emitters)} tiles, 0 cross-cell overlaps (strictly disjoint, pmtiles merge)")
 
         # ── shallow minzoom filter on the built archive: no feature whose minzoom exceeds SPLIT_Z-1
         # may ride a shallow tile — depare (floor DEPARE_MINZOOM) appears iff its floor fits the

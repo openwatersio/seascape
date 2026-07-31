@@ -1,24 +1,37 @@
 # Build optimization backlog
 
 The remaining actionable performance work under the Snakemake build
-(docs/plans/2026-07-14-snakemake-build.md). The former backlog and `aggregate-tile-peaks.md` were
-consolidated on 2026-07-18: the migration resolved or restructured most of that program — per-job
-isolation, engine provenance, measured reservations, and per-tile `benchmark:` TSVs replaced the
-hand-rolled admission scheduler, key machinery, and ad-hoc peak sampling. OOM is no longer the
-build's failure mode; memory *budgeting* (reservations fit from fresh benchmarks) and *windowing*
-(bounding per-job footprints) remain live concerns. Incident evidence, resolved items, and
+(docs/plans/2026-07-14-snakemake-build.md). Incident evidence, resolved items, and
 discarded hypotheses live in [optimization-history.md](optimization-history.md).
 
 ## Remaining action items
 
 Ranked by expected impact on the incremental (weekly-refresh) build first, cold planet second.
-Run 29847332817 (2026-07-21, ccx63, first dispatch after the DAG unification) is the reference
-incremental measurement: **8 h 12 m wall for a build with zero changed source data**. All
-mosaic-side work (239 overlay bundles, 344 terrain renders, index, publish) finished inside the
-first hour; the remaining 7 h+ was the serial `soundings_bundle → vector_bundle → stage_build`
-chain on an otherwise idle 48-core box. No clean cold planet number exists yet: the first planet
-attempt reached 82% of 3,244 tiles in ~35 minutes on a ccx63 before an fd-limit crash. The
-dominant costs are spurious rebuild triggers, vector bundling, and the pathological DEPARE tail.
+
+### Drain the z15 tail — banded rule priorities + fitted big-job reservations
+
+Run 30417069133 measured the mechanism end-to-end. `--prioritize mosaic_index` sets its whole
+dependency closure — every merge — to uniform maximum priority (job logs print
+`priority: highest`), erasing the heavy-first `tile_priority` interleave within the merge class.
+Under uniform priority the scheduler's knapsack maximizes the **sum** of priorities that fit the
+memory budget, so many small jobs always outscore few big ones: hundreds of 2–3 GB coarse merges
+ran ahead of the 9 GB z15 merges (last z15 merge landed ~2.5 h in), the z15 fork chain trailed
+behind its neighborhoods, and the same bias inside the vector band ran windows/contours ahead of
+depare. End state: a ~2.5 h tail of z15 depare draining 6-wide (`DEPARE_GB[15]` = 24 → only
+6 × 24 fit in 161 GB) at load 10–25 on 48 cores. The same bias let fork windows outrun their
+consumers 99-deep — a 295 GB `store/window` transient, volume peak 1.8 of 2.0 TB.
+
+- **Replace `--prioritize mosaic_index` with explicit rule bands**: `mosaic_index` above the
+  merges; `mosaic_tile` as its own graded band (heavy-first `tile_priority` intact) above
+  `VECTOR_BAND`; terrain stays bottom. z15 merges then start at t=0 and their fork chains
+  overlap the coarse-merge flood instead of trailing it.
+- **Re-fit `DEPARE_GB[15]` 24 → ~15** (planet-measured, n=25: mean 10.5 GB, max 13.7 GB, wall
+  mean 12.3 min / max 27.5 min; `attempt` covers the tail) — 10-wide instead of 6-wide.
+- The `store/window` transient either rides item 8's NVMe bind (below) or gains volume-side
+  disk accounting; 250 GB free at peak was closer than comfortable.
+
+Success: the refresh-wave build loses its low-load tail (~2–3 h off run 30417069133's shape).
+Effort: small (priority constants + one table entry). Risk: low.
 
 ### Marsh-coast depare: the post-contour GEOS pass is the new bottleneck
 
@@ -75,8 +88,8 @@ before choosing a mechanism.
 ### Stop false planet rebuilds — trigger hygiene
 
 Run 29847332817 rebuilt the world off a metadata artifact, not data: `mosaic_index`,
-`soundings_bundle`, and all 239 `overlay_bundle` jobs re-ran with reason *"Params have changed
-since last execution: before: `<nothing exclusive>` now: `''`"* — the params-provenance transition
+`soundings_bundle`, and all 239 `overlay_bundle` jobs re-ran with reason _"Params have changed
+since last execution: before: `<nothing exclusive>` now: `''`"_ — the params-provenance transition
 from the single-DAG migration. Everything else cascaded by mtime: `mosaic_index` rewrote
 `mosaic.gti`/`planet-z8.tif` → 344 terrain renders + a full `publish_mosaic`; `soundings_bundle` →
 `vector_bundle` → `stage_build`. Total: 8 h 12 m of ccx63 for a no-op.
@@ -96,6 +109,20 @@ from the single-DAG migration. Everything else cascaded by mtime: `mosaic_index`
   bundle jobs.
 - Verify the next dispatch is a near-no-op (hydrate + stage checks, well under an hour). The
   params records are now written, so this specific transition should be one-time — confirm it.
+- **Resolved 2026-07-29 — fresh-box benchmark-missing reruns.** Snakemake counts a job's
+  benchmark among its products, and benches are box-scratch (per 435c5f0), so every fresh box
+  re-ran `mosaic_index` ("Missing output files: …/bench/mosaic-index.tsv") plus its
+  planet-z8/GTI mtime cascade. Fixed in `snakemake_patches.py`: `Job.missing_output` ignores a
+  missing benchmark for rules with real outputs (output-less rules — `publish_mosaic`,
+  `stage_build` — keep it: the missing bench is what fires them each run, caught by
+  test_build). Two hard lessons attached: benchmark paths are load-bearing scheduler state —
+  relocating them to the store scheduled a **36,642-job full-planet rebuild** (measured live,
+  cancelled) and would regress 435c5f0's per-run analysis; and the fix class must be validated
+  with `test_build.py`, not `test_engine.py` alone.
+- **Elevate the `mosaic_tile` content-hash guard (below, "noted 2026-07-27") to next-build
+  work.** Run 30417069133's wave is its exact payoff case: the weekly S-102 catalog restamp
+  re-merges every intersecting coastal tile, and each byte-identical output re-runs four forks,
+  renders, and a cell for nothing. The guard kills the cascade at the merge.
 
 Success: a build with no changed inputs finishes in minutes, and any planet-scale re-run is
 deliberate. Effort: small. Risk: low.
@@ -211,19 +238,19 @@ harbor cell now builds in 2 m 47 s. Attack items 1–2 below are superseded; the
 stitch-cost work is the `pmtiles merge` follow-up (parked, see below).
 
 **Wagyu exit-106 (shared-borders variant) — resolved 2026-07-23.** The regenerated fixture (Stockholm-archipelago stem FGB
-   `store/depare/6-35-18-10.fgb`, 265 MB, 124k polygons) crashes stock tippecanoe 2.79 AND
-   felt/tippecanoe main (v2.80.0 — the box's build) with `--detect-shared-borders`: a Wagyu
-   hole-placement bug ([mapbox/tippecanoe#761](https://github.com/mapbox/tippecanoe/issues/761),
-   unfixed upstream) on dense hole-heavy polygons; input is valid per ST_IsValid, so **no version
-   bump fixes it**. Fix: `depare_run.py` swaps `--detect-shared-borders` →
-   `--no-simplification-of-shared-nodes` (felt's own documented successor — keeps shared edges
-   exact/crack-free and builds clean, all 124k features retained), with an `assert` guarding
-   against reintroduction. Pre-clean was rejected (the collapse is inside tippecanoe at tile
-   quantization, downstream of source precision); feature-split-by-sys works but is fragile. A
-   minimized git-storable fixture is **impossible** (125 MB floor — the crash is emergent from a
-   large connected polygon mass, so spatial bisection stalls), so the assert is the regression
-   guard rather than a CI fixture; the full fixture (kept locally / R2 if ever wanted) is a
-   positive gate since it now builds clean.
+`store/depare/6-35-18-10.fgb`, 265 MB, 124k polygons) crashes stock tippecanoe 2.79 AND
+felt/tippecanoe main (v2.80.0 — the box's build) with `--detect-shared-borders`: a Wagyu
+hole-placement bug ([mapbox/tippecanoe#761](https://github.com/mapbox/tippecanoe/issues/761),
+unfixed upstream) on dense hole-heavy polygons; input is valid per ST_IsValid, so **no version
+bump fixes it**. Fix: `depare_run.py` swaps `--detect-shared-borders` →
+`--no-simplification-of-shared-nodes` (felt's own documented successor — keeps shared edges
+exact/crack-free and builds clean, all 124k features retained), with an `assert` guarding
+against reintroduction. Pre-clean was rejected (the collapse is inside tippecanoe at tile
+quantization, downstream of source precision); feature-split-by-sys works but is fragile. A
+minimized git-storable fixture is **impossible** (125 MB floor — the crash is emergent from a
+large connected polygon mass, so spatial bisection stalls), so the assert is the regression
+guard rather than a CI fixture; the full fixture (kept locally / R2 if ever wanted) is a
+positive gate since it now builds clean.
 
 **Wagyu exit-106 (coalesce variant) — patched 2026-07-28.** `--coalesce-smallest-as-needed`
 drop passes stack identical tiny-polygon placeholder squares into multipolygons whose holes
@@ -249,9 +276,8 @@ named-layer tippecanoe) saved 22.8% at planet scale, semantically exact on the 1
 The vector bundle is now SHARDED variable-depth runs (one dense shallow run + one run per
 stem-grid cell, all three layers joint per run — depare's no-drop partition policy became the
 invocation-wide `--coalesce-smallest-as-needed`, contours coalesce cleanly, gate-verified),
-tile-joined into the single served archive; the old per-layer tile-join fold is gone, and the
-shard-stitch tile-join is the `pmtiles merge` follow-up below. Legacy baseline was 7 h 01 m /
-62% of the 11 h 19 m build.
+`pmtiles merge`d into the single served archive; the old per-layer tile-join fold is gone. Legacy
+baseline was 7 h 01 m / 62% of the 11 h 19 m build.
 
 **Publish hash pass:** `_HashCache` (mtime_ns+size keyed, store/mosaic/hash-cache.json) was in
 run 29847332817 but cold — `mosaic_publish` still read 376 GB in 30.6 min populating it. Expect
@@ -283,7 +309,7 @@ dropped); the drying sliver filter run per-clip not per-source-polygon (moved to
 gate, seam 2.08e-2° → 7.49e-4°); and the nodata + residual-band seam "mismatches", which proved to
 be a **false positive in `check_depare` itself** — the depare geometry is already seam-consistent to
 ~2e-8°, but the on-seam coverage selector used `ON_EDGE_PIXELS` (0.1 px ≈ 15 m), counting OSM
-boundary detail that merely *grazes* near the seam (one-sided) as coverage. Fixed with a tight
+boundary detail that merely _grazes_ near the seam (one-sided) as coverage. Fixed with a tight
 `ON_SEAM_PIXELS = 1e-3` selector in `check_depare` only (contour crossings keep the looser point
 snap); the real tolerance (`TOL_PIXELS = 3`) is unchanged and the shifted-band negative test still
 fails, so real misalignment is still caught. All depare bands, drying, and nodata now PASS the seam
@@ -300,7 +326,7 @@ One real pre-existing seam mismatch (NOT caused by this work) is deferred:
   module docstring already calls "fundamental," not a clip or window bug (the shapely-clip A/B
   proved the clip faithful). Decision owed: `seam_check.check_contours` should either exclude levels
   above `NAV_SMOOTH_MAX` or carry a wider tolerance for them — it currently flags them as MISMATCH.
-  (The `check_depare` false positive above was the same *class* of over-sensitive-gate issue but a
+  (The `check_depare` false positive above was the same _class_ of over-sensitive-gate issue but a
   distinct mechanism — grazing coverage vs. per-window smoothing — and only the depare side is
   fixed; contours keep `ON_EDGE_PIXELS` because a line crosses the seam at a point.)
 
@@ -326,8 +352,10 @@ gdal_contour idea is moot.
 - Throughput: the large single objects (vector ~10 GB, soundings ~6 GB) crawl on one transfer —
   same knob as the planet-z8 BigTIFF (**25 MB/s** measured): tune `--s3-upload-concurrency` +
   explicit `--s3-chunk-size` (memory ≈ concurrency × chunk) for `copyto`/large objects only.
-  Target ≥2× without regressing tile copies, which already sustain ~201 MB/s (peak 542) with
-  `--transfers 32`. Retain `--stats-log-level NOTICE`.
+  (`--s3-chunk-size 64M` landed 2026-07-29 on the stage_build copyto — required anyway to lift
+  rclone's default-chunking 48 GB object cap; concurrency tuning still open.) Target ≥2× without
+  regressing tile copies, which already sustain ~201 MB/s (peak 542) with `--transfers 32`.
+  Retain `--stats-log-level NOTICE`.
 
 ### Memory reservation upkeep
 
@@ -340,8 +368,10 @@ from the densest measured tile, never an average — and reserve exactly the mea
 pad: fork footprints are window-geometry-deterministic (p50 == max within a class), and
 `attempt` escalation plus the box swapfile already cover the tail. As of 2026-07-28 every fork
 class (window/contour/soundings/depare × child_z) is measured under the streamed
-implementations; two re-fits are owed from accumulating samples: depare z15 (24 reserved vs
-11 measured) and the coarse depare classes (z8–z12 entries predate bucket streaming).
+implementations. Depare z15 is now planet-measured (run 30417069133, n=25: mean 10.5 GB, max
+13.7 GB against 24 reserved) — the re-fit to ~15 rides the tail item at the top of this doc.
+Terrain z15 was re-fit 2026-07-29 (`TERRAIN_FACTOR` 2.0 → 1.3; n=4 at 18.3–18.7 GB, a 2%
+spread). Still owed: the coarse depare classes (z8–z12 entries predate bucket streaming).
 
 Two hard-won invariants to keep enforcing:
 
@@ -384,10 +414,12 @@ after a safe age (four incomplete mosaic-tile uploads from 2026-07-14 were found
 - Release-candidate closeout: validate the accumulated correctness fixes in one planet build, then
   manually dispatch `release.yml` with the validated SHA and verify its live smoke tests
   (feature-branch builds do not auto-release). See ../build-validation.md.
-- NVMe for hot reads: if host metrics show the per-tile mask rasterize contending on the Ceph
-  volume, `cp -p` the masks to NVMe and bind-mount over `store/landmask` (paths and mtimes
-  unchanged, so provenance is untouched). The broader NVMe-hot-store idea is superseded by the
-  plan's named metadata-hydration path (Non-goals: Distribution).
+- NVMe for hot reads — **landed 2026-07-28/29**: the masks are served from NVMe via per-FILE
+  `nsenter` bind mounts (build.yml; per-file, not a directory shadow — the dir also holds the
+  landmask rule's inputs, and the runner service's private mount namespace hides binds made
+  outside PID 1's). Paths and mtimes unchanged; three validated runs show zero DAG impact. The
+  broader NVMe-hot-store idea is superseded by the plan's named metadata-hydration path
+  (Non-goals: Distribution).
 
 ### Fallback, named but not scheduled
 
@@ -400,9 +432,9 @@ tile id as a window id, so a finer stage-3 grid is a parameter change.
 
 Kept for reservation fitting and bbox selection (regenerate via `aggregation_covering.py`):
 
-| metric | value |
-| --- | --- |
-| tiles total | 3286 |
+| metric            | value                                                                          |
+| ----------------- | ------------------------------------------------------------------------------ |
+| tiles total       | 3286                                                                           |
 | child_z histogram | z8:1138 · z9:753 · z10:758 · z11:81 · z12:159 · z13:195 · z14:92 · **z15:110** |
 
 The former z14 tail split: S-102/CUDEM/nz_coastal stems promoted to native z15 (110 stems,
@@ -411,28 +443,25 @@ coast plus the UK surf zone; weekly raw-source refreshes dirty these same tiles 
 tail is steady-state, not a one-time cost. Fresh per-tile peaks come from the per-run
 `bench/*/**.tsv` benchmark artifact on every run.
 
-**Follow-up: replace tile-join with `pmtiles merge` (parked 2026-07-27).** The vector join's
-tile-join must MERGE boundary tiles (adjacent cells co-emit their shared fringe through
-tippecanoe's tile buffer), runs the felt PMTiles writer with its known corruption bug
-(felt/tippecanoe#278), and decodes/re-encodes where a byte copy would do. go-pmtiles
-`merge` is sequential I/O over clustered shards but requires STRICT disjointness (it errors
-on any overlapping tile), so the prerequisite is filtering each cell archive to its owned
-subtree — argued safe because per-stem fork inputs are pre-clipped at cell boundaries (a
-feature never enters a neighbor's tile extent, only its buffer, and the owning tile's own
-buffer covers rendering across the edge; needs one preview eyeball at a cell boundary).
-A working start (owned-subtree filter, pinned go-pmtiles in the Dockerfile, strict-disjoint
-ownership tests, plus switching soundings intermediates to line-delimited .geojsons for
-streaming reads — that piece is separable and can land alone) is parked in the
-native-resolution worktree stash "pmtiles-merge WIP"; known wrinkle from its first run: the
-pre-merge layer-set consistency assertion must tolerate cells that legitimately lack a
-layer (constant-depth regions emit no contours).
+**Vector join: `pmtiles merge` instead of tile-join (landed 2026-07-29).** tile-join had to MERGE
+boundary tiles (adjacent cells co-emit their shared fringe through tippecanoe's tile buffer), ran
+the felt PMTiles writer with its known corruption bug (felt/tippecanoe#278), and decoded/re-encoded
+where a byte copy would do. go-pmtiles `merge` is sequential I/O over clustered shards but requires
+STRICT disjointness (it errors on any overlapping tile), so each cell archive is first filtered to
+its owned subtree (`contour_run._filter_owned_subtree`) — safe because per-stem fork inputs are
+pre-clipped at cell boundaries, so a feature never enters a neighbor's tile extent, only its
+buffer, and the owning tile's own buffer covers rendering across the edge. Two wrinkles worth
+keeping: merge takes layer-schema metadata from its FIRST input, so the lead shard's layer set
+must COVER every shard's (a constant-depth cell legitimately emits no contours, so subset shards
+are legal); and go-pmtiles is pinned + sha256-verified per arch in the Dockerfile.
+**Owed: one preview eyeball at a cell boundary** to confirm the fringe drop leaves no visible seam.
 
 **Content-hash guard on `mosaic_tile` outputs (noted 2026-07-27).** The strip→NY-harbor scope
 transition showed a restamped covering CSV re-merging tiles into byte-identical outputs, whose
 fresh mtimes then rebuilt every downstream fork/render on the next invocation. Snakemake can't
 unschedule a planned cascade mid-run, but across invocations the repo's write_if_changed pattern
 cures it — extend it to the merge: after building a tile in scratch, hash-compare against the
-existing store tile (the publish _HashCache already computes these) and skip the replace when
+existing store tile (the publish \_HashCache already computes these) and skip the replace when
 identical, preserving the mtime. Converts any future spurious-trigger class from "wasted build +
 full downstream cascade" to "wasted build, cascade dies at the merge." Belt on top of the
 scope-independent-covering fix, which removes the known trigger itself.
@@ -458,7 +487,9 @@ merge outputs (the mosaic_tile content-hash guard above).
    intersecting tiles.
 5. **Serial-tail box right-sizing**: the vector phase measured 6–9 GiB at 1–6 cores — a CX53
    (€0.047/hr) instead of the ccx63 (€1.37/hr post-reprice) if the tail survives sharding.
-   Measure the sharded tail first; may be moot.
+   Update 2026-07-29: the sharded tail is measured and it is not the vector phase — cells run
+   2–3 min overlapped mid-build; the real tail is the z15 depare residue (top item), which is
+   memory-bound, not box-class-bound. Likely moot once the priority bands land; re-check then.
 6. **`ST_CoverageSimplify` prototype on the Stockholm fixture** — elevated by the 2026-07-27
    profiling: wagyu hole placement measured 60–99% of bundle CPU on ring-dense tiles, so a
    coverage-safe pre-generalization per zoom tier attacks the dominant remaining cost. Batch step
@@ -468,13 +499,17 @@ merge outputs (the mosaic_tile content-hash guard above).
    Planetiler spike on one dense cell's depare (insurance against the felt fork's bus factor),
    maplibre-contour (chart-grade smoothing/bias questions unresolved).
 
-8. **fork_window outputs → NVMe scratch** (parked; mechanism settled 2026-07-29): do it as a
-   directory bind like the landmask masks — build.yml bind-mounts a box-local dir over
-   `store/window/` before the build — NOT as a path change. The bind keeps the canonical
-   path, so the DAG is untouched and it can land at any time without a rebuild; the dir dies
-   with the box, and a resumed run re-derives windows for stems whose forks hadn't finished
-   (pure derivations, ≤~38 min each). Parked because the per-run saving is small outside a
-   full fork rebuild, and each extra mount is a setup failure mode on long runs.
+8. **fork_window outputs → NVMe scratch** (recommended for the next dispatch; mechanism settled
+   2026-07-29): do it as a directory bind like the landmask masks — build.yml bind-mounts a
+   box-local dir over `store/window/` before the build — NOT as a path change. The bind keeps
+   the canonical path, so the DAG is untouched and it can land at any time without a rebuild;
+   the dir dies with the box, and a resumed run re-derives windows for stems whose forks hadn't
+   finished (pure derivations, ≤~38 min each). Originally parked as a small saving, but run
+   30417069133 re-priced it: the window transient peaked at **295 GB / 99 files** on the volume
+   (1.8 of 2.0 TB, 250 GB free) because the scheduler's small-job bias lets windows outrun
+   their fork consumers — the bind moves that whole transient (and its Ceph round-trips) to
+   box NVMe. Land it together with the tail item's priority bands, now that the novel bundle
+   phases have a validated planet run behind them.
 9. **Single-pass dual-ladder gdal_contour** (noted 2026-07-28): contour runs two full-window
    `gdal_contour` passes (metre + feet ladders); one combined-level pass with features
    duplicated onto both `sys` tags at shared levels saves ~2–4 min per z15 stem of raster

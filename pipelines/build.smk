@@ -389,10 +389,11 @@ rule soundings_tile:
         window="store/window/{stem}.tif",
         masks=MASKS,
     output:
-        "store/soundings/{stem}.geojson"
+        "store/soundings/{stem}.geojsons"
     params:
         version=1, # increment to force a rebuild
         cell=soundings_run.SOUND_CELL_PX, min_depth=soundings_run.SOUND_MIN_DEPTH_M,
+        thin=soundings_run.SOUND_THIN_TIERS,
     priority: vector_tile_priority  # vector band: drain before terrain so the bundle overlaps it
     retries: 2
     resources:
@@ -474,7 +475,7 @@ rule contours:
 
 rule soundings:
     input:
-        lambda wc: expand("store/soundings/{stem}.geojson", stem=covering_stems())
+        lambda wc: expand("store/soundings/{stem}.geojsons", stem=covering_stems())
 
 
 rule depare:
@@ -491,7 +492,7 @@ def tile_inputs(wc):
     """Everything cartographic per stem — the union the `tiles` target gates on (DEPARE rides
     only when enabled)."""
     return (expand("store/contour/{stem}.fgb", stem=covering_stems())
-            + expand("store/soundings/{stem}.geojson", stem=covering_stems())
+            + expand("store/soundings/{stem}.geojsons", stem=covering_stems())
             + expand("store/depare/{stem}.fgb", stem=depare_stems())
             + expand("store/pmtiles/{stem}.pmtiles", stem=render_stems()))
 
@@ -501,17 +502,18 @@ rule tiles:
         tile_inputs
 
 
-# ── vector bundle — cell-subtree sharded variable-depth tippecanoe + tile-join ──
+# ── vector bundle — cell-subtree sharded variable-depth tippecanoe + pmtiles merge ──
 # The one joint variable-depth run is split three ways so the serial variable-depth tiler runs once
 # per cell concurrently, not once over all planet content (docs/plans/2026-07-14-native-resolution.md):
 #   vector_shallow — plain dense -Z0 -z(VECTOR_SPLIT_Z-1) over all three layers, features filtered
 #     to minzoom <= VECTOR_SPLIT_Z-1; owns every z < VECTOR_SPLIT_Z tile.
 #   vector_cell    — one variable-depth run per populated VECTOR_SPLIT_Z cell (default: the
 #     macrotile grid — one covering stem per cell, so the worst cell job is one stem's content),
-#     -Z VECTOR_SPLIT_Z -z(cell child_z); owns the cell's z >= VECTOR_SPLIT_Z subtree. These are the long
-#     poles, so they ride VECTOR_BAND.
-#   vector_join    — tile-join the shallow + all cell archives into the served vector.pmtiles;
-#     ownership is disjoint so the join is pure concatenation (-pk).
+#     -Z VECTOR_SPLIT_Z -z(cell child_z), then rewritten to keep only its z >= VECTOR_SPLIT_Z owned
+#     subtree (fringe tiles dropped). These are the long poles, so they ride VECTOR_BAND.
+#   vector_join    — `pmtiles merge` the shallow + all cell archives into the served vector.pmtiles;
+#     ownership is structurally disjoint after the fringe filter, so the merge is a pure concat
+#     (go-pmtiles refuses overlapping inputs).
 # Layers stay joint within every run (separately-tiled layers leaf at different depths and vanish the
 # shallower one). All zoom gating rides as per-feature tippecanoe.minzoom (contour tiers, depare's z6
 # floor, sounding pyramid levels). 0-byte per-tile inputs are empty tiles (kept by size); an
@@ -520,7 +522,7 @@ rule tiles:
 rule vector_shallow:
     input:
         contours=lambda wc: expand("store/contour/{stem}.fgb", stem=covering_stems()),
-        soundings=lambda wc: expand("store/soundings/{stem}.geojson", stem=covering_stems()),
+        soundings=lambda wc: expand("store/soundings/{stem}.geojsons", stem=covering_stems()),
         depare=lambda wc: expand("store/depare/{stem}.fgb", stem=depare_stems()),
     output:
         "store/bundle/vector-shallow.pmtiles"
@@ -540,7 +542,7 @@ rule vector_shallow:
 rule vector_cell:
     input:
         contours=lambda wc: expand("store/contour/{stem}.fgb", stem=vector_cells().get(wc.cell, [])),
-        soundings=lambda wc: expand("store/soundings/{stem}.geojson", stem=vector_cells().get(wc.cell, [])),
+        soundings=lambda wc: expand("store/soundings/{stem}.geojsons", stem=vector_cells().get(wc.cell, [])),
         depare=lambda wc: expand("store/depare/{stem}.fgb",
                                  stem=(vector_cells().get(wc.cell, []) if DEPARE else [])),
     output:
