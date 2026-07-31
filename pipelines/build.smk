@@ -325,17 +325,18 @@ DEPARE_GB = {15: 36, 14: 7, 13: 3, 12: 4, 10: 4, 9: 4, 8: 4}
 # code, which only shrinks depare, so the fit is an upper bound. The tile is absent on a
 # fresh store (DAG evaluation precedes the merges) — fall back to the DEPARE_GB constants.
 def depare_gb(wc, attempt):
-    # Floored per child_z: compressed tile bytes under-predict at fine zooms, where the
-    # coverage-simplification resident ladder scales with the window's PIXEL area (constant per
-    # child_z) rather than with how compressible the ocean is — run 30641774632 measured
-    # small-tile cz15 stems at 9.6-18.8 GB against tile-fit reserves of 5-7. Floors are that
-    # run's live p99 + pad; the tile fit still governs the big-tile tail (marsh windows).
+    # Floored per child_z at the class MEDIAN, deliberately not the tail: reservations are
+    # admission control, and reserving the p99 for every member idles the box (36 GB held cz15
+    # to 4-wide while live RSS summed to ~12 GB). Over-admission is the cheaper failure — the
+    # tail rides physical headroom + swap, an OOM'd stem retries at x attempt, and run
+    # 30641774632 ran 21 stems past their reservations with zero failures and the best
+    # utilization measured. Fit floors from that run: cz15 actuals 9.6-19.7 GB, p50 ~12.
     cz = int(wc.stem.split("-")[3])
     try:
-        gb = 0.28 + 1.805 * os.path.getsize(f"store/mosaic/tiles/{wc.stem}.tif") / 1e9 + 4
+        gb = 0.28 + 1.805 * os.path.getsize(f"store/mosaic/tiles/{wc.stem}.tif") / 1e9 + 2
     except OSError:
         gb = DEPARE_GB.get(cz, 3)
-    return max(3, {15: 20, 14: 7}.get(cz, 0), math.ceil(gb)) * attempt
+    return max(3, {15: 12, 14: 6}.get(cz, 0), math.ceil(gb)) * attempt
 
 
 def fork_inputs(wc):
