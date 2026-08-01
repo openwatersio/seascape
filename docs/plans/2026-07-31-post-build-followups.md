@@ -26,7 +26,12 @@ _Written 2026-07-31 while the run's final singleton chain executes. Two halves: 
 7. **Extend the live-log pattern** (`> {log} 2>&1` + heartbeat) from depare to the other fork rules if A2 shows any long unattributable phases outside depare.
 8. **GEOS upstream filings** — pending explicit go: the `MakeValid` MultiPolygon-dispatch issue (55× penalty, `repro.py` ready) and the `CoverageValidator` per-target-rebuild issue + partial patch (163 lines, builds clean). Artifacts in the session scratchpad; copy to durable storage before filing.
 9. **`terrain.py` window divergence** (shallow-coarsening open question 8) — the published DEM now disagrees with depare polygons on 0.245% of production water pixels (pond fill); decide render-side adoption or document.
-10. **Backlog carry-overs:** the bbox→planet rerun tax (`216e719`/`684d9af`), fork_window content guard, and the marsh/plan memory + `docs/plans/2026-07-30-shallow-coarsening.md` §10 refresh with this run's box actuals.
+10. **`vector_shallow` optimization** — 3.5 h this run, of which the parallel tiling was healthy and the tail was **561 serial oversize-tile retries** at z6/z7 (single-threaded whole-tile re-encodes under the 500 KB budget). Staged plan:
+    - *Phase 0 (evidence, this run's archive):* decode the named offender tiles, split bytes per layer — expect nodata + coastal depare to dominate, since they carry stem-resolution geometry (2.4 m tolerance) into ~1,200 m/px zooms.
+    - *Phase 1 (flags):* lower low-zoom detail (`-D`), `--maximum-tile-features` / drop-strategy tuning so oversized tiles converge in one pass. Gate on the offender set: budget met without retries, rendered eyeball, no depare partition holes.
+    - *Phase 2 (structural):* per-stem `<stem>-shallow.fgb` inputs pre-simplified to the z7 legibility floor (~570 m) with `coverage_simplify(..., simplify_boundary=False)` — pinned stem boundaries keep shared edges bit-identical across neighbours (no cracks by construction) while interiors collapse ~100×; contours as lines at the same tolerance. Input drops tens-of-GB → hundreds of MB; the retry class should vanish. Own PR (adds an artifact).
+    - *Phase 3 (only if needed):* z-band shards (z0–3/z4–5/z6/z7) + tile-join.
+11. **Backlog carry-overs:** the bbox→planet rerun tax (`216e719`/`684d9af`), fork_window content guard, and the marsh/plan memory + `docs/plans/2026-07-30-shallow-coarsening.md` §10 refresh with this run's box actuals.
 
 ## C. Standing process notes
 
