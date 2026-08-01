@@ -41,6 +41,10 @@ on:
         description: "Extra snakemake args, e.g. -R publish (code changes are force-only)"
         required: false
         default: ""
+      max_jobs:
+        description: "Scope gate: dry-run first and abort if the planned job count exceeds this (empty = no gate). State the expected DAG size here so a planner surprise dies in minutes, not on box time."
+        required: false
+        default: ""
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
@@ -260,6 +264,7 @@ jobs:
           INPUT_FORCE: ${{ github.event.inputs.force }}
           INPUT_DEPARE: ${{ github.event.inputs.depare }}
           INPUT_ARGS: ${{ github.event.inputs.snakemake_args }}
+          INPUT_MAX_JOBS: ${{ github.event.inputs.max_jobs }}
           GH_TOKEN: ${{ github.token }} # the progress-heartbeat gh api calls
           BOX_IP: ${{ needs.create-runner.outputs.ip }} # carried in the build status desc
           # Raw sources (CUDEM/S-102) stream from the public mirror; processed sources
@@ -372,6 +377,25 @@ jobs:
           # bbox run stages under build/<sha>-bbox (see SHA above), so the regional archives
           # are previewable but can never be promoted by release.yml.
           targets=(bundles publish_mosaic stage_build)
+          # Scope gate: the dispatcher states the expected DAG size; if the planner disagrees
+          # (a staleness-trigger surprise: param re-key, rename cascade, temp regeneration),
+          # the run aborts on the dry-run — before any box-scale execution.
+          case "$INPUT_MAX_JOBS" in *[!0-9]*) echo "invalid max_jobs" >&2; exit 1 ;; esac
+          if [ -n "$INPUT_MAX_JOBS" ]; then
+            ./docker.sh snakemake "${targets[@]}" "${extra[@]}" "${force[@]}" \
+              -n \
+              --cores "$cores" --resources mem_gb="$budget_gb" disk_mb="$disk_budget_mb" \
+              --config workdir=/app/state tmp=/app/tmp > /var/tmp/scope-gate.txt 2>&1 \
+              || { tail -50 /var/tmp/scope-gate.txt >&2; echo "scope-gate dry-run failed" >&2; exit 1; }
+            sed -n '/^Job stats/,/^total/p' /var/tmp/scope-gate.txt | tail -40
+            total=$(awk '$1=="total"{n=$2} END{print n+0}' /var/tmp/scope-gate.txt)
+            if [ "$total" -gt "$INPUT_MAX_JOBS" ]; then
+              echo "planned $total jobs exceeds max_jobs=$INPUT_MAX_JOBS — scope mismatch; sample reasons:" >&2
+              grep -h "reason:" /var/tmp/scope-gate.txt | sed 's/[0-9]\{1,\}//g' | sort | uniq -c | sort -rn | head -12 >&2
+              exit 1
+            fi
+            echo "scope gate ok: $total planned jobs <= max_jobs=$INPUT_MAX_JOBS"
+          fi
           # No --prioritize: it flattens the index's whole merge chain to one priority, which
           # lets the scheduler pack small merges ahead of the heavy ones. build.smk's explicit
           # priority bands (index > merges > vector > terrain) order the chain instead.
