@@ -473,10 +473,27 @@ def _json_scalar(v):
 # are never simplified away, so they are always required.
 COMPLETENESS_MIN_PX = 4
 
+LEAF_DETAIL = 12  # tippecanoe's default tile detail: 2**12 = 4096 grid units per tile
 
-def _leaf_pixel_deg(maxz):
-    """One MVT pixel at the leaf zoom, in degrees of longitude (tile extent 4096)."""
-    return 360.0 / (2 ** maxz) / 4096
+# The shallow run's -z is an OVERVIEW zoom — z >= VECTOR_SPLIT_Z is served from the cell archives, so
+# no shallow tile is ever rendered at leaf scale. At LEAF_DETAIL a planet z6/z7 depare tile runs
+# 0.5–2 MB, past tippecanoe's 500 KB ceiling, and the overflow path (--coalesce-smallest-as-needed)
+# merges a band's polygon onto a deeper neighbour: a partition hole and a shoal-bias lie. 1024 units
+# still resolves a quarter of a screen pixel at z7 (~306 m against a ~1.2 km pixel).
+VECTOR_SHALLOW_DETAIL = int(os.environ.get("VECTOR_SHALLOW_DETAIL", "10"))
+
+
+def _leaf_pixel_deg(maxz, detail=LEAF_DETAIL):
+    """One MVT grid unit at the leaf zoom, in degrees of longitude (tile extent 2**detail)."""
+    return 360.0 / (2 ** maxz) / (2 ** detail)
+
+
+def _tile_grid_deg(z):
+    """One MVT grid unit of a tile of the JOINED archive, in degrees of longitude. z below the split
+    comes from the shallow run at VECTOR_SHALLOW_DETAIL, the rest from the per-cell runs at
+    LEAF_DETAIL. Every geometric tolerance below is expressed in grid units, so it has to follow the
+    grid of the tile it measures — a coarser tile quantizes its band edges proportionally further."""
+    return 360.0 / 2 ** z / 2 ** (VECTOR_SHALLOW_DETAIL if z < VECTOR_SPLIT_Z else LEAF_DETAIL)
 
 
 def _survives_leaf(geom, min_deg):
@@ -492,7 +509,7 @@ def _survives_leaf(geom, min_deg):
 
 
 def _fgb_to_seq(fgbs, cols, minzoom_fn, out_path, layer, identity_fn, id0, maxz, max_minzoom=None,
-                min_minzoom=None):
+                min_minzoom=None, leaf_detail=LEAF_DETAIL):
     """Stream per-tile FGBs → one GeoJSONSeq (newline-delimited features) carrying a per-feature
     tippecanoe.minzoom — FGB can't hold the tippecanoe extension, so the run reads GeoJSON like
     soundings already do. One tile in memory at a time (macrotile-sized). Every WRITTEN feature gets
@@ -504,7 +521,7 @@ def _fgb_to_seq(fgbs, cols, minzoom_fn, out_path, layer, identity_fn, id0, maxz,
     it (sub-pixel slivers are exempt, since tippecanoe drops them legitimately)."""
     import geopandas as gpd
     from shapely.geometry import mapping
-    min_deg = COMPLETENESS_MIN_PX * _leaf_pixel_deg(maxz)
+    min_deg = COMPLETENESS_MIN_PX * _leaf_pixel_deg(maxz, leaf_detail)
     fid = id0
     ids = {}
     with open(out_path, "w") as fh:
@@ -567,26 +584,31 @@ def _soundings_to_seq(gjs, out_path, id0, max_minzoom=None, min_minzoom=None):
 
 
 def _tippecanoe_run(layers, minz, maxz, out, variable_depth):
-    """ONE tippecanoe run over the named layer seqs → out (pmtiles). `variable_depth` adds
-    --generate-variable-depth-tile-pyramid (the per-cell runs; the shallow run stays a plain dense
-    pyramid). Every other flag is IDENTICAL across both run kinds so tile content at a given zoom
-    matches the old single joint run. Global --coalesce-smallest-as-needed (merges, never drops: a
-    dropped depare polygon is a partition hole; contours coalesce cleanly, proven by the STEP-0
-    gate) since every as-needed strategy is invocation-wide. --no-simplification-of-shared-nodes
-    keeps partition seams crack-free through per-zoom simplification. -q is dropped so tippecanoe's
-    progress rides the per-rule log (the joint run's 14 h of invisibility motivated this)."""
+    """ONE tippecanoe run over the named layer seqs → out (pmtiles). `variable_depth` marks the
+    per-cell runs, whose -z IS the display leaf: they add --generate-variable-depth-tile-pyramid and
+    pin maxzoom near-lossless. The shallow run is a plain dense pyramid whose every zoom, -z
+    included, is an overview, so it drops that pin and writes at VECTOR_SHALLOW_DETAIL. The rest is
+    shared: --coalesce-smallest-as-needed (an as-needed strategy is invocation-wide; of the ones on
+    offer it merges rather than drops, but a merge still displaces a depare band, so the run must
+    stay under the tile ceiling on its own and never reach for it), and
+    --no-simplification-of-shared-nodes, which keeps partition seams crack-free through per-zoom
+    simplification. -q is dropped so tippecanoe's progress rides the per-rule log (the joint run's
+    14 h of invisibility motivated this)."""
     cmd = ["tippecanoe", "-o", out, "-f"]
     if variable_depth:
         cmd.append("--generate-variable-depth-tile-pyramid")
     cmd += ["-n", "Open Waters Bathymetry", "-A", utils.ATTRIBUTION,
             "-Z", str(minz), "-z", str(maxz), "-P",
             "--coalesce-smallest-as-needed", "--no-simplification-of-shared-nodes",
-            # -S alone ALSO applies at maxzoom (~76 m tolerance at z10), which cut isobaths across
-            # islands the DEM-level land clamp had already routed around — pin maxzoom near-lossless
-            # so leaf tiles keep the clamped shoreline. Env-tunable to dial on a re-bundle.
-            "--simplification", os.environ.get("VECTOR_SIMPLIFICATION", "8"),
-            "--simplification-at-maximum-zoom",
-            os.environ.get("VECTOR_SIMPLIFICATION_MAXZOOM", "1")]
+            "--simplification", os.environ.get("VECTOR_SIMPLIFICATION", "8")]
+    if variable_depth:
+        # -S alone ALSO applies at maxzoom (~76 m tolerance at z10), which cut isobaths across
+        # islands the DEM-level land clamp had already routed around — pin maxzoom near-lossless
+        # so leaf tiles keep the clamped shoreline. Env-tunable to dial on a re-bundle.
+        cmd += ["--simplification-at-maximum-zoom",
+                os.environ.get("VECTOR_SIMPLIFICATION_MAXZOOM", "1")]
+    else:
+        cmd += ["-d", str(VECTOR_SHALLOW_DETAIL), "-D", str(VECTOR_SHALLOW_DETAIL)]
     # --detect-shared-borders drives tippecanoe's wagyu exit-106 hole-placement crash on dense
     # DEPARE geometry (mapbox/tippecanoe#761, unfixed in felt v2.80.0). Its documented successor
     # --no-simplification-of-shared-nodes (above) keeps shared edges crack-free without the crash;
@@ -630,16 +652,17 @@ def _build_seqs_and_run(stems, minz, maxz, id_base, variable_depth, out, max_min
     dseq = utils.vector_scratch("depare.geojsons")
     nid = id_base
     cids = sids = dids = {}
+    detail = LEAF_DETAIL if variable_depth else VECTOR_SHALLOW_DETAIL
     try:
         nid, cids = _fgb_to_seq(cfgbs, ("depth_m", "depth_abs_m", "sys", "depth_ft", "depth_fm"),
                                 lambda p: contour_minzoom(p["sys"], float(p["depth_m"])), cseq,
                                 "contour", lambda p: f"sys={p.get('sys')} depth_m={p.get('depth_m')}",
-                                nid, maxz, max_minzoom, min_minzoom)
+                                nid, maxz, max_minzoom, min_minzoom, detail)
         nid, sids = _soundings_to_seq(sgjs, sseq, nid, max_minzoom, min_minzoom)
         nid, dids = _fgb_to_seq(dfgbs, ("drval1", "drval2", "sys", "rank"),
                                 lambda p: DEPARE_MINZOOM, dseq,
                                 "depare", lambda p: f"drval1={p.get('drval1')} sys={p.get('sys')}",
-                                nid, maxz, max_minzoom, min_minzoom)
+                                nid, maxz, max_minzoom, min_minzoom, detail)
         layers = [(name, seq) for name, seq, ids in
                   (("contours", cseq, cids), ("soundings", sseq, sids), ("depare", dseq, dids)) if ids]
         if layers:
@@ -658,8 +681,8 @@ SHALLOW = "store/bundle/vector-shallow.pmtiles"
 
 def _filter_owned_subtree(archive, cell):
     """Rewrite `archive` in place keeping ONLY tiles in `cell`'s owned z/x/y subtree: a tile (z,x,y)
-    is owned by cell (cz,cx,cy) iff z >= cz and x >> (z-cz) == cx and y >> (z-cz) == cy (cz ==
-    VECTOR_SPLIT_Z, the cell id's own zoom). Fringe tiles — copies a NEIGHBOUR cell's edge buffer
+    is owned by cell (cz,cx,cy) iff z >= cz and x >> (z-cz) == cx and y >> (z-cz) == cy (cz is the
+    cell id's OWN zoom — covering cells root as coarse as seed_z, not VECTOR_SPLIT_Z). Fringe tiles — copies a NEIGHBOUR cell's edge buffer
     bled into this cell's area — are DROPPED, making the per-cell archives structurally disjoint so
     the join's `pmtiles merge` (which refuses overlapping inputs) is a pure concat. Safe: per-stem
     fork inputs are pre-clipped at cell boundaries, so a feature's EXTENT never crosses into a
@@ -673,14 +696,15 @@ def _filter_owned_subtree(archive, cell):
     from pmtiles.tile import zxy_to_tileid
     cz, cx, cy = (int(a) for a in cell.split("-"))
     tmp = archive + ".owned"
-    written = 0
-    with open(archive, "r+b") as src, open(tmp, "wb") as dst:
+    written = dropped = 0
+    with open(archive, "rb") as src, open(tmp, "wb") as dst:
         reader = Reader(MmapSource(src))
         header, metadata = reader.header(), reader.metadata()
         writer = Writer(dst)
         last_tid = -1
         for (z, x, y), data in all_tiles(reader.get_bytes):
             if z < cz or (x >> (z - cz)) != cx or (y >> (z - cz)) != cy:
+                dropped += 1
                 continue
             tid = zxy_to_tileid(z, x, y)
             if tid <= last_tid:
@@ -700,11 +724,12 @@ def _filter_owned_subtree(archive, cell):
         raise SystemExit(f"vector cell {cell}: no tiles in its own subtree after the fringe filter "
                          "— a mis-sharded stem")
     os.replace(tmp, archive)
+    print(f"vector cell {cell}: fringe filter kept {written} tiles, dropped {dropped}")
 
 
 def _archive_metadata(archive):
     from pmtiles.reader import Reader, MmapSource
-    with open(archive, "r+b") as f:
+    with open(archive, "rb") as f:
         return Reader(MmapSource(f)).metadata()
 
 
@@ -712,20 +737,30 @@ def _union_layers_lead(archives, lead):
     """Write `archives[0]` to `lead` with its `vector_layers` widened to the union across every
     shard, so the merged archive advertises exactly the layers its tiles carry.
 
-    Necessary because pmtiles merge copies the layer schema from its FIRST input only and NO shard
-    holds every layer: a sounding's coarsest display zoom is its stem's own z == VECTOR_SPLIT_Z, so
-    none clears the shallow run's -z(VECTOR_SPLIT_Z-1) filter and the shallow archive never declares
-    `soundings`; a constant-depth cell emits no contours. An under-declared archive reads as a
-    dropped layer to anything trusting the metadata (ab_check.py compares exactly this set).
-    Patching a COPY, not the shallow rule's own output, keeps that output's provenance intact."""
+    Necessary because pmtiles merge copies the layer schema from its FIRST input only and no shard
+    is guaranteed every layer: a constant-depth cell emits no contours, and a z8-rooted stem's
+    soundings (coarsest display zoom = the stem's own z) never clear the shallow run's
+    -z(VECTOR_SPLIT_Z-1) filter. An under-declared archive reads as a dropped layer to anything
+    trusting the metadata (ab_check.py compares exactly this set). Patching a COPY, not the shallow
+    rule's own output, keeps that output's provenance intact.
+
+    Also logs each shard's tippecanoe `strategies` block (its own per-zoom drop/coalesce accounting)
+    and tilestats layer counts — merge keeps only the lead's metadata, and this is the record of
+    what each shard did under tile-size pressure."""
     layers = {}
-    for meta in (_archive_metadata(a) for a in archives):
+    for arch in archives:
+        meta = _archive_metadata(arch)
+        name = os.path.basename(arch)
+        strat = {z: s for z, s in enumerate(meta.get("strategies", [])) if s}
+        counts = {l.get("layer"): l.get("count") for l in
+                  meta.get("tilestats", {}).get("layers", [])}
+        print(f"vector shard {name}: tilestats {counts}; strategies {strat}")
         for layer in meta.get("vector_layers", []):
             have = layers.setdefault(layer["id"], dict(layer))
             have["fields"] = {**layer.get("fields", {}), **have.get("fields", {})}
             for key, widen in (("minzoom", min), ("maxzoom", max)):
-                if key in layer and key in have:
-                    have[key] = widen(have[key], layer[key])
+                if key in layer:
+                    have[key] = widen(have[key], layer[key]) if key in have else layer[key]
     if not layers:
         raise SystemExit("vector join: no shard declares a vector layer — every shard is empty")
     meta = {**_archive_metadata(archives[0]), "vector_layers": list(layers.values())}
@@ -791,6 +826,16 @@ def bundle_cell_stable(cell):
     # Drop the fringe tiles a neighbour's edge buffer bled in, so the cells are disjoint for the merge.
     if os.path.getsize(_cell_archive(cell)) > 0:
         _filter_owned_subtree(_cell_archive(cell), cell)
+        # Census THIS archive against THIS cell's ids: a drop caught here names the guilty cell and
+        # stage (cell run or fringe filter), instead of surfacing as an anonymous miss in the join's
+        # whole-planet census.
+        seen = _seen_ids(_cell_archive(cell))
+        for layer, idmap in ids.items():
+            missing = [i for i in idmap if i not in seen]
+            if missing:
+                sample = "; ".join(idmap[i] for i in missing[:5])
+                raise SystemExit(f"vector cell {cell}: {layer}: {len(missing)} of {len(idmap)} input "
+                                 f"features in no tile after the cell run + fringe filter — e.g. {sample}")
     utils.write_if_changed(_cell_sidecar(cell), json.dumps(ids))
     n = {k: len(v) for k, v in ids.items()}
     print(f"vector cell bundle (stable): {_cell_archive(cell)} (z{VECTOR_SPLIT_Z}-{cell_maxz}; {n})")
@@ -960,7 +1005,7 @@ def _vector_selfcheck(vec, maxz, expected=None, per_zoom=6):
 
     for z in sorted(byz):
         ts = byz[z]
-        px = 360.0 / 2 ** z / 4096  # one tile grid unit in degrees (conservative on finer leaves)
+        px = _tile_grid_deg(z)
         for x, y in ts[:: max(1, len(ts) // per_zoom)]:
             L = _decode_tile(vec, z, x, y)
             n_soundings += len(L.get("soundings", []))
@@ -990,7 +1035,7 @@ def _vector_selfcheck(vec, maxz, expected=None, per_zoom=6):
                 # be covered by its 4 children's — an uncovered blob is a hole (gap) opened deeper.
                 kids = [(2 * x, 2 * y), (2 * x + 1, 2 * y), (2 * x, 2 * y + 1), (2 * x + 1, 2 * y + 1)]
                 if z + 1 <= maxz and all(k in present.get(z + 1, ()) for k in kids):
-                    childpx = px / 2
+                    childpx = _tile_grid_deg(z + 1)
                     pu = mband_union(mbands, clip)
                     resid = pu.buffer(-DEPARE_ERODE_PX * childpx) if pu is not None else None
                     if resid is not None and not resid.is_empty:

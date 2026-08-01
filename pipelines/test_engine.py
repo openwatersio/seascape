@@ -497,18 +497,19 @@ def main():
         if os.path.getsize(shallow_arch) > 0:
             for z in _pm_tiles(shallow_arch):
                 assert z < SPLIT_Z, f"shallow archive emitted z{z} >= SPLIT_Z ({SPLIT_Z})"
-        emitters = _c.defaultdict(set)  # (z,x,y) -> {cell (cx,cy)} for z >= SPLIT_Z
+        emitters = _c.defaultdict(set)  # (z,x,y) -> {cell (cz,cx,cy)} for z >= SPLIT_Z
         for ca in cell_archs:
             if os.path.getsize(ca) == 0:
                 continue  # 0-byte = an empty cell; the join skips it
-            cx, cy = (int(v) for v in os.path.basename(ca)[len("vector-cell-"):-len(".pmtiles")].split("-")[1:])
+            # the cell id's own zoom cz, NOT SPLIT_Z: covering cells root as coarse as seed_z
+            cz, cx, cy = (int(v) for v in os.path.basename(ca)[len("vector-cell-"):-len(".pmtiles")].split("-"))
             for z, xys in _pm_tiles(ca).items():
                 assert z >= SPLIT_Z, f"cell archive emitted z{z} < SPLIT_Z ({SPLIT_Z})"
                 for x, y in xys:
                     # after the fringe filter, every tile a cell emits must sit in its OWN subtree
-                    assert (x >> (z - SPLIT_Z), y >> (z - SPLIT_Z)) == (cx, cy), \
-                        f"z{z} {x}/{y} emitted by cell {cx}-{cy} is outside its own subtree — fringe not filtered"
-                    emitters[(z, x, y)].add((cx, cy))
+                    assert z >= cz and (x >> (z - cz), y >> (z - cz)) == (cx, cy), \
+                        f"z{z} {x}/{y} emitted by cell {cz}-{cx}-{cy} is outside its own subtree — fringe not filtered"
+                    emitters[(z, x, y)].add((cz, cx, cy))
         dups = {k: sorted(v) for k, v in emitters.items() if len(v) > 1}
         assert not dups, \
             f"cell archives must be STRICTLY disjoint after the owned-subtree filter, got overlaps: {dict(list(dups.items())[:5])}"

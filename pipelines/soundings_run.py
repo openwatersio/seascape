@@ -324,6 +324,27 @@ def _check():
         assert field == {8: ladder[8 - shift], 9: ladder[9 - shift]}, \
             f"{depth_m} m must ride the lattice {shift} level(s) coarser: {field} vs {ladder}"
     assert _tc(9, 9) == {"minzoom": 9}  # the shifted level reaching child_z is still a finest field
+
+    # mixed field: a 190 m shoal (tier 0) in a 1200 m plain (tier 2). A block's representative takes
+    # the SHOALEST value's shift, so a shelf-break shoal displays at every zoom it would unthinned —
+    # thinning is never allowed to hide a shoal.
+    m = f"{tmp}/mixed.tif"
+    arr = np.full((1024, 1024), -1200.0, "float32")
+    arr[512:640, 512:640] = -190.0  # exactly one CELL=128 block
+    with rasterio.open(m, "w", driver="GTiff", height=1024, width=1024, count=1, dtype="float32",
+                       nodata=NODATA, crs="EPSG:3857",
+                       transform=from_origin(0, 102400, 100, 100)) as dst:
+        dst.write(arr, 1)
+    span = SimpleNamespace(left=0, bottom=0, right=102400, top=102400)
+    with rasterio.open(m) as src:
+        mixed = _pyramid(src, NODATA, span, 1.0, z=8, child_z=9)
+    for dz in (8, 9):
+        assert any(d == 190.0 and mz == dz for d, x, y, mz in mixed), \
+            f"the 190 m shoal must display at z{dz}"
+    # the plain still shows where its shifted lattice has cells the shoal didn't claim (z9 here);
+    # at z8 the whole field's coarse representative IS the shoal — deep is what gets suppressed
+    assert any(d == 1200.0 and mz == 9 for d, x, y, mz in mixed)
+    assert all(d == 190.0 for d, x, y, mz in mixed if mz == 8)
     print("soundings_run self-check ok")
 
 
