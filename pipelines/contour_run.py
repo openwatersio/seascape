@@ -403,18 +403,22 @@ def require_stable_complete(layer, stems, files):
 
 # ── cell-subtree sharded vector bundle → sparse vector.pmtiles ─────────────────────────────────
 # The one joint --generate-variable-depth-tile-pyramid run is split into a global shallow run plus
-# one variable-depth run per populated VECTOR_SPLIT_Z cell, tile-joined into vector.pmtiles (the
-# serial variable-depth tiler then runs once per cell concurrently, not once over all content — see
-# the design note in docs/plans/2026-07-14-native-resolution.md):
+# one variable-depth run per populated VECTOR_SPLIT_Z cell, merged into vector.pmtiles (the serial
+# variable-depth tiler then runs once per cell concurrently, not once over all content — see the
+# design note in docs/plans/2026-07-14-native-resolution.md):
 #   - shallow: plain dense -Z0 -z(VECTOR_SPLIT_Z-1) over all three layers, filtered to features whose
 #     tippecanoe.minzoom <= VECTOR_SPLIT_Z-1; owns every z < VECTOR_SPLIT_Z tile.
-#   - cell:    -Z VECTOR_SPLIT_Z -z(cell max child_z) with variable depth over that cell's covering stems;
-#     owns its z >= VECTOR_SPLIT_Z subtree. Layers stay joint within each run so the layer-vanishing bug
+#   - cell:    -Z VECTOR_SPLIT_Z -z(cell max child_z) with variable depth over that cell's covering stems,
+#     then rewritten to keep ONLY its z >= VECTOR_SPLIT_Z owned subtree (fringe tiles a neighbour's edge
+#     buffer bled in are dropped). Layers stay joint within each run so the layer-vanishing bug
 #     (separately-tiled layers leafing at different depths) stays dead.
-# Tile ownership is disjoint by construction, so the join is pure concatenation (tile-join -pk).
-# All zoom gating rides as per-feature tippecanoe.minzoom: contour tiers via contour_minzoom,
-# depare's z6 floor as a uniform minzoom, soundings' pyramid levels unchanged. The archive is
-# SPARSE — the Worker overzooms ancestors (Part 1); manifest.vector.max_zoom is what turns that on.
+# After the fringe filter tile ownership is STRUCTURALLY disjoint (shallow owns z < VECTOR_SPLIT_Z,
+# each cell exactly its own subtree), so the join is `pmtiles merge` (go-pmtiles) — a pure concat that
+# refuses overlapping inputs, replacing tile-join's boundary-tile MERGE (slow at planet scale + the
+# PMTiles-writer corruption felt/tippecanoe#278). All zoom gating rides as per-feature
+# tippecanoe.minzoom: contour tiers via contour_minzoom, depare's z6 floor as a uniform minzoom,
+# soundings' pyramid levels unchanged. The archive is SPARSE — the Worker overzooms ancestors
+# (Part 1); manifest.vector.max_zoom is what turns that on.
 
 # Union of the three layers' MVT attributes; the FlatGeobuf/GeoJSON Integer64 columns need :int so
 # they don't land as strings. depth_m stays untyped (contours carry an int level, soundings a float
@@ -533,26 +537,32 @@ def _fgb_to_seq(fgbs, cols, minzoom_fn, out_path, layer, identity_fn, id0, maxz,
 
 
 def _soundings_to_seq(gjs, out_path, id0, max_minzoom=None, min_minzoom=None):
-    """Concatenate the per-tile sounding FeatureCollections into one GeoJSONSeq, features passed
-    through untouched except a unique GeoJSON id (counting up from id0) for the completeness check —
-    each already carries its own tippecanoe.minzoom (pyramid level). When max_minzoom is set (the
-    shallow run's -z), a sounding whose minzoom exceeds it is dropped at write time (it rides a
-    deeper cell). Returns (next_id, {id: identity})."""
+    """Stream the per-tile line-delimited sounding features (`.geojsons`, one Feature per line) into
+    one GeoJSONSeq, passed through untouched except a unique GeoJSON id (counting up from id0) for the
+    completeness check — each already carries its own tippecanoe.minzoom (pyramid level). One line in
+    memory at a time (no whole-file json.load). When max_minzoom is set (the shallow run's -z), a
+    sounding whose minzoom exceeds it is dropped at write time (it rides a deeper cell). Returns
+    (next_id, {id: identity})."""
     fid = id0
     ids = {}
     with open(out_path, "w") as fh:
         for gj in gjs:
-            for ft in json.load(open(gj)).get("features", []):
-                mz = ft.get("tippecanoe", {}).get("minzoom", 0)
-                if max_minzoom is not None and mz > max_minzoom:
-                    continue
-                if min_minzoom is not None and mz < min_minzoom:
-                    ft.setdefault("tippecanoe", {})["minzoom"] = min_minzoom  # cell zoom floor, see _fgb_to_seq
-                ft["id"] = fid
-                fh.write(json.dumps(ft))
-                fh.write("\n")
-                ids[fid] = f"sounding depth={ft.get('properties', {}).get('depth_m')}"
-                fid += 1
+            with open(gj) as src:
+                for raw in src:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    ft = json.loads(raw)
+                    mz = ft.get("tippecanoe", {}).get("minzoom", 0)
+                    if max_minzoom is not None and mz > max_minzoom:
+                        continue
+                    if min_minzoom is not None and mz < min_minzoom:
+                        ft.setdefault("tippecanoe", {})["minzoom"] = min_minzoom  # cell zoom floor, see _fgb_to_seq
+                    ft["id"] = fid
+                    fh.write(json.dumps(ft))
+                    fh.write("\n")
+                    ids[fid] = f"sounding depth={ft.get('properties', {}).get('depth_m')}"
+                    fid += 1
     return fid, ids
 
 
@@ -609,7 +619,7 @@ def _build_seqs_and_run(stems, minz, maxz, id_base, variable_depth, out, max_min
     require_stable_complete gates the caller; here 0-byte per-tile files are legitimately empty."""
     depare_on = not os.environ.get("SKIP_DEPARE")
     cfiles = [f"store/contour/{s}.fgb" for s in stems]
-    sfiles = [f"store/soundings/{s}.geojson" for s in stems]
+    sfiles = [f"store/soundings/{s}.geojsons" for s in stems]
     dfiles = [f"store/depare/{s}.fgb" for s in stems] if depare_on else []
     cfgbs = [f for f in cfiles if os.path.getsize(f) > 0]
     sgjs = [f for f in sfiles if os.path.getsize(f) > 0]
@@ -646,6 +656,86 @@ def _build_seqs_and_run(stems, minz, maxz, id_base, variable_depth, out, max_min
 SHALLOW = "store/bundle/vector-shallow.pmtiles"
 
 
+def _filter_owned_subtree(archive, cell):
+    """Rewrite `archive` in place keeping ONLY tiles in `cell`'s owned z/x/y subtree: a tile (z,x,y)
+    is owned by cell (cz,cx,cy) iff z >= cz and x >> (z-cz) == cx and y >> (z-cz) == cy (cz ==
+    VECTOR_SPLIT_Z, the cell id's own zoom). Fringe tiles — copies a NEIGHBOUR cell's edge buffer
+    bled into this cell's area — are DROPPED, making the per-cell archives structurally disjoint so
+    the join's `pmtiles merge` (which refuses overlapping inputs) is a pure concat. Safe: per-stem
+    fork inputs are pre-clipped at cell boundaries, so a feature's EXTENT never crosses into a
+    neighbour's tile — only its render buffer does, and the owning tile's own buffer already covers
+    the shared edge. Preserves the source header's tile type/compression/bounds + the tippecanoe
+    layer-schema metadata; the pmtiles Writer recomputes the zoom bounds from the surviving tiles.
+    Streams tile-by-tile — a dense cell's tile bytes can run to GBs, so nothing is buffered; the
+    Writer needs ascending tile ids, which a clustered archive (tippecanoe's output) yields."""
+    from pmtiles.reader import Reader, MmapSource, all_tiles
+    from pmtiles.writer import Writer
+    from pmtiles.tile import zxy_to_tileid
+    cz, cx, cy = (int(a) for a in cell.split("-"))
+    tmp = archive + ".owned"
+    written = 0
+    with open(archive, "r+b") as src, open(tmp, "wb") as dst:
+        reader = Reader(MmapSource(src))
+        header, metadata = reader.header(), reader.metadata()
+        writer = Writer(dst)
+        last_tid = -1
+        for (z, x, y), data in all_tiles(reader.get_bytes):
+            if z < cz or (x >> (z - cz)) != cx or (y >> (z - cz)) != cy:
+                continue
+            tid = zxy_to_tileid(z, x, y)
+            if tid <= last_tid:
+                raise SystemExit(f"vector cell {cell}: archive is not clustered (tile ids out of "
+                                 "order) — cannot stream the fringe filter")
+            writer.write_tile(tid, data)
+            last_tid = tid
+            written += 1
+        hdr = {k: header[k] for k in ("tile_type", "tile_compression",
+                                      "min_lon_e7", "min_lat_e7", "max_lon_e7", "max_lat_e7",
+                                      "center_zoom", "center_lon_e7", "center_lat_e7")}
+        writer.finalize(hdr, metadata)  # recomputes min/max_zoom from the surviving tiles
+    if not written:
+        # A non-empty cell always owns the tiles its features live in; nothing owned means every tile
+        # was fringe — a mis-sharded stem. Investigate, don't paper over (per the PR contract).
+        os.remove(tmp)
+        raise SystemExit(f"vector cell {cell}: no tiles in its own subtree after the fringe filter "
+                         "— a mis-sharded stem")
+    os.replace(tmp, archive)
+
+
+def _archive_metadata(archive):
+    from pmtiles.reader import Reader, MmapSource
+    with open(archive, "r+b") as f:
+        return Reader(MmapSource(f)).metadata()
+
+
+def _union_layers_lead(archives, lead):
+    """Write `archives[0]` to `lead` with its `vector_layers` widened to the union across every
+    shard, so the merged archive advertises exactly the layers its tiles carry.
+
+    Necessary because pmtiles merge copies the layer schema from its FIRST input only and NO shard
+    holds every layer: a sounding's coarsest display zoom is its stem's own z == VECTOR_SPLIT_Z, so
+    none clears the shallow run's -z(VECTOR_SPLIT_Z-1) filter and the shallow archive never declares
+    `soundings`; a constant-depth cell emits no contours. An under-declared archive reads as a
+    dropped layer to anything trusting the metadata (ab_check.py compares exactly this set).
+    Patching a COPY, not the shallow rule's own output, keeps that output's provenance intact."""
+    layers = {}
+    for meta in (_archive_metadata(a) for a in archives):
+        for layer in meta.get("vector_layers", []):
+            have = layers.setdefault(layer["id"], dict(layer))
+            have["fields"] = {**layer.get("fields", {}), **have.get("fields", {})}
+            for key, widen in (("minzoom", min), ("maxzoom", max)):
+                if key in layer and key in have:
+                    have[key] = widen(have[key], layer[key])
+    if not layers:
+        raise SystemExit("vector join: no shard declares a vector layer — every shard is empty")
+    meta = {**_archive_metadata(archives[0]), "vector_layers": list(layers.values())}
+    shutil.copyfile(archives[0], lead)
+    meta_path = lead + ".json"
+    with open(meta_path, "w") as f:
+        json.dump(meta, f)
+    utils.run_command(f"pmtiles edit --metadata={meta_path} {lead}")
+
+
 def _cell_archive(cell):
     return f"store/bundle/vector-cell-{cell}.pmtiles"
 
@@ -665,7 +755,7 @@ def bundle_shallow_stable():
     import mosaic
     stems = mosaic.covering_stems()
     require_stable_complete("contour", stems, [f"store/contour/{s}.fgb" for s in stems])
-    require_stable_complete("soundings", stems, [f"store/soundings/{s}.geojson" for s in stems])
+    require_stable_complete("soundings", stems, [f"store/soundings/{s}.geojsons" for s in stems])
     if not os.environ.get("SKIP_DEPARE"):
         require_stable_complete("depare", stems, [f"store/depare/{s}.fgb" for s in stems])
     utils.create_folder("store/bundle")
@@ -690,7 +780,7 @@ def bundle_cell_stable(cell):
         raise SystemExit(f"vector cell {cell}: not a populated cell of the covering")
     stems = cells[cell]
     require_stable_complete("contour", stems, [f"store/contour/{s}.fgb" for s in stems])
-    require_stable_complete("soundings", stems, [f"store/soundings/{s}.geojson" for s in stems])
+    require_stable_complete("soundings", stems, [f"store/soundings/{s}.geojsons" for s in stems])
     if not os.environ.get("SKIP_DEPARE"):
         require_stable_complete("depare", stems, [f"store/depare/{s}.fgb" for s in stems])
     utils.create_folder("store/bundle")
@@ -698,18 +788,25 @@ def bundle_cell_stable(cell):
     cell_maxz = _stems_maxz(stems)
     ids = _build_seqs_and_run(stems, VECTOR_SPLIT_Z, cell_maxz, id_base, True, _cell_archive(cell),
                               min_minzoom=VECTOR_SPLIT_Z)
+    # Drop the fringe tiles a neighbour's edge buffer bled in, so the cells are disjoint for the merge.
+    if os.path.getsize(_cell_archive(cell)) > 0:
+        _filter_owned_subtree(_cell_archive(cell), cell)
     utils.write_if_changed(_cell_sidecar(cell), json.dumps(ids))
     n = {k: len(v) for k, v in ids.items()}
     print(f"vector cell bundle (stable): {_cell_archive(cell)} (z{VECTOR_SPLIT_Z}-{cell_maxz}; {n})")
 
 
 def bundle_join_stable():
-    """tile-join the shallow archive + every populated cell archive → store/bundle/vector.pmtiles,
-    the single served sparse pyramid the Worker overzooms (Part 1). Tile ownership is disjoint
-    (shallow owns z < SPLIT_Z, each cell its z >= SPLIT_Z subtree), so the join is pure
-    concatenation — -pk keeps every tile (per-cell runs already enforced size limits; tile-join must
-    not silently skip). The completeness self-check runs on the FINAL archive against the union of
-    the per-cell sidecars' expected ids."""
+    """Merge the shallow archive + every populated (fringe-filtered) cell archive → the single served
+    store/bundle/vector.pmtiles, the sparse pyramid the Worker overzooms (Part 1). Tile ownership is
+    STRUCTURALLY disjoint — the shallow run owns every z < VECTOR_SPLIT_Z tile, and each cell archive
+    was rewritten (bundle_cell_stable) to keep only its own z >= VECTOR_SPLIT_Z subtree — so the join
+    is `pmtiles merge` (go-pmtiles): a pure concat that REFUSES overlapping inputs, replacing
+    tile-join's boundary-tile MERGE (slow at planet scale + the PMTiles-writer corruption
+    felt/tippecanoe#278). merge copies the layer-schema metadata from its FIRST input, so the lead is
+    a patched copy declaring every shard's layers (see _union_layers_lead). The completeness
+    self-check runs on the FINAL merged archive against the union of the per-cell sidecars'
+    expected ids."""
     import mosaic
     covering = mosaic.covering_stems()
     cellmap = vector_covering_cells(covering)
@@ -717,31 +814,36 @@ def bundle_join_stable():
     if not os.path.exists(SHALLOW):
         raise SystemExit(f"vector join: missing {SHALLOW} — run the shallow bundle first")
     expected = {"contours": {}, "soundings": {}, "depare": {}}
-    by_maxz = []  # (maxz, path) — tile-join takes the OUTPUT header's maxzoom from its FIRST input,
-    # so the deepest archive must lead or every deeper tile goes invisible to header-ranged readers
-    # (the self-check, the Worker's TileJSON) while still occupying bytes in the file.
+    archives = []  # shallow leads (planet bounds); order is otherwise irrelevant — pmtiles merge
+    # takes the header zoom bounds from the UNION of all inputs, not the first.
     if os.path.getsize(SHALLOW) > 0:
-        by_maxz.append((VECTOR_SPLIT_Z - 1, SHALLOW))
+        archives.append(SHALLOW)
     for c in cells:
         arch = _cell_archive(c)
         if not os.path.exists(arch):
             raise SystemExit(f"vector join: missing cell archive {arch} — run the cell bundles first")
         if os.path.getsize(arch) == 0:
             continue  # empty cell (0-byte sentinel) — no tiles, no expected ids
-        by_maxz.append((_stems_maxz(cellmap[c]), arch))
+        archives.append(arch)
         with open(_cell_sidecar(c)) as f:
             for layer, m in json.load(f).items():
                 expected[layer].update((int(k), v) for k, v in m.items())
-    archives = [p for _, p in sorted(by_maxz, key=lambda t: -t[0])]
     if not archives:
         raise SystemExit("vector join: no vector features in any shallow or cell archive")
 
     vec = "store/bundle/vector.pmtiles"
     utils.create_folder("store/bundle")
-    cmd = ["tile-join", "-o", vec, "-f", "-pk",
-           "-n", "Open Waters Bathymetry", "-A", utils.ATTRIBUTION, *archives]
-    with utils.log_group(f"vector tile-join ({len(archives)} archives)"):
-        utils.run_monitored(cmd, "vector tile-join", vec)
+    lead = vec + ".lead"  # archives[0] carrying every shard's layer — see _union_layers_lead
+    try:
+        _union_layers_lead(archives, lead)
+        cmd = ["pmtiles", "merge", lead, *archives[1:], vec]  # go-pmtiles: inputs, then output last
+        with utils.log_group(f"vector pmtiles merge ({len(archives)} archives)"):
+            utils.run_monitored(cmd, "vector pmtiles merge", vec)
+    finally:
+        # a full copy of the shallow archive; the build volume has no room to orphan one on failure
+        for scratch in (lead, lead + ".json"):
+            if os.path.exists(scratch):
+                os.remove(scratch)
 
     maxz = _vector_maxz(0)
     expected = {k: v for k, v in expected.items() if v}

@@ -40,7 +40,7 @@ STAGES = {
     "contour": ("contour_run.py", lambda s: ["tile", s], lambda s: f"store/contour/{s}.fgb",
                 "vector"),
     "soundings": ("soundings_run.py", lambda s: ["tile", s],
-                  lambda s: f"store/soundings/{s}.geojson", "vector"),
+                  lambda s: f"store/soundings/{s}.geojsons", "vector"),
 }
 
 

@@ -29,7 +29,7 @@ keep_objs=(
   contour/8-1-1-12-eeeeeeeeeeee.fgb
   contour/8-1-1-12-ffffffffffff.empty            # an empty-fork marker is a referenced name too
   depare/8-1-1-12-111111111111.fgb
-  soundings/8-1-1-12-222222222222.geojson
+  soundings/8-1-1-12-222222222222.geojsons
 )
 # Garbage: unreferenced by ANY of the last N manifests → must be DELETED.
 del_objs=(
@@ -72,15 +72,15 @@ manifest() { # <dir> <id> <name...>
 }
 manifest "$tree" 01AAAAAAAAAAAAAAAAAAAAAAAA \
   pmtiles/7-1-1/8-1-1-12-cccccccccccc.pmtiles pmtiles/7-1-1/6-0-0-8-dddddddddddd.pmtiles \
-  contour/8-1-1-12-eeeeeeeeeeee.fgb depare/8-1-1-12-111111111111.fgb soundings/8-1-1-12-222222222222.geojson
+  contour/8-1-1-12-eeeeeeeeeeee.fgb depare/8-1-1-12-111111111111.fgb soundings/8-1-1-12-222222222222.geojsons
 manifest "$tree" 01BBBBBBBBBBBBBBBBBBBBBBBB \
   pmtiles/7-1-1/8-1-1-12-cccccccccccc.pmtiles pmtiles/7-1-1/6-0-0-8-dddddddddddd.pmtiles \
   contour/8-1-1-12-eeeeeeeeeeee.fgb contour/8-1-1-12-ffffffffffff.empty \
-  depare/8-1-1-12-111111111111.fgb soundings/8-1-1-12-222222222222.geojson
+  depare/8-1-1-12-111111111111.fgb soundings/8-1-1-12-222222222222.geojsons
 manifest "$tree" 01CCCCCCCCCCCCCCCCCCCCCCCC \
   pmtiles/7-1-1/8-1-1-12-aaaaaaaaaaaa.pmtiles pmtiles/7-1-1/6-0-0-8-dddddddddddd.pmtiles \
   contour/8-1-1-12-eeeeeeeeeeee.fgb contour/8-1-1-12-ffffffffffff.empty \
-  depare/8-1-1-12-111111111111.fgb soundings/8-1-1-12-222222222222.geojson \
+  depare/8-1-1-12-111111111111.fgb soundings/8-1-1-12-222222222222.geojsons \
   mosaic/tiles/8-1-1-14-aaaaaaaaaaaa.tif mosaic/planet-z8-pppppppppppp.tif
 printf '{"manifest":"manifests/01CCCCCCCCCCCCCCCCCCCCCCCC.json"}\n' > "$tree/store/manifest.json"
 

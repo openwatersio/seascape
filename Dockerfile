@@ -36,7 +36,7 @@ ENV GDAL_HTTP_MAX_RETRY=5 \
   GDAL_HTTP_RETRY_DELAY=1 \
   GDAL_HTTP_USERAGENT="seascape/1.0 (+https://github.com/openwatersio/seascape)"
 
-# tippecanoe + tile-join (Felt fork) — vector tiles. Pinned at felt/tippecanoe#399 (variable-depth
+# tippecanoe (Felt fork) — vector tiles. Pinned at felt/tippecanoe#399 (variable-depth
 # pyramids must honor per-feature tippecanoe.minzoom and never prune children a pending minzoom
 # still needs; the vector bundle depends on both). patches/ carries fixes not yet upstream:
 # wagyu-drop-unplaceable-hole drops an orphan hole ring instead of aborting the run
@@ -71,6 +71,18 @@ RUN cd /tmp/contour-p && mkdir ms \
   && g++ -O2 -std=c++17 -I. $(gdal-config --cflags) contour-p.cpp -o /usr/local/bin/contour-p $(gdal-config --libs) \
   && contour-p 2>&1 | grep -q usage \
   && rm -rf /tmp/contour-p /tmp/patches
+
+# go-pmtiles — the vector bundle's `pmtiles merge` joins the fringe-filtered cell shards into one
+# sparse vector.pmtiles (a pure concat of structurally-disjoint tiles, no tile-join boundary MERGE).
+# Pinned + sha256-verified per arch, same style as rclone above (do not float).
+RUN case "$TARGETARCH" in \
+      arm64) asset=Linux_arm64;  sha=f8bd47e7ea866863489cad588fbaf2f31f42e5821f7a03f009b3769f05801cb1 ;; \
+      *)     asset=Linux_x86_64; sha=3ed7dbf4ec2e6dfe5e25b6f70d1ffc932729f93c86db353bf514dd71010a312f ;; \
+    esac \
+  && curl -fsSL -o /tmp/pmtiles.tar.gz "https://github.com/protomaps/go-pmtiles/releases/download/v1.31.2/go-pmtiles_1.31.2_${asset}.tar.gz" \
+  && echo "$sha  /tmp/pmtiles.tar.gz" | sha256sum -c \
+  && tar -xzf /tmp/pmtiles.tar.gz -C /usr/local/bin pmtiles \
+  && rm /tmp/pmtiles.tar.gz
 
 # just (task runner) + uv (Python env manager) — the pipeline's two entrypoints.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh \
