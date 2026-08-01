@@ -99,9 +99,10 @@ WORKDIR /app
 COPY pyproject.toml uv.lock /app/
 RUN uv sync --frozen --no-install-project
 
-# py-spy as a static binary (uv venvs ship no pip): stack-dump any wedged job via docker exec.
-RUN curl -fsSL https://github.com/benfred/py-spy/releases/download/v0.4.1/py-spy-v0.4.1-x86_64-unknown-linux-musl.tar.gz \
-  | tar xz -C /usr/local/bin py-spy && py-spy --version
+# py-spy for stack-dumping any wedged job via docker exec. uv installs the PyPI wheel
+# (hash-verified by the index) into the venv; uv venvs ship no pip.
+RUN uv pip install --python /opt/venv/bin/python py-spy==0.4.2 \
+  && /opt/venv/bin/py-spy --version
 ENV PATH="/opt/venv/bin:${PATH}"
 
 # The build is one Snakemake DAG (docker.sh fronts it). e.g.
