@@ -782,7 +782,12 @@ def _seen_ids(vec):
     # scale both shrink ~4^Δz-fold by scoping the decode to leaf tiles (no children in the pmtiles
     # directory) — every feature already lives at its leaf, so the union is unchanged. Not needed yet.
     seen = set()
-    p = subprocess.Popen(["tippecanoe-decode", vec], stdout=subprocess.PIPE, text=True)
+    # -f: variable-depth leaves are written WITHOUT polygon cleaning by design (tippecanoe
+    # README; the Worker cleans on serve), and tile-scale rounding can flip a clipped sliver
+    # ring's sign — strict decode hard-exits on that (EXIT_IMPOSSIBLE, "Polygon begins with an
+    # inner ring"), failing completeness over geometry this check never asserts. Forced decode
+    # emits the identical id stream; a nonzero exit still means a genuinely unreadable archive.
+    p = subprocess.Popen(["tippecanoe-decode", "-f", vec], stdout=subprocess.PIPE, text=True)
     for line in p.stdout:
         m = _FEATURE_ID_RE.search(line)
         if m:
