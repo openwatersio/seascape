@@ -42,9 +42,13 @@ on:
         required: false
         default: ""
       max_jobs:
-        description: "Scope gate: dry-run first and abort if the planned job count exceeds this (empty = no gate). State the expected DAG size here so a planner surprise dies in minutes, not on box time."
+        description: "Scope gate: dry-run first and abort if the planned job count exceeds this or is zero (empty = no gate). State the expected DAG size here so a planner surprise dies in minutes, not on box time."
         required: false
         default: ""
+      targets:
+        description: "Snakemake targets (default: the full build). e.g. soundings_all for an isolated leaf-product rebuild that must not cascade."
+        required: false
+        default: "bundles publish_mosaic stage_build"
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
@@ -265,6 +269,7 @@ jobs:
           INPUT_DEPARE: ${{ github.event.inputs.depare }}
           INPUT_ARGS: ${{ github.event.inputs.snakemake_args }}
           INPUT_MAX_JOBS: ${{ github.event.inputs.max_jobs }}
+          INPUT_TARGETS: ${{ github.event.inputs.targets }}
           GH_TOKEN: ${{ github.token }} # the progress-heartbeat gh api calls
           BOX_IP: ${{ needs.create-runner.outputs.ip }} # carried in the build status desc
           # Raw sources (CUDEM/S-102) stream from the public mirror; processed sources
@@ -376,10 +381,12 @@ jobs:
           # per-source push in publish.smk, run by sources.yml). stage_build always runs; a
           # bbox run stages under build/<sha>-bbox (see SHA above), so the regional archives
           # are previewable but can never be promoted by release.yml.
-          targets=(bundles publish_mosaic stage_build)
+          case "$INPUT_TARGETS" in *[!-A-Za-z0-9_\ ]*) echo "invalid targets" >&2; exit 1 ;; esac
+          read -r -a targets <<<"${INPUT_TARGETS:-bundles publish_mosaic stage_build}"
           # Scope gate: the dispatcher states the expected DAG size; if the planner disagrees
-          # (a staleness-trigger surprise: param re-key, rename cascade, temp regeneration),
-          # the run aborts on the dry-run — before any box-scale execution.
+          # (a staleness-trigger surprise: param re-key, rename cascade, temp regeneration —
+          # or a zero-job plan from a mis-scoped isolation target), the run aborts on the
+          # dry-run — before any box-scale execution.
           case "$INPUT_MAX_JOBS" in *[!0-9]*) echo "invalid max_jobs" >&2; exit 1 ;; esac
           if [ -n "$INPUT_MAX_JOBS" ]; then
             ./docker.sh snakemake "${targets[@]}" "${extra[@]}" "${force[@]}" \
@@ -392,6 +399,10 @@ jobs:
             if [ "$total" -gt "$INPUT_MAX_JOBS" ]; then
               echo "planned $total jobs exceeds max_jobs=$INPUT_MAX_JOBS — scope mismatch; sample reasons:" >&2
               grep -h "reason:" /var/tmp/scope-gate.txt | sed 's/[0-9]\{1,\}//g' | sort | uniq -c | sort -rn | head -12 >&2
+              exit 1
+            fi
+            if [ "$total" -eq 0 ]; then
+              echo "planner found NOTHING to do for '${targets[*]}' — a scope-stating dispatch expects work; if a no-op is intentional, dispatch without max_jobs" >&2
               exit 1
             fi
             echo "scope gate ok: $total planned jobs <= max_jobs=$INPUT_MAX_JOBS"

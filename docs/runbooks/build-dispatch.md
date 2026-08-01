@@ -21,10 +21,12 @@ To predict scope before dispatching, dry-run locally against a representative st
 
 To rebuild one stage-3 product (e.g. all soundings) without re-paying its `temp()` window and everything downstream of the window, split the dispatch in two:
 
-1. **Phase 1:** `snakemake_args: --until <rule>` (e.g. `--until soundings_tile`). `--until` prunes the DAG to ancestors of the named rule — sibling consumers of the shared window never enter the plan. Windows are re-made, consumed, and temp-deleted.
+1. **Phase 1:** dispatch with `targets: soundings_all` (an aggregate rule whose closure is exactly the product files + their windows — sibling window consumers are never in the plan). Windows are re-made, consumed, and temp-deleted. Set `max_jobs` to the expected count (~2 jobs per covering stem).
 2. **Phase 2:** a normal dispatch. Planned only after phase 1 finished, its DAG never schedules the window producer, so nothing cascades. Verified: the phase-2 planner reports the sibling products current.
 
 One dispatch at a time — planning phase 2 while phase 1 runs would see its half-finished state.
+
+**Do not use `--until` for this.** It works on checkpoint-free DAGs but prunes to **zero jobs** under the `cover` checkpoint (reproduced on the real store: the same dry-run plans the full set without `--until` and `total 0` with it) — the run reports "Nothing to be done" and silently does nothing. An isolation target also keeps the covering-derived priority functions working, which bare file targets do not. The scope gate's zero-plan check catches this class.
 
 ## Monitoring a dispatched run
 

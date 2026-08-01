@@ -643,6 +643,16 @@ rule bundles:
         bundle_inputs
 
 
+# Dispatch-only isolation target: rebuild every per-stem soundings file (and the temp() windows
+# they need) WITHOUT entering the vector bundles' closure, so window regeneration cannot cascade
+# into banked contour/depare outputs (docs/runbooks/build-dispatch.md). NOTE: --until cannot do
+# this — it prunes to zero jobs under the cover checkpoint. Dispatch via the workflow's `targets`
+# input; absent from the default target list.
+rule soundings_all:
+    input:
+        lambda wc: expand("store/soundings/{stem}.geojsons", stem=covering_stems())
+
+
 # Upload the finished archives + manifest.json to bathymetry/build/<sha>/ (manifest LAST,
 # marking a complete build; release.yml promotes it). Publishing is remote, so there is no
 # on-disk output — a plain always-runnable target gated on the finished bundles. coverage.pmtiles
