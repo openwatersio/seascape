@@ -116,7 +116,8 @@ contour-p:
       "$src/patches/gdal-polygon-ring-appender-quadratic.patch"
     g++ -O2 -std=c++17 -I. $(gdal-config --cflags) contour-p.cpp \
       -o "$src/pipelines/$out/contour-p" $(gdal-config --libs)
-    "$src/pipelines/$out/contour-p" 2>&1 | grep -q usage
+    # usage exits 2 by design; pipefail must not read that as a failed build
+    ("$src/pipelines/$out/contour-p" 2>&1 || true) | grep -q usage
     rm -rf "$build"
     echo "contour-p ready: pipelines/$out/contour-p"
 
