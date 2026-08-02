@@ -619,6 +619,13 @@ def _tippecanoe_run(layers, minz, maxz, out, variable_depth):
         # so leaf tiles keep the clamped shoreline. Env-tunable to dial on a re-bundle.
         cmd += ["--simplification-at-maximum-zoom",
                 os.environ.get("VECTOR_SIMPLIFICATION_MAXZOOM", "1")]
+        # Marsh-coast cells' full-detail overview tiles run past tippecanoe's 500 KB default
+        # (24 cells, max measured 762 KB), and under budget pressure coalesce-smallest merges
+        # depare polygons across band boundaries (a partition displacement) and swallows
+        # sounding ids (a census failure). Headroom fits every measured tile so the as-needed
+        # pass never arms; the durable shrink is pre-simplified overview geometry — see
+        # docs/plans/2026-07-31-post-build-followups.md.
+        cmd += ["--maximum-tile-bytes", os.environ.get("VECTOR_CELL_TILE_BYTES", "800000")]
     else:
         cmd += ["-d", str(VECTOR_SHALLOW_DETAIL), "-D", str(VECTOR_SHALLOW_DETAIL)]
     # --detect-shared-borders drives tippecanoe's wagyu exit-106 hole-placement crash on dense

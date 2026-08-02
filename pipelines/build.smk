@@ -563,6 +563,7 @@ rule vector_cell:
     # binds on RAM, and a cell run has no honest single thread count (serial walk, parallel
     # read/write). Set mem_gb from the per-cell benchmarks once the first sharded run measures them.
     params:
+        version=1, # increment to force a rebuild
         bbox=os.environ.get("BBOX", ""),  # scope stamp — see mosaic_index
     benchmark:
         f"{TMP}/bench/vector-cell-{{cell}}.tsv"
