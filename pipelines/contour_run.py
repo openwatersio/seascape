@@ -248,6 +248,10 @@ CONTOUR_TIERS = [
 ]
 
 
+# The deepest display minzoom any curve can carry (the native+ band floor).
+CONTOUR_MINZOOM_CEIL = CONTOUR_TIERS[-1][0]
+
+
 def contour_minzoom(sys_tag, depth_m):
     """Per-curve tippecanoe.minzoom: the first CONTOUR_TIERS band that shows the curve (native+ if
     none). The leaf-safe replacement for the old -j $zoom PER_ZOOM_FILTER — a variable-depth leaf
@@ -570,11 +574,19 @@ def _soundings_to_seq(gjs, out_path, id0, max_minzoom=None, min_minzoom=None):
                     if not raw:
                         continue
                     ft = json.loads(raw)
-                    mz = ft.get("tippecanoe", {}).get("minzoom", 0)
+                    tc = ft.get("tippecanoe", {})
+                    mz = tc.get("minzoom", 0)
                     if max_minzoom is not None and mz > max_minzoom:
                         continue
-                    if min_minzoom is not None and mz < min_minzoom:
-                        ft.setdefault("tippecanoe", {})["minzoom"] = min_minzoom  # cell zoom floor, see _fgb_to_seq
+                    if min_minzoom is not None:
+                        # A coarse pyramid level that swaps out BELOW the cell floor displays only in
+                        # shallow tiles — it rides the shallow run whole; clamping it here would ask
+                        # tippecanoe for minzoom > maxzoom, which writes nothing and fails the census.
+                        capz = tc.get("maxzoom")  # absent = uncapped (a finest level persists)
+                        if capz is not None and capz < min_minzoom:
+                            continue
+                        if mz < min_minzoom:
+                            ft.setdefault("tippecanoe", {})["minzoom"] = min_minzoom  # cell zoom floor, see _fgb_to_seq
                     ft["id"] = fid
                     fh.write(json.dumps(ft))
                     fh.write("\n")
@@ -634,7 +646,7 @@ def _empty_archive(out):
 
 
 def _build_seqs_and_run(stems, minz, maxz, id_base, variable_depth, out, max_minzoom=None,
-                        min_minzoom=None):
+                        min_minzoom=None, run_maxz=None):
     """Build the three layer GeoJSONSeqs from `stems` (ids from a disjoint block at id_base), then
     one tippecanoe run → out. Returns the {layer: {id: identity}} completeness map of the WRITTEN,
     above-leaf-pixel features. An all-empty input writes a 0-byte `out` and returns empty maps.
@@ -666,7 +678,9 @@ def _build_seqs_and_run(stems, minz, maxz, id_base, variable_depth, out, max_min
         layers = [(name, seq) for name, seq, ids in
                   (("contours", cseq, cids), ("soundings", sseq, sids), ("depare", dseq, dids)) if ids]
         if layers:
-            _tippecanoe_run(layers, minz, maxz, out, variable_depth)
+            # run_maxz > maxz when a cell's features carry display minzooms past its data ceiling;
+            # maxz itself keeps sizing the completeness floor (the data's own leaf pixel).
+            _tippecanoe_run(layers, minz, run_maxz or maxz, out, variable_depth)
         else:
             _empty_archive(out)
     finally:
@@ -801,12 +815,12 @@ def bundle_shallow_stable():
 
 
 def bundle_cell_stable(cell):
-    """One variable-depth vector run for a SPLIT_Z cell: -Z SPLIT_Z -z(cell max child_z) over the
-    cell's covering stems → store/bundle/vector-cell-<cell>.pmtiles, plus a sidecar of its expected
-    completeness ids the join collects. Owns the cell's z >= SPLIT_Z subtree. An all-empty cell
-    writes a 0-byte archive + empty sidecar (the join skips it). The id base is a disjoint block from
-    a stable sort of the covering's cells, so ids never collide with the shallow run or another
-    cell."""
+    """One variable-depth vector run for a SPLIT_Z cell: -Z SPLIT_Z -z(cell max child_z, raised to
+    CONTOUR_MINZOOM_CEIL when curves demand deeper display) over the cell's covering stems →
+    store/bundle/vector-cell-<cell>.pmtiles, plus a sidecar of its expected completeness ids the
+    join collects. Owns the cell's z >= SPLIT_Z subtree. An all-empty cell writes a 0-byte archive +
+    empty sidecar (the join skips it). The id base is a disjoint block from a stable sort of the
+    covering's cells, so ids never collide with the shallow run or another cell."""
     import bundle
     import mosaic
     covering = mosaic.covering_stems()
@@ -821,8 +835,15 @@ def bundle_cell_stable(cell):
     utils.create_folder("store/bundle")
     id_base = (sorted(cells).index(cell) + 1) * ID_STRIDE
     cell_maxz = _stems_maxz(stems)
+    # A curve's display minzoom can exceed a coarse cell's data ceiling (drying/shallow isobaths
+    # carry up to CONTOUR_MINZOOM_CEIL; a seed_z-rooted cell's stems stop far shallower), and
+    # tippecanoe never writes a feature whose minzoom exceeds the run's -z — silently, planet-wide.
+    # Raising -z makes the leaf guard subdivide exactly those features down to their display zoom;
+    # variable-depth adds no tiles anywhere else, and the worker's ancestor-walk overzoom then
+    # reveals each curve at its own minzoom.
+    run_maxz = max(cell_maxz, CONTOUR_MINZOOM_CEIL)
     ids = _build_seqs_and_run(stems, VECTOR_SPLIT_Z, cell_maxz, id_base, True, _cell_archive(cell),
-                              min_minzoom=VECTOR_SPLIT_Z)
+                              min_minzoom=VECTOR_SPLIT_Z, run_maxz=run_maxz)
     # Drop the fringe tiles a neighbour's edge buffer bled in, so the cells are disjoint for the merge.
     if os.path.getsize(_cell_archive(cell)) > 0:
         _filter_owned_subtree(_cell_archive(cell), cell)
@@ -838,7 +859,7 @@ def bundle_cell_stable(cell):
                                  f"features in no tile after the cell run + fringe filter — e.g. {sample}")
     utils.write_if_changed(_cell_sidecar(cell), json.dumps(ids))
     n = {k: len(v) for k, v in ids.items()}
-    print(f"vector cell bundle (stable): {_cell_archive(cell)} (z{VECTOR_SPLIT_Z}-{cell_maxz}; {n})")
+    print(f"vector cell bundle (stable): {_cell_archive(cell)} (z{VECTOR_SPLIT_Z}-{run_maxz}; {n})")
 
 
 def bundle_join_stable():
