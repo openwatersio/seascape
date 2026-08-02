@@ -573,6 +573,23 @@ rule vector_cell:
         "{PY}/contour_run.py bundle-cell {wildcards.cell} --stable 2> {log}"
 
 
+# Sampled geometric invariants on the served archive (depare partition, zoom floors). BESIDE
+# staging, not ahead of it — completeness is proven per cell, so previewing build/<sha> never
+# waits on this; the run (and the build commit status) still fails if it fails.
+rule vector_selfcheck:
+    input:
+        "store/bundle/vector.pmtiles"
+    output:
+        touch("store/meta/vector-selfcheck.ok")
+    priority: VECTOR_BAND
+    benchmark:
+        f"{TMP}/bench/vector-selfcheck.tsv"
+    log:
+        f"{TMP}/logs/vector-selfcheck.log"
+    shell:
+        "{PY}/contour_run.py check-join --stable 2> {log}"
+
+
 rule vector_join:
     input:
         shallow="store/bundle/vector-shallow.pmtiles",

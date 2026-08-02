@@ -754,6 +754,13 @@ def _archive_metadata(archive):
         return Reader(MmapSource(f)).metadata()
 
 
+def _tile_count(archive):
+    """Logical (addressed) tile count from the archive header — a header field read, not a scan."""
+    from pmtiles.reader import Reader, MmapSource
+    with open(archive, "rb") as f:
+        return Reader(MmapSource(f)).header().get("addressed_tiles_count") or 0
+
+
 def _union_layers_lead(archives, lead):
     """Write `archives[0]` to `lead` with its `vector_layers` widened to the union across every
     shard, so the merged archive advertises exactly the layers its tiles carry.
@@ -877,16 +884,17 @@ def bundle_join_stable():
     is `pmtiles merge` (go-pmtiles): a pure concat that REFUSES overlapping inputs, replacing
     tile-join's boundary-tile MERGE (slow at planet scale + the PMTiles-writer corruption
     felt/tippecanoe#278). merge copies the layer-schema metadata from its FIRST input, so the lead is
-    a patched copy declaring every shard's layers (see _union_layers_lead). The completeness
-    self-check runs on the FINAL merged archive against the union of the per-cell sidecars'
-    expected ids."""
+    a patched copy declaring every shard's layers (see _union_layers_lead). Completeness is proven
+    upstream — every cell archive passed its own census (bundle_cell_stable) — so the join asserts
+    only the concat's tile-count identity here; the sampled geometric invariants run in the
+    vector_selfcheck rule, BESIDE staging rather than ahead of it."""
     import mosaic
     covering = mosaic.covering_stems()
     cellmap = vector_covering_cells(covering)
     cells = sorted(cellmap)
     if not os.path.exists(SHALLOW):
         raise SystemExit(f"vector join: missing {SHALLOW} — run the shallow bundle first")
-    expected = {"contours": {}, "soundings": {}, "depare": {}}
+    n_ids = 0
     archives = []  # shallow leads (planet bounds); order is otherwise irrelevant — pmtiles merge
     # takes the header zoom bounds from the UNION of all inputs, not the first.
     if os.path.getsize(SHALLOW) > 0:
@@ -899,8 +907,7 @@ def bundle_join_stable():
             continue  # empty cell (0-byte sentinel) — no tiles, no expected ids
         archives.append(arch)
         with open(_cell_sidecar(c)) as f:
-            for layer, m in json.load(f).items():
-                expected[layer].update((int(k), v) for k, v in m.items())
+            n_ids += sum(len(m) for m in json.load(f).values())
     if not archives:
         raise SystemExit("vector join: no vector features in any shallow or cell archive")
 
@@ -918,11 +925,34 @@ def bundle_join_stable():
             if os.path.exists(scratch):
                 os.remove(scratch)
 
-    maxz = _vector_maxz(0)
-    expected = {k: v for k, v in expected.items() if v}
-    _vector_selfcheck(vec, maxz, expected)
-    print(f"vector bundle (stable): {vec} (z0-{maxz}; {len(archives)} archives, "
-          f"{sum(len(v) for v in expected.values())} ids)")
+    # A concat cannot drop tiles without the counts disagreeing; the ids inside every tile were
+    # already censused per cell. A shard addressing 0 tiles is itself an anomaly (empties are
+    # 0-byte sentinels and never reach the merge).
+    shard_tiles = 0
+    for a in archives:
+        n = _tile_count(a)
+        if n == 0:
+            raise SystemExit(f"vector join: {os.path.basename(a)} addresses 0 tiles — writer anomaly")
+        shard_tiles += n
+    merged_tiles = _tile_count(vec)
+    if merged_tiles != shard_tiles:
+        raise SystemExit(f"vector join: merged archive addresses {merged_tiles} tiles vs "
+                         f"{shard_tiles} across {len(archives)} shards — the concat lost tiles")
+    print(f"vector bundle (stable): {vec} (z0-{_vector_maxz(0)}; {len(archives)} archives, "
+          f"{merged_tiles} tiles, {n_ids} ids censused per cell)")
+
+
+def check_join_stable():
+    """Sampled geometric invariants on the served vector archive (depare m-band partition, zoom
+    floors, down-zoom conservation). Its own rule, run BESIDE staging rather than ahead of it —
+    completeness is proven per cell and the join's concat by tile-count identity, so previewing
+    build/<sha> never waits on this pass; the run (and the build commit status) still fails if it
+    fails."""
+    vec = "store/bundle/vector.pmtiles"
+    if not os.path.exists(vec):
+        raise SystemExit("vector self-check: missing store/bundle/vector.pmtiles — run the join first")
+    _vector_selfcheck(vec, _vector_maxz(0))
+    print("vector self-check (stable): sampled invariants ok")
 
 
 def _decode_tile(vec, z, x, y):
@@ -1137,10 +1167,13 @@ if __name__ == "__main__":
         bundle_cell_stable(a[1])
     elif a == ["bundle-join", "--stable"]:
         bundle_join_stable()
+    elif a == ["check-join", "--stable"]:
+        check_join_stable()
     elif a[:1] == ["coverage"]:
         coverage_bundle()
     elif a[:1] == ["check"]:
         _check()
     else:
         sys.exit("usage: contour_run.py tile <stem> | bundle-shallow --stable | "
-                 "bundle-cell <cell> --stable | bundle-join --stable | coverage | check")
+                 "bundle-cell <cell> --stable | bundle-join --stable | check-join --stable | "
+                 "coverage | check")

@@ -553,6 +553,7 @@ def main():
         assert {"contours", "soundings", "depare"} <= layers, \
             f"the joined archive must carry all three layers: {sorted(layers)}"
         contour_run._vector_selfcheck(vec, maxz)  # raises SystemExit on any invariant violation
+        snake(tmp, "-c", "4", "vector_selfcheck")  # the rule wiring: runs beside staging in prod
         print(f"vector joined-run ok — one sparse archive, layers {sorted(layers)}, self-check passed")
 
         by_zoom = decode_bundles(tmp)

@@ -48,7 +48,7 @@ on:
       targets:
         description: "Snakemake targets (default: the full build). e.g. soundings_all for an isolated leaf-product rebuild that must not cascade."
         required: false
-        default: "bundles publish_mosaic stage_build"
+        default: "bundles publish_mosaic stage_build vector_selfcheck"
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
@@ -382,7 +382,7 @@ jobs:
           # bbox run stages under build/<sha>-bbox (see SHA above), so the regional archives
           # are previewable but can never be promoted by release.yml.
           case "$INPUT_TARGETS" in *[!-A-Za-z0-9_\ ]*) echo "invalid targets" >&2; exit 1 ;; esac
-          read -r -a targets <<<"${INPUT_TARGETS:-bundles publish_mosaic stage_build}"
+          read -r -a targets <<<"${INPUT_TARGETS:-bundles publish_mosaic stage_build vector_selfcheck}"
           # Scope gate: the dispatcher states the expected DAG size; if the planner disagrees
           # (a staleness-trigger surprise: param re-key, rename cascade, temp regeneration —
           # or a zero-job plan from a mis-scoped isolation target), the run aborts on the
