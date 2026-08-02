@@ -26,7 +26,7 @@ NODATA = -9999
 def merge(filepath):
     filename = filepath.split("/")[-1]
     z, x, y, child_z = (int(a) for a in filename.replace("-aggregation.csv", "").split("-"))
-    tmp_folder = filepath.replace("-aggregation.csv", "-tmp")  # beside the CSV
+    tmp_folder = utils.merge_scratch(filepath)
 
     done_filepath = f"{tmp_folder}/merge-done"
     if os.path.isfile(done_filepath):
@@ -51,7 +51,8 @@ def merge(filepath):
     with rasterio.env.Env(GDAL_CACHEMAX=256):
         with rasterio.open(tiffs[0]) as src:
             height, width, profile = src.height, src.width, src.profile
-        profile.update(tiled=True, blockxsize=512, blockysize=512)
+        # IF_SAFER: the inherited profile is compressed, so IF_NEEDED would never fire
+        profile.update(tiled=True, blockxsize=512, blockysize=512, BIGTIFF="IF_SAFER")
         output_path = f"{tmp_folder}/{len(tiffs)}-3857.tiff"
 
         with rasterio.open(output_path, "w", **profile) as dst:

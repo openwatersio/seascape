@@ -14,9 +14,17 @@ small; the viewer's symbol collision (sorted shallow-first) de-conflicts what re
 
 Per tile: read merged DEM (3857) in row strips -> a staggered-grid PYRAMID (one jittered quincunx
 grid per zoom level, each point valued by the shoalest wet pixel in its block) -> keep points in
-the unbuffered tile bbox -> reproject to 4326 -> store/soundings/{stem}.geojson (per-feature
-tippecanoe minzoom==maxzoom, so each zoom shows one even field, densifying inward). bundle()
-tippecanoes them into a `soundings` layer.
+the unbuffered tile bbox -> reproject to 4326 -> store/soundings/{stem}.geojsons (per-feature
+tippecanoe minzoom==maxzoom, so each zoom shows one even field, densifying inward). The vector
+bundle folds these into the `soundings` layer of the sharded variable-depth run (contour_run).
+
+Each field is also thinned by depth (SOUND_THIN_TIERS): a point deeper than a cutoff displays from
+a 2^shift coarser level of the same pyramid, so the abyss reads sparse at every zoom while
+navigable depths keep full density — chart practice, and the project's navigational depth bands.
+
+The per-stem file is line-delimited GeoJSON (one Feature per line, `.geojsons`), NOT a single
+FeatureCollection: the bundle passthrough streams it line by line (no whole-file json.load), so a
+parallel/streaming consumer reads one feature at a time regardless of tile size.
 
 Chart-cartography grounding (shoal-bias, the radius method, SCAMIN, spacing rules) and the
 seamap fork this mirrors: ../docs/nautical-chart-references.md.
@@ -25,12 +33,10 @@ seamap fork this mirrors: ../docs/nautical-chart-references.md.
 import json
 import math
 import os
-import subprocess
 import sys
 
 import mercantile
 
-import contour_run
 import landmask
 import utils
 
@@ -43,6 +49,30 @@ M_PER_FATHOM = 1.8288
 SOUND_CELL_PX = int(os.environ.get("SOUND_CELL_PX", "64"))
 # Drop soundings shallower than this (metres): near-waterline cells just read "0" and clutter.
 SOUND_MIN_DEPTH_M = float(os.environ.get("SOUND_MIN_DEPTH_M", "1.0"))
+# Depth-tiered thinning: at/beyond each cutoff a sounding rides a 2^shift coarser lattice at every
+# zoom, so deep water reads sparse (chart practice: dense over banks, sparse over the abyss) while
+# navigational depths keep full density. "depth_m:shift" pairs. Env-tunable on a re-run.
+
+
+def _parse_thin_tiers(spec):
+    # Sorted so _thin_shift's last-match-wins scan is correct whatever order the env string uses.
+    try:
+        return sorted((float(d), int(s)) for d, s in
+                      (t.split(":") for t in spec.split(",") if t.strip()))
+    except ValueError:
+        raise SystemExit(f"SOUND_THIN_TIERS {spec!r}: expected comma-separated depth_m:shift pairs, "
+                         'e.g. "200:1,1000:2"')
+
+
+SOUND_THIN_TIERS = _parse_thin_tiers(os.environ.get("SOUND_THIN_TIERS", "200:1,1000:2"))
+
+
+def _thin_shift(depth_pos):
+    s = 0
+    for d, k in SOUND_THIN_TIERS:
+        if depth_pos >= d:
+            s = k
+    return s
 
 
 def _tc(minz, child_z):
@@ -116,13 +146,18 @@ def _pyramid(src, nodata, bbox, min_depth, z, child_z):
     coarse zoom) and placed on a per-row-offset lattice jittered into the cell — an even, chart-
     like field at EVERY zoom. (A single baked stagger can't do that: uniform decimation drops the
     offset rows at coarse zoom, leaving a square grid — the reason a per-level pyramid is needed.)
-    Returns [(depth_pos, x3857, y3857, minz)] with minz==maxz per level, so each zoom shows exactly
-    one level and it densifies as you zoom in."""
+    Deep points display SHIFTED: a point at/beyond a SOUND_THIN_TIERS cutoff shows each zoom from a
+    2^shift coarser level (its finest levels never display), so deep water thins at every zoom while
+    the lattice stays an even quincunx. The pyramid extends max-shift extra levels so the coarsest
+    displayed zoom still gets a (thinned) deep field.
+    Returns [(depth_pos, x3857, y3857, display_z)] with display_z==maxzoom per level, so each zoom
+    shows exactly one field and it densifies as you zoom in."""
     import numpy as np
     transform = src.transform
     g = _shoalest_grid(src, nodata, min_depth)
     pts = []
-    for level in range(max(0, child_z - z) + 1):
+    max_shift = max((s for _, s in SOUND_THIN_TIERS), default=0)
+    for level in range(max(0, child_z - z) + 1 + max_shift):
         cell = SOUND_CELL_PX * (1 << level)
         minz = child_z - level
         ny, nx = g.shape
@@ -132,18 +167,21 @@ def _pyramid(src, nodata, bbox, min_depth, z, child_z):
                 d = g[gy, gx]
                 if np.isnan(d):
                     continue
+                disp = minz + _thin_shift(d)
+                if not z <= disp <= child_z:
+                    continue
                 cx = gx * cell + stagger + cell * (0.25 + 0.5 * _jit(gx, gy))  # jitter, middle half
                 cy = gy * cell + cell * (0.25 + 0.5 * _jit(gy, gx))
                 x, y = transform * (cx, cy)
                 if bbox.left <= x <= bbox.right and bbox.bottom <= y <= bbox.top:
-                    pts.append((float(d), x, y, minz))
+                    pts.append((float(d), x, y, disp))
         g = _reduce_shoalest(g)
     return pts
 
 
 def _sound_dem(dem, tile_obj, z, child_z, tmp, label):
     """Sound any DEM covering the tile's extent: grid-decimated shoalest picks into a tmp
-    geojson. Returns (final_path, count), or None when dry / all-land."""
+    line-delimited geojson. Returns (final_path, count), or None when dry / all-land."""
     import rasterio
     from pyproj import Transformer
     bbox = mercantile.xy_bounds(tile_obj)  # unbuffered, tile-aligned (EPSG:3857)
@@ -164,29 +202,28 @@ def _sound_dem(dem, tile_obj, z, child_z, tmp, label):
                       "properties": _depths(d),
                       "geometry": {"type": "Point", "coordinates": [round(lon, 6), round(lat, 6)]}})
 
-    final = f"{tmp}/soundings.geojson"
-    with open(final, "w") as f:
-        json.dump({"type": "FeatureCollection", "features": feats}, f)
+    final = f"{tmp}/soundings.geojsons"
+    with open(final, "w") as f:  # line-delimited features — see module docstring
+        for ft in feats:
+            f.write(json.dumps(ft))
+            f.write("\n")
     return final, len(feats)
 
 
 def tile(stem):
     """The per-stem Snakemake job: sound one stem from a BUFFERED mosaic window, smoothed at read
-    with the one shared f(depth, zoom), output at store/soundings/<stem>.geojson. A dry tile writes
+    with the one shared f(depth, zoom), output at store/soundings/<stem>.geojsons. A dry tile writes
     a 0-byte sentinel; bundling filters empties by size."""
     import shutil
     import tempfile
 
-    import mosaic
-    import smooth
     z, x, y, child_z = (int(a) for a in stem.split("-"))
-    out = f"store/soundings/{stem}.geojson"
+    out = f"store/soundings/{stem}.geojsons"
     tmp = tempfile.mkdtemp(prefix=f"soundings-{stem}-")  # local scratch; publish crosses to the store
-    dem = mosaic.window_dem(stem, f"{tmp}/dem.tiff")
-    if not os.environ.get("SKIP_SMOOTH"):
-        smooth.smooth_tiff(dem)
-    # Same post-smooth land clamp as contour_tile: without it, smeared/rim negatives
-    # under the land mask mint soundings on islands.
+    # Private copy of the shared smoothed window; the land clamp mutates in place, and
+    # without it smeared/rim negatives under the land mask mint soundings on islands.
+    dem = f"{tmp}/dem.tiff"
+    shutil.copyfile(f"store/window/{stem}.tif", dem)
     landmask.clamp_dem_to_land(dem)
     res = _sound_dem(dem, mercantile.Tile(x=x, y=y, z=z), z, child_z, tmp, stem)
     os.makedirs(os.path.dirname(out), exist_ok=True)
@@ -198,35 +235,6 @@ def tile(stem):
         open(out, "w").close()
         print(f"soundings tile {stem}: empty")
     shutil.rmtree(tmp)
-
-
-def _tippecanoe(gj, maxz, out):
-    """tippecanoe the per-tile soundings geojsons into `out` (layer `soundings`, z0..maxz). -r1
-    keeps every point: per-feature tippecanoe.minzoom already did the density thinning by zoom."""
-    with utils.log_group(f"soundings tippecanoe ({len(gj)} inputs, z0-{maxz})"):
-        utils.run_monitored(
-            ["tippecanoe", "-o", out, "-f", "-l", "soundings",
-             "-n", "Bathymetric soundings", "-A", utils.ATTRIBUTION, "-Z", "0", "-z", str(maxz),
-             "-P", "-q", "-r1", "-y", "depth_m", "-y", "depth_ft", "-y", "depth_fm",
-             *gj], "soundings tippecanoe", out)
-
-
-def bundle_stable():
-    """Soundings bundle: tippecanoe the per-stem geojsons for the covering into
-    store/bundle/soundings.pmtiles. A 0-byte per-tile file is a legitimately dry tile (filtered by
-    size); a MISSING one is an incomplete build (require_stable_complete). Snakemake decides when to
-    invoke, so this always rebuilds."""
-    import mosaic
-    stems = mosaic.covering_stems()
-    files = [f"store/soundings/{s}.geojson" for s in stems]
-    contour_run.require_stable_complete("soundings", stems, files)
-    gj = [f for f in files if os.path.getsize(f) > 0]
-    out = "store/bundle/soundings.pmtiles"
-    utils.create_folder("store/bundle")
-    own_max = max((int(os.path.basename(g).split(".")[0].rsplit("-", 1)[1]) for g in gj), default=0)
-    maxz = contour_run.bundle_maxz_stable(own_max)
-    _tippecanoe(gj, maxz, out)
-    print(f"soundings bundle (stable): {out} (z0-{maxz}, {len(gj)} tiles)")
 
 
 def _check():
@@ -255,8 +263,9 @@ def _check():
     with rasterio.open(p, "w", driver="GTiff", height=256, width=256, count=1,
                        dtype="float32", nodata=NODATA, crs="EPSG:3857", transform=tr) as dst:
         dst.write(arr, 1)
-    global SOUND_CELL_PX
+    global SOUND_CELL_PX, SOUND_THIN_TIERS
     SOUND_CELL_PX = 128
+    SOUND_THIN_TIERS = [(200.0, 1), (1000.0, 2)]  # the documented default; a dev shell's env must not steer the check
     from types import SimpleNamespace
     bbox = SimpleNamespace(left=0, bottom=0, right=25600, top=25600)
     with rasterio.open(p) as src:
@@ -277,6 +286,65 @@ def _check():
     # (minz == child_z) is uncapped so it persists above the local source ceiling
     assert _tc(8, 10) == {"minzoom": 8, "maxzoom": 8}
     assert _tc(10, 10) == {"minzoom": 10}
+
+    # depth-tiered thinning: the tier a depth falls in, at and just under each cutoff
+    assert [_thin_shift(d) for d in (0, 99, 199.9, 200, 999, 1000, 5000)] == [0, 0, 0, 1, 1, 2, 2]
+
+    # tier parsing: order-insensitive (sorted for the last-match-wins scan), loud on malformed input
+    assert _parse_thin_tiers("1000:2, 200:1") == [(200.0, 1), (1000.0, 2)]
+    try:
+        _parse_thin_tiers("200")
+        raise AssertionError("malformed SOUND_THIN_TIERS must exit")
+    except SystemExit as e:
+        assert "depth_m:shift" in str(e)
+
+    def uniform_field(depth_m, z, child_z, n=1024, px=100):
+        """{display_zoom: point count} over a uniformly depth_m-deep n x n DEM."""
+        q = f"{tmp}/uniform-{depth_m}-{z}.tif"
+        with rasterio.open(q, "w", driver="GTiff", height=n, width=n, count=1, dtype="float32",
+                           nodata=NODATA, crs="EPSG:3857",
+                           transform=from_origin(0, n * px, px, px)) as dst:
+            dst.write(np.full((n, n), -float(depth_m), "float32"), 1)
+        whole = SimpleNamespace(left=0, bottom=0, right=n * px, top=n * px)
+        with rasterio.open(q) as src:
+            pts = _pyramid(src, NODATA, whole, 1.0, z, child_z)
+        counts = {}
+        for *_, dz in pts:
+            counts[dz] = counts.get(dz, 0) + 1
+        return counts
+
+    # An unthinned ladder over the same geometry: one 4x-denser field per zoom, deepest densest.
+    ladder = uniform_field(100, z=6, child_z=9)
+    assert sorted(ladder) == [6, 7, 8, 9] and ladder[9] > ladder[8] > ladder[7] > ladder[6]
+    # Each tier rides that same lattice `shift` levels coarser at EVERY zoom — its finest `shift`
+    # levels never display, so deep water thins 4^-shift while < 200 m keeps full density.
+    for depth_m, shift in ((100, 0), (500, 1), (5000, 2)):
+        field = uniform_field(depth_m, z=8, child_z=9)
+        assert sorted(field) == [8, 9], f"{depth_m} m displays at {sorted(field)}, want z8 and z9"
+        assert field == {8: ladder[8 - shift], 9: ladder[9 - shift]}, \
+            f"{depth_m} m must ride the lattice {shift} level(s) coarser: {field} vs {ladder}"
+    assert _tc(9, 9) == {"minzoom": 9}  # the shifted level reaching child_z is still a finest field
+
+    # mixed field: a 190 m shoal (tier 0) in a 1200 m plain (tier 2). A block's representative takes
+    # the SHOALEST value's shift, so a shelf-break shoal displays at every zoom it would unthinned —
+    # thinning is never allowed to hide a shoal.
+    m = f"{tmp}/mixed.tif"
+    arr = np.full((1024, 1024), -1200.0, "float32")
+    arr[512:640, 512:640] = -190.0  # exactly one CELL=128 block
+    with rasterio.open(m, "w", driver="GTiff", height=1024, width=1024, count=1, dtype="float32",
+                       nodata=NODATA, crs="EPSG:3857",
+                       transform=from_origin(0, 102400, 100, 100)) as dst:
+        dst.write(arr, 1)
+    span = SimpleNamespace(left=0, bottom=0, right=102400, top=102400)
+    with rasterio.open(m) as src:
+        mixed = _pyramid(src, NODATA, span, 1.0, z=8, child_z=9)
+    for dz in (8, 9):
+        assert any(d == 190.0 and mz == dz for d, x, y, mz in mixed), \
+            f"the 190 m shoal must display at z{dz}"
+    # the plain still shows where its shifted lattice has cells the shoal didn't claim (z9 here);
+    # at z8 the whole field's coarse representative IS the shoal — deep is what gets suppressed
+    assert any(d == 1200.0 and mz == 9 for d, x, y, mz in mixed)
+    assert all(d == 190.0 for d, x, y, mz in mixed if mz == 8)
     print("soundings_run self-check ok")
 
 
@@ -284,9 +352,7 @@ if __name__ == "__main__":
     a = sys.argv[1:]
     if a[:1] == ["tile"] and len(a) == 2:
         tile(a[1])
-    elif a == ["bundle", "--stable"]:
-        bundle_stable()
     elif a[:1] == ["check"]:
         _check()
     else:
-        sys.exit("usage: soundings_run.py tile <stem> | bundle --stable | check")
+        sys.exit("usage: soundings_run.py tile <stem> | check")

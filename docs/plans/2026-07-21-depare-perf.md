@@ -127,7 +127,7 @@ All phase-2 "owed" items are done and phase 3 (box bbox validation) is complete.
 
 ## Interactions, named
 
-- **Per-layer archives: rejected (2026-07-26)** — `depare.pmtiles` stays an intermediate that rides the `vector.pmtiles` tile-join; the combined archive is the served contract.
+- **Per-layer archives: rejected (2026-07-26)** — the combined `vector.pmtiles` is the served contract. The per-stem depare FGBs feed its single joint variable-depth run directly (no `depare.pmtiles`, no tile-join).
 - **Drying-geometry / depth-below-water plans** touch the same `_depare_dem` sections. Perf fixes here keep semantics frozen; if either plan lands mid-stream, re-run the phase-2 gates on its diff rather than interleaving the changes.
 - **Windowed contours** (backlog): if H-B's subdivision work produces a shared bounded-mask helper, contours' reintroduction can reuse it — note it, don't couple the PRs.
 

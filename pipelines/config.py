@@ -9,6 +9,7 @@ Ported from scripts/config.sh.
 import hashlib
 import json
 import os
+import sys
 from glob import glob
 
 SOURCES_DIR = os.environ.get("SOURCES_DIR", "../sources")
@@ -37,6 +38,11 @@ CONTOUR_LEVELS = [int(x) for x in os.environ.get("CONTOUR_LEVELS", _CONTOUR_LEVE
 # Purely a classifier: it bounds the depare drying bucket and the terrain render's drying code —
 # the published raster carries category codes (0/1/2), never the cap itself.
 DRYING_CAP = float(os.environ.get("DRYING_CAP", "16"))
+
+# Global build-depth ceiling over every source's native/capped zoom: z16 measured unaffordable
+# (the one z16 stem's merge alone ran 1h+ for the last zoom of a single lake); lift per zoom as
+# sparse minting/merging lands. Applied at covering derivation, so no re-registration needed.
+MAX_CHILD_Z = int(os.environ.get("MAX_CHILD_Z", "15"))
 
 # Feet/fathom isobaths: a second contour set at the classic fathom curves. Friendly feet depths
 # (6, 12, 18, 30, 60, 120, 180, 300, 600 ft …) are exactly whole fathoms in feet, so one geometry
@@ -81,7 +87,13 @@ def load_catalog(source):
         item = None
         if os.path.isfile(path):
             with open(path) as f:
-                item = json.load(f)
+                try:
+                    item = json.load(f)
+                except json.JSONDecodeError as e:
+                    # A torn registration (e.g. an unclean volume detach) must name itself —
+                    # the bare decode error says nothing about which source to re-register.
+                    sys.exit(f"corrupt {path} ({e}) — re-register the source "
+                             f"(sources.yml with source={source} force=true)")
         _catalog_cache[ck] = item
     return _catalog_cache[ck]
 
@@ -261,6 +273,5 @@ def _check():
 
 
 if __name__ == "__main__":
-    import sys
     if sys.argv[1:2] == ["--check"]:
         _check()

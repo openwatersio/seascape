@@ -119,7 +119,8 @@ def warp_mixed(inputs, out_tif, zoom, aggregation_tile, buffer):
     # uncompressed) and the I/O writing it.
     _run(f"GDAL_CACHEMAX=512 gdalwarp -overwrite -t_srs EPSG:3857 -tr {res} {res} "
          f"-te {left} {bottom} {right} {top} -r {RESAMPLE} -dstnodata {NODATA} "
-         "-co TILED=YES -co SPARSE_OK=YES -co COMPRESS=ZSTD -co PREDICTOR=3 -co NUM_THREADS=ALL_CPUS "
+         "-co TILED=YES -co BIGTIFF=IF_SAFER -co SPARSE_OK=YES "
+         "-co COMPRESS=ZSTD -co PREDICTOR=3 -co NUM_THREADS=ALL_CPUS "
          f"{' '.join(inputs)} {out_tif}",
          f"gdalwarp(mixed) {out_tif}")
 
@@ -171,7 +172,9 @@ def translate(in_filepath, out_filepath):
     # ZSTD (no predictor — ADD_ALPHA makes this Float32 + a Byte alpha band, and
     # PREDICTOR=3 is float-only) + NUM_THREADS. The merge reads these per-source COGs and
     # inherits the profile into the merged DEM, so compressing here propagates downstream.
-    _run("GDAL_CACHEMAX=512 gdal_translate -of COG -co BIGTIFF=IF_NEEDED -co ADD_ALPHA=YES "
+    # IF_SAFER, not IF_NEEDED: with compression IF_NEEDED never fires, and z15 grids
+    # whose ZSTD output still crosses 4 GB die mid-write in TIFFAppendToStrip.
+    _run("GDAL_CACHEMAX=512 gdal_translate -of COG -co BIGTIFF=IF_SAFER -co ADD_ALPHA=YES "
          "-co OVERVIEWS=NONE -co SPARSE_OK=YES -co BLOCKSIZE=512 "
          f"-co COMPRESS=ZSTD -co NUM_THREADS=ALL_CPUS {in_filepath} {out_filepath}",
          f"gdal_translate {in_filepath}")
@@ -198,7 +201,7 @@ def reproject(filepath):
     aggregation_tile = mercantile.Tile(x=x, y=y, z=z)
 
     # Beside the CSV.
-    tmp_folder = filepath.replace("-aggregation.csv", "-tmp")
+    tmp_folder = utils.merge_scratch(filepath)
     utils.create_folder(tmp_folder)
     metadata_filepath = f"{tmp_folder}/reprojection.json"
     if os.path.isfile(metadata_filepath):

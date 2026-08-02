@@ -30,7 +30,11 @@ preview bbox="-74.30,40.40,-73.75,40.80":
     export WATERMASK="${WATERMASK:-/vsicurl/https://data.openwaters.io/bathymetry/landmask/water.fgb}"
     # One invocation: the `cover` checkpoint runs inside the bundles build (streamed sources),
     # then the DAG re-evaluates into the per-stem mosaic/fork/terrain jobs.
-    uv run snakemake -s ../Snakefile bundles --config stream=1 --cores 8
+    # mem_gb budget from the actual environment (the Docker VM's memory, not the host's), minus
+    # a 2 GB reserve — without it snakemake admits concurrent heavy forks the VM OOM-kills (137).
+    # A dense-harbor z14 contour reserves ~10 GB: give the Docker Desktop VM >=16 GB for those.
+    mem_gb=$(free -g 2>/dev/null | awk 'NR==2{print $2}' || sysctl -n hw.memsize | awk '{print int($1/1073741824)}')
+    uv run snakemake -s ../Snakefile bundles --config stream=1 --cores 8 --resources mem_gb=$((mem_gb > 4 ? mem_gb - 2 : mem_gb))
     # seed.sh needs manifest.json; stage_build writes it locally (publish is a separate, box-only step)
     uv run python -c "import bundle; bundle.stage_build()"
     ../worker/seed.sh
@@ -91,3 +95,57 @@ test-workflows:
 # ci.yml runs it on every push.
 test-gc:
     bash test_gc.sh
+
+# Build contour-p, the DEPARE partition tool production uses (DEPARE_CONTOUR_BIN). Measuring
+# marsh stems with stock gdal_contour measures a path that doesn't ship — the patch is 7x on a
+# 4096px crop and 40x on a full z15 wetland window. Needs the local gdal-config to match the
+# Dockerfile's pinned GDAL_MS_COMMIT.
+contour-p:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    commit=b2e6057d1d0f2cb4c11bfdf79ab1a61def0ce9ca
+    src="{{justfile_directory()}}"; build=$(mktemp -d); out=store/profile/bin
+    mkdir -p "$out" "$build/ms"
+    cp "$src/tools/contour-p/contour-p.cpp" "$build/"
+    for f in point.h square.h utility.h level_generator.h segment_merger.h \
+             contour_generator.h polygon_ring_appender.h; do
+      curl -fsSL "https://raw.githubusercontent.com/OSGeo/gdal/$commit/alg/marching_squares/$f" \
+        -o "$build/ms/$f"
+    done
+    cd "$build" && git apply --directory=ms -p3 \
+      "$src/patches/gdal-polygon-ring-appender-quadratic.patch"
+    g++ -O2 -std=c++17 -I. $(gdal-config --cflags) contour-p.cpp \
+      -o "$src/pipelines/$out/contour-p" $(gdal-config --libs)
+    # usage exits 2 by design; pipefail must not read that as a failed build
+    ("$src/pipelines/$out/contour-p" 2>&1 || true) | grep -q usage
+    rm -rf "$build"
+    echo "contour-p ready: pipelines/$out/contour-p"
+
+# Cut the local marsh profiling fixtures (small real windows over the Gulf, range-read from the
+# published mosaic COGs) into store/profile/root. Needs R2 read creds — the public host refuses
+# range requests.
+perf-fixtures *sites:
+    uv run python perf/fixtures.py build {{sites}}
+    uv run python perf/fixtures.py masks
+
+# Profile one real stage against a fixture and record wall / peak RSS / parts / vertices.
+#   just perf depare 12-1015-1699-15 base
+perf stage stem label="adhoc":
+    uv run python perf/bench.py run {{stage}} {{stem}} --label {{label}}
+
+# Compare two labelled runs; nonzero exit on a regression past threshold.
+perf-compare a b:
+    uv run python perf/bench.py compare {{a}} {{b}}
+
+# Safety gates for a generalization change: shoal-bias, water-network connectivity, drying
+# growth on connected water (raster); partition contract, bounded displacement, named-route
+# continuity (vector). Hard assertions — a failure is a defect, not a threshold to widen.
+perf-gate kind before after *args:
+    uv run python perf/gates.py {{kind}} {{before}} {{after}} {{args}}
+
+# Every self-check in the profiling harness.
+test-perf:
+    uv run python perf/fixtures.py --check
+    uv run python perf/metrics.py --check
+    uv run python perf/bench.py --check
+    uv run python perf/gates.py --check

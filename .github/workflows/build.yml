@@ -41,6 +41,14 @@ on:
         description: "Extra snakemake args, e.g. -R publish (code changes are force-only)"
         required: false
         default: ""
+      max_jobs:
+        description: "Scope gate: dry-run first and abort if the planned job count exceeds this or is zero (empty = no gate). State the expected DAG size here so a planner surprise dies in minutes, not on box time."
+        required: false
+        default: ""
+      targets:
+        description: "Snakemake targets (default: the full build). e.g. soundings_all for an isolated leaf-product rebuild that must not cascade."
+        required: false
+        default: "bundles publish_mosaic stage_build vector_selfcheck"
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
@@ -233,6 +241,26 @@ jobs:
         run: |
           mkdir -p "$TMP"  # first snakemake step; the mount source must exist before docker run
           ./docker.sh snakemake --unlock --config workdir=/app/state tmp=/app/tmp
+      - name: Hot landmask masks on NVMe
+        # Every fork's clamp rasterize range-reads land/water FGBs thousands of times; serve
+        # them from local NVMe via a bind mount so the DAG sees identical paths AND mtimes
+        # (cp -p) — provenance untouched. The bind must land before docker run so the
+        # container's /app/state view includes it. Rebuilt masks (rare) write to the NVMe
+        # copy; the sync-back step below persists them to the volume.
+        run: |
+          src=/mnt/seascape-store/store/landmask
+          mkdir -p /var/tmp/seascape-landmask
+          # Per-FILE binds, not a directory shadow: the dir also holds the landmask rule's
+          # inputs (e.g. land-polygons-split-4326/), which must stay reachable. nsenter into
+          # PID 1's mount namespace: the runner service has its own, and a bind made there
+          # is invisible to the docker daemon (and thus every container).
+          for f in "$src"/*.fgb; do
+            [ -f "$f" ] || continue
+            cp -p "$f" /var/tmp/seascape-landmask/
+            nsenter -t 1 -m mount --bind "/var/tmp/seascape-landmask/$(basename "$f")" "$f"
+            nsenter -t 1 -m mountpoint -q "$f" || { echo "bind failed for $f" >&2; exit 1; }
+            echo "serving $(basename "$f") from NVMe"
+          done
       - name: Build the mosaic (Snakemake)
         env:
           # Dispatch inputs reach the shell as env vars, never interpolated into a shell line.
@@ -240,6 +268,8 @@ jobs:
           INPUT_FORCE: ${{ github.event.inputs.force }}
           INPUT_DEPARE: ${{ github.event.inputs.depare }}
           INPUT_ARGS: ${{ github.event.inputs.snakemake_args }}
+          INPUT_MAX_JOBS: ${{ github.event.inputs.max_jobs }}
+          INPUT_TARGETS: ${{ github.event.inputs.targets }}
           GH_TOKEN: ${{ github.token }} # the progress-heartbeat gh api calls
           BOX_IP: ${{ needs.create-runner.outputs.ip }} # carried in the build status desc
           # Raw sources (CUDEM/S-102) stream from the public mirror; processed sources
@@ -264,12 +294,17 @@ jobs:
           # the pathological deep/complex stems hit this — they retry coarser instead of pinning
           # a core for 8 h+ (depare_run.tile).
           export DEPARE_TIMEOUT="${DEPARE_TIMEOUT:-3600}"
-          # Disk headroom: the mosaic tiles (~360 G) live permanently on the volume, so a warm
-          # volume only adds the lighter fork layers on resume — 50 G covers that churn on a
-          # near-full volume. Refuse early rather than fill mid-run.
-          need_gb=50
+          # Patched-appender polygon contour tool (Dockerfile; exact-geometry-equivalent to
+          # gdal_contour -p, near-linear on marsh-coast ring counts that make stock quadratic).
+          export DEPARE_CONTOUR_BIN="${DEPARE_CONTOUR_BIN:-contour-p}"
+          # Per-phase wall marks in every depare log (depare_run._mark) — ~17 lines per stem,
+          # and the only way to attribute a slow stem to its phase without a local reproduction.
+          export DEPARE_TIMING="${DEPARE_TIMING:-1}"
+          # Disk headroom: warn-only — the disk_mb budget below is the admission control that
+          # actually bounds concurrent tmp usage to real free space, and a rebuild that rewrites
+          # layers in place can legitimately start below the comfortable floor.
           free_gb=$(df -BG --output=avail "$STATE" | tail -1 | tr -dc '0-9')
-          [ "$free_gb" -ge "$need_gb" ] || { echo "only ${free_gb}G free on the store volume (need ${need_gb}G) — GC or resize first" >&2; exit 1; }
+          [ "$free_gb" -ge 50 ] || echo "WARNING: only ${free_gb}G free on the store volume — tight; the disk budget will throttle concurrency" >&2
           # Swap SAFETY NET on the LOCAL NVMe root disk (never the store volume) — insurance,
           # not headroom: the mem_gb budget stays sized to physical RAM, and reservations sit
           # ~10% over measured max, so this only turns a rare over-peak from an arbitrary
@@ -294,15 +329,13 @@ jobs:
           # so the extra width goes to light deep-ocean tiles backfilling blocked IO time.
           # Same knob sources.yml uses for its fetches (16 on 8 vCPUs).
           cores=$(( $(nproc) * 2 ))
-          # Jobs declare disk_mb for their tmp working set; budget it against the volume's
-          # real free space (80%) so concurrent merge tmps can't overflow the store. A depare
-          # planet build accumulates ~50 G of NEW permanent FGBs while merges run — the merge
-          # tmp budget must leave room for that, or concurrent tmps over-commit and fill the
-          # volume mid-run. Reserve it up front (full-planet depare only; the fork rules don't
-          # budget disk, so this reserve is also their headroom).
-          avail_mb=$(df -BM --output=avail /mnt/seascape-store | tail -1 | tr -dc '0-9')
-          reserve_mb=0; [ "$INPUT_DEPARE" = "true" ] && [ -z "$BBOX" ] && reserve_mb=51200
-          disk_budget_mb=$(( (avail_mb - reserve_mb) * 8 / 10 ))
+          # Jobs declare disk_mb for their tmp working set, which lives on box-local NVMe
+          # (merge scratch via utils.merge_scratch -> the container tmpdir), not the store
+          # volume — budget against the NVMe root's free space (80%, minus 20 G for docker
+          # layers/logs). The store volume no longer hosts transient scratch, so its free
+          # space stops throttling merge concurrency.
+          avail_mb=$(df -BM --output=avail / | tail -1 | tr -dc '0-9')
+          disk_budget_mb=$(( (avail_mb - 20480) * 8 / 10 ))
           echo "box: ${total_gb} GB RAM, --cores ${cores} -> budget ${budget_gb} GB (reserve ${reserve_gb} GB)"
           force=()
           if [ "$INPUT_FORCE" = "true" ]; then force=(-F); fi
@@ -340,19 +373,61 @@ jobs:
           # A hard teardown can strand unreadable tiles that look done (mtime valid, data lost);
           # drop them so the engine re-merges instead of poisoning downstream VRT reads.
           # cd /app/state: docker.sh starts in /app; only snakemake chdirs to the state mount
+          # Tool versions into the run log: toolchain skew is diagnosable, never a rerun trigger.
+          ./docker.sh run sh -c "gdal-config --version; tippecanoe --version 2>&1 | head -1" || true
           ./docker.sh run sh -c "cd /app/state && uv run --project /app /app/pipelines/mosaic.py verify"
           # ONE invocation, one DAG: the `cover` checkpoint runs first, then the build
           # re-evaluates into bundles + the mosaic publish (publish_mosaic — `publish` is the
           # per-source push in publish.smk, run by sources.yml). stage_build always runs; a
           # bbox run stages under build/<sha>-bbox (see SHA above), so the regional archives
           # are previewable but can never be promoted by release.yml.
-          targets=(bundles publish_mosaic stage_build)
+          case "$INPUT_TARGETS" in *[!-A-Za-z0-9_\ ]*) echo "invalid targets" >&2; exit 1 ;; esac
+          read -r -a targets <<<"${INPUT_TARGETS:-bundles publish_mosaic stage_build vector_selfcheck}"
+          # Scope gate: the dispatcher states the expected DAG size; if the planner disagrees
+          # (a staleness-trigger surprise: param re-key, rename cascade, temp regeneration —
+          # or a zero-job plan from a mis-scoped isolation target), the run aborts on the
+          # dry-run — before any box-scale execution.
+          case "$INPUT_MAX_JOBS" in *[!0-9]*) echo "invalid max_jobs" >&2; exit 1 ;; esac
+          if [ -n "$INPUT_MAX_JOBS" ]; then
+            ./docker.sh snakemake "${targets[@]}" "${extra[@]}" "${force[@]}" \
+              -n \
+              --cores "$cores" --resources mem_gb="$budget_gb" disk_mb="$disk_budget_mb" \
+              --config workdir=/app/state tmp=/app/tmp > /var/tmp/scope-gate.txt 2>&1 \
+              || { tail -50 /var/tmp/scope-gate.txt >&2; echo "scope-gate dry-run failed" >&2; exit 1; }
+            sed -n '/^Job stats/,/^total/p' /var/tmp/scope-gate.txt | tail -40
+            total=$(awk '$1=="total"{n=$2} END{print n+0}' /var/tmp/scope-gate.txt)
+            if [ "$total" -gt "$INPUT_MAX_JOBS" ]; then
+              echo "planned $total jobs exceeds max_jobs=$INPUT_MAX_JOBS — scope mismatch; sample reasons:" >&2
+              grep -h "reason:" /var/tmp/scope-gate.txt | sed 's/[0-9]\{1,\}//g' | sort | uniq -c | sort -rn | head -12 >&2
+              exit 1
+            fi
+            if [ "$total" -eq 0 ]; then
+              echo "planner found NOTHING to do for '${targets[*]}' — a scope-stating dispatch expects work; if a no-op is intentional, dispatch without max_jobs" >&2
+              exit 1
+            fi
+            echo "scope gate ok: $total planned jobs <= max_jobs=$INPUT_MAX_JOBS"
+          fi
+          # No --prioritize: it flattens the index's whole merge chain to one priority, which
+          # lets the scheduler pack small merges ahead of the heavy ones. build.smk's explicit
+          # priority bands (index > merges > vector > terrain) order the chain instead.
           ./docker.sh snakemake "${targets[@]}" "${extra[@]}" "${force[@]}" \
             --keep-going --rerun-incomplete \
             --cores "$cores" --resources mem_gb="$budget_gb" disk_mb="$disk_budget_mb" \
             --config workdir=/app/state tmp=/app/tmp 2>&1 | tee "$buildlog"
       # Close the `build` status to success so it never lingers at pending, pointing at the
       # published prefix — build/<sha> for planet, build/<sha>-bbox for a bbox preview.
+      - name: Sync rebuilt masks back to the volume
+        if: always()
+        # Unmount first: writes can't reach the shadowed volume dir while the bind is up.
+        # cp -pu persists only files the run actually rebuilt (newer mtime); a no-op else.
+        run: |
+          src=/mnt/seascape-store/store/landmask
+          for f in "$src"/*.fgb; do
+            if nsenter -t 1 -m mountpoint -q "$f" 2>/dev/null; then
+              nsenter -t 1 -m umount "$f"
+              cp -pu "/var/tmp/seascape-landmask/$(basename "$f")" "$f" 2>/dev/null || true
+            fi
+          done
       - name: Publish build status
         if: success()
         env:

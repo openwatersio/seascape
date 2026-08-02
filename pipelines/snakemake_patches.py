@@ -1,5 +1,9 @@
 """Runtime patches to the installed Snakemake, applied at parse time (imported from common.smk).
 
+Two patches: the benchmark-timer leak below, and Job.missing_output (bottom of apply()) so a
+missing benchmark file — always the case at the start of an ephemeral-box run — never re-runs
+an otherwise-current job.
+
 snakemake 9.23.1 benchmark timers leak psutil monitor threads. Two of the three defects
 fire on NORMAL job completion, so at planet scale (~16k benchmarked jobs) leaked DaemonTimers
 accumulate until the scheduler starves — throughput decays monotonically (observed: 11 min/1%
@@ -83,6 +87,31 @@ def apply():
 
     import contextlib
     bench.benchmarked = contextlib.contextmanager(benchmarked)
+
+    # A missing BENCHMARK file must not re-run an otherwise-current job. Benchmarks are
+    # run-scoped scratch (tmp/, moved off the store in 435c5f0), so on every fresh ephemeral
+    # box they are absent — and snakemake counts a job's benchmark among the products whose
+    # absence forces a re-run (Job.products appends it; observed: mosaic_index re-ran per box
+    # with reason "Missing output files: .../bench/mosaic-index.tsv", dragging the planet-z8 +
+    # GTI mtime cascade behind it). Filter the benchmark out of the missing-product check;
+    # jobs that do run still write their benchmark normally — a job that didn't run simply has
+    # no measurement for that run, which is the correct semantics.
+    from snakemake.jobs import Job
+
+    _orig_missing_output = Job.missing_output
+
+    async def missing_output(self, requested):
+        bench_file = self.benchmark
+        # Only when the rule has real outputs: an output-LESS benchmarked rule (publish_mosaic,
+        # stage_build) has the benchmark as its sole product, and its absence is what fires the
+        # rule each run — filtering it there would silently skip publishing (caught by
+        # test_build's stage_build assertion).
+        if bench_file is not None and self.output:
+            requested = [f for f in requested if f != bench_file]
+        async for f in _orig_missing_output(self, requested):
+            yield f
+
+    Job.missing_output = missing_output
 
 
 if __name__ == "__main__":

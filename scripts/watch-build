@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Live view of a dispatched build. Resolves the box from the `build` commit status
+# (the heartbeat carries `root@<ip> · N of M steps`) and tails the build container's
+# log on the box. No arguments needed for the common case.
+#
+#   scripts/watch-build              # follow the current build for HEAD, errors + progress
+#   scripts/watch-build -f           # full log follow, unfiltered
+#   scripts/watch-build <sha|ref>    # a build dispatched from another commit
+#
+# The box is ephemeral: host keys are throwaway (Hetzner reuses IPs), hence the
+# known-hosts bypass. The key is the hcloud-registered seascape-build key.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+filter=1
+if [ "${1:-}" = "-f" ]; then filter=""; shift; fi
+sha=$(git rev-parse "${1:-HEAD}")
+
+desc=$(gh api "repos/{owner}/{repo}/commits/$sha/status" \
+         --jq '.statuses[] | select(.context=="build") | .description' 2>/dev/null || true)
+[ -n "$desc" ] || { echo "no build status on $sha — is a build dispatched from this commit?" >&2; exit 1; }
+echo "build: $desc"
+ip=$(grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' <<<"$desc" | head -1) \
+  || { echo "no box ip in the status (run finished and torn down?)" >&2; exit 1; }
+
+SSH=(ssh -i "$HOME/.ssh/seascape-build"
+     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR
+     "root@$ip")
+if [ -n "$filter" ]; then
+  # Progress lines + anything that reads as trouble. The container name is Docker-random;
+  # the build container is the only one running.
+  "${SSH[@]}" 'docker logs -f --tail 100 $(docker ps -lq) 2>&1' |
+    grep --line-buffered -E "of [0-9]+ steps|Error|error in rule|Traceback|MissingOutputException|failed|Killed|oom|Exception|reason:|Job stats|^total|did not simplify|fell back|WARNING"
+else
+  exec "${SSH[@]}" 'docker logs -f --tail 200 $(docker ps -lq) 2>&1'
+fi

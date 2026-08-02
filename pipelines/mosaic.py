@@ -137,7 +137,8 @@ def _translate(filepath, tmp_folder):
     utils.run_command(
         f"GDAL_CACHEMAX=512 gdal_translate -q -of COG -b 1 -ot Float32 -a_nodata {NODATA} "
         f"-srcwin {buffer_pixels} {buffer_pixels} {w} {h} "
-        "-co COMPRESS=ZSTD -co PREDICTOR=3 -co BLOCKSIZE=512 "
+        # IF_SAFER: IF_NEEDED never fires on compressed output, and >4 GB kills the write
+        "-co BIGTIFF=IF_SAFER -co COMPRESS=ZSTD -co PREDICTOR=3 -co BLOCKSIZE=512 "
         "-co RESAMPLING=AVERAGE -co OVERVIEW_RESAMPLING=AVERAGE -co NUM_THREADS=ALL_CPUS "
         f"{merged} {tmp_cog}")
     return tmp_cog
@@ -149,16 +150,14 @@ def tile(filepath):
     this tile back through windowed VRTs). The tmp folder is cleared first so a retried job never
     reuses a half-written reproject."""
     stem = _stem(filepath)
-    tmp_folder = filepath.replace("-aggregation.csv", "-tmp")
+    tmp_folder = utils.merge_scratch(filepath)
     shutil.rmtree(tmp_folder, ignore_errors=True)
     aggregation_reproject.reproject(filepath)
     aggregation_merge.merge(filepath)
     tmp_cog = _translate(filepath, tmp_folder)
     os.makedirs(tiles_dir(), exist_ok=True)
     out = tile_artifact(stem)
-    with open(tmp_cog, "rb") as f:
-        os.fsync(f.fileno())  # rename is metadata-only; a hard box teardown must not strand garbage
-    os.replace(tmp_cog, out)       # atomic: the stable name only ever appears complete
+    utils.publish(tmp_cog, out)  # scratch (NVMe) and the store volume are separate filesystems
     if not os.environ.get("KEEP_TMP"):  # KEEP_TMP=1 preserves the merged DEM for debugging
         shutil.rmtree(tmp_folder)
     print(f"mosaic tile {stem}: {out}", flush=True)
@@ -527,8 +526,11 @@ def window_dem(stem, out_tif):
     vrt = out_tif + ".vrt"
     utils.run_command(f"gdalbuildvrt -overwrite -te {l} {b} {r} {t} -tr {res} {res} "
                       f"-r bilinear {vrt} {tiles}")
+    # NUM_THREADS=4, not ALL_CPUS: dozens of windows materialize concurrently, and 48
+    # compressor threads each just thrash the box.
     utils.run_command(f"GDAL_CACHEMAX=512 gdal_translate -q -ot Float32 -a_nodata {NODATA} "
-                      "-co TILED=YES -co BLOCKSIZE=512 -co COMPRESS=ZSTD -co PREDICTOR=3 "
+                      "-co TILED=YES -co BIGTIFF=IF_SAFER -co BLOCKSIZE=512 "
+                      "-co COMPRESS=ZSTD -co PREDICTOR=3 -co NUM_THREADS=4 "
                       f"{vrt} {out_tif}")
     os.remove(vrt)
     return out_tif

@@ -1,6 +1,6 @@
 """Shared helpers: PMTiles archive writing, the aggregation covering store, the
 z7-sharded pmtiles layout, terrarium tile encode, priority-grouped source items,
-the merge-weight estimate, and the publish-time file hash / toolchain identity.
+the merge-weight estimate, and the publish-time file hash.
 
 Vendored from mapterhorn (BSD-3, (c) 2025 mapterhorn; see LICENSE.mapterhorn).
 """
@@ -85,7 +85,8 @@ def _process_tree(root):
         try:
             fields = open(f"/proc/{name}/stat").read().rsplit(")", 1)[1].split()
             parents[int(name)] = int(fields[1])
-        except (FileNotFoundError, PermissionError, ValueError, IndexError):
+        # ProcessLookupError: the pid can exit between listdir and open
+        except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError, IndexError):
             pass
     tree = {root}
     while True:
@@ -113,7 +114,7 @@ def _process_metrics(root):
                         deleted += os.stat(path).st_size
                 except (FileNotFoundError, PermissionError, OSError):
                     pass
-        except (FileNotFoundError, PermissionError, ValueError, StopIteration):
+        except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError, StopIteration):
             pass
     return ticks, rss * 1024, read, written, deleted
 
@@ -163,6 +164,17 @@ def vector_scratch(name):
     return os.path.join(root, f"seascape-{os.getpid()}-{name}")
 
 
+def merge_scratch(csv_path):
+    """The merge's per-stem scratch folder (reprojected per-source COGs + the merged DEM),
+    on box-local scratch — transient data never belongs on the persistent store volume,
+    where it competes with real outputs for space and Ceph bandwidth."""
+    root = os.environ.get("MERGE_SCRATCH", tempfile.gettempdir())
+    stem_tmp = os.path.basename(csv_path).replace("-aggregation.csv", "-tmp")
+    path = os.path.join(root, "seascape-merge", stem_tmp)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return path
+
+
 def run_command(command, silent=True, env=None):
     """Run a shell command and return (stdout, stderr). Raise on non-zero exit — don't
     silently swallow failures."""
@@ -197,6 +209,10 @@ def write_if_changed(path, content):
                 return False
     with open(path + ".tmp", "w") as f:
         f.write(content)
+        # fsync before the rename: an unclean volume detach (a killed run) otherwise journals the
+        # rename but drops the unflushed data blocks, leaving a 0-byte file at the declared path.
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(path + ".tmp", path)
     return True
 
@@ -379,26 +395,11 @@ def weight(stem, budget_gb=0, factor=DEFAULT_FACTOR):
     return w
 
 
-# ── publish-time file hash + toolchain identity ──────────────────────────────────────────────────
+# ── publish-time file hash ───────────────────────────────────────────────────────────────────────
 # The mosaic publish content-addresses the finished plain COGs by hashing their bytes; build.smk's
-# mosaic_tile carries the toolchain tag as a rerun param. Both are R2-agnostic — no bucket names here.
+# R2-agnostic — no bucket names here.
 
 @lru_cache(maxsize=1)
-def toolchain():
-    """The toolchain identity: TOOLCHAIN (the workflow passes the GHCR image tag, which pins one
-    GDAL/tippecanoe) when set, else the local GDAL version so a laptop stays honest about GDAL
-    skew. A GDAL bump correctly invalidates the world."""
-    t = os.environ.get("TOOLCHAIN")
-    if t:
-        return t
-    for cmd in (["gdal-config", "--version"], ["gdalinfo", "--version"]):
-        try:
-            out = subprocess.run(cmd, capture_output=True, text=True)
-        except (FileNotFoundError, OSError):
-            continue
-        if out.returncode == 0 and out.stdout.strip():
-            return out.stdout.strip().splitlines()[0]
-    return "no-toolchain"
 
 
 @lru_cache(maxsize=None)
@@ -425,6 +426,10 @@ def publish(tmp_path, final_path):
     copy to a temp beside the final path first, then rename there — the final name only ever appears
     complete, and a crash leaves a temp no freshness check considers."""
     os.makedirs(os.path.dirname(final_path), exist_ok=True)
+    # fsync before rename: the box dies by power cut (runner teardown), and a durable
+    # rename over unflushed data leaves a truncated file at the final name.
+    with open(tmp_path, "rb") as f:
+        os.fsync(f.fileno())
     try:
         os.replace(tmp_path, final_path)
     except OSError as error:
@@ -432,6 +437,8 @@ def publish(tmp_path, final_path):
             raise
         destination_tmp = final_path + ".tmp"
         shutil.copyfile(tmp_path, destination_tmp)
+        with open(destination_tmp, "rb") as f:
+            os.fsync(f.fileno())
         os.replace(destination_tmp, final_path)
         os.remove(tmp_path)
 

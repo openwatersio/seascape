@@ -55,14 +55,20 @@ def bounds_intersect(a, b):
     return False
 
 
-def get_intersecting_tiles_dfs(bounds, tile, zoom):
-    if not bounds_intersect(bounds, mercantile.xy_bounds(tile)):
+def get_intersecting_tiles_dfs(bounds, tile, zoom, clip=None):
+    tile_bounds = mercantile.xy_bounds(tile)
+    if not bounds_intersect(bounds, tile_bounds):
+        return []
+    # clip only PRUNES the walk to the window — it never enters what a yielded tile registers, so
+    # a tile is registered by its full (unclipped) `bounds` membership. A tile within the window
+    # thus sees the same source set under any BBOX (the scope-independent covering invariant).
+    if clip is not None and not bounds_intersect(clip, tile_bounds):
         return []
     if tile.z == zoom:
         return [tile]
     result = []
     for child in mercantile.children(tile, zoom=tile.z + 1):
-        result += get_intersecting_tiles_dfs(bounds, child, zoom)
+        result += get_intersecting_tiles_dfs(bounds, child, zoom, clip)
     return result
 
 
@@ -88,6 +94,14 @@ def _registered_sources():
     return result
 
 
+def resolved_maxzoom(native, cap):
+    """A file's build depth: native overzoom, the source's own cap, then the global ceiling —
+    the ONE derivation both the covering rows and source_maxzooms use."""
+    if cap is not None:
+        native = min(native, cap)
+    return min(native, config.MAX_CHILD_Z)
+
+
 def source_maxzooms():
     """Resolved native/capped maxzoom per registered source, from its catalog seascape:files."""
     resolutions = get_mercator_resolutions(0, 32)
@@ -95,9 +109,8 @@ def source_maxzooms():
     for source in _registered_sources():
         cap = config.source_property(source, "max_zoom")
         for _filename, left, bottom, right, top, width, height in config.source_files(source):
-            zoom = get_smallest_overzoom(left, bottom, right, top, width, height, resolutions)
-            if cap is not None:
-                zoom = min(zoom, cap)
+            zoom = resolved_maxzoom(
+                get_smallest_overzoom(left, bottom, right, top, width, height, resolutions), cap)
             result[source] = max(result.get(source, 0), zoom, utils.macrotile_z)
     return result
 
@@ -113,10 +126,24 @@ def bbox_3857():
     return (left, bottom, right, top)
 
 
+def enum_clip(clip):
+    """The BBOX clip grown by one seed-zoom tile on every side, or None. An in-window aggregation
+    tile can be as coarse as seed_z and so span macrotiles up to that far outside the clip; the
+    covering must register every source covering that halo, or an in-window stem's CSV would list a
+    scope-dependent subset of its sources. Only the ENUMERATION widens — write_stable still writes
+    just the clip-intersecting tiles, so the covering stays window-scoped."""
+    if clip is None:
+        return None
+    seed_z = max(utils.macrotile_z - utils.num_overviews, 0)
+    span = (utils.X_MAX_3857 - utils.X_MIN_3857) / (2 ** seed_z)
+    l, b, r, t = clip
+    return (l - span, b - span, r + span, t + span)
+
+
 def get_macrotile_map():
     macrotile_map = {}
     mercator_resolutions = get_mercator_resolutions(0, 32)
-    clip = bbox_3857()
+    clip = enum_clip(bbox_3857())
     for source in _registered_sources():
         cap = config.source_property(source, "max_zoom")
         rows = config.source_files(source)
@@ -124,20 +151,20 @@ def get_macrotile_map():
         for filename, left, bottom, right, top, width, height in rows:
             buffer = 2 * utils.macrotile_buffer_3857
             bounds = (left - buffer, bottom - buffer, right + buffer, top + buffer)
-            if clip is not None:
-                if not bounds_intersect(bounds, clip):
-                    continue
-                bounds = (max(bounds[0], clip[0]), max(bounds[1], clip[1]),
-                          min(bounds[2], clip[2]), min(bounds[3], clip[3]))
+            # clip is only a scope gate (drop wholly-out-of-window files) and a walk pruner below.
+            # `bounds` stays UNCLIPPED, so every in-window macrotile the file covers registers it —
+            # the same rows a planet build would write. Byte-identical CSVs = no re-merge on a
+            # scope change.
+            if clip is not None and not bounds_intersect(bounds, clip):
+                continue
 
-            maxzoom = get_smallest_overzoom(left, bottom, right, top, width, height, mercator_resolutions)
-            if cap is not None:
-                maxzoom = min(maxzoom, cap)
+            maxzoom = resolved_maxzoom(
+                get_smallest_overzoom(left, bottom, right, top, width, height, mercator_resolutions), cap)
             # Floor to macrotile_z so aggregation-tile zoom never exceeds a
             # tile's content zoom (the cap can't go below this universal floor).
             maxzoom = max(maxzoom, utils.macrotile_z)
 
-            for tile in get_intersecting_tiles_dfs(bounds, mercantile.Tile(x=0, y=0, z=0), utils.macrotile_z):
+            for tile in get_intersecting_tiles_dfs(bounds, mercantile.Tile(x=0, y=0, z=0), utils.macrotile_z, clip):
                 cell = macrotile_map.setdefault((tile.x, tile.y), {"sources": {}})
                 cell["sources"].setdefault(source, []).append({"filename": filename, "maxzoom": maxzoom})
     return macrotile_map
@@ -228,18 +255,26 @@ def write_stable(macrotile_map, aggregation_tiles):
     planet's. Legacy ULID directories (subdirectories) are untouched."""
     folder = "store/aggregation"
     utils.create_folder(folder)
-    items = aggregation_items(macrotile_map, aggregation_tiles)
+    clip = bbox_3857()
+
+    def in_window(name):
+        z, x, y, _ = (int(a) for a in name.removesuffix("-aggregation.csv").split("-"))
+        tb = mercantile.xy_bounds(mercantile.Tile(x=x, y=y, z=z))
+        return clip is None or bounds_intersect(tuple(tb), clip)
+
+    # The map is enum-widened past the clip so in-window CSVs carry their full source set; the
+    # covering itself stays the clip window — write only clip-intersecting tiles (the halo tiles
+    # exist purely to complete those windows' rows).
+    items = {name: content for name, content in
+             aggregation_items(macrotile_map, aggregation_tiles).items() if in_window(name)}
     written = sum(write_if_changed(f"{folder}/{name}", content)
                   for name, content in items.items())
-    clip = bbox_3857()
     pruned = 0
     for path in glob(f"{folder}/*-aggregation.csv"):
         name = path.rsplit("/", 1)[-1]
         if name in items:
             continue
-        z, x, y, _ = (int(a) for a in name.removesuffix("-aggregation.csv").split("-"))
-        tile_bounds = mercantile.xy_bounds(mercantile.Tile(x=x, y=y, z=z))
-        if clip is not None and not bounds_intersect(tuple(tile_bounds), clip):
+        if not in_window(name):
             continue  # outside this bbox run's window — not ours to judge
         os.remove(path)
         pruned += 1
@@ -267,8 +302,16 @@ def main(stable=False):
 
 
 def _check():
-    """Offline: write_if_changed leaves mtimes alone on identical content, and the
-    stable covering prunes a stale in-window tile while keeping an out-of-window one."""
+    """Offline: write_if_changed leaves mtimes alone on identical content, the
+    stable covering prunes a stale in-window tile while keeping an out-of-window one,
+    and MAX_CHILD_Z binds in the row derivation (not just source_maxzooms)."""
+    # The shared derivation binds the ceiling: a file registering deeper than MAX_CHILD_Z
+    # lands at the ceiling, a source cap below it still wins.
+    resolutions = get_mercator_resolutions(0, 32)
+    native = get_smallest_overzoom(0, 0, 10, 10, 4096, 4096, resolutions)
+    assert native > config.MAX_CHILD_Z, f"fixture must exceed the ceiling (native {native})"
+    assert resolved_maxzoom(native, None) == config.MAX_CHILD_Z
+    assert resolved_maxzoom(native, config.MAX_CHILD_Z - 2) == config.MAX_CHILD_Z - 2
     import shutil
     import tempfile
     import time

@@ -15,6 +15,7 @@
 # input functions — those only run when a job is instantiated, which is after the checkpoint.
 
 import json
+import math
 
 import aggregation_reproject
 import bundle
@@ -46,6 +47,7 @@ DEPARE = not os.environ.get("SKIP_DEPARE")
 # function, still before any job runs.
 _STEMS = {}
 _CELLS = {}
+_VCELLS = {}
 
 
 def _covering_key():
@@ -93,8 +95,19 @@ def cell_stems():
     return _CELLS[key]
 
 
+def vector_cells():
+    """cell -> [covering stems] for the sharded vector bundle, built once per DAG evaluation. The
+    vector cells group the covering stems by the VECTOR_SPLIT_Z grid (default: the macrotile grid,
+    one covering stem per cell); each populated cell is one variable-depth vector_cell job."""
+    _, key = _covering_key()
+    if key not in _VCELLS:
+        _VCELLS[key] = contour_run.vector_covering_cells(covering_stems())
+    return _VCELLS[key]
+
+
 wildcard_constraints:
-    stem=r"\d+-\d+-\d+-\d+"
+    stem=r"\d+-\d+-\d+-\d+",
+    cell=r"\d+-\d+-\d+"
 
 
 _TILE_SOURCES = {}
@@ -136,8 +149,15 @@ MERGE_CFG = json.dumps({
 }, sort_keys=True)
 
 
-# The merge job holds only the merged array + reprojected sources, not the vector forks:
-# corpus max 6.5 GB on a 4.3 GB-weight z14, so 1.5x reserves 6.75 GB; retries escalate.
+def _fork_gb(table, default):
+    return lambda wc, attempt: table.get(int(wc.stem.split("-")[3]), default) * attempt
+
+
+# The merge streams block-wise, so its footprint never scales with window size the way
+# weight() assumes: ceil(measured max) per child_z over the 2026-07-28 corpora (z15 8.4 GB
+# vs the 27 GB weight-based reserve that admitted 5 merges where 17 fit). disk_mb stays
+# weight-based — scratch (the -tmp reprojected tiffs) does scale with the window.
+MOSAIC_GB = {15: 9, 14: 7, 13: 3, 12: 2, 11: 2, 10: 2}
 MERGE_FACTOR = 1.5
 
 
@@ -166,6 +186,29 @@ def tile_priority(wc, input=None, attempt=None):
     return _ORDER[key][wc.stem]
 
 
+# Priority bands, highest first: the mosaic index and the merges it gates, then the vector
+# layers, then terrain. Each band sits an order of magnitude above the per-stem interleave
+# range so no stem's rank can cross a band, and the interleave still orders jobs WITHIN a
+# band. Every rule carries its band explicitly because rule priority does NOT propagate
+# upstream (snakemake's dag.update_priority elevates dependency chains only for --prioritize
+# targets) — and `--prioritize mosaic_index`, the alternative, is actively harmful: it
+# flattens the whole merge chain to ONE priority, and the scheduler then maximizes the sum of
+# priorities admitted under the memory budget, so swarms of small coarse merges pack ahead of
+# the few 9 GB z15 merges. Measured (run 30417069133): the last z15 merge landed 2.5 h in,
+# its fork chain trailed behind it, and the build ended with a ~2.5 h low-load z15 tail.
+INDEX_BAND = 3_000_000
+MOSAIC_BAND = 2_000_000
+VECTOR_BAND = 1_000_000
+
+
+def mosaic_tile_priority(wc, input=None, attempt=None):
+    return MOSAIC_BAND + tile_priority(wc, input, attempt)
+
+
+def vector_tile_priority(wc, input=None, attempt=None):
+    return VECTOR_BAND + tile_priority(wc, input, attempt)
+
+
 # One covering tile's merge, alone — the planet's memory hot spot, isolated in its own job.
 # utils.weight seeds the reservation (a geometric estimate the benchmarks re-fit); retries
 # escalate it. On a laptop the reservation is scheduling only (no kernel cap).
@@ -178,11 +221,10 @@ rule mosaic_tile:
         version=1, # increment to force a rebuild
         sources=lambda wc: source_props(wc.stem),
         merge=MERGE_CFG,
-        toolchain=utils.toolchain(),
-    priority: tile_priority  # interleaved heavy-first: evens the memory load over the build
+    priority: mosaic_tile_priority  # mosaic band, interleaved heavy-first within it
     retries: 2
     resources:
-        mem_gb=lambda wc, attempt: utils.weight(wc.stem, factor=MERGE_FACTOR) * attempt,
+        mem_gb=_fork_gb(MOSAIC_GB, 3),
         # real scratch: the -tmp folder of per-source reprojected tiffs, ~tile-sized
         disk_mb=lambda wc: utils.weight(wc.stem, factor=MERGE_FACTOR) * 1024,
     benchmark:
@@ -208,6 +250,7 @@ rule mosaic_index:
         index="store/mosaic/index/covering.parquet",
         planet="store/mosaic/planet-z8.tif",
         gti="store/mosaic/mosaic.gti",
+    priority: INDEX_BAND  # it gates every GTI-reading terrain render: run the moment it is ready
     benchmark:
         f"{TMP}/bench/mosaic-index.tsv"
     log:
@@ -241,28 +284,59 @@ rule publish_mosaic:
 # ── stage 3 (cartographic products): every consumer reads windows of the persisted ──
 # ── mosaic, as a separate job rather than riding inside the merge                    ──
 
-# The one shared f(depth, zoom) — a knob change reruns stage 3 only, never a merge.
+# The one shared f(depth, zoom) — a knob change reruns stage 3 only, never a merge. Every dial
+# prepare_window applies must appear here, coarsening included: a dial missing from this hash
+# leaves the window artifact fresh, so a sweep silently re-measures the previous surface.
 SMOOTH_CFG = json.dumps({} if os.environ.get("SKIP_SMOOTH") else {
     "sigma": smooth.DEM_SIGMA, "sigma_deep": smooth.DEM_SIGMA_DEEP,
     "mask_sigma": smooth.MASK_SIGMA, "slope_low": smooth.SLOPE_LOW,
     "slope_high": smooth.SLOPE_HIGH, "depth_full": smooth.DEPTH_FULL,
-    "depth_smooth": smooth.DEPTH_SMOOTH, "block": smooth.BLOCK}, sort_keys=True)
+    "depth_smooth": smooth.DEPTH_SMOOTH, "block": smooth.BLOCK,
+    "deep_coarsen_threshold_m": smooth.DEEP_COARSEN_THRESHOLD_M,
+    "deep_coarsen_factor": smooth.DEEP_COARSEN_FACTOR,
+    "deep_coarsen_min_child_z": smooth.DEEP_COARSEN_MIN_CHILD_Z,
+    "pond_fill_mm2": smooth.POND_FILL_MM2,
+    "pond_fill_extent_m": smooth.POND_FILL_EXTENT_M,
+    "pond_fill_max_depth_m": smooth.POND_FILL_MAX_DEPTH_M,
+    "pond_fill_min_child_z": smooth.POND_FILL_MIN_CHILD_Z}, sort_keys=True)
 
 
-# Fork reservations by child_z, fitted to the benchmark corpus (11k rows): footprints are
-# deterministic (p95 == max), so reserve measured max + ~10%; retries escalate via `attempt`.
-CONTOUR_GB = {14: 10, 13: 4}
-SOUND_GB = {14: 6, 13: 3}
-# depare peaks at BOTH ends: dense z14 (5.2 GB measured) and the coarse continent-window cz8/cz9
-# stems (5.3 GB measured on 5-9-9-9, run 30025132613 — the whole-window OSM land/water GEOS load).
-# cz8/cz9 = 4 is a deliberate under-reserve (light hedge): most coarse stems are cheap deep-ocean,
-# so it keeps concurrency high and leans on the box's 64 GB NVMe swap + `retries` for the rare
-# coastal-coarse peak. The first planet run measures cz10-12 / z4-anchored coarse to set these honestly.
-DEPARE_GB = {14: 6, 13: 4, 9: 4, 8: 4}
+# Fork reservations by child_z: ceil(measured max RSS) over the runs 30311420659 /
+# 30320876479 / 30348364325 benchmark corpus, no pad — footprints are window-geometry-
+# deterministic (p50 == max within a class), and the rare over-peak is covered by
+# `attempt` escalation on retry plus the box's 64 GB swap.
+# contour refines in feature batches (contour_run.STREAM_BATCH); run 30360226622 measured
+# 4.7 GB at z14 (batch + gdal_contour child). z15 provisional: features carry more vertices,
+# so the same batch count weighs more.
+CONTOUR_GB = {15: 10, 14: 5}
+SOUND_GB = {15: 12, 14: 8, 13: 3}
+# depare reads partition buckets one at a time and writes rows incrementally, so its peak
+# is the biggest band + coverage parts, not the window's whole set.
+# cz8/cz9 = 4 is a deliberate under-reserve (light hedge): the class max (6.5 GB, a
+# continent window) is a single outlier over a cheap deep-ocean majority, so reserving it
+# for all would starve concurrency; the hedge leans on swap + `retries` instead.
+DEPARE_GB = {15: 36, 14: 7, 13: 3, 12: 4, 10: 4, 9: 4, 8: 4}
 
-
-def _fork_gb(table, default):
-    return lambda wc, attempt: table.get(int(wc.stem.split("-")[3]), default) * attempt
+# Per-stem depare reservation from the stem's own mosaic tile size — a constant per child_z
+# reserves the class's worst case for every member (36 GB held four cz15 jobs to a 161 GB
+# budget while their live RSS summed to ~12). Fit over run 30634360224's 2,170 rows:
+# rss_GB = 0.28 + 1.805 x tile_GB (p99 residual 0.40 GB; only 7 cz15 anchors, hence the
+# 4 GB pad and the `attempt` escalation carrying the tail). The rows are pre-pond-fill
+# code, which only shrinks depare, so the fit is an upper bound. The tile is absent on a
+# fresh store (DAG evaluation precedes the merges) — fall back to the DEPARE_GB constants.
+def depare_gb(wc, attempt):
+    # Floored per child_z at the class MEDIAN, deliberately not the tail: reservations are
+    # admission control, and reserving the p99 for every member idles the box (36 GB held cz15
+    # to 4-wide while live RSS summed to ~12 GB). Over-admission is the cheaper failure — the
+    # tail rides physical headroom + swap, an OOM'd stem retries at x attempt, and run
+    # 30641774632 ran 21 stems past their reservations with zero failures and the best
+    # utilization measured. Fit floors from that run: cz15 actuals 9.6-19.7 GB, p50 ~12.
+    cz = int(wc.stem.split("-")[3])
+    try:
+        gb = 0.28 + 1.805 * os.path.getsize(f"store/mosaic/tiles/{wc.stem}.tif") / 1e9 + 2
+    except OSError:
+        gb = DEPARE_GB.get(cz, 3)
+    return max(3, {15: 12, 14: 6}.get(cz, 0), math.ceil(gb)) * attempt
 
 
 def fork_inputs(wc):
@@ -271,18 +345,41 @@ def fork_inputs(wc):
     return [f"store/mosaic/tiles/{s}.tif" for s in mosaic_mod.intersecting_tiles(wc.stem)]
 
 
-rule contour_tile:
+# The forks' shared read surface, built once per stem instead of three times: the buffered
+# window materialized, smoothed, and deep-coarsened. temp() — a z15 window is 4.3 GB and
+# only in-flight stems need theirs on disk. Consumers treat it as read-only.
+rule fork_window:
     input:
         fork_inputs,
+    output:
+        temp("store/window/{stem}.tif")
+    params:
+        version=1, # increment to force a rebuild
+        smooth=SMOOTH_CFG,
+    priority: vector_tile_priority
+    retries: 2
+    resources:
+        mem_gb=4
+    benchmark:
+        f"{TMP}/bench/window/{{stem}}.tsv"
+    log:
+        f"{TMP}/logs/window/{{stem}}.log"
+    shell:
+        "{PY}/smooth.py prepare-window {wildcards.stem} {output} 2> {log}"
+
+
+rule contour_tile:
+    input:
+        window="store/window/{stem}.tif",
         masks=MASKS,
     output:
         "store/contour/{stem}.fgb"
     params:
-        version=1, # increment to force a rebuild
+        version=2, # increment to force a rebuild
         levels=json.dumps({"m": pipeline_config.CONTOUR_LEVELS, "ft": pipeline_config.CONTOUR_LEVELS_FT}),
         nav=contour_run.NAV_SMOOTH_MAX_M, deep=contour_run.DEEP_CUTOFF_M,
-        ring=contour_run.MIN_RING_AREA_M2, smooth=SMOOTH_CFG,
-    priority: tile_priority  # interleaved heavy-first: evens the memory load over the build
+        ring=contour_run.MIN_RING_AREA_M2,
+    priority: vector_tile_priority  # vector band: drain before terrain so the bundle overlaps it
     retries: 2
     resources:
         mem_gb=_fork_gb(CONTOUR_GB, 3)
@@ -296,15 +393,15 @@ rule contour_tile:
 
 rule soundings_tile:
     input:
-        fork_inputs,
+        window="store/window/{stem}.tif",
         masks=MASKS,
     output:
-        "store/soundings/{stem}.geojson"
+        "store/soundings/{stem}.geojsons"
     params:
         version=1, # increment to force a rebuild
         cell=soundings_run.SOUND_CELL_PX, min_depth=soundings_run.SOUND_MIN_DEPTH_M,
-        smooth=SMOOTH_CFG,
-    priority: tile_priority  # interleaved heavy-first: evens the memory load over the build
+        thin=soundings_run.SOUND_THIN_TIERS,
+    priority: vector_tile_priority  # vector band: drain before terrain so the bundle overlaps it
     retries: 2
     resources:
         mem_gb=_fork_gb(SOUND_GB, 2)
@@ -320,28 +417,33 @@ rule soundings_tile:
 # tail is bounded — STRtree + subdivision + snap-round difference (docs/plans/2026-07-21-depare-perf.md).
 rule depare_tile:
     input:
-        fork_inputs,
+        window="store/window/{stem}.tif",
         masks=MASKS,
     output:
         "store/depare/{stem}.fgb"
     params:
-        version=1, # increment to force a rebuild
+        version=2, # increment to force a rebuild
         levels=json.dumps({"m": pipeline_config.DEPARE_LEVELS, "ft": pipeline_config.DEPARE_LEVELS_FT}),
-        drying=pipeline_config.DRYING_CAP, sliver=depare_run.SLIVER_MIN_PX, smooth=SMOOTH_CFG,
-    priority: tile_priority  # interleaved heavy-first: evens the memory load over the build
+        drying=pipeline_config.DRYING_CAP, sliver=depare_run.SLIVER_MIN_PX,
+        simplify_mm=depare_run.SIMPLIFY_MM,
+    priority: vector_tile_priority  # vector band: drain before terrain so the bundle overlaps it
     retries: 2
     resources:
-        mem_gb=_fork_gb(DEPARE_GB, 3)
+        mem_gb=depare_gb
     benchmark:
         f"{TMP}/bench/depare/{{stem}}.tsv"
     log:
         f"{TMP}/logs/depare/{{stem}}.log"
     shell:
-        "{PY}/depare_run.py tile {wildcards.stem} 2> {log}"
+        # stdout carries the timing marks and the per-minute heartbeat; both belong in the
+        # per-stem log so a live job is observable with tail -f, not host forensics.
+        "{PY}/depare_run.py tile {wildcards.stem} > {log} 2>&1"
 
 
 # Weight like the merge: a native z14 window is the same array size; overview stems are tiny.
-TERRAIN_FACTOR = 2.0  # native renders unproven at scale (corpus n=1); keep the wide margin
+# 1.3 = 20% over the measured z15 ceiling (n=4 Solent renders, 18.3-18.7 GB, a 2% spread —
+# pixel-count-dominated, weight()'s 17.3 GB base estimate + 8%); `attempt` covers the tail.
+TERRAIN_FACTOR = 1.3
 
 
 def terrain_inputs(wc):
@@ -382,7 +484,7 @@ rule contours:
 
 rule soundings:
     input:
-        lambda wc: expand("store/soundings/{stem}.geojson", stem=covering_stems())
+        lambda wc: expand("store/soundings/{stem}.geojsons", stem=covering_stems())
 
 
 rule depare:
@@ -399,7 +501,7 @@ def tile_inputs(wc):
     """Everything cartographic per stem — the union the `tiles` target gates on (DEPARE rides
     only when enabled)."""
     return (expand("store/contour/{stem}.fgb", stem=covering_stems())
-            + expand("store/soundings/{stem}.geojson", stem=covering_stems())
+            + expand("store/soundings/{stem}.geojsons", stem=covering_stems())
             + expand("store/depare/{stem}.fgb", stem=depare_stems())
             + expand("store/pmtiles/{stem}.pmtiles", stem=render_stems()))
 
@@ -409,60 +511,103 @@ rule tiles:
         tile_inputs
 
 
-# ── bundles — the three vector layers tile-join into one vector.pmtiles ──
-# Each bundler consumes the PLAIN per-stem outputs (0-byte = an empty tile, kept by size),
-# asserts the covering is hole-free, and always rebuilds — Snakemake owns freshness. depare
-# rides only when SKIP_DEPARE is unset (DEPARE).
-
-rule soundings_bundle:
-    input:
-        lambda wc: expand("store/soundings/{stem}.geojson", stem=covering_stems())
-    output:
-        "store/bundle/soundings.pmtiles"
-    params:
-        bbox=os.environ.get("BBOX", ""),  # scope stamp — see mosaic_index
-    benchmark:
-        f"{TMP}/bench/soundings-bundle.tsv"
-    log:
-        f"{TMP}/logs/soundings-bundle.log"
-    shell:
-        "{PY}/soundings_run.py bundle --stable 2> {log}"
-
-
-# Guarded out entirely when SKIP_DEPARE is set: the input list would be empty.
-if DEPARE:
-    rule depare_bundle:
-        input:
-            lambda wc: expand("store/depare/{stem}.fgb", stem=depare_stems())
-        output:
-            "store/bundle/depare.pmtiles"
-        params:
-            bbox=os.environ.get("BBOX", ""),  # scope stamp — see mosaic_index
-        benchmark:
-            f"{TMP}/bench/depare-bundle.tsv"
-        log:
-            f"{TMP}/logs/depare-bundle.log"
-        shell:
-            "{PY}/depare_run.py bundle --stable 2> {log}"
-
-
-# The contour tippecanoe + the single tile-join that folds soundings (+ depare when enabled)
-# into vector.pmtiles — so both bundled layers are inputs, not just the contour FGBs.
-rule vector_bundle:
+# ── vector bundle — cell-subtree sharded variable-depth tippecanoe + pmtiles merge ──
+# The one joint variable-depth run is split three ways so the serial variable-depth tiler runs once
+# per cell concurrently, not once over all planet content (docs/plans/2026-07-14-native-resolution.md):
+#   vector_shallow — plain dense -Z0 -z(VECTOR_SPLIT_Z-1) over all three layers, features filtered
+#     to minzoom <= VECTOR_SPLIT_Z-1; owns every z < VECTOR_SPLIT_Z tile.
+#   vector_cell    — one variable-depth run per populated VECTOR_SPLIT_Z cell (default: the
+#     macrotile grid — one covering stem per cell, so the worst cell job is one stem's content),
+#     -Z VECTOR_SPLIT_Z -z(cell child_z), then rewritten to keep only its z >= VECTOR_SPLIT_Z owned
+#     subtree (fringe tiles dropped). These are the long poles, so they ride VECTOR_BAND.
+#   vector_join    — `pmtiles merge` the shallow + all cell archives into the served vector.pmtiles;
+#     ownership is structurally disjoint after the fringe filter, so the merge is a pure concat
+#     (go-pmtiles refuses overlapping inputs).
+# Layers stay joint within every run (separately-tiled layers leaf at different depths and vanish the
+# shallower one). All zoom gating rides as per-feature tippecanoe.minzoom (contour tiers, depare's z6
+# floor, sounding pyramid levels). 0-byte per-tile inputs are empty tiles (kept by size); an
+# all-empty cell writes a 0-byte archive the join skips. depare rides only when SKIP_DEPARE is unset
+# (DEPARE). Always rebuilds — Snakemake owns freshness.
+rule vector_shallow:
     input:
         contours=lambda wc: expand("store/contour/{stem}.fgb", stem=covering_stems()),
-        soundings="store/bundle/soundings.pmtiles",
-        depare=(["store/bundle/depare.pmtiles"] if DEPARE else []),
+        soundings=lambda wc: expand("store/soundings/{stem}.geojsons", stem=covering_stems()),
+        depare=lambda wc: expand("store/depare/{stem}.fgb", stem=depare_stems()),
     output:
-        "store/bundle/vector.pmtiles"
+        "store/bundle/vector-shallow.pmtiles"
+    priority: VECTOR_BAND  # above every terrain render, so the shallow run starts as the layers drain
+    resources:
+        mem_gb=20  # UNMEASURED singleton running amid the terrain flood; protective, costs one slot
     params:
         bbox=os.environ.get("BBOX", ""),  # scope stamp — see mosaic_index
     benchmark:
-        f"{TMP}/bench/vector-bundle.tsv"
+        f"{TMP}/bench/vector-shallow.tsv"
     log:
-        f"{TMP}/logs/vector-bundle.log"
+        f"{TMP}/logs/vector-shallow.log"
     shell:
-        "{PY}/contour_run.py bundle --stable 2> {log}"
+        "{PY}/contour_run.py bundle-shallow --stable 2> {log}"
+
+
+rule vector_cell:
+    input:
+        contours=lambda wc: expand("store/contour/{stem}.fgb", stem=vector_cells().get(wc.cell, [])),
+        soundings=lambda wc: expand("store/soundings/{stem}.geojsons", stem=vector_cells().get(wc.cell, [])),
+        depare=lambda wc: expand("store/depare/{stem}.fgb",
+                                 stem=(vector_cells().get(wc.cell, []) if DEPARE else [])),
+    output:
+        archive="store/bundle/vector-cell-{cell}.pmtiles",
+        # the completeness evidence the join consumes; declared so a lost sidecar reruns the cell
+        sidecar="store/bundle/vector-cell-{cell}.ids.json",
+    priority: VECTOR_BAND  # a long pole in the band, so it overlaps the terrain fleet
+    # No threads/mem reservation: the box deliberately oversubscribes CPU (--cores 2x vCPUs) and
+    # binds on RAM, and a cell run has no honest single thread count (serial walk, parallel
+    # read/write). Set mem_gb from the per-cell benchmarks once the first sharded run measures them.
+    params:
+        version=1, # increment to force a rebuild
+        bbox=os.environ.get("BBOX", ""),  # scope stamp — see mosaic_index
+    benchmark:
+        f"{TMP}/bench/vector-cell-{{cell}}.tsv"
+    log:
+        f"{TMP}/logs/vector-cell-{{cell}}.log"
+    shell:
+        "{PY}/contour_run.py bundle-cell {wildcards.cell} --stable 2> {log}"
+
+
+# Sampled geometric invariants on the served archive (depare partition, zoom floors). BESIDE
+# staging, not ahead of it — completeness is proven per cell, so previewing build/<sha> never
+# waits on this; the run (and the build commit status) still fails if it fails.
+rule vector_selfcheck:
+    input:
+        "store/bundle/vector.pmtiles"
+    output:
+        touch("store/meta/vector-selfcheck.ok")
+    priority: VECTOR_BAND
+    benchmark:
+        f"{TMP}/bench/vector-selfcheck.tsv"
+    log:
+        f"{TMP}/logs/vector-selfcheck.log"
+    shell:
+        "{PY}/contour_run.py check-join --stable 2> {log}"
+
+
+rule vector_join:
+    input:
+        shallow="store/bundle/vector-shallow.pmtiles",
+        cells=lambda wc: expand("store/bundle/vector-cell-{cell}.pmtiles", cell=sorted(vector_cells())),
+        sidecars=lambda wc: expand("store/bundle/vector-cell-{cell}.ids.json", cell=sorted(vector_cells())),
+    output:
+        "store/bundle/vector.pmtiles"
+    priority: VECTOR_BAND  # the join finishes the vector band before terrain bundling
+    resources:
+        mem_gb=20  # UNMEASURED singleton running amid the terrain flood; protective, costs one slot
+    params:
+        bbox=os.environ.get("BBOX", ""),  # scope stamp — see mosaic_index
+    benchmark:
+        f"{TMP}/bench/vector-join.tsv"
+    log:
+        f"{TMP}/logs/vector-join.log"
+    shell:
+        "{PY}/contour_run.py bundle-join --stable 2> {log}"
 
 
 # ── terrain (raster) bundles — the planet base archive + one overlay per populated ──
@@ -485,10 +630,6 @@ rule terrain_planet_bundle:
         "{PY}/bundle.py planet --stable 2> {log}"
 
 
-wildcard_constraints:
-    cell=r"\d+-\d+-\d+"
-
-
 rule overlay_bundle:
     input:
         lambda wc: [f"store/pmtiles/{s}.pmtiles" for s in cell_stems().get(wc.cell, [])]
@@ -505,12 +646,11 @@ rule overlay_bundle:
 
 
 def bundle_inputs(wc):
-    """The finished archive set: the vector layers + the raster planet/overlay archives. Both the
-    `bundles` inventory target and `stage_build` gate on it, so neither references the other's
-    input list (which, being a function, doesn't resolve cleanly through `rules`)."""
-    return (["store/bundle/soundings.pmtiles"]
-            + (["store/bundle/depare.pmtiles"] if DEPARE else [])
-            + ["store/bundle/vector.pmtiles", "store/bundle/planet.pmtiles"]
+    """The finished archive set: the one vector.pmtiles + the raster planet/overlay archives. Both
+    the `bundles` inventory target and `stage_build` gate on it, so neither references the other's
+    input list (which, being a function, doesn't resolve cleanly through `rules`). soundings/depare
+    are no longer separate archives — the vector bundle folds them into vector.pmtiles in one run."""
+    return (["store/bundle/vector.pmtiles", "store/bundle/planet.pmtiles"]
             + expand("store/bundle/overlay-{cell}.pmtiles", cell=bundle.overlay_cells(render_stems())))
 
 
@@ -519,6 +659,16 @@ def bundle_inputs(wc):
 rule bundles:
     input:
         bundle_inputs
+
+
+# Dispatch-only isolation target: rebuild every per-stem soundings file (and the temp() windows
+# they need) WITHOUT entering the vector bundles' closure, so window regeneration cannot cascade
+# into banked contour/depare outputs (docs/runbooks/build-dispatch.md). NOTE: --until cannot do
+# this — it prunes to zero jobs under the cover checkpoint. Dispatch via the workflow's `targets`
+# input; absent from the default target list.
+rule soundings_all:
+    input:
+        lambda wc: expand("store/soundings/{stem}.geojsons", stem=covering_stems())
 
 
 # Upload the finished archives + manifest.json to bathymetry/build/<sha>/ (manifest LAST,

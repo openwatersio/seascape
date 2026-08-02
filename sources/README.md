@@ -17,29 +17,30 @@ The axes are orthogonal: most sources are static + processed, nz_coastal is list
 
 ## Built sources
 
-| Source                                                             | Native res  | Zoom cap  | Coverage                            | Datum                   |
-| ------------------------------------------------------------------ | ----------- | --------- | ----------------------------------- | ----------------------- |
-| [GEBCO 2026](gebco/)                                               | ~450 m      | ~z8       | global                              | MSL                     |
-| [EMODnet 2024](emodnet/)                                           | ~115 m      | z11       | European seas                       | LAT (confirm)           |
-| [DDM (Denmark)](ddm/)                                              | 50 m        | z12       | Danish EEZ                          | MSL (DKMSL2022)         |
-| [CUDEM 1/9](cudem/)                                                | ~3.4 m      | z13       | US coast + territories              | NAVD88 / local (terr.)  |
-| [CUDEM 1/3](cudem_third/)                                          | ~10 m       | z12       | US coast + territories (broader)    | NAVD88 / local (terr.)  |
-| [NOAA S-102](noaa_s102/)                                           | ~4–16 m     | z14       | US navigable                        | MLLW (+ uncertainty)    |
-| [Vaklodingen](vaklodingen/)                                        | 20 m        | z12       | Netherlands                         | NAP (~MSL)              |
-| INFOMAR ([10 m](infomar_10m/), [25 m](infomar_25m/))               | 10 m / 25 m | z13 / z11 | Ireland inshore + shelf             | **LAT**                 |
-| [UK SurfZone](uk_surfzone/)                                        | 2 m         | z14       | England intertidal                  | ODN (~MSL)              |
-| [GSC Atlantic](gsc_atlantic/)                                      | 100 m       | ~z10      | Scotian Shelf + NL                  | unverified              |
-| [GSC Pacific](gsc_pacific/)                                        | 10 m        | z13       | BC coast + Salish Sea               | unverified              |
-| [gbr30](gbr30/)                                                    | 30 m        | z12       | GBR + Coral Sea                     | MSL                     |
-| [AusBathyTopo](ausbathytopo/)                                      | 250 m       | z9        | Australia EEZ                       | MSL                     |
-| [BATNAS](batnas/)                                                  | ~180 m      | z10       | Indonesia                           | MSL                     |
-| [swIOBC](swiobc/)                                                  | 250 m       | z9        | SW Indian Ocean                     | ~MSL                    |
-| [NOS Estuarine](noaa_estuarine/)                                   | 30 m        | z11       | 70 US estuaries                     | **MLLW**                |
-| [Great Lakes (NCEI)](great_lakes/)                                 | ~90 m       | z10       | Great Lakes (incl. Canadian halves) | **LWD**                 |
-| [African Great Lakes](african_great_lakes/)                        | 50–100 m    | z13       | Victoria/Albert/Edward/George       | lake surface            |
-| swissBATHY3D ([Léman](lac_leman/), [Neuchâtel](lac_neuchatel/))    | 1–2 m       | z14       | Léman, Neuchâtel                    | LN02 − surface offset   |
-| [Bodensee](bodensee/)                                              | 3 m         | z14       | Lake Constance                      | DHHN92 − surface offset |
-| [Lake Tahoe](lake_tahoe/)                                          | 10 m        | z13       | Lake Tahoe                          | MSL − surface offset    |
+| Source                                                          | Native res  | Zoom cap  | Coverage                            | Datum                   |
+| --------------------------------------------------------------- | ----------- | --------- | ----------------------------------- | ----------------------- |
+| [GEBCO 2026](gebco/)                                            | ~450 m      | ~z8       | global                              | MSL                     |
+| [EMODnet 2024](emodnet/)                                        | ~115 m      | z11       | European seas                       | LAT (confirm)           |
+| [DDM (Denmark)](ddm/)                                           | 50 m        | z12       | Danish EEZ                          | MSL (DKMSL2022)         |
+| [CUDEM 1/9](cudem/)                                             | ~3.4 m      | z13       | US coast + territories              | NAVD88 / local (terr.)  |
+| [CUDEM 1/3](cudem_third/)                                       | ~10 m       | z12       | US coast + territories (broader)    | NAVD88 / local (terr.)  |
+| [NOAA S-102](noaa_s102/)                                        | ~4–16 m     | z15       | US navigable                        | MLLW (+ uncertainty)    |
+| [Vaklodingen](vaklodingen/)                                     | 20 m        | z12       | Netherlands                         | NAP (~MSL)              |
+| INFOMAR ([10 m](infomar_10m/), [25 m](infomar_25m/))            | 10 m / 25 m | z13 / z11 | Ireland inshore + shelf             | **LAT**                 |
+| [UK SurfZone](uk_surfzone/)                                     | 2 m         | z15       | England intertidal                  | ODN (~MSL)              |
+| [GSC Atlantic](gsc_atlantic/)                                   | 100 m       | ~z10      | Scotian Shelf + NL                  | unverified              |
+| [GSC Pacific](gsc_pacific/)                                     | 10 m        | z13       | BC coast + Salish Sea               | unverified              |
+| [gbr30](gbr30/)                                                 | 30 m        | z12       | GBR + Coral Sea                     | MSL                     |
+| [AusBathyTopo](ausbathytopo/)                                   | 250 m       | z9        | Australia EEZ                       | MSL                     |
+| [BATNAS](batnas/)                                               | ~180 m      | z10       | Indonesia                           | MSL                     |
+| [swIOBC](swiobc/)                                               | 250 m       | z9        | SW Indian Ocean                     | ~MSL                    |
+| [NZ Coastal LiDAR](nz_coastal/)                                 | 1 m         | z15       | NZ coastal clusters                 | NZVD2016 (~MSL)         |
+| [NOS Estuarine](noaa_estuarine/)                                | 30 m        | z11       | 70 US estuaries                     | **MLLW**                |
+| [Great Lakes (NCEI)](great_lakes/)                              | ~90 m       | z10       | Great Lakes (incl. Canadian halves) | **LWD**                 |
+| [African Great Lakes](african_great_lakes/)                     | 50–100 m    | z13       | Victoria/Albert/Edward/George       | lake surface            |
+| swissBATHY3D ([Léman](lac_leman/), [Neuchâtel](lac_neuchatel/)) | 1–2 m       | z15 / z16 | Léman, Neuchâtel                    | LN02 − surface offset   |
+| [Bodensee](bodensee/)                                           | 3 m         | z15       | Lake Constance                      | DHHN92 − surface offset |
+| [Lake Tahoe](lake_tahoe/)                                       | 10 m        | z13       | Lake Tahoe                          | MSL − surface offset    |
 
 Priority is derived, not configured: `(maxzoom, id)`, so GEBCO (smallest maxzoom) loses wherever a finer regional source overlaps — except a datum-authoritative source can set `priority` in metadata (S-102 over CUDEM, INFOMAR over EMODnet) to win regardless of zoom. Zoom caps are display caps (`max_zoom`), not native resolution. Inland lakes are pure GEBCO gap-fill: hydraulically isolated, so no seam against the ocean base; freshwater grids store lakebed _elevation_, so each carries a "subtract surface level" offset.
 
@@ -59,28 +60,28 @@ Every open candidate is a GitHub issue labeled [`source`](https://github.com/ope
 
 License is the real filter, not data existence — whole regions surveyed their waters but lock the result. For these coasts GEBCO stays the only option:
 
-| Source / region                                                                                              | Why skipped                                                                                           |
-| ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------- |
-| IBCSO v2 (Southern Ocean)                                                                                    | ≈GEBCO resolution _and_ already folded into GEBCO via Seabed 2030 — no new coverage; <85°S untileable |
-| SRTM15+                                                                                                      | same resolution as GEBCO, already folded in                                                           |
-| ArcticDEM                                                                                                    | topographic land, not bathymetry                                                                      |
-| NIWA NZ 250 m                                                                                                | CC BY-**NC**-SA — offshore NZ stays GEBCO-only (the coast is now [nz_coastal](nz_coastal/), 1 m open)  |
-| LINZ hydro (NZ)                                                                                              | S-63 encrypted / request-by-email — superseded inshore by the open [nz_coastal](nz_coastal/) LiDAR    |
-| SPC Pacific islands 5 m lidar                                                                                | sovereignty-gated, country-owned; public entries are GEBCO-derived                                    |
-| HELCOM BSBD (Baltic)                                                                                         | 250 m — coarser than the EMODnet 115 m already ingested                                               |
-| Sweden, Spain, Portugal, Italy, Greece                                                                       | defense-restricted, viewer-only, or ≤EMODnet                                                          |
-| Japan (JODC J-EGG500, JHA M7000)                                                                             | no-redistribute / paid; soundings reach us via GEBCO anyway                                           |
-| India (INCOIS, NHO)                                                                                          | nationals-only / S-63                                                                                 |
-| Philippines, China, Taiwan                                                                                   | priced / state-secret / gated                                                                         |
-| Vietnam, Thailand, Malaysia, Singapore                                                                       | ENC/chart products only, no open grid                                                                 |
-| Brazil LEPLAC, de Wet SA shelf, Lesser Antilles, EOMAP, Israel, Mexico IBCCA                                 | study-only / NC / no-license / commercial                                                             |
-| Brazil DHN, Chile SHOA, Argentina SHN, Peru/Colombia/Ecuador, Caribbean HOs, SANHO, W/E Africa, Arabian Gulf | closed / request-only — no open hi-res source exists                                                  |
-| HydroLAKES                                                                                                   | vector + scalar depth only — useful as a free lake mask, not bathymetry                               |
-| Caspian Sea                                                                                                  | already inside GEBCO                                                                                  |
-| Baikal, Tanganyika, Malawi, Great Bear/Slave, Titicaca, MN-DNR, Champlain, Salton, TWDB, Mekong/Yangtze      | NC / no-license / points-only / closed                                                                |
+| Source / region                                                                                              | Why skipped                                                                                                                                                              |
+| ------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| IBCSO v2 (Southern Ocean)                                                                                    | ≈GEBCO resolution _and_ already folded into GEBCO via Seabed 2030 — no new coverage; <85°S untileable                                                                    |
+| SRTM15+                                                                                                      | same resolution as GEBCO, already folded in                                                                                                                              |
+| ArcticDEM                                                                                                    | topographic land, not bathymetry                                                                                                                                         |
+| NIWA NZ 250 m                                                                                                | CC BY-**NC**-SA — offshore NZ stays GEBCO-only (the coast is now [nz_coastal](nz_coastal/), 1 m open)                                                                    |
+| LINZ hydro (NZ)                                                                                              | S-63 encrypted / request-by-email — superseded inshore by the open [nz_coastal](nz_coastal/) LiDAR                                                                       |
+| SPC Pacific islands 5 m lidar                                                                                | sovereignty-gated, country-owned; public entries are GEBCO-derived                                                                                                       |
+| HELCOM BSBD (Baltic)                                                                                         | 250 m — coarser than the EMODnet 115 m already ingested                                                                                                                  |
+| Sweden, Spain, Portugal, Italy, Greece                                                                       | defense-restricted, viewer-only, or ≤EMODnet                                                                                                                             |
+| Japan (JODC J-EGG500, JHA M7000)                                                                             | no-redistribute / paid; soundings reach us via GEBCO anyway                                                                                                              |
+| India (INCOIS, NHO)                                                                                          | nationals-only / S-63                                                                                                                                                    |
+| Philippines, China, Taiwan                                                                                   | priced / state-secret / gated                                                                                                                                            |
+| Vietnam, Thailand, Malaysia, Singapore                                                                       | ENC/chart products only, no open grid                                                                                                                                    |
+| Brazil LEPLAC, de Wet SA shelf, Lesser Antilles, EOMAP, Israel, Mexico IBCCA                                 | study-only / NC / no-license / commercial                                                                                                                                |
+| Brazil DHN, Chile SHOA, Argentina SHN, Peru/Colombia/Ecuador, Caribbean HOs, SANHO, W/E Africa, Arabian Gulf | closed / request-only — no open hi-res source exists                                                                                                                     |
+| HydroLAKES                                                                                                   | vector + scalar depth only — useful as a free lake mask, not bathymetry                                                                                                  |
+| Caspian Sea                                                                                                  | already inside GEBCO                                                                                                                                                     |
+| Baikal, Tanganyika, Malawi, Great Bear/Slave, Titicaca, MN-DNR, Champlain, Salton, TWDB, Mekong/Yangtze      | NC / no-license / points-only / closed                                                                                                                                   |
 | LUNG M-V Seenkataster Tiefenkarten (Mecklenburg lakes incl. Müritz)                                          | the data exists (~900 lakes, 1 m isobaths) but is private-use-only, no redistribution (INSPIRE Art. 13(1)(e)); a LUNG/ministry contract is the only path to Müritz depth |
-| German Inland ENCs (ELWIS IENC)                                                                              | open (GeoNutzV) but carry **no depth values** (DEPARE 0/0, no SOUNDG — verified on Potsdamer Havel cells); no cells at all for the Mecklenburg waterways |
-| WSV Peildaten / 3D-Datenarchiv BWaStr                                                                        | the real waterway-depth archive is intranet-only; public DGM-W Atom feed ([#53](https://github.com/openwatersio/seascape/issues/53)) has no Berlin/Mecklenburg tiles |
+| German Inland ENCs (ELWIS IENC)                                                                              | open (GeoNutzV) but carry **no depth values** (DEPARE 0/0, no SOUNDG — verified on Potsdamer Havel cells); no cells at all for the Mecklenburg waterways                 |
+| WSV Peildaten / 3D-Datenarchiv BWaStr                                                                        | the real waterway-depth archive is intranet-only; public DGM-W Atom feed ([#53](https://github.com/openwatersio/seascape/issues/53)) has no Berlin/Mecklenburg tiles     |
 
 Shelved with a revisit path (kept as issues, not re-research):
 
