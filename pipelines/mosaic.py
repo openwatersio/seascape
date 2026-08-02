@@ -52,6 +52,7 @@ import aggregation_covering
 import aggregation_merge
 import aggregation_reproject
 import config
+import smooth
 import utils
 
 NODATA = -9999
@@ -485,6 +486,17 @@ def covering_stems(covering_path="store/aggregation/covering.txt"):
     return [s for s in stems if hits(s)]
 
 
+def window_buffer_3857(stem):
+    """The stage-3 read buffer in metres: the fixed macrotile buffer, or the smooth halo in metres
+    at the stem's child-zoom resolution when that's larger. At coarse zooms the 150 m fixed buffer
+    is under a pixel, so a sub-halo window lets the smooth perturb band edges at coarse-tile seams;
+    scaling by the halo keeps neighbour truth in reach at every zoom. One source of truth for both
+    the window materialize (window_dem) and the fork input tracking (intersecting_tiles)."""
+    child_z = int(stem.split("-")[3])
+    return max(utils.macrotile_buffer_3857,
+               smooth.halo_px() * aggregation_reproject.get_resolution(child_z))
+
+
 def intersecting_tiles(stem, buffer_3857=None):
     """The covering stems whose tiles intersect this stem's BUFFERED bounds — the stage-3
     windowed-read input set. From the (BBOX-scoped) covering only, never the global GTI:
@@ -492,7 +504,7 @@ def intersecting_tiles(stem, buffer_3857=None):
     z, x, y, _cz = (int(a) for a in stem.split("-"))
     l, b, r, t = aggregation_reproject.buffered_bounds(
         mercantile.Tile(x=x, y=y, z=z),
-        utils.macrotile_buffer_3857 if buffer_3857 is None else buffer_3857)
+        window_buffer_3857(stem) if buffer_3857 is None else buffer_3857)
     out = []
     for s in covering_stems():
         sz, sx, sy, _scz = (int(a) for a in s.split("-"))
@@ -509,7 +521,7 @@ def window_dem(stem, out_tif):
     the continuity this can perturb)."""
     z, x, y, child_z = (int(a) for a in stem.split("-"))
     l, b, r, t = aggregation_reproject.buffered_bounds(
-        mercantile.Tile(x=x, y=y, z=z), utils.macrotile_buffer_3857)
+        mercantile.Tile(x=x, y=y, z=z), window_buffer_3857(stem))
     res = aggregation_reproject.get_resolution(child_z)
     tiles = " ".join(tile_artifact(s) for s in intersecting_tiles(stem))
     vrt = out_tif + ".vrt"

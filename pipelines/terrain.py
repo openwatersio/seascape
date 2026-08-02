@@ -34,7 +34,6 @@ build.smk derives the render stems (render_stems) at parse time and schedules on
   python terrain.py --check         self-check (renders a synthetic mosaic tile, asserts the pyramid)
 """
 
-import math
 import os
 import shutil
 import tempfile
@@ -74,8 +73,7 @@ def gti_abspath():
 # halo reads into neighbouring mosaic tiles through the GTI (continuous truth); beyond the built
 # area it fills nodata, which the interior never sees.
 def _halo_px():
-    return int(math.ceil(smooth.TRUNCATE * max(
-        smooth.DEM_SIGMA, smooth.DEM_SIGMA_DEEP, smooth.MASK_SIGMA))) + 1
+    return smooth.halo_px()
 
 
 def window_tiles(stem):

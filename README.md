@@ -11,11 +11,13 @@ Coverage is global through z8 (~15″) with regional detail to z14 (~0.25″) wh
 > situation where inaccuracies could result in harm to people or property. It is intended
 > for general-purpose web mapping and visualization.
 >
-> Depths are **not** reduced to a chart datum and do not account for tides or water
-> level — they are not charted depths. The data is interpolated and merged from sources
-> of differing age, resolution, and datum, then smoothed during tiling, so values are
-> approximate. Gridded bathymetry also omits navigational hazards (rocks, wrecks,
-> obstructions, shoals, aids to navigation) shown on official charts.
+> Depth datum varies by source. Some regional sources use a low-water chart datum
+> (such as LAT or MLLW), while other sources are approximately
+> MSL. The data is interpolated and merged from sources of differing age, resolution,
+> and datum, then smoothed during tiling, so values are approximate and do not account
+> for the current tide or water level. Gridded bathymetry also omits navigational
+> hazards (rocks, wrecks, obstructions, shoals, aids to navigation) shown on official
+> charts.
 >
 > Always consult official nautical charts for navigation.
 
@@ -24,7 +26,8 @@ Coverage is global through z8 (~15″) with regional detail to z14 (~0.25″) wh
 ### Style
 
 A ready-made nautical chart style with depth shading, contour lines and labels,
-spot soundings, drying areas is published alongside the tiles at https://tiles.openwaters.io/seascape/style.json.
+spot soundings, and drying areas is published alongside the tiles at
+https://tiles.openwaters.io/seascape/style.json.
 
 Point MapLibre (or [Maputnik](https://maplibre.org/maputnik/)) straight at it:
 
@@ -51,12 +54,18 @@ safety depth, reading depth at a point).
 
 ### TileJSON
 
-The bathymetry is available as XYZ tiles in two flavors:
+The bathymetry is available through three TileJSON documents:
 
-- **Raster** (Terrarium-encoded DEM) — [TileJSON](https://tiles.openwaters.io/seascape/raster.json) - depth per pixel, for depth shading (color-relief), hillshade, and 3D terrain.
-- **Vector** (MVT) - [TileJSON](https://tiles.openwaters.io/seascape/vector.json) — bathymetric contour lines at non-uniform depth intervals.
+- **Raster DEM** — [TileJSON](https://tiles.openwaters.io/seascape/raster.json);
+  Terrarium-encoded depth and categorical land/water pixels for color relief,
+  hillshade, and 3D terrain.
+- **Chart vectors** — [TileJSON](https://tiles.openwaters.io/seascape/vector.json);
+  MVT depth areas, contour lines, and spot soundings.
+- **Source coverage** — [TileJSON](https://tiles.openwaters.io/seascape/coverage.json);
+  MVT source-provenance footprints.
 
-Point any mapping library that supports XYZ tiles at these URLs. The TileJSONs include attribution and metadata, so libraries that support TileJSON will credit the sources automatically.
+Use the TileJSON URLs so clients receive the current zoom range, bounds, and
+required attribution.
 
 ### MapLibre
 
@@ -85,21 +94,8 @@ const map = new maplibregl.Map({
         url: `${BASE}/vector.json`,
       },
     },
-    layers: [
-      {
-        id: "hillshade",
-        type: "hillshade",
-        source: "bathymetry-dem",
-        paint: { "hillshade-exaggeration": 0.6 },
-      },
-      {
-        id: "contours",
-        type: "line",
-        source: "bathymetry",
-        "source-layer": "contours",
-        paint: { "line-color": "#3b7", "line-width": 0.5, "line-opacity": 0.4 },
-      },
-    ],
+    // See https://tiles.openwaters.io/seascape/style.json for styles
+    layers: [],
   },
 });
 
@@ -111,26 +107,71 @@ For depth **color-relief** shading, contour **labels**, and a layer-toggle UI, s
 demo viewer in [`index.js`](index.js). Attribution is carried in each TileJSON, so
 MapLibre's attribution control credits the sources automatically.
 
+### Raster DEM
+
+Terrarium decodes a pixel to `v = R × 256 + G + B / 256 − 32768` metres. The
+negative domain carries depth; the non-negative domain contains three flat
+category codes:
+
+- `v < 0` — elevation below the winning source's datum. On measured water
+  pixels, `-v` is depth. Encoding is shallow-biased: quantization never makes
+  a depth deeper. See [Depth datums](#depth-datums) for how to interpret it.
+- `v == 0` — water is present but depth is **unknown** (similar to ENC
+  `UNSARE`), not a measured depth of approximately zero.
+- `v == 1` — **drying foreshore**: seabed above datum that covers and uncovers
+  with the tide. The raster does not carry its drying height; use the `depare`
+  vector layer's `drval1` and `drval2`.
+- `v == 2` — **land or out of scope**, not measured land elevation. Missing
+  raster tiles also return this code, so the DEM cannot provide land relief.
+
+The codes decode exactly at native pixels. Values between them can appear at
+resampled or overzoomed boundaries; round to the nearest code, or use `depare`
+for categorical geometry. MapLibre must be told `encoding: "terrarium"`
+directly on the `raster-dem` source—it does not read that setting from
+TileJSON.
+
+### Vector tile schema
+
+The chart-vector TileJSON publishes three source layers:
+
+| Source layer | Geometry and fields                                                                                                                                                                                                                                                                                                                   |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `depare`     | Depth-area polygons. Measured bands have positive-down metre bounds `drval1` (shallow) and `drval2` (deep), plus `sys` (`m` or `ft`) for the isobath ladder. Drying areas have negative `drval1` and no `sys`. Unknown-depth water has no `drval1`; `kind` identifies the mapped-water subtype. `rank` supplies stable fill ordering. |
+| `contours`   | Isobath lines. `depth_m` is signed elevation; `depth_abs_m`, `depth_ft`, and `depth_fm` are positive-down labels. `sys` selects the metre (`m`) or fathom-curve (`ft`) set.                                                                                                                                                           |
+| `soundings`  | Spot depths in positive-down `depth_m`, `depth_ft`, and `depth_fm`. Values are rounded toward shallower water.                                                                                                                                                                                                                        |
+
+The separate `coverage` TileJSON contains a `coverage` polygon layer with
+`source_id`, `source_name`, and `source_maxzoom`. It is useful for
+click-to-identify provenance; keep it as a separate MapLibre source so its
+low-zoom tiles can be overzoomed independently.
+
+## Depth datums
+
+Seascape does not yet normalize every source to one vertical datum. Each
+raster pixel and derived vector feature retains the winning source's datum:
+some regional sources use a low-water chart datum such as LAT or MLLW, while
+GEBCO, EMODnet, and several other sources are approximately MSL.
+
+MSL is above a low-water chart datum, so an MSL-referenced depth reads deeper
+than the equivalent chart-datum depth by the local MSL−LAT separation. That
+difference is commonly about 0.1–0.5 m in microtidal areas and 2–8 m in
+macrotidal areas. Source boundaries can therefore also be datum boundaries.
+The shallow-biased encoding prevents quantization from deepening a source
+value; it does not correct the source datum or account for the current tide.
+
 ## Data sources
 
-Sources are merged by priority: resolution-derived (finer data wins where they overlap), except a datum-authoritative source (`priority` in metadata — e.g. S-102, already on a chart datum) wins the overlap even over a finer one. Each is built under [`sources/`](sources/):
+GEBCO provides the global base. Regional and local datasets fill in finer
+detail where available, with higher-resolution or datum-authoritative sources
+winning where they overlap coarser data.
 
-- **[NOAA S-102](sources/noaa_s102/)** — ~4–16 m, US navigable · NOAA Office of Coast Survey · public domain · already MLLW + per-node uncertainty
-- **[NOAA CUDEM 1/9″](sources/cudem/)** — ~3 m, US coast + territories (HI/PR/USVI/Guam/AmSam/CNMI) · NOAA NCEI · public domain
-- **[NOAA CUDEM 1/3″](sources/cudem_third/)** — ~10 m, US coast + territories · NOAA NCEI · public domain
-- **[Danmarks Dybdemodel (DDM)](sources/ddm/)** — 50 m, Danish waters · SDFI / Dataforsyningen
-- **[EMODnet Bathymetry 2024](sources/emodnet/)** — ~115 m, European waters · EMODnet Bathymetry Consortium · CC-BY 4.0
-- **[GEBCO 2026 Grid](sources/gebco/)** — 15″ (~450 m), global base · GEBCO Compilation Group / BODC · public domain
+See [sources/README.md](sources/README.md) for the complete source catalog,
+coverage, resolution, datum, attribution, licensing, and source requests.
 
-…plus regional sources for Ireland, the Netherlands, England's intertidal zone, Canada's coasts, Australia, Indonesia, the SW Indian Ocean, US estuaries, and surveyed lakes (Great Lakes, African Great Lakes, Alpine lakes, Tahoe).
-
-See [sources/README.md](sources/README.md) for the full catalog, and to request a new source.
-
-## Building & contributing
+## Contributing
 
 The build pipeline, local development, container usage, and CI/deploy live in
-[CONTRIBUTING.md](CONTRIBUTING.md). Drag any `.pmtiles` into the
-[PMTiles Viewer](https://protomaps.github.io/PMTiles/) to inspect it.
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
@@ -139,7 +180,7 @@ The build pipeline, local development, container usage, and CI/deploy live in
 **Tiles** — the tile compilation published at `tiles.openwaters.io/seascape` is licensed [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/): free for any use with the following attribution:
 
 ```
-© Open Water Software, LLC (https://openwaters.io/charts/seascape#license)
+© Open Waters (https://openwaters.io/charts/seascape#license)
 ```
 
 The underlying data remains under each source's own open terms. The full attribution list is available in the `attribution` field of the TileJSON endpoints ([raster.json](https://tiles.openwaters.io/seascape/raster.json), [vector.json](https://tiles.openwaters.io/seascape/vector.json)). It is displayed by MapLibre's attribution control automatically, which satisfies each source's terms.

@@ -105,6 +105,34 @@ def _smooth_geom(geom, tol, iterations):
     return geom
 
 
+def _lines(geom):
+    """Every non-empty LineString inside a geometry, recursing into Multi/GeometryCollection and
+    dropping the point/polygon slivers a clip or make_valid can leave (the line analog of
+    depare_run._polys) — so the output layer stays uniformly line (FlatGeobuf rejects a mixed layer)."""
+    t = geom.geom_type
+    if t == "LineString":
+        return [] if geom.is_empty else [geom]
+    if t in ("MultiLineString", "GeometryCollection"):
+        return [ln for g in geom.geoms for ln in _lines(g)]
+    return []
+
+
+def _clip_to_bbox(in_fgb, out_fgb, clip):
+    """Clip the smoothed contours to the tile bbox in shapely (EPSG:3857), keeping only line pieces
+    — ogr2ogr -clipsrc emits a GeometryCollection here that the FlatGeobuf write rejects (the GDAL
+    GeometryCollection trap, same as depare's shapely clip). Returns the surviving feature count."""
+    import geopandas as gpd
+    from shapely import make_valid
+    from shapely.geometry import MultiLineString
+    gdf = gpd.read_file(in_fgb)
+    clipped = [MultiLineString(parts) if parts else None  # PROMOTE_TO_MULTI: uniform line layer
+               for parts in (_lines(make_valid(g).intersection(clip)) for g in gdf.geometry)]
+    gdf["geometry"] = clipped
+    gdf = gdf[gdf.geometry.notna() & ~gdf.geometry.is_empty]
+    gdf.to_file(out_fgb, driver="FlatGeobuf")
+    return len(gdf)
+
+
 def _drop_small_rings(geom, min_area):
     """Drop closed-ring parts enclosing < min_area m²; keep open lines. None if empty."""
     from shapely.geometry import MultiLineString, Polygon
@@ -194,11 +222,10 @@ def _contour_dem(dem, tile_obj, child_z, tmp, label):
     smoothed = f"{tmp}/contour-smooth.fgb"
     smooth_and_enrich(sources, smoothed, tol=get_resolution(child_z))
 
+    from shapely.geometry import box
     b = mercantile.xy_bounds(tile_obj)  # unbuffered, tile-aligned (EPSG:3857)
     clipped = f"{tmp}/contour-clip.fgb"
-    _run(f"ogr2ogr -f FlatGeobuf -overwrite -nlt PROMOTE_TO_MULTI "
-         f"-clipsrc {b.left} {b.bottom} {b.right} {b.top} {clipped} {smoothed}", "ogr2ogr clip")
-    if feature_count(clipped) == 0:
+    if _clip_to_bbox(smoothed, clipped, box(b.left, b.bottom, b.right, b.top)) == 0:
         print(f"contour: no features in tile bbox for {label}")
         return None
 

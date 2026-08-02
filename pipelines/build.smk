@@ -2,9 +2,10 @@
 # from the repo-root Snakefile (never run with `-s`), so cover/masks/catalogs and these rules
 # share one graph and one invocation.
 #
-# Freshness here is ENGINE provenance (inputs + params). CODE is deliberately not an input
-# (force-only: `-R mosaic_tile`) — an innocuous merge-module edit must not re-merge the planet
-# by default.
+# Freshness here is ENGINE provenance (inputs + params). CODE is deliberately not an input — an
+# innocuous merge-module edit must not re-merge the planet. To force a rule when its logic DID
+# change, bump its `version` param (declarative, lives in the rule); `-R <rule>` is the ad-hoc
+# override. This relies on the default rerun-triggers (params on) — never pin `--rerun-triggers mtime`.
 #
 # STEMS are a RUNTIME product: the `cover` checkpoint (repo-root Snakefile) writes the covering
 # this build scopes from, so nothing per-stem is known at parse. Every aggregator derives its
@@ -140,8 +141,29 @@ MERGE_CFG = json.dumps({
 MERGE_FACTOR = 1.5
 
 
-def tile_weight(wc, input=None, attempt=None):
-    return utils.weight(wc.stem, factor=MERGE_FACTOR)
+# Schedule order: heaviest-first, diluted so cumulative weight stays linear — each slot takes
+# from the heavy end of the weight-sorted covering while on/below the even-workload line, else
+# from the light end. The heavy:light interleave self-tunes to the covering's actual weight mix,
+# instead of an all-heavy memory-bound start and an all-light cpu-bound rest.
+_ORDER = {}
+
+
+def tile_priority(wc, input=None, attempt=None):
+    _, key = _covering_key()
+    if key not in _ORDER:
+        # render_stems ⊇ covering_stems: terrain_render prioritizes overview stems too
+        stems = sorted(render_stems(), key=utils.weight, reverse=True)
+        n, avg = len(stems), sum(utils.weight(s) for s in stems) / len(stems)
+        order, hi, lo, cum = [], 0, n - 1, 0.0
+        for i in range(n):
+            if cum <= i * avg:
+                stem, hi = stems[hi], hi + 1
+            else:
+                stem, lo = stems[lo], lo - 1
+            cum += utils.weight(stem)
+            order.append(stem)
+        _ORDER[key] = {s: n - i for i, s in enumerate(order)}
+    return _ORDER[key][wc.stem]
 
 
 # One covering tile's merge, alone — the planet's memory hot spot, isolated in its own job.
@@ -153,10 +175,11 @@ rule mosaic_tile:
     output:
         "store/mosaic/tiles/{stem}.tif"
     params:
+        version=1, # increment to force a rebuild
         sources=lambda wc: source_props(wc.stem),
         merge=MERGE_CFG,
         toolchain=utils.toolchain(),
-    priority: tile_weight  # heavy-first: shortens the tail; coastal tiles free stage-3 work first
+    priority: tile_priority  # interleaved heavy-first: evens the memory load over the build
     retries: 2
     resources:
         mem_gb=lambda wc, attempt: utils.weight(wc.stem, factor=MERGE_FACTOR) * attempt,
@@ -230,7 +253,12 @@ SMOOTH_CFG = json.dumps({} if os.environ.get("SKIP_SMOOTH") else {
 # deterministic (p95 == max), so reserve measured max + ~10%; retries escalate via `attempt`.
 CONTOUR_GB = {14: 10, 13: 4}
 SOUND_GB = {14: 6, 13: 3}
-DEPARE_GB = {14: 6, 13: 4}
+# depare peaks at BOTH ends: dense z14 (5.2 GB measured) and the coarse continent-window cz8/cz9
+# stems (5.3 GB measured on 5-9-9-9, run 30025132613 — the whole-window OSM land/water GEOS load).
+# cz8/cz9 = 4 is a deliberate under-reserve (light hedge): most coarse stems are cheap deep-ocean,
+# so it keeps concurrency high and leans on the box's 64 GB NVMe swap + `retries` for the rare
+# coastal-coarse peak. The first planet run measures cz10-12 / z4-anchored coarse to set these honestly.
+DEPARE_GB = {14: 6, 13: 4, 9: 4, 8: 4}
 
 
 def _fork_gb(table, default):
@@ -250,10 +278,11 @@ rule contour_tile:
     output:
         "store/contour/{stem}.fgb"
     params:
+        version=1, # increment to force a rebuild
         levels=json.dumps({"m": pipeline_config.CONTOUR_LEVELS, "ft": pipeline_config.CONTOUR_LEVELS_FT}),
         nav=contour_run.NAV_SMOOTH_MAX_M, deep=contour_run.DEEP_CUTOFF_M,
         ring=contour_run.MIN_RING_AREA_M2, smooth=SMOOTH_CFG,
-    priority: tile_weight  # heavy-first; greedy backfills lighter ready jobs into the rest of the budget
+    priority: tile_priority  # interleaved heavy-first: evens the memory load over the build
     retries: 2
     resources:
         mem_gb=_fork_gb(CONTOUR_GB, 3)
@@ -272,9 +301,10 @@ rule soundings_tile:
     output:
         "store/soundings/{stem}.geojson"
     params:
+        version=1, # increment to force a rebuild
         cell=soundings_run.SOUND_CELL_PX, min_depth=soundings_run.SOUND_MIN_DEPTH_M,
         smooth=SMOOTH_CFG,
-    priority: tile_weight  # heavy-first; greedy backfills lighter ready jobs into the rest of the budget
+    priority: tile_priority  # interleaved heavy-first: evens the memory load over the build
     retries: 2
     resources:
         mem_gb=_fork_gb(SOUND_GB, 2)
@@ -286,8 +316,8 @@ rule soundings_tile:
         "{PY}/soundings_run.py tile {wildcards.stem} 2> {log}"
 
 
-# Behind SKIP_DEPARE until the perf backlog's bounding work: the dense-tile GEOS tail is
-# unbounded (~65 min single-core measured on the densest stem).
+# On by default (the build.yml `depare` input); SKIP_DEPARE=1 opts out. The nodata-pass GEOS
+# tail is bounded — STRtree + subdivision + snap-round difference (docs/plans/2026-07-21-depare-perf.md).
 rule depare_tile:
     input:
         fork_inputs,
@@ -295,9 +325,10 @@ rule depare_tile:
     output:
         "store/depare/{stem}.fgb"
     params:
+        version=1, # increment to force a rebuild
         levels=json.dumps({"m": pipeline_config.DEPARE_LEVELS, "ft": pipeline_config.DEPARE_LEVELS_FT}),
         drying=pipeline_config.DRYING_CAP, sliver=depare_run.SLIVER_MIN_PX, smooth=SMOOTH_CFG,
-    priority: tile_weight  # heavy-first; greedy backfills lighter ready jobs into the rest of the budget
+    priority: tile_priority  # interleaved heavy-first: evens the memory load over the build
     retries: 2
     resources:
         mem_gb=_fork_gb(DEPARE_GB, 3)
@@ -327,8 +358,9 @@ rule terrain_render:
         terrain_inputs
     output:
         "store/pmtiles/{stem}.pmtiles"
-    priority: tile_weight  # heavy-first; greedy backfills lighter ready jobs into the rest of the budget
+    priority: tile_priority  # interleaved heavy-first: evens the memory load over the build
     params:
+        version=1, # increment to force a rebuild
         cfg=json.dumps(terrain_mod._config(), sort_keys=True),
     resources:
         mem_gb=lambda wc, attempt: utils.weight(wc.stem, factor=TERRAIN_FACTOR) * attempt,

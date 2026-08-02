@@ -44,15 +44,6 @@ const map = new maplibregl.Map({
 });
 window.map = map; // exposed for debugging / verification
 
-// MapLibre keeps compact attribution expanded until the first map interaction;
-// collapse it once the style (and its attributions) have loaded.
-map.on("load", () =>
-  map
-    .getContainer()
-    .querySelector(".maplibregl-ctrl-attrib")
-    ?.classList.remove("maplibregl-compact-show"),
-);
-
 map.addControl(new maplibregl.NavigationControl());
 map.addControl({
   onAdd: () => document.getElementById("controls"),

@@ -100,17 +100,6 @@ A full build (`planet`) lands in `pipelines/store/bundle/`:
 - `coverage.pmtiles` — source-provenance footprints, its own tileset ending at z8 (MapLibre overzooms it independently; inside `vector.pmtiles` the sea-sized fills either minted millions of deep-ocean tiles or vanished above their zoom).
 - `manifest.json` — planet metadata + `overlay.cells` ({cell: max_zoom}) for the Worker.
 
-### The published-raster contract
-
-The Terrarium-decoded DEM (`readDepth` returns exactly this) carries depth in its negative domain and three flat category codes in its non-negative domain. For decoded value `v` (metres):
-
-- `v < 0` — elevation below the winning source's datum; on measured water pixels `-v` is the charted depth. The *encoding* is shallow-biased (quantize never deepens a value). The *datum* is per-source: LAT/MLLW where those sources win, but GEBCO/EMODnet are ≈MSL — which sits **above** any low-water datum — so their depths read **deep** vs a proper chart datum by the local MSL−LAT separation (0.1–0.5 m micro-tidal, 2–8 m macro-tidal) until datum unification.
-- `v == 0` — water present, **depth unknown** (ENC `UNSARE` analogue), not a measured depth of approximately zero.
-- `v == 1` — **drying foreshore** (seabed in `(0, DRYING_CAP]` seaward of the land line): covers and uncovers with the tide. The drying *height* is not carried — the `depare` layer's `drval` bands are the only drying-height source.
-- `v == 2` — **land / out of scope.** Not measured elevation; the terrain render classifies all land here (and the Worker serves it for missing tiles), so hillshade finds no slope on land — no fake topo relief, no halo ring at unknown-depth lakes.
-
-The codes are exact multiples of the quantize floor, so they decode exactly at every zoom. Values *between* codes are smoothing/overzoom interpolation transitions — round to the nearest code, or consult `depare` for the categorical truth.
-
 ### Why a planet cap + grid overlays
 
 GEBCO is ~z8 native; regional sources reach ~z14. Baking a full z0–14 pyramid would upsample GEBCO globally (hundreds of GB, no new data). Instead: the planet is capped at `macrotile_z` (complete, all-sources-merged base, ~1–2 GB) with fixed-grid overlay archives above it, each carrying the GEBCO-filled merged mosaic (Terrarium has no transparency, so an overlay must not punch holes). Overlays are grid cells rather than per-source archives on purpose: a cell is a fixed fraction of the globe, so a new source adds _cells_ instead of growing any single archive (a per-source overlay's size tracked its footprint and outgrew CI runner disks).
