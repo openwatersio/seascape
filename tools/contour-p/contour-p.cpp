@@ -181,7 +181,8 @@ int main(int argc, char **argv)
     {
         FGBWriter w(layer, gt, dfMinimum);
         typedef PolygonRingAppender<FGBWriter> RingAppender;
-        RingAppender appender(w);
+        const double W = GDALGetRasterXSize(in), H = GDALGetRasterYSize(in);
+        RingAppender appender(w, -1.0, -1.0, W + 1.0, H + 1.0);
         FixedLevelRangeIterator lv(
             &levels[0], levels.size(),
             -std::numeric_limits<double>::infinity(), dfMaximum);
