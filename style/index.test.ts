@@ -144,7 +144,7 @@ test("layer ids are stable — consumers key toggles/queries off them", () => {
   expect(layers().map((l) => l.id)).toEqual([
     "depth-shading",
     "depth-areas",
-    "hillshade",
+    "depth-hillshade",
     "contour-lines",
     "contour-labels",
     "soundings",
