@@ -185,18 +185,21 @@ def _render(stem, out_pmtiles):
     if not os.environ.get("SKIP_SMOOTH"):
         smooth.smooth_tiff(window)  # the ONE f(depth,zoom); halo makes interior identical to whole
 
-    # Rasterize the combined land mask on the window's exact grid so _encode_tile can nudge
-    # land-side exact-0 pixels (clamped polders, beyond-build land fringe) to land, keeping decoded
-    # 0 unambiguously water. Same #24 machinery, degrades to no-nudge when no mask is published.
-    # Regional windows only (cz>=8, the per-tile VRT path): a planet-scale window's -spat clip
-    # streams the entire vector mask (GBs) instead of an indexed subset. At z<=7 a land-side
-    # exact-0 area is a few pixels; a rasterized planet-z8 mask artifact is the upgrade path.
+    # Land mask on the window's exact grid so _encode_tile can nudge land-side exact-0 pixels
+    # (clamped polders, the below-sea-level Caspian Depression, beyond-build land fringe) to
+    # land, keeping decoded 0 unambiguously water. Same #24 machinery, degrades to no-nudge
+    # when no mask is published. cz>=8 rasterizes the vector mask per window (indexed -spat
+    # reads); coarser stems window the prepped planet-z8 raster instead — a continental -spat
+    # clip selects most of the planet's polygons, re-reading the whole multi-GB FGB per stem.
     mask = None
+    with rasterio.open(window) as w:
+        b, wres = w.bounds, w.res[0]
     if cz >= 8 and landmask._present(landmask.path()):
         mask = f"{tmp}/landmask.tif"
-        with rasterio.open(window) as w:
-            b, wres = w.bounds, w.res[0]
         landmask.rasterize((b.left, b.bottom, b.right, b.top), wres, mask)
+    elif cz < 8 and landmask.raster_available():
+        mask = f"{tmp}/landmask.tif"
+        landmask.extract_raster((b.left, b.bottom, b.right, b.top), wres, mask)
 
     x_min, y_min = x * span, y * span
     from concurrent.futures import ThreadPoolExecutor

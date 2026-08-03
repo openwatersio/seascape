@@ -94,6 +94,7 @@ rule publish_masks:
     input:
         land="store/landmask/land.fgb",
         water="store/landmask/water.fgb",
+        raster="store/landmask/land-z8.tif",
     output:
         touch("store/meta/publish/landmask")
     log:
@@ -101,7 +102,8 @@ rule publish_masks:
     shell:
         "( " + PUBLISH_GUARD +
         'rclone copyto "{input.land}" "{DEST}/landmask/land.fgb" --retries 5; '
-        'rclone copyto "{input.water}" "{DEST}/landmask/water.fgb" --retries 5 ) 2> {log}'
+        'rclone copyto "{input.water}" "{DEST}/landmask/water.fgb" --retries 5; '
+        'rclone copyto "{input.raster}" "{DEST}/landmask/land-z8.tif" --retries 5 ) 2> {log}'
 
 
 # A single-source dispatch publishes only that source; full runs add coverage + masks.

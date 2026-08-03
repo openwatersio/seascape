@@ -225,6 +225,26 @@ rule landmask:
         "{PY}/landmask.py prep 2> {log}"
 
 
+# Effective land (land ∖ water) rasterized once onto the z8 render grid — the overview
+# terrain stems' mask (a continental vector clip per coarse stem would re-read the whole
+# multi-GB FGB; this is windowed instead).
+rule landraster:
+    input:
+        "store/landmask/land.fgb",
+        "store/landmask/water.fgb",
+    output:
+        "store/landmask/land-z8.tif"
+    priority: 10_000_000  # see landmask
+    resources:
+        mem_gb=8  # planet gdal_rasterize + mode overviews
+    benchmark:
+        f"{TMP}/bench/landraster.tsv"
+    log:
+        f"{TMP}/logs/landraster.log"
+    shell:
+        "{PY}/landmask.py prep-raster 2> {log}"
+
+
 rule watermask:
     output:
         "store/landmask/water.fgb"

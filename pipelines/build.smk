@@ -31,6 +31,7 @@ import utils
 # Mask inputs only when they are local files — a /vsicurl mask (streamed preview) has no
 # file to track; its identity rides in the mask content, tracked via its input file.
 MASKS = [p for p in (landmask.path(), landmask.water_path()) if not p.startswith("/vsi")]
+RASTER_MASK = [] if landmask.raster_path().startswith("/vsi") else [landmask.raster_path()]
 
 # depare rides only when SKIP_DEPARE is unset — an env gate, known at parse, so it decides which
 # depare rules even EXIST (an empty input list would break the bundle rules). The stem set behind
@@ -449,10 +450,11 @@ TERRAIN_FACTOR = 1.3
 def terrain_inputs(wc):
     """cz>=8 renders read a per-stem VRT of their halo-buffered tile set, so they run the
     moment their neighborhood merges; cz<8 needs the GTI's planet-z8-COG fall-through. The masks
-    ride too: the render rasterizes the land mask to nudge land-side exact-0 pixels to land."""
+    ride too: cz>=8 rasterizes the vector land mask to nudge land-side exact-0 pixels to land,
+    cz<8 windows the prepped land-z8 raster for the same nudge."""
     if int(wc.stem.split("-")[3]) >= 8:
         return [f"store/mosaic/tiles/{s}.tif" for s in terrain_mod.window_tiles(wc.stem)] + MASKS
-    return list(rules.mosaic_index.output) + MASKS
+    return list(rules.mosaic_index.output) + MASKS + RASTER_MASK
 
 
 rule terrain_render:
