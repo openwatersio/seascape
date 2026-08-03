@@ -164,9 +164,10 @@ def prep_water(processes=8):
 
     Chart-relevant means two filters on top of polygons-only: EXCLUDED_SUBTYPES drops the kinds
     that are never chart water (ocean/physical are covered by the land polygons; human_made is
-    swimming pools/fountains/basins; wastewater and spring likewise), and MIN_AREA_M2 floors the
-    compact kinds — channel kinds (river/canal/stream) are exempt, since a tiny fragment there is
-    usually a segment of a connected waterway where a gap does real damage.
+    swimming pools/fountains/basins; wastewater and spring likewise), and MIN_AREA_M2 floors
+    every kind except CHANNEL_KINDS (river/canal/stream) — a tiny channel polygon is usually a
+    segment of a connected waterway where a gap does real damage, while flooring by default
+    keeps a future Overture subtype's small junk from leaking in unexamined.
 
     Each feature keeps its Overture `subtype` as `kind` plus `class`, `is_salt`, and
     `is_intermittent` for finer product decisions downstream: the rasterize burns geometry only
