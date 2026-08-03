@@ -1085,13 +1085,18 @@ def _check():
                        nodata=-9999, crs="EPSG:3857",
                        transform=from_origin(bb.left, bb.top, wres, wres)) as dst:
         dst.write(kdem, 1)
-    lake, river, lagoon = cell_box(2, 15, 18, 45), cell_box(22, 15, 38, 45), cell_box(42, 15, 58, 45)
+    lake, river, lagoon, tidal_lake = (cell_box(2, 15, 13, 45), cell_box(17, 15, 28, 45),
+                                       cell_box(32, 15, 43, 45), cell_box(47, 15, 58, 45))
     gpd.GeoDataFrame(geometry=[_box(*bb)], crs="EPSG:3857").to_file(
         f"{d}/land.fgb", driver="FlatGeobuf")
-    # The lagoon is `kind=lake` rescued by class ALONE (is_salt deliberately all-null: the
-    # fillna path must run without deciding the outcome).
-    gpd.GeoDataFrame({"kind": ["lake", "river", "lake"], "class": [None, None, "lagoon"],
-                      "is_salt": [None, None, None]}, geometry=[lake, river, lagoon],
+    # Each rescue clause decides exactly one box: the lagoon by class ALONE, the tidal lake by
+    # tidal=yes ALONE (is_salt deliberately all-null: the fillna path must run without deciding
+    # the outcome).
+    gpd.GeoDataFrame({"kind": ["lake", "river", "lake", "lake"],
+                      "class": [None, None, "lagoon", None],
+                      "is_salt": [None, None, None, None],
+                      "tidal": [None, None, None, "yes"]},
+                     geometry=[lake, river, lagoon, tidal_lake],
                      crs="EPSG:3857").to_file(f"{d}/water.fgb", driver="FlatGeobuf")
     saved = {k: os.environ.get(k) for k in ("LANDMASK", "WATERMASK")}
     os.environ["LANDMASK"], os.environ["WATERMASK"] = f"{d}/land.fgb", f"{d}/water.fgb"
@@ -1111,6 +1116,8 @@ def _check():
         "a lake is off chart datum — its [0, cap] rim must emit no drying"
     assert dry.intersects(lagoon).any(), \
         "class=lagoon must rescue a kind=lake polygon (most lagoons carry no other signal)"
+    assert dry.intersects(tidal_lake).any(), \
+        "an OSM tidal=yes must rescue a kind=lake polygon"
     nodata_rows = rows[rows["drval1"].isna()]
     assert nodata_rows.covers(lake.intersection(cell_box(0, 20, 60, 40)).centroid).any(), \
         "the lake's [0, cap] shore ribbon stays part of its nodata polygon"

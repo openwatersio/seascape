@@ -44,8 +44,8 @@ lake/river sources are the path if any is ever wanted.
 
 Local layout (store/landmask/): land.fgb — the prepared EPSG:3857 land mask; water.fgb
 — the chart-relevant inland-water polygons subtracted from it, each carrying its Overture
-`kind` (river/lake/canal/reservoir/...) plus `class`/`is_salt`/`is_intermittent` for the
-depare nodata layer (optional: absent -> land-only mask, no crash); land-z8.tif — the
+`kind` (river/lake/canal/reservoir/...) plus `class`/`is_salt`/`is_intermittent`/`tidal` for
+the depare nodata layer (optional: absent -> land-only mask, no crash); land-z8.tif — the
 effective land (land ∖ water) rasterized onto the z8 render grid for the overview terrain
 stems (optional: absent -> maskless encode). All are spatial-indexed / tiled and
 HTTP-range friendly. LANDMASK / WATERMASK / LANDRASTER override the paths.
@@ -331,7 +331,11 @@ def _water_tile(job):
         return None  # open ocean: the read selected nothing
     utils.run_command(
         f"ogr2ogr -f GPKG -t_srs EPSG:3857 -overwrite -nln water -dialect SQLITE "
-        "-sql \"SELECT geometry, subtype AS kind, class, is_salt, is_intermittent FROM water_raw "
+        "-sql \"SELECT geometry, subtype AS kind, class, is_salt, is_intermittent, "
+        # tidal rides Overture's source_tags pass-through (OSM tidal=* verbatim; the parquet
+        # reader exposes the MAP column as JSON text). Undocumented upstream — if a release
+        # drops it the column reads all-null and the depare tidal rescue shrinks to class+salt.
+        "json_extract(source_tags, '$.tidal') AS tidal FROM water_raw "
         "WHERE GeometryType(geometry) LIKE '%POLYGON%'\" "
         f"-clipsrc {w} {s} {e} {n} {tile} {raw}",
         silent=True)
