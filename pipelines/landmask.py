@@ -45,13 +45,16 @@ lake/river sources are the path if any is ever wanted.
 Local layout (store/landmask/): land.fgb — the prepared EPSG:3857 land mask; water.fgb
 — the inland-water polygons subtracted from it, each carrying its Overture `kind`
 (river/lake/canal/reservoir) for the depare nodata layer (optional: absent -> land-only
-mask, i.e. today's behavior, no crash). Both are spatial-indexed and HTTP-range friendly.
-LANDMASK / WATERMASK override the paths (defaults store/landmask/{land,water}.fgb).
+mask, i.e. today's behavior, no crash); land-z8.tif — the effective land (land ∖ water)
+rasterized onto the z8 render grid for the overview terrain stems (optional: absent ->
+maskless encode). All are spatial-indexed / tiled and HTTP-range friendly.
+LANDMASK / WATERMASK / LANDRASTER override the paths.
 
-  python landmask.py prep        download -> unzip -> convert the land mask (run once)
-  python landmask.py prep-water  download -> convert the inland-water mask (run once)
-  python landmask.py tiles       tile the masks into store/bundle/land.pmtiles
-  python landmask.py --check     self-check
+  python landmask.py prep         download -> unzip -> convert the land mask (run once)
+  python landmask.py prep-water   download -> convert the inland-water mask (run once)
+  python landmask.py prep-raster  rasterize effective land onto the z8 grid (run once)
+  python landmask.py tiles        tile the masks into store/bundle/land.pmtiles
+  python landmask.py --check      self-check
 """
 
 import os
@@ -89,6 +92,7 @@ MERC_LAT = 85.06
 
 DEFAULT_LANDMASK = "store/landmask/land.fgb"
 DEFAULT_WATERMASK = "store/landmask/water.fgb"
+DEFAULT_LANDRASTER = "store/landmask/land-z8.tif"
 
 
 def path():
@@ -103,6 +107,13 @@ def water_path():
     store/landmask/water.fgb). Optional: when it points nowhere the mask degrades to land-only.
     Read per call for the same reason path() is — a caller setting WATERMASK after import wins."""
     return os.environ.get("WATERMASK", DEFAULT_WATERMASK)
+
+
+def raster_path():
+    """The rasterized effective-land mask (prep_raster), read from LANDRASTER at *call time*
+    (default store/landmask/land-z8.tif). Optional like the water mask: absent -> overview
+    terrain stems encode maskless."""
+    return os.environ.get("LANDRASTER", DEFAULT_LANDRASTER)
 
 
 def require():
@@ -413,6 +424,83 @@ def rasterize_water(bounds_3857, res, out_tif, water_src=None):
                 os.remove(f)
 
 
+# The z8 render grid prep_raster burns on: 2**8 tiles of 512 px across the 3857 world — the
+# same pixel size aggregation_reproject.get_resolution(8) derives. Overview render windows
+# (cz<8) are exact power-of-two decimations of this grid, so extract_raster reads align with
+# the internal overviews pixel-for-pixel.
+MERC_X = 20037508.342789244
+Z8_RES = 2 * MERC_X / (2 ** 8 * 512)
+
+
+def prep_raster(te=(-MERC_X, -MERC_X, MERC_X, MERC_X), res=Z8_RES):
+    """Rasterize the effective-land mask once onto the global z8 render grid (1=land, 0=water,
+    the same land-then-water composite rasterize() burns per stem) with mode-decimated internal
+    overviews, at raster_path(). Overview terrain stems window this instead of vector-rasterizing:
+    a continental -spat clip selects most of the planet's polygons, so every coarse stem would
+    re-read nearly the whole multi-GB FGB. No -spat pre-clip here for the same reason — the
+    planet extent selects everything, so the burns read the FGBs directly. Guarded so a re-run
+    is a no-op; a binary sparse mask compresses to tens of MB. Water optional, like everywhere."""
+    out = raster_path()
+    if os.path.isfile(out):
+        print(f"land raster already present: {out}")
+        return
+    land = path()
+    if not _present(land):
+        raise SystemExit(f"land mask {land} not found — run `landmask.py prep` first")
+    utils.create_folder(os.path.dirname(out) or ".")
+    water = water_path()
+    tmp_out = out + ".tmp.tif"
+    try:
+        utils.run_command(
+            f"gdal_rasterize -burn 1 -ot Byte -init 0 -te {te[0]} {te[1]} {te[2]} {te[3]} "
+            f"-tr {res} {res} -co COMPRESS=DEFLATE -co BIGTIFF=IF_SAFER -co TILED=YES "
+            f"-co SPARSE_OK=YES {land} {tmp_out}")
+        if _present(water):
+            # kind <> 'physical': same marine-bay exclusion as rasterize() — burning holeless
+            # bays back to water would erase real islands.
+            utils.run_command(
+                f"gdal_rasterize -burn 0 -where \"kind <> 'physical'\" {water} {tmp_out}")
+        # Overviews down to a 512-px planet (level 256 = the z0 render window); mode keeps a
+        # majority-land block land instead of nearest's coin flip. Levels that would undershoot
+        # one 512 block are dropped (only reachable on the tiny self-check grid).
+        width = round((te[2] - te[0]) / res)
+        levels = [2 ** k for k in range(1, 9) if width >> k >= 512]
+        if levels:
+            utils.run_command(
+                f"gdaladdo -r mode --config COMPRESS_OVERVIEW DEFLATE {tmp_out} "
+                + " ".join(str(l) for l in levels))
+        os.replace(tmp_out, out)
+    finally:
+        if os.path.isfile(tmp_out):
+            os.remove(tmp_out)
+    print(f"land raster ready: {out}")
+
+
+def raster_available():
+    """Like _present, but a /vsi raster is probed with a real open: the artifact is optional
+    (absent -> maskless overview encode), so a streamed preview pointing at a not-yet-published
+    URL must degrade like a missing local file, not die mid-render."""
+    p = raster_path()
+    if not p.startswith("/vsi"):
+        return os.path.isfile(p)
+    try:
+        with rasterio.open(p):
+            return True
+    except rasterio.errors.RasterioIOError:
+        return False
+
+
+def extract_raster(bounds_3857, res, out_tif):
+    """Cut a window of the prepped effective-land raster onto the given grid — the overview
+    stems' mask path, same 1=land/0=water contract as rasterize(). gdalwarp -te/-tr guarantees
+    the output grid matches the render window exactly (the encode dims guard); -r near on the
+    mode-built overviews makes decimated reads aligned block copies, not resampling."""
+    xmin, ymin, xmax, ymax = bounds_3857
+    utils.run_command(
+        f"gdalwarp -overwrite -te {xmin} {ymin} {xmax} {ymax} -tr {res} {res} -r near "
+        f"-co COMPRESS=DEFLATE -co TILED=YES -co SPARSE_OK=YES {raster_path()} {out_tif}")
+
+
 def _clamp_negative_land(dem_path, mask_tif, valid):
     """Shared windowed clamp: where land (mask==1) AND valid(ds, win, a) AND value<0, set 0.
     Mask-first — read the cheap Byte mask window and skip landless blocks before decoding the
@@ -669,6 +757,29 @@ def _check():
         "the water burn must only turn land->water, never water->land"
     assert not ((land == 0) & (lw == 1)).any(), "the water burn must not create land over water"
 
+    # The raster-mask path (overview terrain stems): prep the artifact on this same grid, window
+    # it back with extract_raster, and require the exact composite rasterize() burns — land,
+    # water subtracted, the physical bay ignored. Then a 2x-decimated read must keep the grid
+    # contract (halved dims) with both classes present.
+    raster = f"{d}/land-z8.tif"
+    env_prev = {k: os.environ.get(k) for k in ("LANDMASK", "WATERMASK", "LANDRASTER")}
+    os.environ.update(LANDMASK=land_fgb, WATERMASK=water_fgb, LANDRASTER=raster)
+    try:
+        prep_raster(te=te, res=res)
+        ext = f"{d}/extract.tif"
+        extract_raster(te, res, ext)
+        with rasterio.open(ext) as m:
+            full = m.read(1)
+        assert np.array_equal(full, lw), "extract_raster must reproduce rasterize()'s composite"
+        extract_raster(te, res * 2, ext)
+        with rasterio.open(ext) as m:
+            half = m.read(1)
+        assert half.shape == (h // 2, w // 2), "decimated extract must keep the -te/-tr grid"
+        assert (half == 1).any() and (half == 0).any(), "decimated mask must keep both classes"
+    finally:
+        for k, v in env_prev.items():
+            os.environ.pop(k, None) if v is None else os.environ.update({k: v})
+
     # The marine 'physical' bay overlapping the land corner must NOT subtract: probe a
     # point inside both the land box and the bay box (lon/lat 1.1,1.1).
     from rasterio.transform import rowcol
@@ -770,9 +881,11 @@ if __name__ == "__main__":
         prep()
     elif sys.argv[1:2] == ["prep-water"]:
         prep_water(int(sys.argv[2]) if len(sys.argv) > 2 else 8)
+    elif sys.argv[1:2] == ["prep-raster"]:
+        prep_raster()
     elif sys.argv[1:2] == ["tiles"]:
         tiles()
     elif sys.argv[1:2] == ["--check"]:
         _check()
     else:
-        sys.exit("usage: landmask.py prep | prep-water | tiles | --check")
+        sys.exit("usage: landmask.py prep | prep-water | prep-raster | tiles | --check")

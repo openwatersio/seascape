@@ -28,6 +28,7 @@ preview bbox="-74.30,40.40,-73.75,40.80":
     export SOURCE_VSI_BASE="${SOURCE_VSI_BASE:-/vsicurl/https://data.openwaters.io/bathymetry/source}"
     export LANDMASK="${LANDMASK:-/vsicurl/https://data.openwaters.io/bathymetry/landmask/land.fgb}"
     export WATERMASK="${WATERMASK:-/vsicurl/https://data.openwaters.io/bathymetry/landmask/water.fgb}"
+    export LANDRASTER="${LANDRASTER:-/vsicurl/https://data.openwaters.io/bathymetry/landmask/land-z8.tif}"
     # One invocation: the `cover` checkpoint runs inside the bundles build (streamed sources),
     # then the DAG re-evaluates into the per-stem mosaic/fork/terrain jobs.
     # mem_gb budget from the actual environment (the Docker VM's memory, not the host's), minus
