@@ -43,12 +43,12 @@ water polygon (Dead Sea, Salton) still flatten to 0 — accepted ceiling, dedica
 lake/river sources are the path if any is ever wanted.
 
 Local layout (store/landmask/): land.fgb — the prepared EPSG:3857 land mask; water.fgb
-— the inland-water polygons subtracted from it, each carrying its Overture `kind`
-(river/lake/canal/reservoir) for the depare nodata layer (optional: absent -> land-only
-mask, i.e. today's behavior, no crash); land-z8.tif — the effective land (land ∖ water)
-rasterized onto the z8 render grid for the overview terrain stems (optional: absent ->
-maskless encode). All are spatial-indexed / tiled and HTTP-range friendly.
-LANDMASK / WATERMASK / LANDRASTER override the paths.
+— the chart-relevant inland-water polygons subtracted from it, each carrying its Overture
+`kind` (river/lake/canal/reservoir/...) plus `class`/`is_salt`/`is_intermittent` for the
+depare nodata layer (optional: absent -> land-only mask, no crash); land-z8.tif — the
+effective land (land ∖ water) rasterized onto the z8 render grid for the overview terrain
+stems (optional: absent -> maskless encode). All are spatial-indexed / tiled and
+HTTP-range friendly. LANDMASK / WATERMASK / LANDRASTER override the paths.
 
   python landmask.py prep         download -> unzip -> convert the land mask (run once)
   python landmask.py prep-water   download -> convert the inland-water mask (run once)
@@ -157,16 +157,23 @@ def prep():
 
 
 def prep_water(processes=8):
-    """Build the inland-water mask once: read the Overture water parquet, keep only polygonal
-    non-ocean features (rivers/lakes/canals/reservoirs — the ocean is already bounded by the
-    land polygons), reproject to EPSG:3857, and write one spatial-indexed FlatGeobuf at
+    """Build the inland-water mask once: read the Overture water parquet, keep only chart-relevant
+    polygonal water, reproject to EPSG:3857, and write one spatial-indexed FlatGeobuf at
     water_path(). The land clamp's rasterize subtracts it per tile, so a flagged coarse source
     keeps its genuine depths inside mapped water. Guarded so a re-run is a no-op.
 
-    Each feature keeps its Overture `subtype` as `kind` (river/lake/canal/reservoir): the
-    rasterize burns geometry only (so Part 2's clamp is unaffected), but the depare nodata layer
-    passes `kind` through to label unknown-depth water. Two passes. The remote pass pulls
-    non-ocean rows with the one filter the parquet reader can push down (`subtype <> 'ocean'`);
+    Chart-relevant means two filters on top of polygons-only: EXCLUDED_SUBTYPES drops the kinds
+    that are never chart water (ocean/physical are covered by the land polygons; human_made is
+    swimming pools/fountains/basins; wastewater and spring likewise), and MIN_AREA_M2 floors
+    every kind except CHANNEL_KINDS (river/canal/stream) — a tiny channel polygon is usually a
+    segment of a connected waterway where a gap does real damage, while flooring by default
+    keeps a future Overture subtype's small junk from leaking in unexamined.
+
+    Each feature keeps its Overture `subtype` as `kind` plus `class`, `is_salt`, and
+    `is_intermittent` for finer product decisions downstream: the rasterize burns geometry only
+    (so Part 2's clamp is unaffected), but the depare nodata layer passes `kind` through to
+    label unknown-depth water. Two passes. The remote pass pulls
+    rows with the one filter the parquet reader can push down (the subtype exclusion);
     geometry-type predicates (OGR_GEOMETRY / ST_GeometryType) silently match nothing through that
     read path, so dropping the linear river/stream centerlines Overture also carries (a burned
     line would punch a spurious 1-px water gap across land) happens in a local pass — SQLite
@@ -213,13 +220,15 @@ def prep_water(processes=8):
         # _water_tile's -clipsrc runs AFTER its polygon filter, so a clipped feature can
         # re-enter as a collection/empty; those crash tippecanoe's FlatGeobuf reader
         # (exit 106) and leave the header untyped. Final conversion re-filters + types,
-        # and re-drops 'physical' (marine bays/straits) in case the tile pass predates
-        # that filter.
+        # re-applies the kind drops in case the tile pass predates them, and applies the
+        # area floor. ST_Area here is EPSG:3857 m² (lat-inflated), so the floor loosens
+        # toward the poles — the conservative direction, more features kept.
         utils.run_command(
             f"ogr2ogr -f FlatGeobuf -overwrite -nln water -nlt PROMOTE_TO_MULTI "
             f"-dialect SQLITE -sql \"SELECT * FROM water WHERE "
             f"GeometryType(geometry) LIKE '%POLYGON%' AND NOT ST_IsEmpty(geometry) "
-            f"AND kind <> 'physical'\" "
+            f"AND kind NOT IN {EXCLUDED_SUBTYPES} "
+            f"AND (kind IN {CHANNEL_KINDS} OR ST_Area(geometry) >= {MIN_AREA_M2})\" "
             f"{out} {merged}", silent=False)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -281,6 +290,18 @@ def tiles(out=LAND_TILES):
 # handful of dense land tiles (Europe/Asia rivers) dominate, most tiles are near-empty ocean.
 WATER_TILE_DEG = int(os.environ.get("WATER_TILE_DEG", "20"))
 
+# Overture subtypes that are never chart water: ocean/physical are already bounded by the land
+# polygons; human_made is 2.6M features, 98% under 1000 m² (swimming pools, fountains, basins).
+EXCLUDED_SUBTYPES = "('ocean','physical','human_made','wastewater','spring')"
+
+# Kinds exempt from the area floor: a tiny river/canal/stream polygon is usually a segment of a
+# connected waterway, and a dropped segment punches a gap in the channel.
+CHANNEL_KINDS = "('river','canal','stream')"
+
+# Area floor (EPSG:3857 m²) for compact kinds — sub-pixel even at z14, and dominated by
+# retention ponds and farm dams that read as noise on a chart.
+MIN_AREA_M2 = 1000
+
 
 def _water_grid(step):
     """(w, s, e, n) windows tiling the whole lon range and the web-mercator lat band, clamped so no
@@ -304,13 +325,13 @@ def _water_tile(job):
     utils.run_command(
         "AWS_NO_SIGN_REQUEST=YES AWS_DEFAULT_REGION=us-west-2 "
         f"ogr2ogr -f GPKG -overwrite -nln water_raw -lco SPATIAL_INDEX=NO "
-        f"-spat {w} {s} {e} {n} -where \"subtype NOT IN ('ocean','physical')\" {raw} {WATER_PARQUET_URL}",
+        f"-spat {w} {s} {e} {n} -where \"subtype NOT IN {EXCLUDED_SUBTYPES}\" {raw} {WATER_PARQUET_URL}",
         silent=True)
     if not os.path.isfile(raw):
         return None  # open ocean: the read selected nothing
     utils.run_command(
         f"ogr2ogr -f GPKG -t_srs EPSG:3857 -overwrite -nln water -dialect SQLITE "
-        "-sql \"SELECT geometry, subtype AS kind FROM water_raw "
+        "-sql \"SELECT geometry, subtype AS kind, class, is_salt, is_intermittent FROM water_raw "
         "WHERE GeometryType(geometry) LIKE '%POLYGON%'\" "
         f"-clipsrc {w} {s} {e} {n} {tile} {raw}",
         silent=True)

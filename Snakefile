@@ -248,6 +248,8 @@ rule landraster:
 rule watermask:
     output:
         "store/landmask/water.fgb"
+    params:
+        version=1, # increment to force a rebuild
     priority: 10_000_000  # see landmask
     retries: 2
     threads: 8  # the planet read is tiled + parallel (landmask._water_tile); IO-bound S3 reads
