@@ -16,3 +16,4 @@ pipelines/.snakemake/
 .snakemake
 .codegraph
 docs/perf/logs/
+.claude

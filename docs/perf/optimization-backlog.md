@@ -8,32 +8,7 @@ discarded hypotheses live in [optimization-history.md](optimization-history.md).
 
 Ranked by expected impact on the incremental (weekly-refresh) build first, cold planet second.
 
-### Drain the z15 tail — banded rule priorities + fitted big-job reservations
-
-Run 30417069133 measured the mechanism end-to-end. `--prioritize mosaic_index` sets its whole
-dependency closure — every merge — to uniform maximum priority (job logs print
-`priority: highest`), erasing the heavy-first `tile_priority` interleave within the merge class.
-Under uniform priority the scheduler's knapsack maximizes the **sum** of priorities that fit the
-memory budget, so many small jobs always outscore few big ones: hundreds of 2–3 GB coarse merges
-ran ahead of the 9 GB z15 merges (last z15 merge landed ~2.5 h in), the z15 fork chain trailed
-behind its neighborhoods, and the same bias inside the vector band ran windows/contours ahead of
-depare. End state: a ~2.5 h tail of z15 depare draining 6-wide (`DEPARE_GB[15]` = 24 → only
-6 × 24 fit in 161 GB) at load 10–25 on 48 cores. The same bias let fork windows outrun their
-consumers 99-deep — a 295 GB `store/window` transient, volume peak 1.8 of 2.0 TB.
-
-- **Replace `--prioritize mosaic_index` with explicit rule bands**: `mosaic_index` above the
-  merges; `mosaic_tile` as its own graded band (heavy-first `tile_priority` intact) above
-  `VECTOR_BAND`; terrain stays bottom. z15 merges then start at t=0 and their fork chains
-  overlap the coarse-merge flood instead of trailing it.
-- **Re-fit `DEPARE_GB[15]` 24 → ~15** (planet-measured, n=25: mean 10.5 GB, max 13.7 GB, wall
-  mean 12.3 min / max 27.5 min; `attempt` covers the tail) — 10-wide instead of 6-wide.
-- The `store/window` transient either rides item 8's NVMe bind (below) or gains volume-side
-  disk accounting; 250 GB free at peak was closer than comfortable.
-
-Success: the refresh-wave build loses its low-load tail (~2–3 h off run 30417069133's shape).
-Effort: small (priority constants + one table entry). Risk: low.
-
-### Marsh-coast depare: the post-contour GEOS pass is the new bottleneck
+### Marsh-coast depare: coarsening landed, shoal-bias audit owed
 
 `contour-p` (patched GDAL ring appender, 2026-07-29) removed the polygon-contour
 pathology; the remaining cost on marsh stems is everything downstream of it. Measured on
@@ -50,40 +25,26 @@ Gulf-wetland z15 stems (run 30482927526, ccx33):
   28 GB budget of a ccx33; it is the argument for keeping `DEPARE_GB[15]` generous until
   this pass is bounded, and against re-fitting it from pre-fix corpora.
 
-**Simplify the geometry instead of just tolerating it** — stub plan at
-[../plans/2026-07-30-shallow-coarsening.md](../plans/2026-07-30-shallow-coarsening.md).
-Block-max coarsening of the shallow bands (bias-shallow by construction; channels survive
-pixel-exactly), mirroring `deep_coarsen` at the other end of the ladder. Approved in principle
-2026-07-30, mechanism sketched, parameters and gates NOT settled. This is the lever that makes
-marsh stems cheap; `OGR_GEOJSON_MAX_OBJ_SIZE` only stops them failing.
+**The coarsening landed** ([../plans/2026-07-30-shallow-coarsening.md](../plans/2026-07-30-shallow-coarsening.md)): the drying bucket is coverage-unioned and bands coverage-simplify to the S-58 legibility floor (`003ebad`, 4.7× on the pathology), and enclosed sub-legible marsh ponds fill in the fork window (`7c77424`, 11.6×). Block-max coarsening was refuted by measurement — part count, not vertex count, drives the GEOS cost, and block-max left parts unchanged. `contour-p` ships via the Dockerfile from `patches/gdal-polygon-ring-appender-quadratic.patch` (upstream PR: OSGeo/gdal#14983). Standing practice: profile marsh changes locally on `pipelines/perf/` (z12 fixture stems + prod root) before any dispatch.
 
-**Reservation consequence, and the mechanism to fix it.** Fixing the contour stage MOVED
-the memory ceiling up: pre-fix these stems died in `gdal_contour -p` and never reached the
-GEOS phase, so every depare RSS number on record (mean 10.5, max 13.7, later 19.5 GB) came
-from stems that were never the expensive ones. Measured now: `8-63-105-15` peaked ~29 GB
-RSS + 3.8 GB swapped against `DEPARE_GB[15]` = 24 — a breach, and at 6-wide on a 161 GB
-budget that projects to ~198 GB against 192 GB physical. So `DEPARE_GB[15]` must go UP,
-fitted from the post-fix peak (this reverses the earlier "re-fit 24 -> ~15" note above,
-which was derived from the pre-fix corpus).
+**Reservation consequence — the per-stem fit is in.** Marsh stems set the depare memory
+ceiling: `8-63-105-15` peaked ~29 GB RSS + 3.8 GB swapped (pre-fix corpora never sampled
+these stems — they died in `gdal_contour -p` before the GEOS phase). Reservations now come
+from `depare_gb` (build.smk): a fit from the stem's own mosaic-tile size (run 30634360224,
+2,170 rows), floored per child_z at the class MEDIAN, with `attempt` escalation carrying
+the tail — run 30641774632 ran 21 stems past their reservations with zero failures and the
+best utilization measured. `depare_run.tile` also logs the window size next to its polygon
+count (a compressed window's size tracks the geometric detail that drives the GEOS peak;
+the observed scaling is superlinear: 6.0 GB window -> 9.7 GB peak, 9.94 GB -> ~29 GB), so
+each planet run adds ~110 paired z15 points to refine the fit — it had only 7 cz15
+anchors. The named end state is still a per-job kernel cap (see "Memory reservation
+upkeep"), which turns a wrong estimate into one retried job instead of a swapping box.
 
-Better than a bigger constant: **reserve from the window's file size.** `input.size_mb` in
-a resource callable is evaluated lazily, after the producing job runs (verified 2026-07-29
-on a scratch Snakefile: the callable saw the real size at execution; dry runs skip it), and
-a COMPRESSED window's size tracks its geometric detail — which is what drives the GEOS
-peak. Marsh coastlines compress worst and cost most. Paired data so far is too thin to fit
-(6.0 GB window -> 9.7 GB peak = 1.6x; 9.94 GB -> ~29 GB = 2.8x, i.e. superlinear), so
-`depare_run.tile` now logs the window size next to its polygon count: one planet run yields
-~110 paired z15 points, and the fit can replace the child_z table. Keep the table as a FLOOR
-so the change can never reserve less than today. The named end state is still a per-job
-kernel cap (see "Memory reservation upkeep"), which turns a wrong estimate into one retried
-job instead of a swapping box.
+Remaining open:
 
-These stems now COMPLETE (they never did before), so this is an optimization, not a
-blocker. Where to look first: the nodata differencing and drying algebra scale with band
-part count, and the 2026-07-21 fix (STRtree + subdivision + snap-rounded overlay) was
-tuned on harbor geometry, not 40k-part marsh bands. Profile with `DEPARE_TIMING=1` on the
-preserved windows (`store/profile/depare-pathology/`, plus the Gulf windows on the volume)
-before choosing a mechanism.
+- **Shipped shoal-bias violations.** The `-r average` whole-window retry rescue (`depare_run.py`) and the symmetric shallow Gaussian both chart deeper than truth in places, and `SMOOTH_CFG` doesn't reach the coarsen dials. The shallow-bias audit (intake item 1 below) is the measurement to run before choosing fixes.
+- **Re-profile the split.** The "~89% is the post-contour pass" attribution above predates the coarsening dials; measure on the perf rig before investing further here.
+- The GEOS pathologies the pass routes around (MakeValid MultiPolygon dispatch; CoverageValidator per-target index rebuilds) are documented with measurements and queued for upstream filing; no pipeline work rides on them.
 
 ### Stop false planet rebuilds — trigger hygiene
 
@@ -104,11 +65,7 @@ from the single-DAG migration. Everything else cascaded by mtime: `mosaic_index`
   idea, which would have pushed every deliberate force back onto `-R` at dispatch). Extend the
   token to the bundle rules as they're modified; deliberately no CI guard (code can change without
   warranting a bump).
-- Add a dry-run gate: `snakemake -n` job summary logged at the top of every build, and a loud
-  warning (or abort for scheduled runs) when a refresh-class dispatch schedules planet-scale
-  bundle jobs.
-- Verify the next dispatch is a near-no-op (hydrate + stage checks, well under an hour). The
-  params records are now written, so this specific transition should be one-time — confirm it.
+- **Landed — dispatch scope gate** (`8689962`): every dispatch states `max_jobs`; the workflow logs the `snakemake -n` plan and aborts when it exceeds the stated scope OR plans zero jobs for a scope-stating dispatch (the silent-no-op failure mode measured on a `--until` run). A `targets` input plus isolation aggregates (e.g. `soundings_all`) keep leaf rebuilds scoped without staleness overrides. The params-provenance transition confirmed one-time: later runs re-ran nothing on params except deliberate scope changes.
 - **Resolved 2026-07-29 — fresh-box benchmark-missing reruns.** Snakemake counts a job's
   benchmark among its products, and benches are box-scratch (per 435c5f0), so every fresh box
   re-ran `mosaic_index` ("Missing output files: …/bench/mosaic-index.tsv") plus its
@@ -184,6 +141,8 @@ Gate: a bbox run followed by a planet DRY RUN should schedule zero terrain and z
 That belongs in `test_engine`'s scope-transition check, which already asserts the healing
 half of this behaviour.
 
+Until the structural fixes land, the dispatch scope gate (`max_jobs` + zero-plan abort, above) bounds the blast radius operationally: the tax surfaces in the logged plan and aborts loudly instead of running silently.
+
 **Not implicated, verified from the same log.** None of the 2026-07-29 changes triggered
 anything: `DEPARE_GB` is a `resources:` value, priority bands are `priority:`, the
 `contour-p` selection is an env var, and code + the Dockerfile are deliberately not rule
@@ -234,8 +193,15 @@ z0..SPLIT-1) + one `vector_cell` per covering root cell + `vector_join`, all Sna
 cells build as their stems finish (observed overlapping the fork band mid-run), cache in the
 store, and only dirty cells rebuild on refresh — the "incremental bundling" end state below is
 structurally in place. Measured: the old joint run took 14.5 h single-threaded; a dense NYC
-harbor cell now builds in 2 m 47 s. Attack items 1–2 below are superseded; the remaining
-stitch-cost work is the `pmtiles merge` follow-up (parked, see below).
+harbor cell now builds in 2 m 47 s. The stitch is `pmtiles merge` (landed, see the workload-shape
+section). The chain is validated end-to-end: the first complete planet build (2026-08-02)
+census-verified every cell against its fork sidecars (94.1 M feature ids, fringe drops
+accounted) and proved the concat join by tile-count identity — ~10 s at planet scale vs
+tile-join's 4 m 46 s on the same inputs.
+
+Open: marsh cells run with `VECTOR_CELL_TILE_BYTES` = 800 KB tile-byte headroom (`c52dbf4`)
+over tippecanoe's 500 KB default — a stopgap. The structural fix is shrinking overview-zoom
+tiles so the cap can retire.
 
 **Wagyu exit-106 (shared-borders variant) — resolved 2026-07-23.** The regenerated fixture (Stockholm-archipelago stem FGB
 `store/depare/6-35-18-10.fgb`, 265 MB, 124k polygons) crashes stock tippecanoe 2.79 AND
@@ -257,19 +223,9 @@ drop passes stack identical tiny-polygon placeholder squares into multipolygons 
 wagyu cannot parent, and the vendored wagyu aborts the whole run. Cell 8-34-83 reproduced
 deterministically; `patches/wagyu-drop-unplaceable-hole.patch` drops the orphan hole instead
 (the fix the tippecanoe maintainer endorsed in mapbox/tippecanoe#761 but never implemented).
-Only tiles that previously crashed change bytes. Upstream PR to felt/tippecanoe pending.
-
-Attack in this order:
-
-1. **`--read-parallel` / input format** for the ~80 min single-threaded read phase, and
-   **sharding** for the low-parallelism tiling phase (spatially partition into 4/8 balanced
-   shards on NVMe, merge; adopt only with identical addressed tiles, per-layer counts, canonical
-   hashes). Target: the joint vector run under ~1 h.
-2. **Incremental bundling** — the end state that makes refresh builds minutes, not hours: keep
-   per-shard (or per-cell, like `overlay_bundle`) archives cached in the store and rebuild only
-   dirty shards, merging cheaply into the served archives at publish. The overlay bundles already
-   prove the shape: 239 of them rebuilt in ~2 min wall. Sketch after sharding lands, since shard
-   boundaries and the merge step are shared machinery.
+Only tiles that previously crashed change bytes. Upstream: pushed as
+`bkeepers/tippecanoe:wagyu-drop-unplaceable-hole` with the PR body drafted
+(`upstream-tippecanoe-wagyu-pr.md`); filing awaits approval.
 
 Prior data points that still inform the work: unified invocation (contours + soundings in one
 named-layer tippecanoe) saved 22.8% at planet scale, semantically exact on the 16-stem sample.
@@ -291,56 +247,9 @@ Keep the operational lessons regardless: Tippecanoe tmp + output on NVMe (never 
 heartbeats (elapsed, CPU, RSS, IO deltas, deleted-open tmp bytes, disk headroom) around every long
 subprocess.
 
-### Bound DEPARE and re-enable it
+### Deep-contour seam tolerance in `check_contours`
 
-The bound is implemented and measured (2026-07-21, working tree; execution plan + full findings:
-[../plans/2026-07-21-depare-perf.md](../plans/2026-07-21-depare-perf.md)). The planet corpus put
-the tail in **coarse stems**, not the dense coast — `6-21-22-9` (cz9) 8.9 h, `6-19-18-9` 5.2 h on
-the box vs 90 min for the densest z14 — all attributed to the nodata pass differencing every OSM
-water feature against one monolithic coverage∪drying union. Fix in `depare_run.py`: STRtree
-true-intersects prefilter + subdivision of parts over 512 vertices + one `grid_size=1e-6`
-snap-rounded difference (float OverlayNG mis-overlays some multi-piece unions — GEOS 3.13,
-point-in-polygon-arbitrated). Local results: 366/84/102 s on the three profile stems, bands +
-drying byte-exact, nodata deltas arbitrated benign; `DEPARE_TIMEOUT` backstop added. The seam gate
-then caught defects across the stage-3 seam, now fixed: coarse windows under-buffered for the smooth
-halo (halo-scaled `window_buffer_3857`, band seams pass — this also surfaced and forced the contour
-`ogr2ogr -clipsrc` → shapely-clip port, which additionally recovers 2 features ogr2ogr silently
-dropped); the drying sliver filter run per-clip not per-source-polygon (moved to a pre-clip area
-gate, seam 2.08e-2° → 7.49e-4°); and the nodata + residual-band seam "mismatches", which proved to
-be a **false positive in `check_depare` itself** — the depare geometry is already seam-consistent to
-~2e-8°, but the on-seam coverage selector used `ON_EDGE_PIXELS` (0.1 px ≈ 15 m), counting OSM
-boundary detail that merely _grazes_ near the seam (one-sided) as coverage. Fixed with a tight
-`ON_SEAM_PIXELS = 1e-3` selector in `check_depare` only (contour crossings keep the looser point
-snap); the real tolerance (`TOL_PIXELS = 3`) is unchanged and the shifted-band negative test still
-fails, so real misalignment is still caught. All depare bands, drying, and nodata now PASS the seam
-gate (≤2.7e-7°). Remaining before removing `SKIP_DEPARE`: box bbox validation via the build.yml
-`depare` input + stale `store/depare` cleanup, per-zoom `DEPARE_GB` re-fit from box benchmarks, then
-the planet run. Effort remaining: small-medium. Risk: low-medium.
-
-One real pre-existing seam mismatch (NOT caused by this work) is deferred:
-
-- **Deep Chaikin-smoothed contours diverge at tile seams** (measured on 6-19-18-9|6-19-19-9: the
-  20 fm / 50 m / 30 fm levels, all deeper than `NAV_SMOOTH_MAX` = 30 m). Shallow (unsmoothed)
-  contours match exactly; the deep lines smooth away from the raw tile-edge per window, so the two
-  windows' Chaikin passes disagree at the seam. This is the intentional shallow-bias smoothing the
-  module docstring already calls "fundamental," not a clip or window bug (the shapely-clip A/B
-  proved the clip faithful). Decision owed: `seam_check.check_contours` should either exclude levels
-  above `NAV_SMOOTH_MAX` or carry a wider tolerance for them — it currently flags them as MISMATCH.
-  (The `check_depare` false positive above was the same _class_ of over-sensitive-gate issue but a
-  distinct mechanism — grazing coverage vs. per-window smoothing — and only the depare side is
-  fixed; contours keep `ON_EDGE_PIXELS` because a line crosses the seam at a point.)
-
-### Reintroduce windowed contours — resolved 2026-07-28, different mechanism
-
-The memory problem moved and was fixed where it actually lived: the peak was never the
-gdal_contour subprocess (scanline-streamed) but the post-extraction GeoDataFrame phase holding
-three full copies of the window's contour set (72 GB measured on z15 UK stems). The refine
-(enrich → Chaikin → ring-drop → clip) now streams in 100k-feature batches to an appended
-GeoJSONSeq; measured 9.9 GB / 6–9 min at z15 (was 72 GB / 24 min). The shared `fork_window`
-rule additionally builds each stem's smoothed+coarsened window once instead of three times
-(deep_coarsen strip-streamed, byte-identical by differential test; in-process GDAL block cache
-capped — its 5%-of-RAM default was the last hidden multi-GB term). The `6e5fb55` block-windowed
-gdal_contour idea is moot.
+Deep Chaikin-smoothed contours diverge at tile seams (measured on 6-19-18-9|6-19-19-9: the 20 fm / 50 m / 30 fm levels, all deeper than `NAV_SMOOTH_MAX` = 30 m). Shallow (unsmoothed) contours match exactly; the deep lines smooth away from the raw tile-edge per window, so the two windows' Chaikin passes disagree at the seam — the intentional shallow-bias smoothing the module docstring calls "fundamental," not a clip or window bug (the shapely-clip A/B proved the clip faithful). Decision owed: `seam_check.check_contours` should either exclude levels above `NAV_SMOOTH_MAX` or carry a wider tolerance for them — it currently flags them as MISMATCH. (Same class as the `check_depare` grazing-coverage false positive fixed in the depare re-enable — see optimization-history.md — but a distinct mechanism; contours keep `ON_EDGE_PIXELS` because a line crosses the seam at a point.)
 
 ### Publish overlap and large-object upload tuning
 
@@ -363,15 +272,17 @@ gdal_contour idea is moot.
 (the run's benchmark artifact) after each planet run. Benchmarks are per-run scratch now, so the
 rows are already fresh — no cross-run stale rows to filter. Per-job kernel caps (cgroup /
 `docker run --memory` per job) land once reservations are benchmark-backed — a cap equal to the
-reservation turns a wrong estimate into one retried job instead of a box OOM. Price reservations
-from the densest measured tile, never an average — and reserve exactly the measured ceiling, no
-pad: fork footprints are window-geometry-deterministic (p50 == max within a class), and
-`attempt` escalation plus the box swapfile already cover the tail. As of 2026-07-28 every fork
-class (window/contour/soundings/depare × child_z) is measured under the streamed
-implementations. Depare z15 is now planet-measured (run 30417069133, n=25: mean 10.5 GB, max
-13.7 GB against 24 reserved) — the re-fit to ~15 rides the tail item at the top of this doc.
+reservation turns a wrong estimate into one retried job instead of a box OOM. Reserve from the
+class MEDIAN with small pads, not the tail: over-admission keeps the box busy, and `attempt`
+escalation plus the box swapfile turn the rare breach into one retried job (run 30641774632 ran
+21 stems past their reservations with zero failures and the best utilization measured). The old
+reserve-the-ceiling rule assumed p50 == max within a fork class; the marsh classes broke that.
+As of 2026-07-28 every fork class (window/contour/soundings/depare × child_z) is measured under
+the streamed implementations. Depare reserves per stem from its mosaic-tile size (`depare_gb` in
+build.smk, median-floored per child_z — see the marsh item above); re-fit its coefficients from
+each planet run's bench rows, since the current fit has only 7 cz15 anchors.
 Terrain z15 was re-fit 2026-07-29 (`TERRAIN_FACTOR` 2.0 → 1.3; n=4 at 18.3–18.7 GB, a 2%
-spread). Still owed: the coarse depare classes (z8–z12 entries predate bucket streaming).
+spread).
 
 Two hard-won invariants to keep enforcing:
 
@@ -392,14 +303,6 @@ numbers: ~17 min single-core index + a modestly parallel z8 build. If the rule's
 the z8 warp dominating, split it into its own rule so index-only changes don't re-decimate the
 planet. Effort: small.
 
-### GTI native-resolution regression check at release-candidate
-
-The fix is implemented (the `.gti` carries explicit `<ResX>/<ResY>` at the covering's finest
-resolution) but the regression validation is still owed before release: Bay Area development/build
-previews match at the same viewport; regional overlay sizes don't collapse; a high-res indexed COG
-stays distinguishable from planet-z8 through the GTI above z8; global fallback still reads the z8
-overview.
-
 ### R2 garbage collection and multipart hygiene
 
 Volume GC is largely obsolete: plain stable names overwrite in place, and the legacy-state
@@ -411,9 +314,7 @@ after a safe age (four incomplete mosaic-tile uploads from 2026-07-14 were found
 
 - Orphan-source guard: `aggregation_covering` skips sources missing `metadata.json`; landmask and
   coverage callers can still load them. Apply the same guard everywhere.
-- Release-candidate closeout: validate the accumulated correctness fixes in one planet build, then
-  manually dispatch `release.yml` with the validated SHA and verify its live smoke tests
-  (feature-branch builds do not auto-release). See ../build-validation.md.
+- Release-candidate closeout — **done for v0.3.0** (complete planet build → candidate QA → promote → smoke tests green); the process is documented in ../runbooks/build-dispatch.md and ../build-validation.md. Known quality follow-ups from the QA ride as issues #108–#110.
 - NVMe for hot reads — **landed 2026-07-28/29**: the masks are served from NVMe via per-FILE
   `nsenter` bind mounts (build.yml; per-file, not a directory shadow — the dir also holds the
   landmask rule's inputs, and the runner service's private mount namespace hides binds made
@@ -468,49 +369,50 @@ scope-independent-covering fix, which removes the known trigger itself.
 
 ## Toolchain-evaluation intake (2026-07-27)
 
-From docs/plans/2026-07-27-toolchain-evaluation.md, ranked cheapest/easiest first, cross-referenced
-against this branch: already done or in flight there — the cell-sharded bundle measurement, the
-nodata pre-simplification, the pmtiles-merge stitch (parked above with WIP), and skip-if-identical
-merge outputs (the mosaic_tile content-hash guard above).
+From docs/plans/2026-07-27-toolchain-evaluation.md, ranked cheapest/easiest first. Already
+delivered: the cell-sharded bundle, the nodata pre-simplification, the pmtiles-merge stitch, and
+soundings intermediates as line-delimited `.geojsons` (`soundings_run.py` streams one Feature per
+line). Still owed from the "done or in flight" set: skip-if-identical merge outputs (the
+mosaic_tile content-hash guard above).
 
-1. **Soundings intermediates → line-delimited `.geojsons`** so the bundle passthrough streams
-   lines instead of json.load-ing FeatureCollections (the ~80 min single-threaded read at planet).
-   Small and separable; a working start sits in the "pmtiles-merge WIP" stash.
-2. **Shallow-bias audit via `gdal raster mosaic --pixel-function max`** (GDAL 3.12+): diff
+1. **Shallow-bias audit via `gdal raster mosaic --pixel-function max`** (GDAL 3.12+): diff
    shallowest-wins vs priority-wins per pixel over a sample of stems — a free chart-safety check,
-   one command, no pipeline change.
-3. **Trial `--drop-by-attribute-as-needed`** (felt, Mar 2026) on the vector cell runs: drop by
+   one command, no pipeline change. Elevated by the shipped shoal-bias violations (marsh item
+   above).
+2. **Trial `--drop-by-attribute-as-needed`** (felt, Mar 2026) on the vector cell runs: drop by
    depth-band importance instead of geometry density, env-gated, gate-verified before adoption.
-4. **Split staleness keys — mostly landed 2026-07-27**: `utils.toolchain()` is deleted; tools
+   A candidate lever for retiring the 800 KB cell tile-byte headroom (vector bundling item).
+3. **Split staleness keys — mostly landed 2026-07-27**: `utils.toolchain()` is deleted; tools
    are not rule inputs, and deliberate Dockerfile changes bump the affected rules' `version`
    params (mapping documented in the Dockerfile stanzas). Remaining: scope MASKS to
    intersecting tiles.
-5. **Serial-tail box right-sizing**: the vector phase measured 6–9 GiB at 1–6 cores — a CX53
+4. **Serial-tail box right-sizing**: the vector phase measured 6–9 GiB at 1–6 cores — a CX53
    (€0.047/hr) instead of the ccx63 (€1.37/hr post-reprice) if the tail survives sharding.
    Update 2026-07-29: the sharded tail is measured and it is not the vector phase — cells run
-   2–3 min overlapped mid-build; the real tail is the z15 depare residue (top item), which is
-   memory-bound, not box-class-bound. Likely moot once the priority bands land; re-check then.
-6. **`ST_CoverageSimplify` prototype on the Stockholm fixture** — elevated by the 2026-07-27
-   profiling: wagyu hole placement measured 60–99% of bundle CPU on ring-dense tiles, so a
-   coverage-safe pre-generalization per zoom tier attacks the dominant remaining cost. Batch step
-   feeding the existing FGB → tippecanoe path; no serving change.
-7. Bigger or gated, in order: LERC_ZSTD mosaic re-encode (~halves the store; needs the shallow
+   2–3 min overlapped mid-build; the real tail is the z15 depare residue, which is memory-bound,
+   not box-class-bound and now addressed by the priority bands + fitted reservations (see
+   optimization-history.md). Re-check the tail shape on the next planet run.
+5. **Coverage-safe pre-generalization for the bundle** — the depare pipeline now
+   coverage-simplifies bands to the S-58 floor in shapely before tippecanoe (the marsh item
+   above), which delivers most of what the `ST_CoverageSimplify` prototype was after. Re-profile
+   wagyu's share of bundle CPU on ring-dense tiles (was 60–99%) before investing further.
+6. Bigger or gated, in order: LERC_ZSTD mosaic re-encode (~halves the store; needs the shallow
    pre-bias to keep charted ≤ true), pre-baked overzoom leaves (traffic-gated Worker CPU-ms cut),
    Planetiler spike on one dense cell's depare (insurance against the felt fork's bus factor),
    maplibre-contour (chart-grade smoothing/bias questions unresolved).
 
-8. **fork_window outputs → NVMe scratch** (recommended for the next dispatch; mechanism settled
+7. **fork_window outputs → NVMe scratch** (recommended for the next dispatch; mechanism settled
    2026-07-29): do it as a directory bind like the landmask masks — build.yml bind-mounts a
    box-local dir over `store/window/` before the build — NOT as a path change. The bind keeps
    the canonical path, so the DAG is untouched and it can land at any time without a rebuild;
    the dir dies with the box, and a resumed run re-derives windows for stems whose forks hadn't
    finished (pure derivations, ≤~38 min each). Originally parked as a small saving, but run
    30417069133 re-priced it: the window transient peaked at **295 GB / 99 files** on the volume
-   (1.8 of 2.0 TB, 250 GB free) because the scheduler's small-job bias lets windows outrun
+   (1.8 of 2.0 TB, 250 GB free) because the scheduler's small-job bias let windows outrun
    their fork consumers — the bind moves that whole transient (and its Ceph round-trips) to
-   box NVMe. Land it together with the tail item's priority bands, now that the novel bundle
-   phases have a validated planet run behind them.
-9. **Single-pass dual-ladder gdal_contour** (noted 2026-07-28): contour runs two full-window
+   box NVMe. The priority bands shrink the consumer lag but don't bound the transient; land
+   the bind (or volume-side disk accounting on `fork_window`) on the next dispatch.
+8. **Single-pass dual-ladder gdal_contour** (noted 2026-07-28): contour runs two full-window
    `gdal_contour` passes (metre + feet ladders); one combined-level pass with features
    duplicated onto both `sys` tags at shared levels saves ~2–4 min per z15 stem of raster
    scanning. Fiddly level-membership mapping; only worth it if the window band stays the

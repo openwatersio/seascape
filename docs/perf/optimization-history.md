@@ -32,6 +32,44 @@ the backlog; its memory findings are recorded (and corrected) below.
   serial tail, observed twice (the second: the resume run serialized its stranded z14 heavies for
   hours).
 
+## Resolved 2026-07/08: the z15 scheduling tail (run 30417069133)
+
+Run 30417069133 measured the mechanism end-to-end. `--prioritize mosaic_index` set its whole
+dependency closure — every merge — to uniform maximum priority (job logs printed
+`priority: highest`), erasing the heavy-first `tile_priority` interleave within the merge class.
+Under uniform priority the scheduler's knapsack maximizes the **sum** of priorities that fit the
+memory budget, so many small jobs always outscore few big ones: hundreds of 2–3 GB coarse merges
+ran ahead of the 9 GB z15 merges (last z15 merge landed ~2.5 h in), the z15 fork chain trailed
+behind its neighborhoods, and the same bias inside the vector band ran windows/contours ahead of
+depare. End state: a ~2.5 h tail of z15 depare draining 6-wide (`DEPARE_GB[15]` = 24 → only
+6 × 24 fit in 161 GB) at load 10–25 on 48 cores. The same bias let fork windows outrun their
+consumers 99-deep — a 295 GB `store/window` transient, volume peak 1.8 of 2.0 TB.
+
+Fixed by two mechanisms, both in build.smk:
+
+- **Explicit rule bands** replaced `--prioritize mosaic_index`: `INDEX_BAND` (3M) >
+  `MOSAIC_BAND` (2M, heavy-first `tile_priority` interleave intact within it) >
+  `VECTOR_BAND` (1M) > terrain. z15 merges start at t=0 and their fork chains overlap the
+  coarse-merge flood instead of trailing it.
+- **Fitted per-stem depare reservations** (`depare_gb`): fit from the stem's own mosaic-tile
+  size (run 30634360224, 2,170 rows), floored per child_z at the class median. The interim
+  "re-fit `DEPARE_GB[15]` 24 → ~15" idea (from n=25 planet peaks, mean 10.5 / max 13.7 GB) was
+  first reversed by the post-contour-fix marsh peaks (~29 GB on `8-63-105-15`; the pre-fix
+  corpus had never sampled the expensive stems, which died in `gdal_contour -p` before the
+  GEOS phase), then superseded by the fit. Run 30641774632 ran 21 stems past their
+  reservations with zero failures and the best utilization measured.
+
+The `store/window` transient is not fully bounded by the bands; the fork_window NVMe bind that
+absorbs it is still in the backlog's intake list (item 7).
+
+## Resolved 2026-08-02: shipped with the native-resolution release (v0.3.0)
+
+- **Depth areas re-enabled end-to-end** (execution record: docs/plans/2026-07-21-depare-perf.md). The bounded nodata pass (STRtree true-intersects prefilter + subdivision of parts over 512 vertices + one `grid_size=1e-6` snap-rounded difference), halo-scaled window buffers, the contour `ogr2ogr -clipsrc` → shapely-clip port, the drying pre-clip area gate, and the `ON_SEAM_PIXELS = 1e-3` fix to `check_depare`'s grazing-coverage false positive all shipped; all depare bands, drying, and nodata pass the seam gate (≤2.7e-7°). The one deferred piece (deep-contour seam tolerance in `check_contours`) stays in the backlog.
+- **Windowed contours, resolved at the real peak (2026-07-28).** The 72 GB z15 peak was never the gdal_contour subprocess (scanline-streamed) but the post-extraction GeoDataFrame phase holding three full copies of the window's contour set. The refine (enrich → Chaikin → ring-drop → clip) streams 100k-feature batches to an appended GeoJSONSeq (9.9 GB / 6–9 min at z15, was 72 GB / 24 min), and the shared `fork_window` rule builds each stem's smoothed+coarsened window once instead of three times (deep_coarsen strip-streamed, byte-identical by differential test; in-process GDAL block cache capped — the 5%-of-RAM default was the last hidden multi-GB term). The `6e5fb55` block-windowed gdal_contour idea is moot.
+- **GTI native-resolution regression check.** The `.gti` carries explicit `<ResX>/<ResY>` at the covering's finest resolution; validated in the v0.3.0 candidate QA (same-viewport dev/build comparisons plus decoded tiles from z5 to z15) and shipped.
+- **Marsh-coast coarsening.** Drying coverage-union + band coverage-simplify to the S-58 floor (4.7×) and fork-window pond fill (11.6×); block-max refuted — part count, not vertex count, drives the GEOS cost. The z15 marsh class completes in production under the fitted reservations.
+- **Vector chain validated end-to-end.** The first complete planet build census-verified every cell archive against its fork sidecars (94.1 M feature ids, fringe drops accounted) and proved the `pmtiles merge` concat by tile-count identity — ~10 s at planet scale vs tile-join's 4 m 46 s on the same inputs.
+
 ## Complete run 29518661202 performance baseline
 
 Run 29518661202 completed in 11h18m54s on a 48-core, 184 GiB ccx63. The workflow resource sampler
