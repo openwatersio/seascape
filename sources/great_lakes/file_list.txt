@@ -2,6 +2,11 @@
 # Full open-lake grids (US + Canadian sides), direct HTTP .tar.gz, no login. This covers all
 # SIX Great Lakes water bodies: NGDC's Erie grid is "Lake Erie AND Lake Saint Clair", so
 # St. Clair is included in erie_lld (confirmed ~4.6 m at the lake centre) — no separate grid.
+# The grids carry land topography across their full rectangles, each relative to its OWN
+# lake's LWD, and the rectangles overlap other lakes' shores — land below a neighbour's LWD
+# reads negative (huron_lld charts Hamilton, ON at −77 m). clamp_positive can't catch that,
+# hence land_clamp: the warp-time mask zeroes negative-under-land; the lakes themselves stay
+# open through the inland-water subtraction.
 https://www.ngdc.noaa.gov/mgg/greatlakes/superior/data/geotiff/superior_lld.geotiff.tar.gz
 https://www.ngdc.noaa.gov/mgg/greatlakes/michigan/data/geotiff/michigan_lld.geotiff.tar.gz
 https://www.ngdc.noaa.gov/mgg/greatlakes/huron/data/geotiff/huron_lld.geotiff.tar.gz

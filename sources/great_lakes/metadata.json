@@ -6,6 +6,7 @@
     "max_zoom": 10,
     "datum": "Low Water Datum (LWD) per lake — a low-water / chart-datum analog",
     "clamp_positive": true,
+    "land_clamp": true,
     "crs": "EPSG:4269",
     "unpack": "tar.gz:*_lld.tif!1"
 }
