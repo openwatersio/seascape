@@ -428,7 +428,7 @@ export function layers(
       },
     },
     {
-      id: "hillshade",
+      id: "depth-hillshade",
       type: "hillshade",
       source: dem,
       layout: { visibility: "none" },

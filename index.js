@@ -61,7 +61,7 @@ map.addControl({
 // ─── Layer toggles ────────────────────────────────────────────────────────
 const toggles = {
   "toggle-depth": ["depth-shading", "depth-areas"],
-  "toggle-hillshade": ["hillshade"],
+  "toggle-hillshade": ["depth-hillshade"],
   "toggle-contours": ["contour-lines", "contour-labels"],
   "toggle-soundings": ["soundings"],
   "toggle-osm": ["osm-base"],
