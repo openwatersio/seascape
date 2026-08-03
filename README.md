@@ -4,7 +4,7 @@ Bathymetry as web map tiles for MapLibre / Mapbox GL, built from a mosaic of glo
 
 Coverage is global through z8 (~15″) with regional detail to z14 (~0.25″) where high-res sources exist.
 
-[![Seascape screenshot](https://github.com/user-attachments/assets/b503d5a1-9894-47f3-8fa2-ce3b6f86ad28)](https://openwatersio.github.io/seascape/#8.41/65.382/-23.2)
+[![Seascape screenshot](https://github.com/user-attachments/assets/396e33f2-909c-4643-8486-df4e071f2201)](https://openwatersio.github.io/seascape/#8.41/65.382/-23.2)
 
 > [!WARNING]
 > **Not for navigational use.** Do not use this bathymetry for navigation, or in any
