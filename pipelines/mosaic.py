@@ -131,26 +131,20 @@ def _translate(filepath, tmp_folder):
         raise ValueError(f"mosaic {stem}: de-buffered size {w}x{h} is not a positive multiple of 512")
 
     tmp_cog = f"{tmp_folder}/mosaic.tif"
-    base = f"{tmp_folder}/mosaic-base.tif"
     # -b 1: drop any alpha band; -a_nodata -9999 + -ot Float32: one uniform sentinel + dtype across
     # every tile (GEBCO-only tiles are Int16 upstream). -srcwin adjusts the geotransform, so the
     # output origin is the tile's exact bounds. The transient smooth/encode never see this file.
-    utils.run_command(
-        f"GDAL_CACHEMAX=512 gdal_translate -q -of GTiff -b 1 -ot Float32 -a_nodata {NODATA} "
-        f"-srcwin {buffer_pixels} {buffer_pixels} {w} {h} "
-        # IF_SAFER: IF_NEEDED never fires on compressed output, and >4 GB kills the write
-        "-co BIGTIFF=IF_SAFER -co COMPRESS=ZSTD -co PREDICTOR=3 -co TILED=YES "
-        "-co BLOCKXSIZE=512 -co BLOCKYSIZE=512 -co NUM_THREADS=ALL_CPUS "
-        f"{merged} {base}")
     # The overviews stop at the 512 block (= z8) and ARE the charted depth at every zoom below the
-    # tile's native one, so they decimate by MAX, never `average` (utils.shoal_overviews).
-    utils.shoal_overviews(base)
-    utils.run_command(
-        f"GDAL_CACHEMAX=512 gdal_translate -q -of COG -a_nodata {NODATA} "
-        "-co BIGTIFF=IF_SAFER -co COMPRESS=ZSTD -co PREDICTOR=3 -co BLOCKSIZE=512 "
-        "-co OVERVIEWS=FORCE_USE_EXISTING -co NUM_THREADS=ALL_CPUS "
-        f"{base} {tmp_cog}")
-    os.remove(base)
+    # tile's native one, so they decimate by MAX, never `average` (utils.shoal_cog_source).
+    args = (f"-b 1 -ot Float32 -a_nodata {NODATA} "
+            f"-srcwin {buffer_pixels} {buffer_pixels} {w} {h}")
+    with utils.shoal_cog_source(merged, args) as src:
+        utils.run_command(
+            f"GDAL_CACHEMAX=512 gdal_translate -q -of COG -a_nodata {NODATA} "
+            # IF_SAFER: IF_NEEDED never fires on compressed output, and >4 GB kills the write
+            "-co BIGTIFF=IF_SAFER -co COMPRESS=ZSTD -co PREDICTOR=3 -co BLOCKSIZE=512 "
+            "-co OVERVIEWS=FORCE_USE_EXISTING -co NUM_THREADS=ALL_CPUS "
+            f"{src} {tmp_cog}")
     return tmp_cog
 
 
@@ -258,17 +252,19 @@ def _warp_planet(index_path, out_tmp):
     for stale in (out_tmp, base):
         if os.path.exists(stale):
             os.remove(stale)
+    # The warp lands in a plain GTiff first: it is the one artifact here that cannot be a VRT
+    # (re-running a planet-wide decimation per pyramid level would cost far more than the file).
     utils.run_command(
         f"GDAL_CACHEMAX=512 gdalwarp -q -overwrite -r max -tr {res8} {res8} "
         f"-dstnodata {NODATA} -of GTiff -co BIGTIFF=YES -co COMPRESS=ZSTD -co PREDICTOR=3 "
         "-co TILED=YES -co BLOCKXSIZE=512 -co BLOCKYSIZE=512 -co NUM_THREADS=ALL_CPUS "
         f"GTI:{index_path} {base}")
-    utils.shoal_overviews(base)
-    utils.run_command(
-        f"GDAL_CACHEMAX=512 gdal_translate -q -of COG -a_nodata {NODATA} "
-        "-co BIGTIFF=YES -co COMPRESS=ZSTD -co PREDICTOR=3 -co BLOCKSIZE=512 "
-        "-co OVERVIEWS=FORCE_USE_EXISTING -co NUM_THREADS=ALL_CPUS "
-        f"{base} {out_tmp}")
+    with utils.shoal_cog_source(base) as src:
+        utils.run_command(
+            f"GDAL_CACHEMAX=512 gdal_translate -q -of COG -a_nodata {NODATA} "
+            "-co BIGTIFF=YES -co COMPRESS=ZSTD -co PREDICTOR=3 -co BLOCKSIZE=512 "
+            "-co OVERVIEWS=FORCE_USE_EXISTING -co NUM_THREADS=ALL_CPUS "
+            f"{src} {out_tmp}")
     os.remove(base)
 
 

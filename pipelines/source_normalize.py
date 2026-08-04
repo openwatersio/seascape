@@ -40,31 +40,17 @@ def predictor_for(filepath):
 
 
 def normalize_file(filepath, crs, nodata):
-    base = filepath + ".base.tif"
     tmp = filepath + ".norm.tif"
-    predictor = predictor_for(filepath)
-    cmd = ["gdal_translate", "-q", "-of", "GTiff", "-co", "TILED=YES", "-co", "BLOCKXSIZE=512",
-           "-co", "BLOCKYSIZE=512", "-co", "COMPRESS=ZSTD", "-co", "NUM_THREADS=ALL_CPUS",
-           "-co", "BIGTIFF=IF_NEEDED", "-co", f"PREDICTOR={predictor}"]
+    args = []
     if crs:
-        cmd += ["-a_srs", crs]
+        args += ["-a_srs", crs]
     if nodata is not None:
-        cmd += ["-a_nodata", str(nodata)]
-    cmd += [filepath, base]
-    subprocess.run(cmd, check=True)
-    # A MAX pyramid over an undeclared sentinel would chart it as land, so a file with no nodata
-    # keeps the full-res-only shape the aggregation warp already handles.
-    levels = utils.shoal_overviews(base) if _has_nodata(base) else 0
-    overviews = "FORCE_USE_EXISTING" if levels else "NONE"
-    subprocess.run(["gdal_translate", "-of", "COG", *COG_OPTS, "-co", f"PREDICTOR={predictor}",
-                    "-co", f"OVERVIEWS={overviews}", base, tmp], check=True)
-    os.remove(base)
+        args += ["-a_nodata", str(nodata)]
+    with utils.shoal_cog_source(filepath, " ".join(args)) as src:
+        subprocess.run(["gdal_translate", "-of", "COG", *COG_OPTS,
+                        "-co", f"PREDICTOR={predictor_for(filepath)}",
+                        "-co", "OVERVIEWS=FORCE_USE_EXISTING", src, tmp], check=True)
     os.replace(tmp, filepath)
-
-
-def _has_nodata(filepath):
-    with rasterio.open(filepath) as src:
-        return src.nodata is not None
 
 
 def main():
@@ -132,6 +118,24 @@ def _check():
                 prev = lvl
             # the AVERAGE pyramid is what the assertions are worth: it drowns the shoal
             assert ref.read(1, out_shape=(N // 4, N // 4))[25, 25] < -40.0
+
+        # Odd dimensions: levels must be ceil-sized like GDAL's own, and the padded edge block
+        # must max over only the real pixel it covers rather than reading the pad as data.
+        odd = f"{d}/odd.tif"
+        oarr = np.full((1023, 1025), -50.0, dtype="float32")
+        oarr[:, -1] = -3.0  # the odd trailing column, which every edge block must carry up
+        with rasterio.open(odd, "w", driver="GTiff", height=1023, width=1025, count=1,
+                           dtype="float32", nodata=ND, crs="EPSG:4326",
+                           transform=from_origin(0, 1, 1e-4, 1e-4)) as f:
+            f.write(oarr, 1)
+        normalize_file(odd, "EPSG:4326", ND)
+        with rasterio.open(odd) as got:
+            assert got.overviews(1) == [2, 4], got.overviews(1)
+            for factor, size in ((2, (512, 513)), (4, (256, 257))):
+                lvl = got.read(1, out_shape=size)
+                assert lvl.shape == size, (factor, lvl.shape)
+                assert (lvl[:, -1] == -3.0).all(), (factor, "odd edge column lost its shoal")
+                assert (lvl[:, :-1] == -50.0).all(), (factor, "pad leaked into the interior")
 
         bare = f"{d}/b.tif"
         with rasterio.open(bare, "w", driver="GTiff", height=N, width=N, count=1, dtype="float32",

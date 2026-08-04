@@ -370,45 +370,98 @@ def get_grouped_source_items(filepath):
 # finest data under it — `average` crosses a shoal edge and charts water that isn't there.
 #
 # Neither gdaladdo nor the COG driver's OVERVIEW_RESAMPLING offers a max kernel (GDAL 3.13:
-# nearest|average|rms|gauss|bilinear|cubic|cubicspline|lanczos|average_magphase|mode), but
-# `gdalwarp -r max` does, and `gdal raster overview add --overview-src` attaches finished rasters
-# as overviews verbatim. So each level is a 2:1 `gdalwarp -r max` of the level above — max is
-# associative, so the cascade equals a block max over the full-res grid at a third of the I/O —
-# and the COG driver adopts them with OVERVIEWS=FORCE_USE_EXISTING.
+# nearest|average|rms|gauss|bilinear|cubic|cubicspline|lanczos|average_magphase|mode), so the levels
+# are decimated here and handed to the COG driver through a VRT that names them as its own
+# <Overview> elements. The attach copies nothing and the VRT costs no I/O, so the COG write stays a
+# single full-res pass and the whole cost of the policy is the one extra full-res read the levels
+# need — measured +20% on a 32768 px mosaic tile, against +354% for materializing an intermediate.
 
 COG_MIN_OVERVIEW_PX = 512  # the COG driver's own stopping rule: one 512 block
+_SHOAL_STRIPE_BYTES = 1 << 28  # read budget per stripe; a stripe is 2 source rows per output row
 
 
-def shoal_overviews(path, min_size=COG_MIN_OVERVIEW_PX):
-    """Attach a shoal-biased (per-cell MAX of elevation) internal overview pyramid to `path`,
-    stopping at `min_size` like the COG driver does. `gdalwarp -r max` skips nodata, so a block
-    with any valid child takes the max of its valid children and only an all-nodata block stays
-    nodata — nodata can never swallow a shoal. Follow with a
-    `gdal_translate -of COG -co OVERVIEWS=FORCE_USE_EXISTING` to get the COG layout back."""
-    with rasterio.open(path) as src:
-        width, height, bounds, res = src.width, src.height, src.bounds, abs(src.transform.a)
-    tmp = tempfile.mkdtemp(prefix="seascape-shoal-", dir=os.path.dirname(os.path.abspath(path)))
+def _block_max(src_path, dst_path, nodata):
+    """Decimate `src_path` 2:1 by nodata-aware per-cell MAX into a fresh GTiff at `dst_path`.
+    A block with any valid child takes the max of its valid children; only an all-nodata block
+    stays nodata, so nodata can never swallow a shoal. Streamed in stripes of whole 2-row pairs —
+    a full mosaic level is gigapixels, and blocks never straddle a stripe, so per-stripe output is
+    identical to whole-array."""
+    # Multi-threaded block (de)compression: the full-res read is this pass's dominant cost, and
+    # single-threaded ZSTD makes it 4x slower (measured 8.2s vs 1.3s on a 32768 px mosaic tile).
+    # 4, not ALL_CPUS: many jobs run this concurrently on a deliberately-oversubscribed box
+    # (see the mosaic window materializer), and N x 48 decode threads thrash instead of helping.
+    with rasterio.Env(GDAL_NUM_THREADS="4"), rasterio.open(src_path) as src:
+        w, h = src.width, src.height
+        ow, oh = -(-w // 2), -(-h // 2)  # ceil, matching GDAL's overview sizing
+        dtype = src.dtypes[0]
+        profile = src.profile
+        # The level's geotransform: same top-left corner, twice the pixel size. Anchoring on the
+        # corner (not the centre) is what keeps every level co-registered with the full-res grid.
+        t = src.transform
+        profile.update(driver="GTiff", width=ow, height=oh, count=1, tiled=True,
+                       blockxsize=512, blockysize=512, compress="zstd", zstd_level=1,
+                       bigtiff="IF_SAFER", nodata=nodata,
+                       transform=rasterio.Affine(t.a * 2, t.b, t.c, t.d, t.e * 2, t.f))
+        profile.pop("predictor", None)  # float-only, and these levels are read once then deleted
+        floor = np.array(-np.inf if "float" in dtype else np.iinfo(dtype).min, dtype=dtype)
+        rows = max(1, _SHOAL_STRIPE_BYTES // (w * np.dtype(dtype).itemsize * 2))
+
+        with rasterio.open(dst_path, "w", **profile) as dst:
+            for oy in range(0, oh, rows):
+                n = min(rows, oh - oy)
+                a = src.read(1, window=rasterio.windows.Window(0, oy * 2, w, min(n * 2, h - oy * 2)))
+                # Pad an odd trailing row/column with nodata: the edge block then maxes over the
+                # one real pixel it covers, exactly as GDAL's ceil-sized overview does.
+                a = np.pad(a, ((0, n * 2 - a.shape[0]), (0, ow * 2 - a.shape[1])),
+                           constant_values=nodata)
+                # Four strided quarters, not a reshape-and-reduce: reducing over two non-adjacent
+                # axes of a 2x2-blocked view is 4.7x slower and allocates the whole stripe again.
+                quarters = [a[i::2, j::2] for i in (0, 1) for j in (0, 1)]
+                # `x != x` drops NaN, which would poison the max — and is the nodata test itself
+                # when a source declares nodata AS NaN.
+                bad = [(x == nodata) | (x != x) for x in quarters]
+                masked = [np.where(b, floor, x) for b, x in zip(bad, quarters)]
+                m = np.maximum(np.maximum(masked[0], masked[1]),
+                               np.maximum(masked[2], masked[3]))
+                dst.write(np.where(bad[0] & bad[1] & bad[2] & bad[3], nodata, m).astype(dtype), 1,
+                          window=rasterio.windows.Window(0, oy, ow, n))
+    return ow, oh
+
+
+@contextmanager
+def shoal_cog_source(src, translate_args="", min_size=COG_MIN_OVERVIEW_PX):
+    """Yield a VRT over `src` (with any `gdal_translate` args applied) carrying a shoal-biased
+    per-cell MAX pyramid as its <Overview> elements, down to `min_size` like the COG driver stops.
+    Feed it to `gdal_translate -of COG -co OVERVIEWS=FORCE_USE_EXISTING`, which adopts those levels
+    verbatim in a single full-res pass — do NOT materialize an intermediate GTiff to attach them to.
+
+    Levels cascade off each other: MAX is associative, so level k is the same array whether taken
+    from level k-1 or from the full-res grid, at a quarter of the reads. Only a single-band raster
+    with a declared nodata gets a pyramid — a MAX over an undeclared sentinel would chart it as
+    land — and anything else yields a plain VRT, which FORCE_USE_EXISTING turns into no overviews.
+    """
+    tmp = tempfile.mkdtemp(prefix="seascape-shoal-", dir=os.path.dirname(os.path.abspath(src)))
     try:
-        levels, prev, w, h, r = [], path, width, height, res
-        while max(w, h) > min_size:
-            w, h, r = -(-w // 2), -(-h // 2), r * 2  # ceil, matching GDAL's overview sizing
+        vrt = f"{tmp}/base.vrt"
+        run_command(f"gdal_translate -q -of VRT {translate_args} {src} {vrt}")
+        with rasterio.open(vrt) as ds:
+            eligible = ds.count == 1 and ds.nodata is not None
+            w, h, nodata = ds.width, ds.height, ds.nodata
+        levels, prev = [], vrt
+        while eligible and max(w, h) > min_size:
             level = f"{tmp}/ov{len(levels) + 1}.tif"
-            # -te anchored at the base's top-left corner keeps every level co-registered with the
-            # full-res grid; -ts pins the ceil size so an odd dimension can't drift a half pixel.
-            # ZSTD_LEVEL=1: these levels are read once and deleted, so bound the scratch cheaply
-            # rather than compress well (no PREDICTOR — the helper also runs on Int16 sources).
-            run_command(f"gdalwarp -q -overwrite -r max -ts {w} {h} "
-                        f"-te {bounds.left} {bounds.top - h * r} {bounds.left + w * r} {bounds.top} "
-                        "-multi -wo NUM_THREADS=ALL_CPUS -wm 512 -co TILED=YES -co COMPRESS=ZSTD "
-                        f"-co ZSTD_LEVEL=1 -co NUM_THREADS=ALL_CPUS -co BIGTIFF=IF_SAFER "
-                        f"{prev} {level}")
+            w, h = _block_max(prev, level, nodata)
             levels.append(level)
             prev = level
-        if not levels:
-            return 0
-        srcs = " ".join(f"--overview-src {l}" for l in levels)
-        run_command(f"gdal raster overview add -q -i {path} {srcs}")
-        return len(levels)
+        if levels:
+            refs = "".join(
+                f'<Overview><SourceFilename relativeToVRT="1">{os.path.basename(l)}'
+                f"</SourceFilename><SourceBand>1</SourceBand></Overview>" for l in levels)
+            with open(vrt) as f:
+                xml = f.read()
+            with open(vrt, "w") as f:
+                f.write(xml.replace("</VRTRasterBand>", f"{refs}</VRTRasterBand>", 1))
+        yield vrt
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

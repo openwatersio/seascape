@@ -323,9 +323,9 @@ def _check():
                            transform=from_origin(b.left, b.top, res, res)) as dst:
             dst.write(arr, 1)
         cog = f"store/mosaic/tiles/{stem}.tif"
-        utils.shoal_overviews(raw)
-        utils.run_command(f"gdal_translate -q -of COG -a_nodata {NODATA} "
-                          f"-co OVERVIEWS=FORCE_USE_EXISTING -co BLOCKSIZE=512 {raw} {cog}")
+        with utils.shoal_cog_source(raw) as src:
+            utils.run_command(f"gdal_translate -q -of COG -a_nodata {NODATA} "
+                              f"-co OVERVIEWS=FORCE_USE_EXISTING -co BLOCKSIZE=512 {src} {cog}")
         os.remove(raw)
         os.makedirs("store/aggregation")
         with open("store/aggregation/covering.txt", "w") as f:
