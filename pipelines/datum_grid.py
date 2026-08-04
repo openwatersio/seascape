@@ -123,6 +123,9 @@ def harvest(dest):
         urllib.request.urlretrieve(BUNDLE_URL, tmp)
         os.replace(tmp, zip_path)
     root = os.path.join(dest, "vdatum")
+    # A fresh tree per extraction: extracting a new bundle edition over an old tree would
+    # silently mix regions from both editions into the composed surface.
+    shutil.rmtree(root, ignore_errors=True)
     with zipfile.ZipFile(zip_path) as z:
         members = [m for m in z.namelist() if wanted_member(m)]
         print(f"extracting {len(members)} of {len(z.namelist())} bundle members")
@@ -383,7 +386,9 @@ def fill_holes(path, res=RES, fill_km=FILL_KM):
 
 
 def build(bundle, out=OUT):
-    work = f"{STORE}/work"
+    # Keyed to the output so concurrent surface builds (Phase 2 adds more grids) can't
+    # share — and race on — one scratch tree.
+    work = out + ".work"
     shutil.rmtree(work, ignore_errors=True)
     os.makedirs(work, exist_ok=True)
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)

@@ -137,10 +137,13 @@ def write_sidecar(source, negate, offset, clamp_positive, surface=None):
     downstream when it lived only in this CLI arg). Written whenever the step runs, so a source
     whose recipe calls source_datum always leaves a sidecar."""
     os.makedirs(f"store/source/{source}", exist_ok=True)
+    # Canonical surface name, never a path: the value flows into the catalog as
+    # seascape:datum_surface, where "navd88_mllw" must compare equal however it was invoked.
+    name = os.path.splitext(os.path.basename(surface))[0] if surface else None
     with open(f"store/source/{source}/datum.json", "w") as f:
         json.dump({"negate": bool(negate), "offset_m": float(offset),
                    "clamp_positive": bool(clamp_positive),
-                   "offset_surface": surface or None}, f, indent=2)
+                   "offset_surface": name}, f, indent=2)
 
 
 def main():
