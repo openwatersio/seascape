@@ -14,12 +14,12 @@ Consequence: coarse zooms are not a strict decimation of fine zooms, so features
 between levels — invisible in shading, intended for contours.
 
 Two pyramids: the mosaic COGs' internal overviews are the *access* pyramid (unsmoothed truth,
-shoal-biased per-cell MAX so no zoom charts water deeper than the survey under it) — a decimated GTI
-read picks each tile's overview automatically, so the
-rule here is ALWAYS read at target resolution, never full-res-then-decimate. This module builds the
-*served* pyramid: smoothed, encoded, display-conditioned. z0-~z4 read the mosaic's own GTI-
+class-aware shoal reduction so no zoom charts water deeper than the survey under it, and no coarse
+pixel closes a channel its finest data holds open) — every read here is pinned to a level of it, so
+the rule is ALWAYS read at target resolution, never full-res-then-decimate. This module builds the
+*served* pyramid: smoothed, encoded, display-conditioned. z0-z7 read the mosaic's own GTI-
 registered planet z8 COG (the <Overview> in mosaic.gti), not thousands of tile-COG top overviews —
-that fallthrough is automatic in the GTI decimated read too.
+that fallthrough is automatic in the GTI decimated read.
 
 Reads the mosaic by ABSOLUTE path through the SYSTEM gdal (the toolchain the pipeline shells to),
 not rasterio's bundled GDAL — the GTI's RELATIVE IndexDataset/Overview refs resolve
@@ -54,9 +54,11 @@ import utils
 
 NODATA = -9999
 
-# Decimating the mosaic must stay bias-shallow, the same rule its overviews are built by
-# (utils.shoal_overviews). Carried into _config so changing it reruns every terrain stem.
-READ_RESAMPLE = "max"
+# Every window read lands 1:1 on a level of the mosaic's class-aware shoal pyramid (see
+# _read_window), so this kernel only ever replicates a coarser neighbour tile — it must not reduce.
+# A reducing kernel here would decimate a second time, class-blind, over whatever the pyramid
+# already decided. Carried into _config so changing it reruns every terrain stem.
+READ_RESAMPLE = "nearest"
 
 
 # ── the mosaic GTI, read through the system gdal by absolute path ──────────────────────────────
@@ -90,11 +92,20 @@ def window_tiles(stem):
 
 def _read_window(anchor, cz, halo, out_tif, src=None):
     """Warp a buffered window of the mosaic — the anchor tile's 3857 bounds expanded by `halo`
-    px on every side — to `out_tif` at zoom `cz` resolution, through the SYSTEM gdal. A decimated
-    read picks each mosaic tile's own shoal-biased overview, and z<=8 falls through to the planet
-    z8 COG the .gti registers — never a full-res-then-decimate. `-r max` for the same reason those
-    overviews are MAX: any residual decimation must stay bias-shallow (on the aligned power-of-two
-    reads this render makes, the overview lands 1:1 and the kernel is an identity). Exact grid
+    px on every side — to `out_tif` at zoom `cz` resolution, through the SYSTEM gdal.
+
+    Every source pixel this reads comes off a pyramid level built by the class-aware shoal
+    reduction, at exactly res(cz), so the warp is a grid-aligned copy and never decimates:
+
+      cz >= 8   the window VRT is built AT res(cz) (see _render), and a VRT source at a coarser
+                target resolution is served from its own overview — one exists at factor
+                2**(tile child_z - cz) for every cz >= 8, because a tile COG is 512*2**(child_z-8)
+                px and its pyramid stops at the 512 block (= res(z8)).
+      cz < 8    the read goes through the .gti, whose <Overview> is the planet z8 COG; GDAL
+                cascades into that COG's own pyramid, which carries a level for every zoom down to
+                z0 (mosaic._build_planet).
+
+    A window tile COARSER than res(cz) is replicated, which is what READ_RESAMPLE is for. Exact grid
     registration: -te/-tr snap the window to the global 3857 grid so the interior origin is EXACTLY
     the anchor's mercantile bounds (a slip ceils the virtual extent to a 1-px overhang). -dstnodata
     fills the beyond-extent halo with the one sentinel."""
@@ -182,8 +193,13 @@ def _render(stem, out_pmtiles):
     if cz >= 8 and not os.environ.get("MOSAIC_GTI"):
         src = f"{tmp}/window.vrt"
         tiles = " ".join(mosaic.tile_artifact(s) for s in window_tiles(stem))
-        aggregation_reproject._run(f"gdalbuildvrt -q -overwrite -resolution highest {src} {tiles}",
-                                   f"terrain vrt {stem}")
+        # AT the target resolution, not the finest tile's: a VRT pinned to a resolution serves each
+        # source from its own overview at that resolution, so a tile finer than this zoom enters
+        # through its class-aware pyramid level instead of being decimated here.
+        res = aggregation_reproject.get_resolution(cz)
+        aggregation_reproject._run(
+            f"gdalbuildvrt -q -overwrite -resolution user -tr {res} {res} {src} {tiles}",
+            f"terrain vrt {stem}")
     # The RAM peak the terrain_render rule reserves (build.smk mem_gb=weight) is here — the gdalwarp
     # window read + the smooth hold the multi-GB window array (a native macrotile window is 32768²
     # float32). The engine schedules one process per stem, so the cgroup cap bounds each in isolation.
@@ -307,15 +323,22 @@ def _check():
     d = tempfile.mkdtemp()
     try:
         os.chdir(d)
-        # A z8 mosaic tile at child_z=10 (span 4 -> 2048 px native), constant -30 m with a nodata
-        # hole in one corner, built as a real COG with shoal-biased overviews (mosaic.tile's shape).
+        # A z8 mosaic tile at child_z=10 (span 4 -> 2048 px native), -30 m with a nodata hole in one
+        # corner, a land block, and a one-pixel channel through it, built as a real COG with the
+        # class-aware shoal pyramid (mosaic.tile's shape).
         z, x, y, cz = 8, 75, 96, 10
         stem = f"{z}-{x}-{y}-{cz}"
         res = aggregation_reproject.get_resolution(cz)
         core = 4 * 512
-        b = mercantile.xy_bounds(mercantile.Tile(x=x, y=y, z=z))
+        anchor = mercantile.Tile(x=x, y=y, z=z)
+        b = mercantile.xy_bounds(anchor)
+        channel = 1836
         arr = np.full((core, core), -30.0, dtype="float32")
         arr[-200:, -200:] = NODATA
+        # A land block two 512-tiles clear of the interior tile the depth assertions read, so its
+        # smoothing halo cannot reach them.
+        arr[:512, 1536:] = 30.0
+        arr[:512, channel] = -10.0
         os.makedirs("store/mosaic/tiles")
         raw = "store/mosaic/tiles/raw.tif"
         with rasterio.open(raw, "w", driver="GTiff", height=core, width=core, count=1,
@@ -370,6 +393,37 @@ def _check():
                               .astype("float32"))
         assert (np.abs(inner - (-30.0)) < 1e-3).all(), \
             f"interior served depth must track the mosaic (-30 m), got {np.unique(inner)[:5]}"
+
+        # The window read is a 1:1 copy of the mosaic's class-aware pyramid level, never a second
+        # decimation of its own: at an overview zoom the one-pixel channel through the land block is
+        # still water, and the all-land blocks beside it are still land.
+        ozoom = cz - 1
+        ores = aggregation_reproject.get_resolution(ozoom)
+        wvrt, wtif = f"{d}/w.vrt", f"{d}/w.tif"
+        # With a COARSER neighbour in the window (a GEBCO-only z8 tile beside a surveyed one — the
+        # ordinary case at a coverage edge), a VRT resolved to its finest source cannot serve either
+        # from a pyramid level, and the warp does the decimating instead.
+        nb = mercantile.Tile(x=x + 1, y=y, z=z)
+        nbb = mercantile.xy_bounds(nb)
+        neighbour = f"store/mosaic/tiles/{z}-{nb.x}-{nb.y}-{z}.tif"
+        with rasterio.open(neighbour, "w", driver="GTiff", height=512, width=512, count=1,
+                           dtype="float32", nodata=NODATA, crs="EPSG:3857",
+                           transform=from_origin(nbb.left, nbb.top,
+                                                 aggregation_reproject.get_resolution(z),
+                                                 aggregation_reproject.get_resolution(z))) as dst:
+            dst.write(np.full((512, 512), -30.0, dtype="float32"), 1)
+        aggregation_reproject._run(
+            f"gdalbuildvrt -q -overwrite -resolution user -tr {ores} {ores} {wvrt} {cog} {neighbour}",
+            "check window vrt")
+        _read_window(anchor, ozoom, 0, wtif, wvrt)
+        with rasterio.open(wtif) as f:
+            win_arr = f.read(1)
+        assert win_arr.shape == (core // 2, core // 2), win_arr.shape
+        assert (win_arr[:256, channel // 2] == -10.0).all(), \
+            ("the channel closed in the window read", np.unique(win_arr[:256, channel // 2])[:4])
+        assert win_arr[0, 768] == 30.0 and win_arr[255, 1023] == 30.0, \
+            ("an all-land block must stay land in the window read", win_arr[0, 768], win_arr[255, 1023])
+        assert (win_arr[300:600, 300:600] == -30.0).all(), "measured depth must pass the read untouched"
 
         # render an overview stem too (reads the mosaic's shoal-biased overview); it must decode to ~-30
         ostem = next(s for s in stems if s.endswith("-9"))

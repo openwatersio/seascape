@@ -7,7 +7,7 @@ overview pyramid.
 
 The aggregation warp builds each tile at the FINEST source's resolution, so a source finer
 than that grid (CUDEM 1/9 arc-second into a z13 tile is ~2.2x) is decimated on read. With
-overviews present that read starts from a per-cell MAX level instead of the full-res grid:
+overviews present that read starts from a class-aware shoal level instead of the full-res grid:
 measured on a Chesapeake CUDEM tile, the warp halves (2.9s -> 1.5s) and the output moves
 +0.11 m shallower on average, +5.9 m at the shoals it stops drowning.
 """
@@ -65,31 +65,62 @@ def main():
         normalize_file(filepath, a.crs, a.nodata)
 
 
+def _reduce_ref(prev, nodata, cap):
+    """The class-aware reduction spelled out independently of utils, for the self-check to assert
+    against: (level, all-children-water mask). A block with any water-domain child reduces over
+    those alone; an all-land block over its valid children; an all-nodata block stays nodata."""
+    import numpy as np
+    h, w = prev.shape[0] // 2, prev.shape[1] // 2
+    q = prev[:h * 2, :w * 2].reshape(h, 2, w, 2)
+    good = (q != nodata) & (q == q)
+    wet = good & (q <= cap)
+    land_max = np.where(good, q, -np.inf).max(axis=(1, 3))
+    wet_max = np.where(wet, q, -np.inf).max(axis=(1, 3))
+    lvl = np.where(wet.any(axis=(1, 3)), wet_max, land_max)
+    lvl[~good.any(axis=(1, 3))] = nodata
+    return lvl.astype(prev.dtype), (wet | ~good).all(axis=(1, 3)) & good.any(axis=(1, 3))
+
+
 def _check():
-    """The normalized COG's shoal-biased pyramid, against a synthetic 2048 px shoal field:
-    a one-pixel -2 m shoal on a -50 m bed, an all-nodata block, and a block that is nodata
-    except for one shallow pixel. Every level must (a) equal the max of its children,
-    (b) be pointwise >= the same level built with OVERVIEW_RESAMPLING=AVERAGE, (c) keep the
-    all-nodata block nodata while the 3-nodata-plus-a-shoal block reads the shoal. A file with
-    no declared nodata gets no pyramid at all."""
+    """The normalized COG's class-aware shoal pyramid.
+
+    Fixture 1, a 2048 px all-water shoal field (a one-pixel -2 m shoal on a -50 m bed, an all-nodata
+    block, and a block that is nodata except for one shallow pixel): every level must (a) match the
+    class-aware reduction of the level above, (b) be pointwise >= the same level built with
+    OVERVIEW_RESAMPLING=AVERAGE wherever the block is entirely water-domain — the only domain in
+    which comparing to an average of everything under the block means anything — and (c) keep the
+    all-nodata block nodata while the 3-nodata-plus-a-shoal block reads the shoal.
+
+    Fixture 2, a mixed coastline (land, drying flat, dredged channel) cut by a one-pixel channel:
+    the channel never turns positive at any level down to a single pixel, the drying flat stays in
+    the drying domain, and all-land blocks stay land.
+
+    A file with no declared nodata gets no pyramid at all."""
     import shutil
     import tempfile
 
     import numpy as np
     from rasterio.transform import from_origin
 
-    ND, N = -9999.0, 2048
+    import config
+
+    ND, N, CAP = -9999.0, 2048, config.DRYING_CAP
     d = tempfile.mkdtemp()
+
+    def write(path, a):
+        with rasterio.open(path, "w", driver="GTiff", height=a.shape[0], width=a.shape[1], count=1,
+                           dtype="float32", nodata=ND, crs="EPSG:4326",
+                           transform=from_origin(0, 1, 1e-4, 1e-4)) as f:
+            f.write(a, 1)
+        return path
+
     try:
         arr = np.full((N, N), -50.0, dtype="float32")
         arr[100, 100] = -2.0                       # an isolated shoal among -50 m
         arr[200:204, 200:204] = ND                 # an all-nodata block
         arr[300:304, 300:304] = ND
         arr[303, 303] = -5.0                       # nodata must not swallow this one
-        src = f"{d}/a.tif"
-        with rasterio.open(src, "w", driver="GTiff", height=N, width=N, count=1, dtype="float32",
-                           nodata=ND, crs="EPSG:4326", transform=from_origin(0, 1, 1e-4, 1e-4)) as f:
-            f.write(arr, 1)
+        src = write(f"{d}/a.tif", arr)
         avg = f"{d}/avg.tif"
         subprocess.run(["gdal_translate", "-q", "-of", "COG", "-co", "BLOCKSIZE=512",
                         "-co", "OVERVIEW_RESAMPLING=AVERAGE", src, avg], check=True)
@@ -102,14 +133,12 @@ def _check():
             for factor in got.overviews(1):
                 h = w = N // factor
                 lvl = got.read(1, out_shape=(h, w))
-                # (a) exactly the max of the level above, nodata excluded
-                q = prev.reshape(h, 2, w, 2)
-                want = np.where(q == ND, -np.inf, q).max(axis=(1, 3))
-                want[np.isinf(want)] = ND
-                assert np.array_equal(lvl, want.astype("float32")), factor
-                # (b) never deeper than the average pyramid at the same pixel
+                want, allwet = _reduce_ref(prev, ND, CAP)
+                assert np.array_equal(lvl, want), factor
+                assert allwet[(prev != ND).reshape(h, 2, w, 2).any(axis=(1, 3))].all(), \
+                    "fixture 1 is all water: every valid block must be water-domain"
                 a = ref.read(1, out_shape=(h, w))
-                both = (lvl != ND) & (a != ND)
+                both = (lvl != ND) & (a != ND) & allwet
                 assert (lvl[both] >= a[both] - 1e-6).all(), \
                     f"level {factor}: {int((lvl[both] < a[both] - 1e-6).sum())} px deeper than AVERAGE"
                 assert lvl[100 // factor, 100 // factor] == -2.0, (factor, "shoal drowned")
@@ -118,6 +147,61 @@ def _check():
                 prev = lvl
             # the AVERAGE pyramid is what the assertions are worth: it drowns the shoal
             assert ref.read(1, out_shape=(N // 4, N // 4))[25, 25] < -40.0
+
+        # A coastline in one footprint: land above, a drying flat at the water's edge, a dredged
+        # basin below, and a one-pixel channel cut through the land into it. CHAN sits in the same
+        # 2x2 block as land at every level, so it is the case a plain max would close.
+        CHAN = 1020
+        coast = np.full((N, N), -10.0, dtype="float32")
+        coast[:1024, :] = 30.0                     # land, well above the cap
+        coast[1024:1040, :] = 1.0                  # drying flat
+        coast[:1040, CHAN] = -10.0                 # the channel, one pixel wide
+        cpath = write(f"{d}/coast.tif", coast)
+        normalize_file(cpath, "EPSG:4326", ND)
+        with rasterio.open(cpath) as got:
+            prev = coast
+            for factor in got.overviews(1):
+                lvl = got.read(1, out_shape=(N // factor, N // factor))
+                want, _ = _reduce_ref(prev, ND, CAP)
+                assert np.array_equal(lvl, want), factor
+                prev = lvl
+        # A block is pure land only while it stays clear of the channel column (2**level <= CHAN)
+        # and above the drying flat (2**level <= 1024).
+        level, step = 0, coast
+        while 2 ** level < 1024:
+            step, _ = _reduce_ref(step, ND, CAP)
+            level += 1
+            assert step[0, CHAN >> level] == -10.0, \
+                (f"level {2 ** level}: the channel through the land closed", step[0, CHAN >> level])
+            assert step[1024 >> level, 0] == 1.0, \
+                (f"level {2 ** level}: the drying flat left the drying domain", step[1024 >> level, 0])
+            if 2 ** level <= CHAN:
+                assert step[0, 0] == 30.0, \
+                    (f"level {2 ** level}: an all-land block must stay land", step[0, 0])
+
+        # One pixel of water through solid land, reduced by the REAL kernel to a single pixel: the
+        # channel is the only water in its block at every level, and land never takes a block.
+        chan = np.full((N, N), 30.0, dtype="float32")
+        chan[:, CHAN] = -10.0
+        step, level = write(f"{d}/chan.tif", chan), 0
+        prev = chan
+        while True:
+            nxt = f"{d}/chan-{level + 1}.tif"
+            w, h = utils._block_reduce(step, nxt, ND)
+            level += 1
+            with rasterio.open(nxt) as f:
+                lvl = f.read(1)
+            want, _ = _reduce_ref(prev, ND, CAP)
+            assert np.array_equal(lvl, want), f"level {2 ** level} diverged from the class rule"
+            assert (lvl[:, CHAN >> level] == -10.0).all(), \
+                (f"level {2 ** level}: a one-pixel channel closed — "
+                 f"{int((lvl[:, CHAN >> level] > CAP).sum())} px went land")
+            if 2 ** level <= CHAN:
+                assert (lvl[:, 0] == 30.0).all(), f"level {2 ** level}: land lost its own blocks"
+            if max(w, h) == 1:
+                break
+            step, prev = nxt, lvl
+        assert level == 11, f"the reduction must run to a single pixel, stopped at level {level}"
 
         # Odd dimensions: levels must be ceil-sized like GDAL's own, and the padded edge block
         # must max over only the real pixel it covers rather than reading the pad as data.

@@ -218,14 +218,20 @@ def _uniform_coarsen(dem, factor, out):
     times out (shallow-complexity stems the depth gate can't help). gdal_contour reads the small
     raster directly; _depare_dem re-reads res per file, so the sliver gate adapts.
 
-    `-r max` (gdalwarp; gdal_translate has no max kernel): coarsening the DEM these depth areas are
-    cut from must never move a band edge into deeper water, so every coarse cell takes the
-    shallowest elevation under it."""
+    utils' class-aware shoal reduction, `factor` halvings of it, rather than any gdal kernel:
+    coarsening the DEM these depth areas are cut from must never move a band edge into deeper water,
+    and a plain max would hand a coastal cell to the land beside the channel, cutting a DEPARE
+    band — and the drying bucket with it — straight across navigable water."""
+    assert factor >= 2 and factor & (factor - 1) == 0, f"coarsen factor must be a power of 2: {factor}"
     with rasterio.open(dem) as src:
-        width, height = src.width, src.height
-    contour_run._run(
-        f"gdalwarp -q -overwrite -r max -ts {width // factor} {height // factor} {dem} {out}",
-        "gdalwarp -r max")
+        nodata = src.nodata
+    if nodata is None:
+        raise ValueError(f"{dem}: no declared nodata — the shoal reduction needs one to skip holes")
+    step, root = dem, out.rsplit(".", 1)[0]
+    for level in range(factor.bit_length() - 1):
+        halved = out if 2 ** (level + 1) == factor else f"{root}-{2 ** (level + 1)}x.tiff"
+        utils._block_reduce(step, halved, nodata)
+        step = halved
     return out
 
 
@@ -1013,6 +1019,22 @@ def _check():
     with rasterio.open(p, "w", driver="GTiff", height=h, width=w, count=1, dtype="float32",
                        nodata=-9999, crs="EPSG:3857", transform=tr) as dst:
         dst.write(dem, 1)
+
+    # The timeout rescue's coarsen is class-aware: a one-pixel channel through the land rows still
+    # reads as water in the 4x window, so the band it is cut from stays open, and the land beside it
+    # stays land. Its grid is the same corner at 4x the pixel.
+    cut = np.array(dem)
+    cut[:10, 24] = -7.0
+    cp = f"{d}/cut.tif"
+    with rasterio.open(cp, "w", driver="GTiff", height=h, width=w, count=1, dtype="float32",
+                       nodata=-9999, crs="EPSG:3857", transform=tr) as dst:
+        dst.write(cut, 1)
+    with rasterio.open(_uniform_coarsen(cp, 4, f"{d}/cut-4x.tiff")) as small:
+        coarse, ctr = small.read(1), small.transform
+    assert coarse.shape == (h // 4, w // 4), coarse.shape
+    assert (coarse[:2, 6] == -7.0).all(), ("the coarsen closed a channel", coarse[:2, 6])
+    assert (coarse[:2, :6] > cap).all(), ("land must stay land in the coarsen", coarse[0, :6])
+    assert (ctr.a, ctr.c, ctr.f) == (tr.a * 4, tr.c, tr.f), "the coarsen moved the grid"
 
     raw = partitions(p, levels_m, f"{d}/raw.fgb")
     bands = read_bucket(raw, "amax <= 0")
