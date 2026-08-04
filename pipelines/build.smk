@@ -220,7 +220,7 @@ rule mosaic_tile:
     output:
         "store/mosaic/tiles/{stem}.tif"
     params:
-        version=1, # increment to force a rebuild
+        version=2, # increment to force a rebuild
         sources=lambda wc: source_props(wc.stem),
         merge=MERGE_CFG,
     priority: mosaic_tile_priority  # mosaic band, interleaved heavy-first within it

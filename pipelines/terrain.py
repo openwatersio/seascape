@@ -8,13 +8,14 @@ Each output zoom renders by reading the MOSAIC at that zoom's resolution
   -> Terrarium encode (encode.py's conservative, bias-shallow quantization)
   -> single-zoom pmtiles bundle.py concatenates (store/pmtiles/<stem>.pmtiles).
 
-Reading the mosaic's nodata-aware `average` overviews at each zoom and smoothing there gives
+Reading the mosaic's nodata-aware overviews at each zoom and smoothing there gives
 f(depth, zoom) a real metre meaning at every level (the zoom-tier contour design assumes this).
 Consequence: coarse zooms are not a strict decimation of fine zooms, so features may shift slightly
 between levels — invisible in shading, intended for contours.
 
-Two pyramids: the mosaic COGs' internal overviews are the *access* pyramid (unsmoothed
-truth, `average`-resampled) — a decimated GTI read picks each tile's overview automatically, so the
+Two pyramids: the mosaic COGs' internal overviews are the *access* pyramid (unsmoothed truth,
+shoal-biased per-cell MAX so no zoom charts water deeper than the survey under it) — a decimated GTI
+read picks each tile's overview automatically, so the
 rule here is ALWAYS read at target resolution, never full-res-then-decimate. This module builds the
 *served* pyramid: smoothed, encoded, display-conditioned. z0-~z4 read the mosaic's own GTI-
 registered planet z8 COG (the <Overview> in mosaic.gti), not thousands of tile-COG top overviews —
@@ -53,6 +54,10 @@ import utils
 
 NODATA = -9999
 
+# Decimating the mosaic must stay bias-shallow, the same rule its overviews are built by
+# (utils.shoal_overviews). Carried into _config so changing it reruns every terrain stem.
+READ_RESAMPLE = "max"
+
 
 # ── the mosaic GTI, read through the system gdal by absolute path ──────────────────────────────
 
@@ -85,13 +90,14 @@ def window_tiles(stem):
 
 def _read_window(anchor, cz, halo, out_tif, src=None):
     """Warp a buffered window of the mosaic — the anchor tile's 3857 bounds expanded by `halo`
-    px on every side — to `out_tif` at zoom `cz` resolution, through the SYSTEM gdal. `-r average`
-    (the anti-alias prefilter decimation needs): a decimated read picks
-    each mosaic tile's own `average` overview, and z<=8 falls through to the planet z8 COG the .gti
-    registers — never a full-res-then-decimate. Exact grid registration: -te/-tr snap the window to
-    the global 3857 grid so the interior origin is EXACTLY the anchor's mercantile bounds (a slip
-    ceils the virtual extent to a 1-px overhang). -dstnodata fills the beyond-extent halo with the
-    one sentinel."""
+    px on every side — to `out_tif` at zoom `cz` resolution, through the SYSTEM gdal. A decimated
+    read picks each mosaic tile's own shoal-biased overview, and z<=8 falls through to the planet
+    z8 COG the .gti registers — never a full-res-then-decimate. `-r max` for the same reason those
+    overviews are MAX: any residual decimation must stay bias-shallow (on the aligned power-of-two
+    reads this render makes, the overview lands 1:1 and the kernel is an identity). Exact grid
+    registration: -te/-tr snap the window to the global 3857 grid so the interior origin is EXACTLY
+    the anchor's mercantile bounds (a slip ceils the virtual extent to a 1-px overhang). -dstnodata
+    fills the beyond-extent halo with the one sentinel."""
     res = aggregation_reproject.get_resolution(cz)
     span = 2 ** (cz - anchor.z)
     core = span * 512
@@ -101,7 +107,7 @@ def _read_window(anchor, cz, halo, out_tif, src=None):
     right = left + (core + 2 * halo) * res
     bottom = top - (core + 2 * halo) * res
     aggregation_reproject._run(
-        f"GDAL_CACHEMAX=512 gdalwarp -q -overwrite -r average -t_srs EPSG:3857 "
+        f"GDAL_CACHEMAX=512 gdalwarp -q -overwrite -r {READ_RESAMPLE} -t_srs EPSG:3857 "
         f"-tr {res} {res} -te {left} {bottom} {right} {top} -dstnodata {NODATA} "
         f"-of GTiff -co TILED=YES -co BLOCKXSIZE=512 -co BLOCKYSIZE=512 -co COMPRESS=ZSTD -co PREDICTOR=3 "
         f"-co NUM_THREADS=ALL_CPUS {_q(src or gti_abspath())} {out_tif}",
@@ -245,6 +251,7 @@ def _config():
         "shallow_rel": encode.SHALLOW_REL, "shallow_min_step": encode.SHALLOW_MIN_STEP,
         "macrotile_z": utils.macrotile_z, "num_overviews": utils.num_overviews,
         "resample": aggregation_reproject.RESAMPLE, "drying_cap": config.DRYING_CAP,
+        "read_resample": READ_RESAMPLE,
     }
     if not os.environ.get("SKIP_SMOOTH"):
         cfg["smooth"] = {
@@ -301,7 +308,7 @@ def _check():
     try:
         os.chdir(d)
         # A z8 mosaic tile at child_z=10 (span 4 -> 2048 px native), constant -30 m with a nodata
-        # hole in one corner, built as a real COG with average overviews (mosaic.tile's shape).
+        # hole in one corner, built as a real COG with shoal-biased overviews (mosaic.tile's shape).
         z, x, y, cz = 8, 75, 96, 10
         stem = f"{z}-{x}-{y}-{cz}"
         res = aggregation_reproject.get_resolution(cz)
@@ -316,8 +323,9 @@ def _check():
                            transform=from_origin(b.left, b.top, res, res)) as dst:
             dst.write(arr, 1)
         cog = f"store/mosaic/tiles/{stem}.tif"
-        utils.run_command(f"gdal_translate -q -of COG -a_nodata {NODATA} -co RESAMPLING=AVERAGE "
-                          f"-co OVERVIEW_RESAMPLING=AVERAGE -co BLOCKSIZE=512 {raw} {cog}")
+        utils.shoal_overviews(raw)
+        utils.run_command(f"gdal_translate -q -of COG -a_nodata {NODATA} "
+                          f"-co OVERVIEWS=FORCE_USE_EXISTING -co BLOCKSIZE=512 {raw} {cog}")
         os.remove(raw)
         os.makedirs("store/aggregation")
         with open("store/aggregation/covering.txt", "w") as f:
@@ -363,7 +371,7 @@ def _check():
         assert (np.abs(inner - (-30.0)) < 1e-3).all(), \
             f"interior served depth must track the mosaic (-30 m), got {np.unique(inner)[:5]}"
 
-        # render an overview stem too (reads the mosaic's average overview); it must decode to ~-30
+        # render an overview stem too (reads the mosaic's shoal-biased overview); it must decode to ~-30
         ostem = next(s for s in stems if s.endswith("-9"))
         render(ostem)
         with open(f"store/pmtiles/{ostem}.pmtiles", "r+b") as f:

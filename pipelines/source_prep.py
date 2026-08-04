@@ -9,7 +9,7 @@ the per-source knobs that live in Justfile flags on the legacy chain:
   datum_offset_m  constant shift to the target datum (source_datum --offset)
   offset_surface  reference raster subtracted per pixel for a spatially-varying datum
                   separation (source_datum --offset-surface); names a raster in the datum
-                  store, e.g. "navd88_mllw" (built by datum_grid.py)
+                  store, e.g. "navd88_chart" (built by datum_grid.py)
   clamp_positive  drop cells above the water surface (source_datum --clamp-positive)
   unpack          how to turn each raw asset into staged raster(s); absent = a bare
                   raster (see below)
@@ -322,6 +322,8 @@ def _clear_stale(root):
         os.remove(stale)
     shutil.rmtree(f"{root}/asc", ignore_errors=True)
     shutil.rmtree(f"{root}/_7z_extract", ignore_errors=True)
+    for scratch in glob(f"{root}/seascape-shoal-*"):  # a crashed normalize's pyramid levels
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 class CorruptRaw(Exception):

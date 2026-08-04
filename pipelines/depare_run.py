@@ -214,12 +214,18 @@ def _run_bounded(cmd, what, timeout):
 
 
 def _uniform_coarsen(dem, factor, out):
-    """Whole-window average downsample — the retry rescue when even the deep-coarsened window
+    """Whole-window shoal-biased downsample — the retry rescue when even the deep-coarsened window
     times out (shallow-complexity stems the depth gate can't help). gdal_contour reads the small
-    raster directly; _depare_dem re-reads res per file, so the sliver gate adapts."""
+    raster directly; _depare_dem re-reads res per file, so the sliver gate adapts.
+
+    `-r max` (gdalwarp; gdal_translate has no max kernel): coarsening the DEM these depth areas are
+    cut from must never move a band edge into deeper water, so every coarse cell takes the
+    shallowest elevation under it."""
+    with rasterio.open(dem) as src:
+        width, height = src.width, src.height
     contour_run._run(
-        f"gdal_translate -q -r average -outsize {100 // factor}% {100 // factor}% {dem} {out}",
-        "gdal_translate -r average")
+        f"gdalwarp -q -overwrite -r max -ts {width // factor} {height // factor} {dem} {out}",
+        "gdalwarp -r max")
     return out
 
 
@@ -785,7 +791,7 @@ def tile(stem):
     import tempfile
 
     # DEPARE_TIMEOUT (seconds; unset = no bound): each gdal_contour -p pass runs under this
-    # bound; on expiry the tile retries once on a uniform 4x-average window, then fails
+    # bound; on expiry the tile retries once on a uniform 4x shoal-biased window, then fails
     # honestly. The SIGALRM backstop (8x: 2 ladders x 2 attempts x contour + GEOS slack) still
     # bounds the whole tile so no phase can hang a run (docs/plans/2026-07-21-depare-perf.md).
     timeout = int(os.environ.get("DEPARE_TIMEOUT", "0"))
@@ -811,7 +817,7 @@ def tile(stem):
         try:
             res = _depare_dem(dem, tile_obj, child_z, tmp, stem, timeout=timeout)
         except ContourTimeout as e:
-            print(f"depare tile {stem}: {e} — retrying on a uniform 4x-average window",
+            print(f"depare tile {stem}: {e} — retrying on a uniform 4x shoal-biased window",
                   file=sys.stderr, flush=True)
             dem = _uniform_coarsen(dem, 4, f"{tmp}/dem-4x.tiff")
             res = _depare_dem(dem, tile_obj, child_z, tmp, stem, timeout=timeout)

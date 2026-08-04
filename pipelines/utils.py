@@ -21,6 +21,7 @@ import time
 
 import numpy as np
 
+import rasterio
 from rasterio.warp import transform_bounds
 import mercantile
 import pmtiles.tile as _pmtiles_tile
@@ -361,6 +362,55 @@ def get_grouped_source_items(filepath):
         })
     grouped_source_items.append(current_group)
     return grouped_source_items
+
+
+# ── shoal-biased overview pyramid ────────────────────────────────────────────────────────────────
+# Elevation is negative-down, so the shallowest child of a 2x2 block is its MAXIMUM. Decimating a
+# depth raster by MAX is the only kernel that guarantees a coarse pixel never reads deeper than the
+# finest data under it — `average` crosses a shoal edge and charts water that isn't there.
+#
+# Neither gdaladdo nor the COG driver's OVERVIEW_RESAMPLING offers a max kernel (GDAL 3.13:
+# nearest|average|rms|gauss|bilinear|cubic|cubicspline|lanczos|average_magphase|mode), but
+# `gdalwarp -r max` does, and `gdal raster overview add --overview-src` attaches finished rasters
+# as overviews verbatim. So each level is a 2:1 `gdalwarp -r max` of the level above — max is
+# associative, so the cascade equals a block max over the full-res grid at a third of the I/O —
+# and the COG driver adopts them with OVERVIEWS=FORCE_USE_EXISTING.
+
+COG_MIN_OVERVIEW_PX = 512  # the COG driver's own stopping rule: one 512 block
+
+
+def shoal_overviews(path, min_size=COG_MIN_OVERVIEW_PX):
+    """Attach a shoal-biased (per-cell MAX of elevation) internal overview pyramid to `path`,
+    stopping at `min_size` like the COG driver does. `gdalwarp -r max` skips nodata, so a block
+    with any valid child takes the max of its valid children and only an all-nodata block stays
+    nodata — nodata can never swallow a shoal. Follow with a
+    `gdal_translate -of COG -co OVERVIEWS=FORCE_USE_EXISTING` to get the COG layout back."""
+    with rasterio.open(path) as src:
+        width, height, bounds, res = src.width, src.height, src.bounds, abs(src.transform.a)
+    tmp = tempfile.mkdtemp(prefix="seascape-shoal-", dir=os.path.dirname(os.path.abspath(path)))
+    try:
+        levels, prev, w, h, r = [], path, width, height, res
+        while max(w, h) > min_size:
+            w, h, r = -(-w // 2), -(-h // 2), r * 2  # ceil, matching GDAL's overview sizing
+            level = f"{tmp}/ov{len(levels) + 1}.tif"
+            # -te anchored at the base's top-left corner keeps every level co-registered with the
+            # full-res grid; -ts pins the ceil size so an odd dimension can't drift a half pixel.
+            # ZSTD_LEVEL=1: these levels are read once and deleted, so bound the scratch cheaply
+            # rather than compress well (no PREDICTOR — the helper also runs on Int16 sources).
+            run_command(f"gdalwarp -q -overwrite -r max -ts {w} {h} "
+                        f"-te {bounds.left} {bounds.top - h * r} {bounds.left + w * r} {bounds.top} "
+                        "-multi -wo NUM_THREADS=ALL_CPUS -wm 512 -co TILED=YES -co COMPRESS=ZSTD "
+                        f"-co ZSTD_LEVEL=1 -co NUM_THREADS=ALL_CPUS -co BIGTIFF=IF_SAFER "
+                        f"{prev} {level}")
+            levels.append(level)
+            prev = level
+        if not levels:
+            return 0
+        srcs = " ".join(f"--overview-src {l}" for l in levels)
+        run_command(f"gdal raster overview add -q -i {path} {srcs}")
+        return len(levels)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ── merge-weight estimate (the mosaic_tile reservation seed) ─────────────────────────────────
