@@ -61,7 +61,7 @@ from glob import glob
 import config
 import utils
 from convert_e00 import e00_to_tif
-from source_datum import surface_path, transform_file, write_sidecar
+from source_datum import flatten_compound_crs, surface_path, transform_file, write_sidecar
 from source_normalize import normalize_file
 
 # Only trust a URL's trailing extension when it names a real data/archive format;
@@ -435,6 +435,12 @@ def prep(source):
             print(f"{source}: {uncorrected}/{len(tifs)} file(s) outside the reference's "
                   "coverage — passed through uncorrected")
 
+    # After the transform, which already reduces the CRS on the files it rewrites; this
+    # catches the rest, so no staged raster reaches a warp carrying a vertical CRS.
+    flattened = sum(flatten_compound_crs(tif) for tif in tifs)
+    if flattened:
+        print(f"{source}: dropped the vertical CRS from {flattened}/{len(tifs)} file(s)")
+
     crs, nodata = meta.get("crs"), meta.get("nodata")
     print(f"{source}: normalize {len(tifs)} file(s) (crs={crs} nodata={nodata})")
     for tif in tifs:
@@ -590,6 +596,26 @@ def _check():
             f.write(tif_bytes(7.0))
         stage(bid)
         assert os.path.isfile(f"store/source/{bid}/{bid}_0.tif"), "bare raster stages under legacy name"
+
+        # A source with NO datum knobs (the CUDEM-territory shape) still loses a compound
+        # CRS's vertical half, with its values untouched — nothing downstream may see one.
+        # A bare raster stages as a HARDLINK to its raw, so this also pins the raw bytes:
+        # an in-place header edit here would rewrite the verbatim download.
+        vid = "_prep_vertical"
+        vu = "https://x/compound.tif"
+        seed(vid, [vu], {"name": "Compound"})
+        with rasterio.open(raw_of(vid, vu), "w", driver="GTiff", height=2, width=2, count=1,
+                           dtype="float32", nodata=-9999.0,
+                           crs=rasterio.crs.CRS.from_epsg(5498),  # NAD83 + NAVD88 height
+                           transform=from_origin(0, 2, 1, 1)) as dst:
+            dst.write(np.full((2, 2), -4.5, dtype="float32"), 1)
+        raw_bytes = open(raw_of(vid, vu), "rb").read()
+        prep(vid)
+        with rasterio.open(f"store/source/{vid}/{vid}_0.tif") as src:
+            assert src.crs.to_epsg() == 4269, src.crs
+            assert (src.read(1) == -4.5).all(), src.read(1)
+        assert open(raw_of(vid, vu), "rb").read() == raw_bytes, \
+            "flattening a hardlinked bare raster must not write through into raw/"
 
         # `offset_surface` drives the per-pixel datum correction (the CUDEM shape: bare rasters,
         # no crs/nodata override, a reference from the datum store) and lands in the sidecar.

@@ -12,9 +12,11 @@ the catalog's seascape:files feeds); shells out via utils.run_command.
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
+from xml.sax.saxutils import unescape
 
 import mercantile
 import numpy as np
@@ -65,6 +67,10 @@ FEATHER_MIN_LEVELS = int(os.environ.get("AGG_FEATHER_MIN_LEVELS", "2"))
 # only ever fill gaps under a finer source anyway, and a global one has no coverage edge
 # to feather at all.
 FEATHER_MAX_FACTOR = 32
+
+# The VRT's input references, read by regex rather than an XML parser (the same XXE-avoidance
+# source_enumerate makes for bucket listings).
+_SOURCE_FILENAME_RE = re.compile(r"<SourceFilename[^>]*>([^<]*)</SourceFilename>")
 
 
 def negate_band1(filepath):
@@ -200,11 +206,26 @@ def create_virtual_raster(tmp_folder, i, source_items):
     source = source_items[0]["source"]
     vrt = f"{tmp_folder}/{i}.vrt"
     listpath = f"{tmp_folder}/{i}-file-list.txt"
+    paths = [config.source_path(source, item["filename"]) for item in source_items]
     with open(listpath, "w") as f:
-        for item in source_items:
-            f.write(config.source_path(source, item["filename"]) + "\n")
+        f.write("".join(p + "\n" for p in paths))
     utils.run_command(f"gdalbuildvrt -overwrite {band_select(source)}-input_file_list {listpath} {vrt}", silent=SILENT)
+    assert_vrt_complete(vrt, paths)
     return vrt
+
+
+def assert_vrt_complete(vrt, paths):
+    """Raise unless the built VRT references every input. gdalbuildvrt skips an input whose
+    CRS differs from the first with a warning and exit 0 — and the warning can read "expected
+    NAD83, got NAD83" when the two differ only by an attached vertical component, so a third of
+    a source's coverage can vanish from the mosaic with nothing in the log naming it. Matched on
+    basename: gdalbuildvrt may store a path relative to the VRT."""
+    with open(vrt) as f:
+        referenced = {os.path.basename(unescape(m)) for m in _SOURCE_FILENAME_RE.findall(f.read())}
+    dropped = [p for p in paths if os.path.basename(p) not in referenced]
+    if dropped:
+        raise RuntimeError(f"gdalbuildvrt dropped {len(dropped)}/{len(paths)} input(s) from "
+                           f"{vrt} — heterogeneous CRS? e.g. {dropped[:3]}")
 
 
 def per_tile_vrts(tmp_folder, i, source_items):
@@ -451,6 +472,20 @@ def _check():
     warp_mixed([a], just_a, 9, tile, 0)
     va, vboth = valid(just_a), valid(both)
     assert vboth > va > 0, (va, vboth)
+
+    # assert_vrt_complete: same-CRS inputs all land in the VRT; a mixed pair (gdalbuildvrt
+    # drops the off-CRS one with only a warning) must raise and name the missing file.
+    c, mixed_vrt = f"{d}/c_z17.tif", f"{d}/mixed.vrt"
+    utm_box(c, 32617, 760000, 4438000, 30.0)
+    same_vrt = f"{d}/same.vrt"
+    utils.run_command(f"gdalbuildvrt -overwrite {same_vrt} {a} {c}")
+    assert_vrt_complete(same_vrt, [a, c])
+    utils.run_command(f"gdalbuildvrt -overwrite {mixed_vrt} {a} {b}")
+    try:
+        assert_vrt_complete(mixed_vrt, [a, b])
+        assert False, "expected a dropped off-CRS input to raise"
+    except RuntimeError as e:
+        assert "b_z18.tif" in str(e) and "1/2" in str(e), e
 
     # run_command must RAISE on a failed gdalbuildvrt (not swallow it) — the bug that let a
     # missing VRT reach gdalwarp as a baffling "No such file" and kill an hour-long aggregate.

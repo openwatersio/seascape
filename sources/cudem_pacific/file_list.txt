@@ -1,0 +1,14 @@
+# NOAA CUDEM 1/9 arc-second, Pacific territories — a *filelist* (manifest), not a data
+# file: each line is an NCEI urllist the engine fetches, 71 tiles across Hawaii, Guam,
+# CNMI and American Samoa. These sit apart from the mainline `cudem` source because their
+# HORIZONTAL frames genuinely differ — Hawaii is WGS 84 (EPSG:4326), Guam is NAD83(MA11)
+# (EPSG:6325), CNMI/AmSam are NAD83 (EPSG:4269) — which is what `mixed_crs: true` is for;
+# CONUS+AK+PR/USVI are uniformly EPSG:4269 and take the cheaper single-VRT path.
+# Vertical is a local island datum per territory (HI=MSL, AmSam=ASVD02, CNMI=NAVD88, Guam
+# declares none) and VDatum publishes no grid out here, so nothing is corrected: depths
+# stay on their own ~MSL-family datum until per-island scalars land. NoData varies per
+# tile (-9999 / -999999) and each file's header carries it.
+https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_ninth_Topobathy_Hawaii_9428/urllist9428.txt
+https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_ninth_Topobathy_Guam_9462/urllist9462.txt
+https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_ninth_Topobathy_AmSam_9460/urllist9460.txt
+https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_ninth_Topobathy_CNMI_9560/urllist9560.txt

@@ -1,10 +1,10 @@
 {
-    "name": "NOAA CUDEM 1/3 arc-second (NCEI Topobathy 2014)",
+    "name": "NOAA CUDEM 1/3 arc-second (Pacific territories)",
     "producer": "NOAA NCEI",
     "website": "https://www.ncei.noaa.gov/products/coastal-relief-model",
     "license": "public domain (U.S. Government work)",
     "max_zoom": 12,
-    "datum": "MLLW where VDatum covers; NAVD88 uncorrected elsewhere (most of Alaska)",
-    "offset_surface": "navd88_mllw",
+    "datum": "local island datums (~MSL), uncorrected — no VDatum coverage",
+    "mixed_crs": true,
     "filter": "*.tif|*.tiff"
 }

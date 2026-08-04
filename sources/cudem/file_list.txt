@@ -1,24 +1,14 @@
 # NOAA CUDEM 1/9 arc-second national topobathy — a *filelist* (manifest), not a
-# data file: one tile URL per line, ~940 tiles across all 18 US coastal regions
-# (Atlantic, Gulf, Pacific, AK). Each tile is fetched, corrected onto MLLW against
-# store/datum/navd88_mllw.tif (metadata `offset_surface`) and normalized to a COG —
-# no build-time NOAA reads. NAVD88 vertical / NAD83 (EPSG:4269) horizontal upstream.
-# NOAA regenerates the manifest as tiles are re-surveyed, so coverage stays current
-# without re-listing here.
+# data file: each line is an NCEI urllist the engine fetches, 965 tiles across the 18
+# US coastal regions (Atlantic, Gulf, Pacific, AK) plus Puerto Rico and the USVI.
+# Each tile is fetched, corrected onto MLLW against store/datum/navd88_mllw.tif
+# (metadata `offset_surface`) and normalized to a COG — no build-time NOAA reads.
+# NAD83 (EPSG:4269) horizontal throughout, which is what lets the whole source mosaic
+# through one VRT; vertical is NAVD88, or PRVD02/VIVD09 in PR/USVI (both ≡ LMSL, so
+# VDatum's `S = −mllw` branch corrects them with the rest). NOAA regenerates the
+# manifests as tiles are re-surveyed, so coverage stays current without re-listing here.
+# Hawaii, Guam, CNMI and American Samoa are their own source (cudem_pacific): different
+# horizontal frames, and no VDatum grid to correct against.
 https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_ninth_Topobathy_2014_8483/urllist8483.txt
-
-# Territory topobathy (issue #32): Hawaii, Puerto Rico, USVI, Guam, American Samoa,
-# CNMI — same NCEI bucket family, same COG tiles, 106 more tiles. Each nearshore
-# product carries its OWN local vertical datum, not NAVD88: HI=MSL, PR=PRVD02,
-# USVI=VIVD09, Guam=GUVD04, AmSam=ASVD02, CNMI=NAVD88 (all local-MSL-family, verified
-# in the tile headers). NoData varies per tile (-9999 / -999999); gdalwarp reads each
-# tile's nodata + CRS at reproject, so they ingest as-is exactly like CONUS. PR/USVI are
-# inside VDatum coverage and correct with the rest; Hawaii and the Pacific territories
-# have no VDatum grid at all and stay on their own local datum until per-island scalars
-# land — that's why the header keeps the per-territory datum on record.
-https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_ninth_Topobathy_Hawaii_9428/urllist9428.txt
 https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_ninth_Topobathy_PuertoRico_9525/urllist9525.txt
 https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_ninth_Topobathy_USVI_9529/urllist9529.txt
-https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_ninth_Topobathy_Guam_9462/urllist9462.txt
-https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_ninth_Topobathy_AmSam_9460/urllist9460.txt
-https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_ninth_Topobathy_CNMI_9560/urllist9560.txt

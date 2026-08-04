@@ -1,0 +1,13 @@
+# NOAA CUDEM 1/3 arc-second, Pacific territories — a *filelist* (manifest), not a data
+# file: each line is an NCEI urllist the engine fetches, 92 tiles across Hawaii, Guam,
+# CNMI and American Samoa. The offshore/deeper band that telescopes out beyond the 1/9
+# nearshore zone, and a separate source id from cudem_pacific because the zoom cap follows
+# the resolution (z12 vs z13). Hawaii is WGS 84 (EPSG:4326) and the rest NAD83
+# (EPSG:4269), so the collection advertises no single CRS (`mixed_crs: true`). Vertical is
+# a local island datum per territory (HI=MSL, Guam/CNMI/AmSam labeled NAVD88) and VDatum
+# publishes no grid out here, so nothing is corrected. NoData varies per tile (-9999 /
+# -999999) and each file's header carries it.
+https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_third_Topobathy_Hawaii_9429/urllist9429.txt
+https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_third_Topobathy_Guam_9463/urllist9463.txt
+https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_third_Topobathy_AmSam_9461/urllist9461.txt
+https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_third_Topobathy_CNMI_9561/urllist9561.txt

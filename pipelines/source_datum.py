@@ -21,11 +21,15 @@ Applied in that order, then ``clamp_positive``. Operates per file in
 happens later, in the aggregation stage), preserving nodata/geotransform. Only valid
 pixels are transformed, so nodata never gets negated into a spurious depth. Writes a
 tiled GeoTIFF; source_normalize makes the final LERC COG.
+
+``flatten_compound_crs`` lives here too: every staged raster loses the vertical half of a
+compound CRS, whether or not a value transform applies.
 """
 
 import argparse
 import json
 import os
+import shutil
 import sys
 from glob import glob
 
@@ -52,13 +56,36 @@ def surface_path(name):
 
 
 def horizontal_crs(crs):
-    """The horizontal half of a compound source CRS. CUDEM tiles declare NAD83 + NAVD88
-    height (EPSG:5498); once the reference is subtracted they are no longer on NAVD88 and EPSG
-    has no compound code for MLLW, so the vertical component is dropped rather than left lying."""
+    """The horizontal half of a compound source CRS (CUDEM tiles declare NAD83 + NAVD88
+    height, EPSG:5498), unchanged when it carries no vertical component."""
+    if crs is None:
+        return crs
     proj = ProjCRS.from_wkt(crs.to_wkt())
     if not proj.is_compound:
         return crs
     return rasterio.crs.CRS.from_wkt(proj.sub_crs_list[0].to_wkt())
+
+
+def flatten_compound_crs(filepath):
+    """Drop a staged raster's vertical CRS — header only, pixels untouched — and report
+    whether it changed. Unconditional, never gated on a value transform: a compound vertical
+    frame is a lie once the values are datum-corrected, and a materialized warp would apply
+    its geoid separation to them."""
+    with rasterio.open(filepath) as src:
+        crs = src.crs
+    flat = horizontal_crs(crs)
+    if flat == crs:
+        return False
+    # Onto a fresh inode, like every other prep step: a bare staged raster is a hardlink to
+    # its raw/ download, so an in-place header write would reach through into the verbatim
+    # bytes. Upstream ships COGs and normalize rewrites the layout next, so breaking it here
+    # costs nothing.
+    tmp = filepath + ".crs.tif"
+    shutil.copyfile(filepath, tmp)
+    with rasterio.open(tmp, "r+", IGNORE_COG_LAYOUT_BREAK="YES") as dst:
+        dst.crs = flat
+    os.replace(tmp, filepath)
+    return True
 
 
 def reference_on(ref, transform, shape, crs):
@@ -91,7 +118,7 @@ def transform_file(filepath, negate, offset, clamp_positive=False, surface=None)
             if surface and src.crs is None:
                 raise ValueError(f"{filepath}: --offset-surface needs the file's own CRS "
                                  "(the reference is resampled onto its grid)")
-            crs = horizontal_crs(src.crs) if surface else src.crs
+            crs = horizontal_crs(src.crs)
             nodata = profile.get("nodata")
             if clamp_positive and nodata is None:
                 raise ValueError(f"{filepath}: --clamp-positive needs a nodata value set")
@@ -187,8 +214,8 @@ def main():
 def _check():
     """Self-check the value transform on synthetic rasters (no GDAL CLI): negate + offset,
     clamp_positive, and the offset-surface subtract — including the reference-nodata
-    pass-through, the source's own nodata staying untouched, and a compound source CRS losing
-    its (now wrong) vertical component."""
+    pass-through, the source's own nodata staying untouched, and the unconditional compound-CRS
+    reduction (standalone, and through transform_file's no-surface path)."""
     import os
     import tempfile
     from rasterio.transform import from_origin
@@ -260,10 +287,36 @@ def _check():
     with rasterio.open(path4) as src:
         assert (src.read(1) == -5.0).all(), src.read(1)
 
-    # A compound source CRS (CUDEM's NAD83 + NAVD88 height) keeps its horizontal half only —
-    # the vertical component is a lie once the reference has been subtracted.
+    # A compound source CRS (CUDEM's NAD83 + NAVD88 height) keeps its horizontal half only.
     assert horizontal_crs(rasterio.crs.CRS.from_epsg(5498)).to_epsg() == 4269
     assert horizontal_crs(rasterio.crs.CRS.from_epsg(4269)).to_epsg() == 4269
+    assert horizontal_crs(None) is None
+
+    # The reduction is unconditional, not a side effect of a transform: a compound file with
+    # NO transform to apply still comes out 2D, with its values and nodata bit-identical.
+    compound = os.path.join(d, "compound.tif")
+    vals = np.array([[-12.5, 3.25], [nodata, 0.0]], dtype="float32")
+    with rasterio.open(compound, "w", driver="GTiff", height=2, width=2, count=1,
+                       dtype="float32", nodata=nodata, crs=rasterio.crs.CRS.from_epsg(5498),
+                       transform=from_origin(0, 2, 1, 1)) as dst:
+        dst.write(vals, 1)
+    assert flatten_compound_crs(compound) is True
+    with rasterio.open(compound) as src:
+        assert src.crs.to_epsg() == 4269, src.crs
+        assert (src.read(1) == vals).all(), src.read(1)
+        assert src.nodata == nodata
+    assert flatten_compound_crs(compound) is False  # already 2D: nothing to rewrite
+
+    # …and transform_file reduces it too, even on the no-surface path.
+    compound2 = os.path.join(d, "compound2.tif")
+    with rasterio.open(compound2, "w", driver="GTiff", height=2, width=2, count=1,
+                       dtype="float32", nodata=nodata, crs=rasterio.crs.CRS.from_epsg(5498),
+                       transform=from_origin(0, 2, 1, 1)) as dst:
+        dst.write(vals, 1)
+    transform_file(compound2, negate=False, offset=-1.0)
+    with rasterio.open(compound2) as src:
+        assert src.crs.to_epsg() == 4269, src.crs
+        assert src.read(1)[0, 0] == -13.5 and src.read(1)[1, 0] == nodata, src.read(1)
 
     # Striping is an implementation detail, not a value change: a file taller than one stripe
     # transforms identically to a short one.

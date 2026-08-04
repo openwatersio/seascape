@@ -22,8 +22,9 @@ The axes are orthogonal: most sources are static + processed, nz_coastal and CUD
 | [GEBCO 2026](gebco/)                                            | ~450 m      | ~z8       | global                              | MSL                     |
 | [EMODnet 2024](emodnet/)                                        | ~115 m      | z11       | European seas                       | **LAT**                 |
 | [DDM (Denmark)](ddm/)                                           | 50 m        | z12       | Danish EEZ                          | MSL (DKMSL2022)         |
-| [CUDEM 1/9](cudem/)                                             | ~3.4 m      | z13       | US coast + territories              | **MLLW** (VDatum grid)  |
-| [CUDEM 1/3](cudem_third/)                                       | ~10 m       | z12       | US coast + territories (broader)    | **MLLW** (VDatum grid)  |
+| [CUDEM 1/9](cudem/)                                             | ~3.4 m      | z13       | US coast + PR/USVI                  | **MLLW** (VDatum grid)  |
+| [CUDEM 1/3](cudem_third/)                                       | ~10 m       | z12       | US coast + PR/USVI (broader)        | **MLLW** (VDatum grid)  |
+| CUDEM Pacific ([1/9](cudem_pacific/), [1/3](cudem_pacific_third/)) | ~3.4/10 m | z13 / z12 | HI, Guam, CNMI, American Samoa      | local island (~MSL)     |
 | [NOAA S-102](noaa_s102/)                                        | ~4–16 m     | z15       | US navigable                        | MLLW (+ uncertainty)    |
 | [Vaklodingen](vaklodingen/)                                     | 20 m        | z12       | Netherlands                         | NAP (~MSL)              |
 | INFOMAR ([10 m](infomar_10m/), [25 m](infomar_25m/))            | 10 m / 25 m | z13 / z11 | Ireland inshore + shelf             | **LAT**                 |
@@ -44,7 +45,9 @@ The axes are orthogonal: most sources are static + processed, nz_coastal and CUD
 
 Priority is derived, not configured: `(maxzoom, id)`, so GEBCO (smallest maxzoom) loses wherever a finer regional source overlaps — except a datum-authoritative source can set `priority` in metadata (S-102 over CUDEM, INFOMAR over EMODnet) to win regardless of zoom. Zoom caps are display caps (`max_zoom`), not native resolution. Inland lakes are pure GEBCO gap-fill: hydraulically isolated, so no seam against the ocean base; freshwater grids store lakebed _elevation_, so each carries a "subtract surface level" offset.
 
-S-102's ~4.3k products are copied object-for-object into the data bucket on a schedule rather than downloaded to a runner, and aggregation range-reads our copy, so NOAA churn or outages can redden a sources refresh but never a build. It takes the per-tile engine path too: its products span multiple UTM zones, so the mosaic reprojects them per-tile rather than as one VRT. CUDEM's ~1.3k tiles (~197 GB) are prepared on the box against the persistent store volume, because each one is corrected from NAVD88 onto MLLW before it registers ([datum plan](../docs/plans/2026-08-03-datum-vdatum.md)).
+S-102's ~4.3k products are copied object-for-object into the data bucket on a schedule rather than downloaded to a runner, and aggregation range-reads our copy, so NOAA churn or outages can redden a sources refresh but never a build. It takes the per-tile engine path too: its products span multiple UTM zones, so the mosaic reprojects them per-tile rather than as one VRT. CUDEM's ~1.5k tiles (~197 GB) are prepared on the box against the persistent store volume, because each `cudem`/`cudem_third` tile is corrected from NAVD88 onto MLLW before it registers ([datum plan](../docs/plans/2026-08-03-datum-vdatum.md)).
+
+CUDEM is four sources rather than two because horizontal frames, not depths, decide how a collection mosaics. CONUS, Alaska, Puerto Rico and the USVI are uniformly NAD83 (EPSG:4269), so `cudem`/`cudem_third`'s 1,382 tiles merge through one VRT; Hawaii is WGS 84 and Guam is NAD83(MA11), genuinely heterogeneous, so `cudem_pacific`/`cudem_pacific_third` take the per-tile reprojection path S-102 uses. The split keeps the datum row honest too: `cudem*` is on MLLW, `cudem_pacific*` on local island datums VDatum publishes no grid for. Vertical datums play no part in it — every source's staged rasters lose the vertical half of a compound CRS at prep, so no warp can apply a geoid shift to the pixel values.
 
 ## Open candidates
 
@@ -52,7 +55,6 @@ Every open candidate is a GitHub issue labeled [`source`](https://github.com/ope
 
 - [#29](https://github.com/openwatersio/seascape/issues/29) **AusSeabed per-survey COGs** — the AU z12–13 tier, the biggest open win; access verified (public WFS index + anonymous zips).
 - [#36](https://github.com/openwatersio/seascape/issues/36) **Great Salt Lake** — the last unbuilt surveyed lake.
-- [#32](https://github.com/openwatersio/seascape/issues/32) **CUDEM territories** (HI/PR/USVI/Guam/AmSam/CNMI) — extend the existing streamed source.
 - [#38](https://github.com/openwatersio/seascape/issues/38) **IBCAO** — best Arctic resolution, blocked on a licence-ambiguity question, not build work.
 - [#86](https://github.com/openwatersio/seascape/issues/86) **Berlin Tiefenlinienkarte** + [#87](https://github.com/openwatersio/seascape/issues/87) **Brandenburg Seenvermessung** — the Berlin/Potsdam waterways (Müggelsee, Wannsee, Templiner See, 253 BB lakes); both vector isobaths, need a contour→grid step; low-water offsets per impoundment pool from PEGELONLINE/BWu (in the issues).
 
@@ -92,7 +94,7 @@ Two coverage notes that look like gaps but aren't: EMODnet's 58 tiles are the fu
 
 ## Cross-cutting
 
-- **Datum is the recurring wrinkle.** Already low-water (plug into the chart-datum work cleanly): EMODnet (LAT), INFOMAR, S-102, NOS Estuarine, GSC Pacific (CHS Chart Datum, LLWLT), NCEI Great Lakes (LWD), and among candidates UKHO-EEZ, Kartverket, BSH, SHOM. CUDEM gets there in prep: `offset_surface` subtracts a composed VDatum separation grid per pixel (a scalar can't — the NAVD88−MLLW span is +0.13 to +3.3 m across US waters), leaving Hawaii, the Pacific territories and Alaska off the SE panhandle on their own datums where VDatum has no grid. Everything else MSL/NAP/ODN/elevation needs an offset. GSC Atlantic declares no vertical datum at all — CHS chart datum inshore blended into ~MSL offshore, so no single offset is correct. USACE eHydro mixes MLLW vs LWRP _per district_ — its single biggest ingest risk ([#50](https://github.com/openwatersio/seascape/issues/50)).
+- **Datum is the recurring wrinkle.** Already low-water (plug into the chart-datum work cleanly): EMODnet (LAT), INFOMAR, S-102, NOS Estuarine, GSC Pacific (CHS Chart Datum, LLWLT), NCEI Great Lakes (LWD), and among candidates UKHO-EEZ, Kartverket, BSH, SHOM. CUDEM gets there in prep: `offset_surface` subtracts a composed VDatum separation grid per pixel (a scalar can't — the NAVD88−MLLW span is +0.13 to +3.3 m across US waters), leaving Alaska off the SE panhandle on NAVD88 and the whole `cudem_pacific*` pair on local island datums, where VDatum has no grid at all. Everything else MSL/NAP/ODN/elevation needs an offset. GSC Atlantic declares no vertical datum at all — CHS chart datum inshore blended into ~MSL offshore, so no single offset is correct. USACE eHydro mixes MLLW vs LWRP _per district_ — its single biggest ingest risk ([#50](https://github.com/openwatersio/seascape/issues/50)).
 - **Modeled ≠ surveyed.** GLOBathy/3D-LAKES are interpolated depth, not measurement — fine as a labeled low-zoom fill, never as authoritative depth (violates the "honest about quality" principle if shown un-flagged; blocked on [#17](https://github.com/openwatersio/seascape/issues/17)).
 - **No open surveyed global inland compilation exists.** The global lake products are modeled; surveyed lakes are ingested one by one (see the built table).
 
