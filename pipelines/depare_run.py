@@ -14,8 +14,8 @@ water compose without extra layers or archives:
      positive level, so its [0, DRYING_CAP] bucket is the foreshore and shares its 0 m
      seaward edge with the shoal band's amax=0 edge — the same ring, so tippecanoe's
      --detect-shared-borders simplifies both identically with no crack. Cut to effective
-     water (seaward of the OSM land line, but kept inside mapped inland water — the
-     ICW/tidal-channel case), see generate().
+     water (seaward of the OSM land line, but kept inside mapped tidal inland water — the
+     ICW/tidal-channel case; a lake has no chart datum to dry against), see generate().
   3. nodata — water OSM maps as a polygon but the DEM holds no depth for (a #24-cleared
      lake, unsurveyed margins beside a fairway). NO drval1/drval2 — absence IS the encoding
      (MVT has no null; the fill's "no drval1" case renders S-52's NODATA fill) — plus a
@@ -85,6 +85,31 @@ NODATA_RANK = 0
 BAND_RANK = 1
 DRYING_RANK = 2
 
+# Overture water kinds with no tide: drying is referenced to chart datum, so a [0, cap] bucket
+# inside one of these is an artefact (a lake bed on MSL, a clamp-seam rim), never foreshore.
+# Everything else — river, canal, an absent kind — counts as tidal, since dropping real drying is
+# the unsafe direction. Positive evidence overrides the kind prior via _may_dry: the subtype alone
+# misfiles coastal water (OSM maps most lagoons as bare water=lagoon — 93% carry neither salt=*
+# nor tidal=*, so the class must rescue on its own; is_salt / tidal are verbatim OSM salt=yes /
+# tidal=yes). A column the feed doesn't carry only shrinks the rescue, never the suppression.
+NON_TIDAL_KINDS = ("lake", "reservoir")
+TIDAL_CLASSES = ("lagoon",)
+
+
+def _may_dry(w):
+    """Mask over the water frame: features that may contain drying foreshore. Bracket access,
+    not itertuples — `class` is a keyword, so itertuples renames it to a positional field."""
+    may = ~w["kind"].isin(NON_TIDAL_KINDS) if "kind" in w.columns else w.geometry.notna()
+    for c in ("water_class", "class"):
+        if c in w.columns:
+            may |= w[c].isin(TIDAL_CLASSES)
+            break
+    if "is_salt" in w.columns:
+        may |= w["is_salt"].fillna(False).astype(bool)
+    if "tidal" in w.columns:
+        may |= w["tidal"] == "yes"
+    return may
+
 # Sliver filter: the vector edges (OSM water outline, effective-land cut) and the raster
 # depth-band edge (pixel-staircased) never coincide exactly, so `water minus coverage` (nodata)
 # and `bucket minus land` (drying) both leave crumbs along every near-coincident boundary. Drop
@@ -93,10 +118,23 @@ DRYING_RANK = 2
 # compactness < 0.2), so 4 px removes them all — while real intertidal flats and small unsurveyed
 # ponds bottom out around 4 px and survive. The old 64 px was tuned for nodata lakes alone and
 # culled ~1000 genuine small drying flats (only ~2% of the area, but most of the visible detail).
-# Ceiling: a pure area gate can't tell a LONG thin ribbon (1 px × 100 px ≈ 100 px area) from a
-# compact real flat; none occurred here (the difference yields corner fragments, not ribbons), but
-# a width/compactness gate is the targeted tool if thin ribbons ever appear. Env-tunable.
+# Ceiling: a pure area gate cannot tell a LONG thin ribbon (1 px × 100 px ≈ 100 px area) from a
+# compact real flat, so ribbons above it are the drying legibility gate's job below. Env-tunable.
 SLIVER_MIN_PX = float(os.environ.get("SLIVER_MIN_PX", "4"))
+
+# Drying legibility gate: where the coast is low the [0, DRYING_CAP] bucket covers the whole
+# landmass, so the OSM land line is the only thing dividing foreshore from land and the cut sheds
+# ribbons too thin to draw — on a Delmarva back-barrier stem (12-1184-1591-14) the cut alone takes
+# the bucket from 628 parts to 2013, and 647 of the 713 that survive the sliver filter are too
+# small to hold a mark. Two instruments together, because either alone is wrong: AREA below the
+# smallest mark the compilation scale can hold, AND WIDTH (2·area/perimeter) under one DEM pixel.
+# The width term is what keeps this off the real flats a plain area cull takes: on that stem it
+# spares 198 compact small ones the area test alone deletes (713 -> 267 parts, not 66), and drops
+# 0.76% of the band's area in hairlines. Both thresholds are per stem: the area
+# is 16 mm² at the STEM's own compilation scale (a rendering pixel is MM_PER_PX at scale, so a map
+# mm is res/MM_PER_PX projected metres), never a pinned zoom. Set either to 0 to disable the gate.
+DRYING_LEGIBLE_MM2 = float(os.environ.get("DRYING_LEGIBLE_MM2", "16"))
+DRYING_MIN_WIDTH_PX = float(os.environ.get("DRYING_MIN_WIDTH_PX", "1"))
 
 # S-58 Ed. 7.0.0 check 571 caps ENC vertex density at 0.3 mm at compilation scale — the only hard
 # numeric geometry rule in the standards, and a raw gdal_contour partition carries ~5x more than it
@@ -232,6 +270,16 @@ def _polys(geom):
     if t in ("MultiPolygon", "GeometryCollection"):
         return [p for g in geom.geoms for p in _polys(g)]
     return []
+
+
+def _illegible_drying(poly, min_area_m2, min_width_m):
+    """True when a drying part fails BOTH legibility instruments: too small to hold a mark at the
+    stem's compilation scale, and thinner than the raster that drew it. Width is 2·area/perimeter,
+    the same sliver measure the partition gate uses. Either test alone deletes real geometry — a
+    compact flat is small but drawable, a tidal ribbon is thin but long — so both must fail."""
+    if min_area_m2 <= 0 or min_width_m <= 0 or poly.length <= 0:
+        return False
+    return poly.area < min_area_m2 and 2 * poly.area / poly.length < min_width_m
 
 
 def _subdivide(geom, max_pts=512, depth=0):
@@ -546,6 +594,10 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0):
     stem_res = get_resolution(child_z)          # the stem's own MVT pixel, EPSG:3857 metres
     nodata_tol = NODATA_SIMPLIFY_PX * stem_res  # generalize nodata to the stem's resolution
     band_tol = SIMPLIFY_MM / MM_PER_PX * stem_res  # the S-58 vertex floor at this stem's scale
+    # Drying legibility: area at the STEM's scale (what a reader sees), width in the DEM's own
+    # pixel (what drew the ribbon) — the two differ on the coarsened retry window.
+    drying_legible_area = DRYING_LEGIBLE_MM2 * (stem_res / MM_PER_PX) ** 2
+    drying_min_width = DRYING_MIN_WIDTH_PX * res
     sink = _RowSink(f"{tmp}/depare-rows.geojsons")
 
     # ── depth bands + drying ── the metre + fathom partition ladders, each off one gdal_contour -p
@@ -603,8 +655,8 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0):
     # intersects — identical output (a disjoint part is a no-op), bounded local work. The
     # monolithic union made every feature pay the whole window's vertex count (the 8.9 h stems).
 
-    # Inland-water feed, read once by bbox (the nodata pass iterates its features for `kind`; the
-    # drying cut unions its geometry). Optional: absent -> no water term (today's land-only gate).
+    # Inland-water feed, read once by bbox (the nodata pass iterates all its features for `kind`;
+    # the drying cut unions the tidal ones). Optional: absent -> no water term (land-only gate).
     water_src = landmask.water_path()
     water = None
     if landmask._present(water_src):
@@ -614,7 +666,8 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0):
     _mark("water-read")
     # Parts, same reason as coverage: the union's one consumer (the drying water term) only
     # needs the parts near the bucket.
-    water_parts = [make_valid(g) for g in water.geometry] if water is not None else []
+    tidal_parts = [make_valid(g) for g in water.geometry[_may_dry(water)]] \
+        if water is not None else []
     _mark("water-make-valid")
 
     # ── drying ── fold the [0, DRYING_CAP] foreshore in as DEPARE with a negative drval1. Cut the
@@ -622,12 +675,14 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0):
     # osmdata land product does NOT punch inland water out as holes, so a tidal channel OSM maps as
     # a water polygon sits INSIDE the land coverage; cutting by raw land would delete the drying
     # flats in and along that channel (the ICW/tidal-river failure). effective_water = (NOT land)
-    # OR water, so drying = bucket.difference(land) ∪ bucket.intersection(water) — matching the
-    # raster gate (rasterize burns land=1 then water=0) without materialising land ∖ water. Absent
-    # land.fgb -> no landward cut (degrade; land.fgb is effectively always present); absent
-    # water.fgb -> effective_water = NOT land (the union term is empty). The bucket arrives
-    # simplified in the SAME coverage pass as the bands, which is what keeps the shared 0 m edge
-    # aligned; clip in shapely; the min-area filter drops seam slivers.
+    # OR tidal water, so drying = bucket.difference(land) ∪ bucket.intersection(tidal) — matching
+    # the raster gate (rasterize burns land=1 then water=0) without materialising land ∖ water, with
+    # NON_TIDAL_KINDS held out so a lake keeps only what the land cut leaves (nothing: the land
+    # product does not hole-punch inland water). Absent land.fgb -> no landward cut (degrade;
+    # land.fgb is effectively always present); absent water.fgb -> effective_water = NOT land (the
+    # union term is empty). The bucket arrives simplified in the SAME coverage pass as the bands,
+    # which is what keeps the shared 0 m edge aligned; clip in shapely; the min-area filter drops
+    # seam slivers and the legibility gate the hairlines the land cut leaves above them.
     drying_area = None
     if drying_geoms:
         bucket = coverage_union(drying_geoms)
@@ -644,14 +699,14 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0):
         else:
             effective = bucket.difference(land_geom)
             _mark("drying-diff-land")
-            if water_parts:
+            if tidal_parts:
                 # Prune to water parts that truly intersect the bucket (predicate, like the nodata
                 # pass — cut drying-water-terms 63->17 s on 6-19-18-9), then ONE float intersection
                 # against their union: the window-spanning BUCKET is the unbounded operand, so
                 # pairwise would be quadratic (912 s+ measured). No GRID here — this shape measured
                 # byte-exact on every profile stem, and snap-rounding traded that for nothing.
-                near = [water_parts[i]
-                        for i in STRtree(water_parts).query(bucket, predicate="intersects")]
+                near = [tidal_parts[i]
+                        for i in STRtree(tidal_parts).query(bucket, predicate="intersects")]
                 if near:
                     effective = valid_union([effective, bucket.intersection(shapely.union_all(near))])
                 _mark("drying-water-terms")
@@ -661,7 +716,8 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0):
             drying_area = effective  # subtracted from nodata below (over the buffered extent)
             drying_rows = []
             for full in _polys(effective):  # gate the PRE-clip polygon so a seam sliver of a big flat survives both sides
-                if full.area >= min_area:
+                if full.area >= min_area and not _illegible_drying(
+                        full, drying_legible_area, drying_min_width):
                     for p in _polys(full.intersection(clip)):  # clip the survivors; no re-filter on the piece
                         drying_rows.append({"geometry": p, "drval1": -config.DRYING_CAP,
                                             "drval2": 0.0, "sys": None, "kind": None,
@@ -801,8 +857,9 @@ def _check():
     extra DRYING_CAP level yields the [0, DRYING_CAP] drying bucket (selected by 0 < amax <= cap,
     never amin), each water depth lands in its ladder bucket, the water bands are pairwise disjoint
     and jointly cover the water, the ladders ascend and end at 0, and the buckets are deterministic
-    (the seam contract reduces to this). The effective-land drying cut is exercised end-to-end
-    against real masks in test_engine.check_depare_drying."""
+    (the seam contract reduces to this). The drying legibility gate takes a hairline and spares the
+    compact flat of equal area. Then the effective-water cut end to end on fixture masks: the
+    bucket ships as drying inside a tidal water polygon, never inside a lake."""
     import tempfile
 
     import numpy as np
@@ -840,6 +897,20 @@ def _check():
         "coverage_union must merge along shared edges"
     assert coverage_union([_box(0, 0, 2, 1), _box(1, 0, 3, 1)]).equals(_box(0, 0, 3, 1)), \
         "coverage_union must fall back to unary_union when the parts overlap"
+
+    # The drying legibility gate needs BOTH instruments to fail. A compact flat and a hairline of
+    # the SAME area are what a pure area gate cannot tell apart, and the flat is the one the 2026
+    # cull deleted by the thousand — so the width term must spare it and take the ribbon.
+    _flat, _ribbon = _box(0, 0, 30, 30), _box(0, 0, 1, 900)
+    assert abs(_flat.area - _ribbon.area) < 1e-9, "the pair must be indistinguishable by area"
+    assert not _illegible_drying(_flat, 1164.0, 2.39), "a compact sub-legible flat must survive"
+    assert _illegible_drying(_ribbon, 1164.0, 2.39), "a sub-legible hairline must be dropped"
+    # Above the area threshold nothing is dropped, however thin: shedding drying is the unsafe
+    # direction, so a long ribbon stays even though it draws as a line.
+    assert not _illegible_drying(_box(0, 0, 1, 2000), 1164.0, 2.39), \
+        "the gate must not reach a ribbon above the legibility area"
+    assert not _illegible_drying(_ribbon, 0, 2.39) and not _illegible_drying(_ribbon, 1164.0, 0), \
+        "either threshold at 0 disables the gate"
 
     # Coverage simplification is the whole partition contract in one call: two bands sharing a
     # dense chain must come back sharing the IDENTICAL chain — same vertices, in both members —
@@ -995,6 +1066,61 @@ def _check():
     flat_g = read_bucket(partitions(fp, levels_m, f"{d}/flat-raw.fgb"), "amax <= 0")
     assert len(flat_g) == 0, \
         "a uniform-0 surface must produce no depth band (it's the drying bucket, not a shoal tint)"
+
+    # The drying water term is tidal-only, end to end: one [0, cap] band crossing two water
+    # polygons that both sit inside the land coverage (so the water term alone decides) ships as
+    # foreshore inside the river and nowhere inside the lake, whose shore ribbon stays nodata.
+    t = mercantile.Tile(x=2048, y=2048, z=12)
+    bb = mercantile.xy_bounds(t)
+    wres = (bb.right - bb.left) / 60
+
+    def cell_box(c0, r0, c1, r1):  # DEM cell indices -> EPSG:3857 box on the tile grid
+        return _box(bb.left + c0 * wres, bb.top - r1 * wres,
+                    bb.left + c1 * wres, bb.top - r0 * wres)
+
+    kdem = np.full((60, 60), cap + 50, dtype="float32")
+    kdem[20:40, :] = 2.0  # a [0, cap] foreshore band crossing both water polygons
+    kp = f"{d}/kind-dem.tif"
+    with rasterio.open(kp, "w", driver="GTiff", height=60, width=60, count=1, dtype="float32",
+                       nodata=-9999, crs="EPSG:3857",
+                       transform=from_origin(bb.left, bb.top, wres, wres)) as dst:
+        dst.write(kdem, 1)
+    lake, river, lagoon, tidal_lake = (cell_box(2, 15, 13, 45), cell_box(17, 15, 28, 45),
+                                       cell_box(32, 15, 43, 45), cell_box(47, 15, 58, 45))
+    gpd.GeoDataFrame(geometry=[_box(*bb)], crs="EPSG:3857").to_file(
+        f"{d}/land.fgb", driver="FlatGeobuf")
+    # Each rescue clause decides exactly one box: the lagoon by class ALONE, the tidal lake by
+    # tidal=yes ALONE (is_salt deliberately all-null: the fillna path must run without deciding
+    # the outcome).
+    gpd.GeoDataFrame({"kind": ["lake", "river", "lake", "lake"],
+                      "class": [None, None, "lagoon", None],
+                      "is_salt": [None, None, None, None],
+                      "tidal": [None, None, None, "yes"]},
+                     geometry=[lake, river, lagoon, tidal_lake],
+                     crs="EPSG:3857").to_file(f"{d}/water.fgb", driver="FlatGeobuf")
+    saved = {k: os.environ.get(k) for k in ("LANDMASK", "WATERMASK")}
+    os.environ["LANDMASK"], os.environ["WATERMASK"] = f"{d}/land.fgb", f"{d}/water.fgb"
+    try:
+        out = _depare_dem(kp, t, t.z, tempfile.mkdtemp(), "kind-check")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    assert out, "the kind fixture must produce rows"
+    rows = gpd.read_file(out[0]).to_crs("EPSG:3857")
+    dry = rows[rows["drval1"].notna() & (rows["drval1"] < 0)]
+    assert dry.intersects(river).any(), "drying must survive inside a tidal (river) water polygon"
+    assert not dry.intersects(lake).any(), \
+        "a lake is off chart datum — its [0, cap] rim must emit no drying"
+    assert dry.intersects(lagoon).any(), \
+        "class=lagoon must rescue a kind=lake polygon (most lagoons carry no other signal)"
+    assert dry.intersects(tidal_lake).any(), \
+        "an OSM tidal=yes must rescue a kind=lake polygon"
+    nodata_rows = rows[rows["drval1"].isna()]
+    assert nodata_rows.covers(lake.intersection(cell_box(0, 20, 60, 40)).centroid).any(), \
+        "the lake's [0, cap] shore ribbon stays part of its nodata polygon"
     print(f"depare_run self-check ok ({len(bands)} m-bands, {len(drying)} drying, "
           f"{len(gft_bands)} ft-bands)")
 

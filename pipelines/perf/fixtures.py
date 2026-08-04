@@ -1,12 +1,12 @@
 #!/usr/bin/env -S uv run --script
-"""Local profiling fixtures: small real windows over the Gulf marsh, cut from the published
-mosaic COGs by range read.
+"""Local profiling fixtures: small real windows over the Gulf marsh and the Delmarva lagoons, cut
+from the published mosaic COGs by range read.
 
 A real z15 marsh stem is a z8 macrotile: 65666 px square, 17.2 GB as Float32. That does not run
 on a 17 GB laptop, so the fixtures are synthetic macrotile-z stems over the same ground —
-`2^(15-12)*512 = 4096` px core for a z12 stem, at native z15 resolution. Nothing in the stage-3
-path reads utils.macrotile_z, and geometry comes from the stem's mercantile bounds plus the
-raster's own transform, so these exercise the real code at real detail.
+`2^(15-12)*512 = 4096` px core for a z12 stem, at the macrotile's own child_z resolution. Nothing
+in the stage-3 path reads utils.macrotile_z, and geometry comes from the stem's mercantile bounds
+plus the raster's own transform, so these exercise the real code at real detail.
 
 Each crop is written as the stem's OWN mosaic tile at exactly the stem's buffered bounds, so
 mosaic.intersecting_tiles(stem) == [stem] and window_dem's -te matches the crop — no nodata fill
@@ -55,7 +55,14 @@ SITES = {
                   "Barataria Waterway; highest 0 m crossings/row (67)"),
     "atchafalaya": ("8-63-105-15-c5e84cd361a5.tif", -91.25, 29.60,
                     "open bay with real -2/-5 m bathymetry; the level-set control"),
+    "delmarva": ("8-74-99-14-3fb472fde1f8.tif", -75.9103, 37.2197,
+                 "back-barrier lagoons; the drying fragmentation site, 713 parts at z12"),
 }
+
+# A crop must carry its macrotile's OWN child_z or it is not the surface production contours:
+# the Delmarva macrotile is cz14, and reading it at CHILD_Z would invent detail the mosaic
+# does not hold.
+SITE_CHILD_Z = {"delmarva": 14}
 
 # Published mask sizes, so a stale mask can never silently change a measurement. A stale or
 # absent water.fgb changes the nodata layer AND the drying cut, which is exactly the mechanism
@@ -63,10 +70,10 @@ SITES = {
 MASKS = {"land.fgb": 1358292496, "water.fgb": 17814296120}
 
 
-def stem_for(site, z=12, child_z=CHILD_Z):
+def stem_for(site, z=12, child_z=None):
     _tile, lon, lat, _why = SITES[site]
     t = mercantile.tile(lon, lat, z)
-    return f"{z}-{t.x}-{t.y}-{child_z}"
+    return f"{z}-{t.x}-{t.y}-{child_z or SITE_CHILD_Z.get(site, CHILD_Z)}"
 
 
 def geometry(stem):
@@ -167,6 +174,10 @@ def _check():
         s = stem_for(site, 12)
         assert len(s.split("-")) == 4
         assert SITES[site][0].endswith(".tif")
+        # A crop read at the wrong child_z is a different surface, so the stem's child_z must be
+        # the one its published macrotile carries — which the tile's own basename states.
+        assert s.split("-")[3] == SITES[site][0].split("-")[3], \
+            f"{site}: stem {s} does not carry its macrotile's child_z ({SITES[site][0]})"
     print(f"fixtures self-check ok (z12 -> {w}px window, {int(halo_px)}px halo, {res:.7f} m/px)")
 
 

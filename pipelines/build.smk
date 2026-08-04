@@ -299,7 +299,10 @@ SMOOTH_CFG = json.dumps({} if os.environ.get("SKIP_SMOOTH") else {
     "pond_fill_mm2": smooth.POND_FILL_MM2,
     "pond_fill_extent_m": smooth.POND_FILL_EXTENT_M,
     "pond_fill_max_depth_m": smooth.POND_FILL_MAX_DEPTH_M,
-    "pond_fill_min_child_z": smooth.POND_FILL_MIN_CHILD_Z}, sort_keys=True)
+    "pond_fill_min_child_z": smooth.POND_FILL_MIN_CHILD_Z,
+    # Not a dial — smooth_array's shoal clamp carries no knob, and a surface property with no
+    # dial would otherwise leave every window fresh across a change to it.
+    "shoal_clamped": True}, sort_keys=True)
 
 
 # Fork reservations by child_z: ceil(measured max RSS) over the runs 30311420659 /

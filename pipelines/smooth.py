@@ -7,7 +7,8 @@ the kernel grows toward DEM_SIGMA_DEEP through the shelf; the informational deep
 the 200 m shelf break is smoothed hard. A slope gate preserves steep detail (canyon
 walls, seamounts) at every depth. Navigation safety is bounded by under-keel
 clearance, so the shallow band (≤ DEPTH_FULL = 30 m, the ECDIS default safety
-contour) — where measured precision matters most — stays at the light baseline.
+contour) — where measured precision matters most — stays at the light baseline,
+and the blur is clamped shoal-ward so no pixel ever reads deeper than its source.
 Applied to each aggregation tile's merged DEM, so the raster encode and the contour
 fork share one smoothed surface. Processed in overlapping windows (halo = the gaussian truncation radius),
 so peak memory is one padded block, not the whole raster — a z14 macrotile is
@@ -109,6 +110,9 @@ def smooth_array(dem, res, nodata=NODATA):
     depth_w = np.clip((depth - DEPTH_FULL) / (DEPTH_SMOOTH - DEPTH_FULL), 0.0, 1.0)
     blurred = blur_light * (1.0 - depth_w) + blur_heavy * depth_w
     out = dem * (1.0 - flat_w) + blurred * flat_w
+    # A symmetric kernel deepens the shoal side of every slope, and a chart may never read deeper
+    # than its source (IHO S-4 B-411.5), so the blur is allowed to shoal only.
+    out = np.maximum(out, dem)
     return np.where(water, out, dem).astype("float32")  # land + nodata untouched
 
 
@@ -284,7 +288,8 @@ def pond_fill(dem, child_z=POND_FILL_MIN_CHILD_Z, mm2=None, extent_m=None, block
 
 
 def _check():
-    """Deep flat smooths harder than shallow; shallow stays denoised; a steep step is preserved."""
+    """Deep flat smooths harder than shallow; shallow stays denoised; a steep step is preserved;
+    no pixel comes back deeper than it went in."""
     rng = np.random.default_rng(0)
     noise = rng.normal(0, 5, (256, 256)).astype("float32")
     shallow_in = (-10 + noise).astype("float32")    # ≤30 m → light baseline blur
@@ -293,6 +298,8 @@ def _check():
     d_out = smooth_array(deep_in, res=300.0)
     assert s_out.std() < shallow_in.std(), (s_out.std(), shallow_in.std())  # shallow still denoised, not turned off
     assert d_out.std() < s_out.std(), (d_out.std(), s_out.std())            # deep smoothed harder than shallow
+    for a, b in ((shallow_in, s_out), (deep_in, d_out)):
+        assert (b >= a).all(), float(np.max(a - b))  # IHO S-4 B-411.5: never deeper than the source
 
     step = np.where(np.arange(256)[None, :] < 128, -10.0, -2000.0).astype("float32")
     step = np.broadcast_to(step, (256, 256)).copy()
