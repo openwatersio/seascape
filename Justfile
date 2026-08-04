@@ -73,6 +73,8 @@ test-sources:
     uv run python source_prep.py --check
     uv run python source_polygonize.py --check
     uv run python source_check.py --check
+    uv run python source_datum.py --check
+    uv run python datum_grid.py --check
     uv run snakemake -s ../Snakefile -n sources > /dev/null
 
 # Build self-checks: the e2e (real stage-1 CLIs + the unified DAG), the `cover` checkpoint

@@ -1,10 +1,10 @@
 # NOAA CUDEM 1/9 arc-second national topobathy — a *filelist* (manifest), not a
 # data file: one tile URL per line, ~940 tiles across all 18 US coastal regions
-# (Atlantic, Gulf, Pacific, AK). source_mirror registers each tile as a relative
-# objects/<key> row (header reads for newly-listed tiles only) + a mirror manifest;
-# the bytes are copied into the store's object mirror — no build-time NOAA reads.
-# NAVD88 vertical / NAD83 (EPSG:4269) horizontal. NOAA regenerates the manifest as
-# tiles are re-surveyed, so coverage stays current without re-listing here.
+# (Atlantic, Gulf, Pacific, AK). Each tile is fetched, corrected onto MLLW against
+# store/datum/navd88_mllw.tif (metadata `offset_surface`) and normalized to a COG —
+# no build-time NOAA reads. NAVD88 vertical / NAD83 (EPSG:4269) horizontal upstream.
+# NOAA regenerates the manifest as tiles are re-surveyed, so coverage stays current
+# without re-listing here.
 https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_ninth_Topobathy_2014_8483/urllist8483.txt
 
 # Territory topobathy (issue #32): Hawaii, Puerto Rico, USVI, Guam, American Samoa,
@@ -12,9 +12,10 @@ https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_ninth_Topobathy_201
 # product carries its OWN local vertical datum, not NAVD88: HI=MSL, PR=PRVD02,
 # USVI=VIVD09, Guam=GUVD04, AmSam=ASVD02, CNMI=NAVD88 (all local-MSL-family, verified
 # in the tile headers). NoData varies per tile (-9999 / -999999); gdalwarp reads each
-# tile's nodata + CRS at reproject, so they ingest as-is exactly like CONUS. When #16's
-# low-water offset lands each territory needs its own offset (distinct datums) — that's
-# why the header keeps the per-territory datum on record.
+# tile's nodata + CRS at reproject, so they ingest as-is exactly like CONUS. PR/USVI are
+# inside VDatum coverage and correct with the rest; Hawaii and the Pacific territories
+# have no VDatum grid at all and stay on their own local datum until per-island scalars
+# land — that's why the header keeps the per-territory datum on record.
 https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_ninth_Topobathy_Hawaii_9428/urllist9428.txt
 https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_ninth_Topobathy_PuertoRico_9525/urllist9525.txt
 https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_ninth_Topobathy_USVI_9529/urllist9529.txt

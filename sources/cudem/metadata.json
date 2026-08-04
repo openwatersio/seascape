@@ -4,6 +4,8 @@
     "website": "https://www.ncei.noaa.gov/products/coastal-relief-model",
     "license": "public domain (U.S. Government work)",
     "max_zoom": 13,
-    "raw": true,
+    "datum": "MLLW where VDatum covers; NAVD88 / local territory datums uncorrected elsewhere",
+    "offset_surface": "navd88_mllw",
+    "mixed_crs": true,
     "filter": "*.tif|*.tiff"
 }

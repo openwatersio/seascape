@@ -6,7 +6,10 @@ the per-source knobs that live in Justfile flags on the legacy chain:
   crs             horizontal CRS to assign (source_normalize --crs)
   nodata          nodata value to assign (source_normalize --nodata)
   negate          raw values are positive-down depth → flip (source_datum --negate)
-  datum_offset_m  constant shift to ~MSL (source_datum --offset)
+  datum_offset_m  constant shift to the target datum (source_datum --offset)
+  offset_surface  reference raster subtracted per pixel for a spatially-varying datum
+                  separation (source_datum --offset-surface); names a raster in the datum
+                  store, e.g. "navd88_mllw" (built by datum_grid.py)
   clamp_positive  drop cells above the water surface (source_datum --clamp-positive)
   unpack          how to turn each raw asset into staged raster(s); absent = a bare
                   raster (see below)
@@ -58,7 +61,7 @@ from glob import glob
 import config
 import utils
 from convert_e00 import e00_to_tif
-from source_datum import transform_file, write_sidecar
+from source_datum import surface_path, transform_file, write_sidecar
 from source_normalize import normalize_file
 
 # Only trust a URL's trailing extension when it names a real data/archive format;
@@ -414,11 +417,23 @@ def prep(source):
     negate = bool(meta.get("negate", False))
     offset = float(meta.get("datum_offset_m", 0.0))
     clamp = bool(meta.get("clamp_positive", False))
-    write_sidecar(source, negate, offset, clamp)  # even for a no-op: the catalog's invariant
-    if negate or offset or clamp:
-        print(f"{source}: datum negate={negate} offset={offset} clamp_positive={clamp}")
+    name = meta.get("offset_surface")
+    write_sidecar(source, negate, offset, clamp, name)  # even for a no-op: the catalog's invariant
+    surface = surface_path(name) if name else None
+    if surface and not os.path.isfile(surface):
+        sys.exit(f"{source}: offset surface {surface} is not in the store — "
+                 "build it with datum_grid.py")
+    if negate or offset or clamp or surface:
+        print(f"{source}: datum negate={negate} offset={offset} surface={name} "
+              f"clamp_positive={clamp}")
+        uncorrected = 0
         for tif in tifs:
-            transform_file(tif, negate, offset, clamp)
+            corrected = transform_file(tif, negate, offset, clamp, surface)
+            if surface and not corrected:
+                uncorrected += 1
+        if uncorrected:
+            print(f"{source}: {uncorrected}/{len(tifs)} file(s) outside the reference's "
+                  "coverage — passed through uncorrected")
 
     crs, nodata = meta.get("crs"), meta.get("nodata")
     print(f"{source}: normalize {len(tifs)} file(s) (crs={crs} nodata={nodata})")
@@ -531,7 +546,8 @@ def _check():
             "in-place steps must never write through into raw/"
         with open(f"store/source/{sid}/datum.json") as f:
             sidecar = json.load(f)
-        assert sidecar == {"negate": True, "offset_m": -1.0, "clamp_positive": False}, sidecar
+        assert sidecar == {"negate": True, "offset_m": -1.0, "clamp_positive": False,
+                           "offset_surface": None}, sidecar
         for name, want in (("a.tif", -6.0), ("b.tif", -11.0)):  # -(v) - 1
             with rasterio.open(f"store/source/{sid}/{name}") as src:
                 assert src.crs.to_epsg() == 28992, (name, src.crs)
@@ -574,6 +590,33 @@ def _check():
             f.write(tif_bytes(7.0))
         stage(bid)
         assert os.path.isfile(f"store/source/{bid}/{bid}_0.tif"), "bare raster stages under legacy name"
+
+        # `offset_surface` drives the per-pixel datum correction (the CUDEM shape: bare rasters,
+        # no crs/nodata override, a reference from the datum store) and lands in the sidecar.
+        sid_s = "_prep_surface"
+        su = "https://x/tile.tif"
+        seed(sid_s, [su], {"name": "Surface", "offset_surface": "synth"})
+        with rasterio.open(raw_of(sid_s, su), "w", driver="GTiff", height=2, width=2, count=1,
+                           dtype="float32", nodata=-9999.0, crs="EPSG:4326",
+                           transform=from_origin(0, 2, 1, 1)) as dst:
+            dst.write(np.full((2, 2), -10.0, dtype="float32"), 1)  # bed 10 m below zero
+        os.makedirs("store/datum", exist_ok=True)
+        with rasterio.open("store/datum/synth.tif", "w", driver="GTiff", height=2, width=2,
+                           count=1, dtype="float32", crs="EPSG:4326", nodata=-9999.0,
+                           transform=from_origin(0, 2, 1, 1)) as dst:
+            dst.write(np.full((2, 2), -1.0, dtype="float32"), 1)  # chart datum 1 m lower
+        prep(sid_s)
+        with open(f"store/source/{sid_s}/datum.json") as f:
+            assert json.load(f)["offset_surface"] == "synth"
+        with rasterio.open(f"store/source/{sid_s}/{sid_s}_0.tif") as src:
+            assert src.read(1)[0, 0] == -9.0, src.read(1)  # bed - (-1): shallower
+        # A declared surface that isn't in the store must name itself, not silently no-op.
+        os.remove("store/datum/synth.tif")
+        try:
+            prep(sid_s)
+            assert False, "expected a missing offset surface to exit"
+        except SystemExit as e:
+            assert "offset surface" in str(e) and "datum_grid.py" in str(e), e
 
         # Two archives whose members share a basename must hard-error, not silently overwrite.
         cid = "_prep_collide"

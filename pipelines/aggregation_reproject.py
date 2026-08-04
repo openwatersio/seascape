@@ -243,8 +243,8 @@ def warp_mixed(inputs, out_tif, zoom, aggregation_tile, buffer):
     """gdalwarp several heterogeneous-CRS inputs into one 3857 GTiff mosaic. A warped
     VRT can't span source CRSs (it has one), so warp straight to a raster — each input
     is reprojected from its own UTM zone, so a zone-crossing tile keeps every source.
-    No value transform: streamed sources skip source_datum, MLLW->MSL is a future
-    VDatum job; nan source-nodata maps to NODATA via -dstnodata."""
+    No value transform: a source's datum correction is baked in at prep (source_datum),
+    never here; nan source-nodata maps to NODATA via -dstnodata."""
     left, bottom, right, top = buffered_bounds(aggregation_tile, buffer)
     res = get_resolution(zoom)
     # ZSTD+predictor3 (single-band Float32) shrinks this transient ~4x; SPARSE_OK skips

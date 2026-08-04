@@ -49,8 +49,9 @@ rule mirror_objects:
 
 
 # Push one source, catalog.json last. Processed: sync + footprint. Raw: copy, never
-# sync (objects/ under the prefix must never be swept). bounds.csv stays excluded on both
-# legs, so a dead local copy is never pushed and R2's retired object is never deleted.
+# sync (objects/ under the prefix must never be swept). bounds.csv and objects/ stay excluded
+# on both legs, so a dead local copy is never pushed and a retired R2 prefix is never deleted —
+# a source that moves from raw to processed must not sweep its old object mirror on the way.
 rule publish_source:
     input:
         unpack(publish_inputs)
@@ -68,7 +69,7 @@ rule publish_source:
         'if [ "{params.raw}" = "true" ]; then '
         '  rclone copy "$src" "$dest" --exclude "bounds.csv" --exclude "catalog.json" --exclude "objects/**" --exclude "raw/**" --retries 5; '
         'else '
-        '  rclone sync "$src" "$dest" --exclude "bounds.csv" --exclude "catalog.json" --exclude "raw/**" --retries 5; '
+        '  rclone sync "$src" "$dest" --exclude "bounds.csv" --exclude "catalog.json" --exclude "objects/**" --exclude "raw/**" --retries 5; '
         '  if [ -f "store/polygon/{wildcards.source}.gpkg" ]; then '
         '    rclone copyto "store/polygon/{wildcards.source}.gpkg" "{DEST}/polygon/{wildcards.source}.gpkg" --retries 5; '
         '  fi; '

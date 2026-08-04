@@ -1,5 +1,5 @@
 # The Snakemake build — ONE DAG, ONE entry (this file). See docs/plans/2026-07-14-snakemake-build.md.
-# Per-source knobs (crs/nodata/negate/datum_offset_m/clamp_positive/unpack)
+# Per-source knobs (crs/nodata/negate/datum_offset_m/offset_surface/clamp_positive/unpack)
 # live in sources/<id>/metadata.json. Run from the repo root:
 #   uv run snakemake sources [--config source=<id>] [-n]
 #   uv run snakemake catalogs                     # + masks, covering, coverage
@@ -38,6 +38,13 @@ STREAMED = ([s for s in ALL_SOURCES if not (_wd / "store/source" / s / "raw").is
 LOCAL_PROCESSED = [s for s in PROCESSED if s not in STREAMED]
 LOCAL_RAW = [s for s in RAW if s not in STREAMED]
 LOCAL_LISTED = [s for s in LISTED if s not in STREAMED]
+
+# offset_surface: <name> ⇒ that source's prep subtracts store/datum/<name>.tif per pixel —
+# the chart datum's height in the source's own vertical frame, for the tidal separations no
+# scalar datum_offset_m can express (pipelines/datum_grid.py builds the reference).
+DATUM_SURFACES = sorted({name for name in
+                         (pipeline_config.load_metadata(s).get("offset_surface")
+                          for s in ALL_SOURCES) if name})
 
 ONLY = config.get("source")
 if ONLY and ONLY not in PROCESSED + RAW:
@@ -103,6 +110,7 @@ rule prep_source:
         raw_assets,
         metadata=str(SOURCES_DIR / "{source}/metadata.json"),
         recipe=recipe_files,  # everything --hash-recipe hashes, so any recipe edit restamps
+        surface=offset_surface,  # the datum reference, for a source that declares one
     output:
         # staged tif names aren't knowable at parse; catalog.json is the declared artifact
         "store/source/{source}/catalog.json"
@@ -207,6 +215,30 @@ rule fetch_catalog:
         "if ! grep -q '\"seascape:files\"' $c; then "
         "  curl -fsS {STREAM_BASE}/{wildcards.source}/bounds.csv -o $b.tmp && mv $b.tmp $b; "
         "fi ) 2> {log} || {{ rm -f {output.catalog}.tmp store/source/{wildcards.source}/bounds.csv.tmp; exit 1; }}"
+
+
+# The chart-datum reference a prep subtracts (source_datum --offset-surface) — a support
+# artifact like the landmask, NOT a sources/ entry (everything under sources/ enters the merge).
+# Composing it downloads NOAA's pinned VDatum bundle (3.2 GB, cached beside the output) and runs
+# the per-region formula over it, so the store's copy IS the cache. Keyed on the module that
+# holds both the bundle pin and the composition: a formula fix must not ship under the old grid.
+rule datum_surface:
+    input:
+        str(SCRIPTS / "datum_grid.py"),
+    output:
+        "store/datum/{name}.tif"
+    wildcard_constraints:
+        name=pat(DATUM_SURFACES)
+    priority: 5_000_000  # a source prep waits on it; same band as the registrations
+    retries: 2  # the bundle fetch is one 3.2 GB stream from vdatum.noaa.gov
+    resources:
+        mem_gb=8  # a region's grids in flight + the coarse fill pass
+    benchmark:
+        f"{TMP}/bench/datum_surface/{{name}}.tsv"
+    log:
+        f"{TMP}/logs/datum_surface/{{name}}.log"
+    shell:
+        "{PY}/datum_grid.py --out {output} 2> {log}"
 
 
 # Masks rebuild only when forced (-R landmask): pinned snapshot/release ⇒ no data drift.
