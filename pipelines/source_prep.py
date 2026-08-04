@@ -61,7 +61,8 @@ from glob import glob
 import config
 import utils
 from convert_e00 import e00_to_tif
-from source_datum import flatten_compound_crs, surface_path, transform_file, write_sidecar
+from source_datum import (coverage_report, flatten_compound_crs, surface_path, transform_file,
+                          write_sidecar)
 from source_normalize import normalize_file
 
 # Only trust a URL's trailing extension when it names a real data/archive format;
@@ -428,14 +429,15 @@ def prep(source):
     if negate or offset or clamp or surface:
         print(f"{source}: datum negate={negate} offset={offset} surface={name} "
               f"clamp_positive={clamp}")
-        uncorrected = 0
+        per_file = []
         for tif in tifs:
-            corrected = transform_file(tif, negate, offset, clamp, surface)
-            if surface and not corrected:
-                uncorrected += 1
-        if uncorrected:
-            print(f"{source}: {uncorrected}/{len(tifs)} file(s) outside the reference's "
-                  "coverage — passed through uncorrected")
+            corrected, valid = transform_file(tif, negate, offset, clamp, surface)
+            per_file.append((os.path.basename(tif), corrected, valid))
+        if surface:
+            # Rewritten with the measured coverage: how much of the source actually moved is
+            # only known once every file is transformed.
+            write_sidecar(source, negate, offset, clamp, name,
+                          coverage_report(source, per_file))
 
     # After the transform, which already reduces the CRS on the files it rewrites; this
     # catches the rest, so no staged raster reaches a warp carrying a vertical CRS.
@@ -555,7 +557,7 @@ def _check():
         with open(f"store/source/{sid}/datum.json") as f:
             sidecar = json.load(f)
         assert sidecar == {"negate": True, "offset_m": -1.0, "clamp_positive": False,
-                           "offset_surface": None}, sidecar
+                           "offset_surface": None, "corrected_fraction": None}, sidecar
         for name, want in (("a.tif", -6.0), ("b.tif", -11.0)):  # -(v) - 1
             with rasterio.open(f"store/source/{sid}/{name}") as src:
                 assert src.crs.to_epsg() == 28992, (name, src.crs)
@@ -632,12 +634,17 @@ def _check():
         with rasterio.open("store/datum/synth.tif", "w", driver="GTiff", height=2, width=2,
                            count=1, dtype="float32", crs="EPSG:4326", nodata=-9999.0,
                            transform=from_origin(0, 2, 1, 1)) as dst:
-            dst.write(np.full((2, 2), -1.0, dtype="float32"), 1)  # chart datum 1 m lower
+            # Chart datum 1 m lower over the western column only: the coverage edge a real
+            # boundary tile sits on, so the source's corrected fraction is a ratio, not 1.
+            dst.write(np.array([[-1.0, -9999.0]] * 2, dtype="float32"), 1)
         prep(sid_s)
         with open(f"store/source/{sid_s}/datum.json") as f:
-            assert json.load(f)["offset_surface"] == "synth"
+            sidecar_s = json.load(f)
+        assert sidecar_s["offset_surface"] == "synth", sidecar_s
+        assert sidecar_s["corrected_fraction"] == 0.5, sidecar_s
         with rasterio.open(f"store/source/{sid_s}/{sid_s}_0.tif") as src:
-            assert src.read(1)[0, 0] == -9.0, src.read(1)  # bed - (-1): shallower
+            assert src.read(1)[0, 0] == -9.0, src.read(1)   # bed - (-1): shallower
+            assert src.read(1)[0, 1] == -10.0, src.read(1)  # no coverage: passed through
         # A declared surface that isn't in the store must name itself, not silently no-op.
         os.remove("store/datum/synth.tif")
         try:

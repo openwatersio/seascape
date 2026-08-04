@@ -25,12 +25,18 @@ CNMI, American Samoa and Alaska outside the southeast panhandle have no VDatum g
 outside coverage the reference is nodata, which ``source_datum --offset-surface`` treats as
 "leave the pixel alone".
 
+Publication is gated on two independent checks, because either alone ships a broken surface:
+the benchmark stations validate the formula and its sign at 16 points, and ``check_coverage``
+validates that all 52 regions are actually in the mosaic and that it is the size it was. The
+per-region pixel counts land in ``store/datum/navd88_chart.json`` beside the COG.
+
 Run from pipelines/:
     uv run python datum_grid.py --bundle <extracted-vdatum-dir>   # or omit to fetch the zip
     uv run python datum_grid.py --check
 """
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -104,6 +110,31 @@ BENCHMARKS = [
 ]
 # VDatum's own stated uncertainty for NAVD88->MLLW is 9 cm; the tolerance sits inside that.
 BENCHMARK_TOL = 0.05
+
+# The 52 tidal regions the pinned bundle ships. `regions()` skips a directory whose .met or
+# mllw grid it cannot see, so a renamed member or a half-extracted bundle drops a whole coast
+# out of the mosaic — 16 point samples never notice, this does. Re-seed with the bundle URL.
+EXPECTED_REGIONS = frozenset({
+    "AKglacier00_8301", "AKwhale00_8301", "AKyakutat00_8301", "ALFLgom02_8301",
+    "ALmobile02_8301", "CAmontby13_8301", "CAoregon00_8301", "CAsfbay13_8301",
+    "CAsfdel00_8301", "CAsouin00_8301", "CAsouthn00_8301", "DEVAemb23_8301",
+    "DEdelbay33_8301", "FLGAeastbays31_8301", "FLGAeastshelf41_8301", "FLandrew02_8301",
+    "FLapalach01_8301", "FLjoseph03_8301", "FLpensac02_8301", "FLsoicw01_8301",
+    "FLsouth12_8301", "FLwest01_8301", "GASCNCsab31_8301", "LAatchaf00_8301",
+    "LAmobile02_8301", "LATXintra00_8301", "LATXoffshr00_8301", "MDVAechb11_8301",
+    "MDnwchb11_8301", "MENHMAgome23_8301", "NCcoast11_8301", "NCinner11_8301",
+    "NJVAmab33_8301", "NJncstemb12_8301", "NJscstemb32_8301", "NYNJhbr34_8301",
+    "NYgr8bay34_8301", "ORcoain00_8301", "ORcoast00_8301", "PRVIis00_8301",
+    "PRVIof00_8301", "RICTbis44_8301", "TXLAgulf00_8301", "TXcentr00_8301",
+    "TXintra00_8301", "TXoffshr00_8301", "VAswchb11_8301", "WAcoast00_8301",
+    "WAjdfin00_8301", "WAjdfuca14_8301", "WApugets13_8301", "WCoffsh00_8301",
+})
+
+# Valid pixels in the published surface, counted over store/datum/navd88_chart.tif. Composition
+# is deterministic under the pinned bundle, so the band absorbs only resampler edge changes
+# across GDAL versions; anything that truncates or drops coverage moves it by far more.
+EXPECTED_TOTAL_PX = 351_067_891
+COVERAGE_TOL = 0.02
 
 
 # ── bundle ───────────────────────────────────────────────────────────────────────────
@@ -349,7 +380,8 @@ def nearest_fill(values, valid, max_px):
 
 
 def fill_holes(path, res=RES, fill_km=FILL_KM):
-    """Close the interior gaps between adjacent regions' validity polygons, in place.
+    """Close the interior gaps between adjacent regions' validity polygons, in place. Returns
+    (mosaicked valid px, px the fill added).
 
     Two scales, because the mosaic is billions of pixels and a distance transform over it is
     not affordable: solve the fill on a ~1 km grid (where a smooth metre-scale field loses
@@ -399,7 +431,7 @@ def fill_holes(path, res=RES, fill_km=FILL_KM):
     print(f"  fill: patched {patched} fine pixels")
     # Counted while the fill already had every block decompressed — a rescan of the
     # billions-of-pixel COG just for this number is not affordable.
-    return valid + patched
+    return valid, patched
 
 
 # ── Columbia River Datum override ────────────────────────────────────────────────────
@@ -427,6 +459,8 @@ def crd_override(bnd_path, gtx_path, path, res=RES, fill_km=FILL_KM):
     which is already this file's reference convention. Verified against the three CO-OPS
     stations publishing both NAVD88 and ``CRD_OFFSET`` (residuals <= 3.2 cm) and, at the mouth,
     against Astoria's MLLW (0.8 mm) — see the ``BENCHMARKS`` table.
+
+    Returns (px now on CRD, px the repaint newly covered).
 
     ``CRD.bnd`` is the datum boundary, NOT the grid's nodata footprint: ``crd.gtx`` carries
     values ~50 km seaward of the envelope out over the open Pacific, where MLLW is what charts
@@ -465,7 +499,7 @@ def crd_override(bnd_path, gtx_path, path, res=RES, fill_km=FILL_KM):
         block[take] = filled[take]
         dst.write(block, 1, window=window)
     print(f"  CRD: {int(take.sum())} px on Columbia River Datum ({added} newly covered)")
-    return added
+    return int(take.sum()), added
 
 
 def build(bundle, out=OUT):
@@ -480,31 +514,43 @@ def build(bundle, out=OUT):
     if not found:
         sys.exit(f"no VDatum tidal regions under {bundle}")
     print(f"composing {len(found)} regions")
-    tifs, boxes = [], []
+    tifs, boxes, region_px = [], [], {}
     for i, region in enumerate(found, 1):
         reference, transform = compose(bundle, region)
         path = os.path.join(work, f"{region['id']}.tif")
         write_region(reference, transform, path)
         tifs.append(path)
         boxes.append(region["bbox"])
+        region_px[region["id"]] = int((reference != NODATA).sum())
         print(f"  {i}/{len(found)} {region['id']} ({region['horz']}) "
-              f"{int((reference != NODATA).sum())} valid px")
+              f"{region_px[region['id']]} valid px")
 
     bounds = snap_bounds(boxes, RES)
     merged = os.path.join(work, "mosaic.tif")
     width, height = mosaic(tifs, bounds, merged)
     print(f"mosaic {width}x{height} at {RES} deg, bounds {bounds}")
-    valid = fill_holes(merged)
+    mosaic_px, filled_px = fill_holes(merged)
     crd = os.path.join(bundle, CRD_DIR)
-    valid += crd_override(os.path.join(crd, "CRD.bnd"), os.path.join(crd, "crd.gtx"), merged)
+    crd_px, crd_added = crd_override(os.path.join(crd, "CRD.bnd"),
+                                     os.path.join(crd, "crd.gtx"), merged)
+    valid = mosaic_px + filled_px + crd_added
+    # Per-region counts are on each region's own grid, so they overlap and out-total the
+    # mosaic; what they pin is that every region reached the mosaic with data.
+    report = {"regions": region_px, "mosaic_px": mosaic_px, "filled_px": filled_px,
+              "crd_px": crd_px, "total_px": valid, "res": RES, "fill_km": FILL_KM,
+              "bounds": list(bounds), "size": [width, height], "bundle": BUNDLE_URL}
 
     tmp = out + ".tmp.tif"
     subprocess.run(["gdal_translate", "-of", "COG", *COG_OPTS, "-co", "PREDICTOR=3",
                     merged, tmp], check=True)
-    # Gate publication on the benchmark stations: a formula/mosaic/input regression must fail
-    # the build here, never ship a surface that silently mis-corrects every CUDEM depth.
+    # Gate publication on the benchmark stations AND on coverage: a formula/mosaic/input
+    # regression must fail the build here, never ship a surface that silently mis-corrects
+    # (or silently fails to correct) every CUDEM depth.
     check_benchmarks(tmp)
+    check_coverage(report)
     os.replace(tmp, out)
+    with open(report_path(out), "w") as f:
+        json.dump(report, f, indent=2)
     shutil.rmtree(work, ignore_errors=True)
     print(f"{out}: {width}x{height}, {valid} valid px, "
           f"{os.path.getsize(out) / 1e6:.1f} MB")
@@ -529,6 +575,52 @@ def sample_bilinear(path, lon, lat):
     return top * (1 - fy) + bottom * fy
 
 
+def report_path(out=OUT):
+    """The coverage sidecar beside a composed surface."""
+    return os.path.splitext(out)[0] + ".json"
+
+
+def valid_px(path):
+    """Valid pixels in a composed surface. The COG is sparse — the ~90% of blocks no region
+    wrote are never materialized — so counting the published grid costs a few seconds."""
+    with rasterio.open(path) as src:
+        return sum(int(np.count_nonzero(src.read(1, window=window) != src.nodata))
+                   for _, window in src.block_windows(1))
+
+
+def check_total_px(total, tol=COVERAGE_TOL):
+    """The surface is the size it was. Truncated bounds, a fill that stopped filling, or a
+    region composing to a fraction of itself all land here and nowhere else."""
+    if not EXPECTED_TOTAL_PX * (1 - tol) <= total <= EXPECTED_TOTAL_PX * (1 + tol):
+        raise AssertionError(f"surface holds {total} valid px, expected {EXPECTED_TOTAL_PX} "
+                             f"+/-{tol:.0%} — coverage changed, not just its values")
+    return total
+
+
+def check_coverage(report, tol=COVERAGE_TOL):
+    """Every bundle region reached the mosaic, and the mosaic is the size it was.
+
+    The station checks sample 16 points: a region that fell out of the bundle glob, a region
+    that composed to nothing, or a rebuild that truncated the mosaic moves none of them, and
+    the resulting hole is a coast charted on the wrong datum. Names what is missing, because
+    the fix (which region, which grid) is otherwise a bundle-wide hunt."""
+    composed = report["regions"]
+    missing = sorted(EXPECTED_REGIONS - set(composed))
+    unknown = sorted(set(composed) - EXPECTED_REGIONS)
+    empty = sorted(r for r, px in composed.items() if not px)
+    if missing:
+        raise AssertionError(f"{len(missing)} VDatum region(s) absent from the composition: "
+                             f"{', '.join(missing)}")
+    if unknown:
+        raise AssertionError(f"region(s) EXPECTED_REGIONS does not list: {', '.join(unknown)} "
+                             "— reseed it and EXPECTED_TOTAL_PX against the new bundle")
+    if empty:
+        raise AssertionError(f"region(s) composed 0 valid px: {', '.join(empty)}")
+    total = check_total_px(report["total_px"], tol)
+    print(f"coverage ok ({len(composed)} regions, {total} valid px, "
+          f"{total / EXPECTED_TOTAL_PX - 1:+.2%} vs expected)")
+
+
 def check_benchmarks(path=OUT, tol=BENCHMARK_TOL):
     """The composed reference against published CO-OPS separations. The sign is the point: the
     file holds -S, so a station's separation reads back as the negated sample. Each station is
@@ -549,9 +641,10 @@ def check_benchmarks(path=OUT, tol=BENCHMARK_TOL):
 
 
 def _check():
-    """Offline tier: the branch formula, the mosaic's priority + fallthrough, and the bounded
-    fill, on synthetic rasters. The bundle-dependent tier (the 14 benchmark stations) runs on
-    top whenever a composed grid is present."""
+    """Offline tier: the branch formula, the coverage gate, the mosaic's priority +
+    fallthrough, and the bounded fill, on synthetic rasters. The grid-dependent tier runs on
+    top whenever a composed surface is present: its counted size, its per-region sidecar if
+    one sits beside it, and the benchmark stations."""
     import tempfile
     from rasterio.transform import from_origin
 
@@ -576,6 +669,26 @@ def _check():
     assert wanted_member("vdatum/CRD/crd.gtx")
     assert wanted_member("vdatum/CRD/CRD.bnd")
     assert not wanted_member("vdatum/CRD/CRD.kml")
+
+    # check_coverage: a full composition passes; a dropped region, a region that composed to
+    # nothing, and a truncated mosaic each fail naming what went wrong.
+    full = {"regions": {r: 1_000_000 for r in EXPECTED_REGIONS}, "total_px": EXPECTED_TOTAL_PX}
+    check_coverage(full)
+
+    def refuse(report, expect):
+        try:
+            check_coverage(report)
+            assert False, f"expected check_coverage to fail on {expect}"
+        except AssertionError as e:
+            assert expect in str(e), (expect, e)
+
+    dropped = {**full, "regions": {r: p for r, p in full["regions"].items()
+                                   if r != "WApugets13_8301"}}
+    refuse(dropped, "WApugets13_8301")
+    refuse({**full, "regions": {**full["regions"], "PRVIis00_8301": 0}}, "PRVIis00_8301")
+    refuse({**full, "regions": {**full["regions"], "XXnew00_8301": 5}}, "XXnew00_8301")
+    refuse({**full, "total_px": int(EXPECTED_TOTAL_PX * 0.8)}, "coverage changed")
+    check_coverage({**full, "total_px": int(EXPECTED_TOTAL_PX * 1.01)})  # inside the band
 
     # nearest_fill: a hole inside the radius takes its neighbour, one outside stays nodata.
     values = np.array([[1.0, 0.0, 0.0, 0.0, 2.0]], dtype="float32")
@@ -653,6 +766,18 @@ def _check():
 
     print("datum_grid.py self-check ok (offline tier)")
     if os.path.isfile(OUT):
+        # Count the published grid rather than trusting the build's own bookkeeping: a
+        # sidecar written beside a truncated surface would agree with itself.
+        counted = check_total_px(valid_px(OUT))
+        print(f"{OUT}: {counted} valid px ({counted / EXPECTED_TOTAL_PX - 1:+.2%} vs expected)")
+        if os.path.isfile(report_path()):
+            with open(report_path()) as f:
+                report = json.load(f)
+            check_coverage(report)
+            assert report["total_px"] == counted, (report["total_px"], counted)
+        else:
+            print(f"{report_path()} absent — skipping the per-region coverage tier "
+                  "(the next build writes it)")
         check_benchmarks()
     else:
         print(f"{OUT} absent — skipping the benchmark-station tier "

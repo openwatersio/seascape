@@ -108,10 +108,11 @@ def _stripes(height, width):
 
 
 def transform_file(filepath, negate, offset, clamp_positive=False, surface=None):
-    """Rewrite one file with the value transform applied. Returns the number of pixels the
-    reference actually corrected (0 when no ``surface`` is given)."""
+    """Rewrite one file with the value transform applied. Returns (pixels the reference
+    actually corrected — 0 when no ``surface`` is given, valid pixels in the file), the pair
+    whose ratio is this file's datum coverage."""
     ref = rasterio.open(surface) if surface else None
-    corrected = 0
+    corrected = valid = 0
     try:
         with rasterio.open(filepath) as src:
             profile = src.profile
@@ -129,12 +130,13 @@ def transform_file(filepath, negate, offset, clamp_positive=False, surface=None)
                 for window in _stripes(src.height, src.width):
                     data = src.read(1, window=window).astype("float32")
                     mask = src.read_masks(1, window=window) != 0  # True where valid
-                    valid = data[mask]
+                    valid += int(mask.sum())
+                    values = data[mask]
                     if negate:
-                        valid = -valid
+                        values = -values
                     if offset:
-                        valid = valid + np.float32(offset)
-                    data[mask] = valid
+                        values = values + np.float32(offset)
+                    data[mask] = values
                     if ref is not None:
                         reference = reference_on(ref, src.window_transform(window),
                                                  data.shape, crs)
@@ -155,14 +157,61 @@ def transform_file(filepath, negate, offset, clamp_positive=False, surface=None)
     finally:
         if ref is not None:
             ref.close()
-    return corrected
+    return corrected, valid
 
 
-def write_sidecar(source, negate, offset, clamp_positive, surface=None):
+# The reference's coverage edge is a smooth line hundreds of km long, so a file crossing it
+# loses percent, not per-mille; a sliver this small is a hole or a nodata leak instead.
+SLIVER_RATIO = 0.995
+
+
+def coverage_report(source, per_file):
+    """Log per-file datum coverage from [(name, corrected, valid), …] and return the source's
+    corrected fraction (None when it has no valid pixels at all).
+
+    A file at 0.0 is outside the reference entirely (Alaska off the SE panhandle, the Pacific
+    territories) and a file between 0 and ``SLIVER_RATIO`` straddles its coverage edge — both
+    are the documented no-op, reported but never warned about, or every CUDEM boundary tile
+    cries wolf."""
+    total_corrected = sum(c for _, c, _ in per_file)
+    total_valid = sum(v for _, _, v in per_file)
+    full = partial = uncovered = 0
+    for name, corrected, valid in per_file:
+        if not valid:
+            continue
+        ratio = corrected / valid
+        if corrected == valid:
+            full += 1
+        elif not corrected:
+            uncovered += 1
+        else:
+            partial += 1
+            note = f"{source}: {name} {ratio:.4f} corrected"
+            if ratio >= SLIVER_RATIO:
+                note = (f"WARNING: {note} — a sliver uncorrected, too small for the "
+                        "reference's coverage edge; check it for a hole")
+            print(note)
+    if not total_valid:
+        return None
+    fraction = total_corrected / total_valid
+    print(f"{source}: reference corrected {fraction:.4f} of valid px "
+          f"({full} file(s) fully, {partial} partly, {uncovered} outside coverage, "
+          f"of {len(per_file)})")
+    if not total_corrected:
+        print(f"WARNING: {source}: an offset surface is declared but corrected NOTHING — "
+              "the source and the reference may not overlap, or the CRS may be wrong")
+    return fraction
+
+
+def write_sidecar(source, negate, offset, clamp_positive, surface=None, corrected=None):
     """Record the applied transform in store/source/<id>/datum.json — the machine-readable
     provenance source_catalog folds into the catalog item (vertical-datum offset was invisible
     downstream when it lived only in this CLI arg). Written whenever the step runs, so a source
-    whose recipe calls source_datum always leaves a sidecar."""
+    whose recipe calls source_datum always leaves a sidecar.
+
+    ``corrected`` is the fraction of the source's valid pixels the reference reached: pixels
+    inside one source sit on different datums wherever coverage ends, and the surface name
+    alone reads as if all of them moved."""
     os.makedirs(f"store/source/{source}", exist_ok=True)
     # Canonical surface name, never a path: the value flows into the catalog as
     # seascape:datum_surface, where "navd88_chart" must compare equal however it was invoked.
@@ -170,7 +219,9 @@ def write_sidecar(source, negate, offset, clamp_positive, surface=None):
     with open(f"store/source/{source}/datum.json", "w") as f:
         json.dump({"negate": bool(negate), "offset_m": float(offset),
                    "clamp_positive": bool(clamp_positive),
-                   "offset_surface": name}, f, indent=2)
+                   "offset_surface": name,
+                   "corrected_fraction": None if corrected is None else round(corrected, 4)},
+                  f, indent=2)
 
 
 def main():
@@ -201,21 +252,22 @@ def main():
     filepaths = sorted(glob(f"store/source/{a.source}/*.tif"))
     print(f"{a.source}: negate={a.negate} offset={a.offset} surface={a.offset_surface} "
           f"clamp_positive={a.clamp_positive} on {len(filepaths)} file(s)")
-    uncorrected = 0
+    per_file = []
     for filepath in filepaths:
-        corrected = transform_file(filepath, a.negate, a.offset, a.clamp_positive, surface)
-        if surface and not corrected:
-            uncorrected += 1
-    if uncorrected:
-        print(f"{a.source}: {uncorrected} file(s) outside the reference's coverage — "
-              "passed through uncorrected")
+        corrected, valid = transform_file(filepath, a.negate, a.offset, a.clamp_positive,
+                                          surface)
+        per_file.append((os.path.basename(filepath), corrected, valid))
+    if surface:
+        write_sidecar(a.source, a.negate, a.offset, a.clamp_positive, a.offset_surface,
+                      coverage_report(a.source, per_file))
 
 
 def _check():
     """Self-check the value transform on synthetic rasters (no GDAL CLI): negate + offset,
     clamp_positive, and the offset-surface subtract — including the reference-nodata
-    pass-through, the source's own nodata staying untouched, and the unconditional compound-CRS
-    reduction (standalone, and through transform_file's no-surface path)."""
+    pass-through, the source's own nodata staying untouched, the corrected/valid pair each
+    file reports, the coverage report built from those pairs, and the unconditional
+    compound-CRS reduction (standalone, and through transform_file's no-surface path)."""
     import os
     import tempfile
     from rasterio.transform import from_origin
@@ -269,10 +321,11 @@ def _check():
                        dtype="float32", crs="EPSG:4326", nodata=nodata,
                        transform=from_origin(0.0, 4.0, 1.0, 1.0)) as dst:
         dst.write(bed, 1)
-    corrected = transform_file(path3, negate=False, offset=0.0, surface=ref_path)
+    corrected, valid = transform_file(path3, negate=False, offset=0.0, surface=ref_path)
     with rasterio.open(path3) as src:
         o3 = src.read(1)
     assert corrected == 8, corrected  # the two western columns of four rows
+    assert valid == 12, valid         # three columns of four rows; the fourth is nodata
     assert o3[0, 0] == -9.0 and o3[0, 1] == -19.0, o3  # bed - (-1): shallower
     assert o3[0, 2] == -30.0, o3                       # no reference coverage: unchanged
     assert o3[0, 3] == nodata, o3                      # the file's own nodata: untouched
@@ -283,9 +336,32 @@ def _check():
                        dtype="float32", crs="EPSG:4326", nodata=nodata,
                        transform=from_origin(50.0, 4.0, 1.0, 1.0)) as dst:
         dst.write(np.full((2, 2), -5.0, dtype="float32"), 1)
-    assert transform_file(path4, False, 0.0, surface=ref_path) == 0
+    assert transform_file(path4, False, 0.0, surface=ref_path) == (0, 4)
     with rasterio.open(path4) as src:
         assert (src.read(1) == -5.0).all(), src.read(1)
+
+    # coverage_report: a source's fraction is corrected/valid over its files, an all-nodata
+    # file contributes nothing, and a source the reference never reached returns 0.0.
+    assert coverage_report("s", [("a.tif", 8, 12), ("b.tif", 0, 4), ("c.tif", 0, 0)]) == 0.5
+    assert coverage_report("s", [("a.tif", 0, 4)]) == 0.0
+    assert coverage_report("s", [("a.tif", 0, 0)]) is None
+    assert coverage_report("s", [("a.tif", 4, 4)]) == 1.0
+
+    # …and it warns only where a warning is assertable: a sliver (a hole's signature) and a
+    # source the reference never reached. A boundary tile and an out-of-coverage tile are the
+    # documented no-op — CUDEM has thousands, so warning there would train the eye to ignore it.
+    def logged(per_file):
+        import contextlib
+        import io as _io
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            coverage_report("s", per_file)
+        return buf.getvalue()
+
+    assert "WARNING" in logged([("a.tif", 9970, 10000)]), "a 0.997 sliver must warn"
+    assert "WARNING" in logged([("a.tif", 0, 10000)]), "a source corrected nothing must warn"
+    assert "WARNING" not in logged([("a.tif", 9000, 10000), ("b.tif", 0, 10000)])
+    assert "0.9000 corrected" in logged([("a.tif", 9000, 10000)]), "partial ratio is reported"
 
     # A compound source CRS (CUDEM's NAD83 + NAVD88 height) keeps its horizontal half only.
     assert horizontal_crs(rasterio.crs.CRS.from_epsg(5498)).to_epsg() == 4269
