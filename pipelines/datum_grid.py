@@ -1,15 +1,16 @@
-"""Compose ``store/datum/navd88_mllw.tif`` — the MLLW surface as a height in the NAVD88 frame.
+"""Compose ``store/datum/navd88_chart.tif`` — local chart datum as a height in the NAVD88 frame.
 
 A support artifact like the landmask, NOT a ``sources/`` entry (everything under ``sources/``
 enters the merge). It is the reference a NAVD88 source is corrected against on the subtract
 convention::
 
-    reference = -S       where S = NAVD88 - MLLW    (Mayport 8720211: S = +0.947, ref = -0.947)
-    bed_MLLW  = bed_NAVD88 - reference
+    reference = -S       where S = NAVD88 - chart datum  (Mayport 8720211: S = +0.947, ref = -0.947)
+    bed_chart = bed_NAVD88 - reference
 
-``S > 0`` almost everywhere, so the corrected bed rises and depths get shallower — the
-bias-shallow-safe direction. It goes the other way only in the Columbia River estuary
-(-0.53 m at Skamokawa), where NOAA charts use CRD rather than MLLW anyway.
+Chart datum is MLLW over the US coast and CRD (Columbia River Datum) in the Columbia reach,
+because that is what NOAA charts each against. ``S > 0`` almost everywhere, so the corrected
+bed rises and depths get shallower — the bias-shallow-safe direction; it goes the other way up
+a river, where the low-water surface climbs above the geoid with the channel.
 
 Input is NOAA's VDatum grid bundle (public domain), pinned by its dated URL. Per tidal region
 the bundle ships ``<REGION>_{tss,mllw}.gtx`` (Float32, nodata -88.8888, longitudes on a 0-360
@@ -19,9 +20,10 @@ node registration to GDAL's pixel-is-area corner convention, so no half-pixel co
 
 Stages: compose S per region on its own mllw grid -> mosaic smallest-bbox-last so the finest
 region wins where valid -> bounded nearest-fill of the interior gaps between adjacent regions
--> one 4326 COG. Coverage is US coastal only: Hawaii, Guam, CNMI, American Samoa and Alaska
-outside the southeast panhandle have no VDatum grid at all, and outside coverage the reference
-is nodata, which ``source_datum --offset-surface`` treats as "leave the pixel alone".
+-> repaint the Columbia onto CRD -> one 4326 COG. Coverage is US coastal only: Hawaii, Guam,
+CNMI, American Samoa and Alaska outside the southeast panhandle have no VDatum grid at all, and
+outside coverage the reference is nodata, which ``source_datum --offset-surface`` treats as
+"leave the pixel alone".
 
 Run from pipelines/:
     uv run python datum_grid.py --bundle <extracted-vdatum-dir>   # or omit to fetch the zip
@@ -40,15 +42,16 @@ from glob import glob
 import numpy as np
 import rasterio
 from pyproj import Transformer
+from rasterio.features import rasterize
 from rasterio.transform import Affine
 from rasterio.warp import Resampling, reproject
-from rasterio.windows import Window
+from rasterio.windows import Window, from_bounds
 
 from source_normalize import COG_OPTS
 
 BUNDLE_URL = "https://vdatum.noaa.gov/download/data/vdatum_all_20250917.zip"
 STORE = "store/datum"
-OUT = f"{STORE}/navd88_mllw.tif"
+OUT = f"{STORE}/navd88_chart.tif"
 
 GTX_NODATA = -88.8888  # every VDatum .gtx, all 52 regions
 NODATA = -9999.0
@@ -62,6 +65,8 @@ RES = 0.001
 # Helmert must be evaluated at. Off by a decade costs ~1 cm of separation.
 NAD83_EPOCH = 2010.0
 
+CRD_DIR = "CRD"  # the bundle's Columbia River Datum override, outside the 52 tidal regions
+
 # Adjacent regions' validity polygons leave interior holes 5-30 km wide (Panama City 5 km,
 # Neah Bay 5 km, Sitka 20-30 km). Beyond this the reference stays nodata rather than
 # extrapolating a tidal surface into water no region models.
@@ -69,27 +74,33 @@ FILL_KM = 20.0
 KM_PER_DEG = 111.32  # a degree of latitude; a degree of longitude is shorter, so a fill
                      # radius measured in degrees never reaches further than FILL_KM
 
-# Published (ortho_datum - MLLW) from the CO-OPS metadata API, epoch 1983-2001, converted from
-# station-datum feet. Spans all three formula branches and both signs — Skamokawa is the one
-# station where the correction charts deeper, and Boston/San Diego bracket the 1.5 m span that
-# rules out any single scalar.
+# Published (ortho_datum - chart datum) from the CO-OPS metadata API, epoch 1983-2001, converted
+# from station-datum feet. Spans all three formula branches, both datums and both signs;
+# Boston/San Diego bracket the 1.5 m span that rules out any single scalar.
 #     https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations/{id}/datums.json
+# CRD stations publish no CRD row: the datum sits at the station's `CRD_OFFSET` value on its own
+# station datum, so S = (NAVD88 - CRD_OFFSET) ft x 0.3048. Kalama's 5.95 ft offset is what pins
+# that reading — the alternatives it rules out miss there by metres, not centimetres.
 BENCHMARKS = [
-    # (id, name, lon, lat, published S in metres)
-    ("8720211", "Mayport FL", -81.4133, 30.4000, +0.948),
-    ("8729108", "Panama City FL", -85.6644, 30.1497, +0.171),
-    ("8779770", "Port Isabel TX", -97.2155, 26.0612, +0.259),
-    ("8443970", "Boston MA", -71.0503, 42.3539, +1.676),
-    ("8665530", "Charleston SC", -79.9236, 32.7808, +0.957),
-    ("9410170", "San Diego CA", -117.1767, 32.7156, +0.131),
-    ("9414290", "San Francisco CA", -122.4659, 37.8063, -0.018),
-    ("9439040", "Astoria OR", -123.7683, 46.2073, -0.064),
-    ("9440569", "Skamokawa WA", -123.4565, 46.2703, -0.530),
-    ("9447130", "Seattle WA", -122.3393, 47.6026, +0.713),
-    ("9453220", "Yakutat AK", -139.7334, 59.5485, +0.180),
-    ("9451054", "Port Alexander AK", -134.6470, 56.2467, +0.360),
-    ("9755371", "San Juan PR", -66.1164, 18.4589, +0.232),
-    ("9751639", "Charlotte Amalie VI", -64.9258, 18.3306, +0.116),
+    # (id, name, lon, lat, published S in metres, chart datum)
+    ("8720211", "Mayport FL", -81.4133, 30.4000, +0.948, "MLLW"),
+    ("8729108", "Panama City FL", -85.6644, 30.1497, +0.171, "MLLW"),
+    ("8779770", "Port Isabel TX", -97.2155, 26.0612, +0.259, "MLLW"),
+    ("8443970", "Boston MA", -71.0503, 42.3539, +1.676, "MLLW"),
+    ("8665530", "Charleston SC", -79.9236, 32.7808, +0.957, "MLLW"),
+    ("9410170", "San Diego CA", -117.1767, 32.7156, +0.131, "MLLW"),
+    ("9414290", "San Francisco CA", -122.4659, 37.8063, -0.018, "MLLW"),
+    # Astoria is 4 km seaward of the CRD envelope, so it still validates the MLLW composition —
+    # and it guards the transition, CRD being defined to merge into MLLW at the river entrance.
+    ("9439040", "Astoria OR", -123.7683, 46.2073, -0.064, "MLLW"),
+    ("9440569", "Skamokawa WA", -123.4565, 46.2703, -0.381, "CRD"),
+    ("9440357", "Kalama WA", -122.8367, 45.9867, -1.088, "CRD"),
+    ("9439201", "St Helens OR", -122.7970, 45.8650, -1.305, "CRD"),
+    ("9447130", "Seattle WA", -122.3393, 47.6026, +0.713, "MLLW"),
+    ("9453220", "Yakutat AK", -139.7334, 59.5485, +0.180, "MLLW"),
+    ("9451054", "Port Alexander AK", -134.6470, 56.2467, +0.360, "MLLW"),
+    ("9755371", "San Juan PR", -66.1164, 18.4589, +0.232, "MLLW"),
+    ("9751639", "Charlotte Amalie VI", -64.9258, 18.3306, +0.116, "MLLW"),
 ]
 # VDatum's own stated uncertainty for NAVD88->MLLW is 9 cm; the tolerance sits inside that.
 BENCHMARK_TOL = 0.05
@@ -109,6 +120,8 @@ def wanted_member(name):
     if parts[1] == "core":
         return parts[2] in ("geoid18", "geoid12b", "xgeoid20b") and len(parts) > 3
     region, leaf = parts[1].lower(), parts[-1].lower()
+    if region == CRD_DIR.lower():
+        return leaf in ("crd.gtx", "crd.bnd")
     return leaf in (f"{region}.met", f"{region}_tss.gtx", f"{region}_mllw.gtx")
 
 
@@ -160,8 +173,8 @@ def surface(region_dir, name):
 
 def regions(bundle):
     """Every tidal region in the bundle, largest bbox first — the mosaic order that lets the
-    smallest (finest) region land last and win. Directories with no ``.met`` (``CRD``,
-    ``IGLD85``, ``core``) carry no tidal surface and drop out here."""
+    smallest (finest) region land last and win. Directories with no ``.met`` (``IGLD85``,
+    ``core``, and ``CRD``, which ``crd_override`` handles on its own terms) drop out here."""
     out = []
     for met_path in sorted(glob(os.path.join(bundle, "*", "*.met"))):
         region_dir = os.path.dirname(met_path)
@@ -216,8 +229,12 @@ def sample_onto(path, transform, shape):
     are plain lon/lat on the bundle's 0-360 axis, so this is interpolation, not reprojection."""
     dst = np.full(shape, np.nan, dtype="float32")
     with rasterio.open(path) as src:
-        reproject(source=rasterio.band(src, 1), destination=dst,
-                  src_transform=src.transform, src_crs="EPSG:4326", src_nodata=GTX_NODATA,
+        data = src.read(1)
+        # Masked array, not rasterio.band(): reproject ignores src_nodata on a band source
+        # (rasterio 1.4.4 / GDAL 3.10.3), and -88.8888 then interpolates through as a height.
+        source = np.ma.masked_where(np.abs(data - GTX_NODATA) <= 1e-3, data)
+        reproject(source=source, destination=dst,
+                  src_transform=src.transform, src_crs="EPSG:4326",
                   dst_transform=transform, dst_crs="EPSG:4326", dst_nodata=np.nan,
                   resampling=Resampling.bilinear)
     return dst
@@ -385,6 +402,72 @@ def fill_holes(path, res=RES, fill_km=FILL_KM):
     return valid + patched
 
 
+# ── Columbia River Datum override ────────────────────────────────────────────────────
+
+def read_bnd(path):
+    """A VDatum ``.bnd`` validity polygon as a lon/lat ring. Two leading columns per line;
+    trailing flag columns and the blank lines that pad the file are ignored."""
+    ring = []
+    with open(path) as f:
+        for line in f:
+            fields = line.split()
+            if len(fields) >= 2:
+                ring.append((float(fields[0]), float(fields[1])))
+    return ring
+
+
+def crd_override(bnd_path, gtx_path, path, res=RES, fill_km=FILL_KM):
+    """Repaint the Columbia River reach onto CRD (Columbia River Datum), in place.
+
+    NOAA charts the Columbia against CRD, not MLLW. The two are equal by construction at the
+    river entrance and diverge upstream to 0.67 m by Longview, with MLLW the deeper — so
+    correcting the river to MLLW charts it deeper than its own datum, the unsafe direction.
+
+    ``crd.gtx`` needs no composition: its values ARE the CRD surface's height above NAVD88,
+    which is already this file's reference convention. Verified against the three CO-OPS
+    stations publishing both NAVD88 and ``CRD_OFFSET`` (residuals <= 3.2 cm) and, at the mouth,
+    against Astoria's MLLW (0.8 mm) — see the ``BENCHMARKS`` table.
+
+    ``CRD.bnd`` is the datum boundary, NOT the grid's nodata footprint: ``crd.gtx`` carries
+    values ~50 km seaward of the envelope out over the open Pacific, where MLLW is what charts
+    use. Inside the envelope CRD wins outright — no MLLW value survives there — and the grid's
+    upland holes are nearest-filled from CRD's own channel values rather than left on MLLW,
+    which would step by up to 0.67 m at the water's edge. Run after ``fill_holes`` so neither
+    datum can be smeared across the boundary by a later fill.
+    """
+    ring = read_bnd(bnd_path)
+    west, east = min(x for x, _ in ring), max(x for x, _ in ring)
+    south, north = min(y for _, y in ring), max(y for _, y in ring)
+    with rasterio.open(path, "r+") as dst:
+        box = from_bounds(west, south, east, north, dst.transform)
+        # A pixel of margin so rasterizing the ring can't clip against the window edge, then
+        # clamped: an envelope reaching the mosaic's own edge would otherwise index off it.
+        col = max(0, int(np.floor(box.col_off)) - 1)
+        row = max(0, int(np.floor(box.row_off)) - 1)
+        window = Window(col, row,
+                        min(dst.width - col, int(np.ceil(box.col_off + box.width)) + 1 - col),
+                        min(dst.height - row, int(np.ceil(box.row_off + box.height)) + 1 - row))
+        transform = dst.window_transform(window)
+        shape = (int(window.height), int(window.width))
+        inside = rasterize([({"type": "Polygon", "coordinates": [ring]}, 1)], out_shape=shape,
+                           transform=transform, fill=0, dtype="uint8").astype(bool)
+        # crd.gtx is on the bundle's 0-360 longitude axis; meet it there. Downsampling its
+        # 0.0002 deg to the output grid is safe undersampling: a river datum's slope is ~1 cm/km,
+        # so the field moves ~1 mm across an output pixel.
+        crd = sample_onto(gtx_path, Affine(transform.a, 0.0, transform.c + 360.0,
+                                           0.0, transform.e, transform.f), shape)
+        valid = np.isfinite(crd)
+        filled, ok = nearest_fill(np.where(valid, crd, NODATA).astype("float32"), valid,
+                                  fill_km / KM_PER_DEG / res)
+        block = dst.read(1, window=window)
+        take = inside & ok
+        added = int((take & (block == NODATA)).sum())
+        block[take] = filled[take]
+        dst.write(block, 1, window=window)
+    print(f"  CRD: {int(take.sum())} px on Columbia River Datum ({added} newly covered)")
+    return added
+
+
 def build(bundle, out=OUT):
     # Keyed to the output so concurrent surface builds (Phase 2 adds more grids) can't
     # share — and race on — one scratch tree.
@@ -412,6 +495,8 @@ def build(bundle, out=OUT):
     width, height = mosaic(tifs, bounds, merged)
     print(f"mosaic {width}x{height} at {RES} deg, bounds {bounds}")
     valid = fill_holes(merged)
+    crd = os.path.join(bundle, CRD_DIR)
+    valid += crd_override(os.path.join(crd, "CRD.bnd"), os.path.join(crd, "crd.gtx"), merged)
 
     tmp = out + ".tmp.tif"
     subprocess.run(["gdal_translate", "-of", "COG", *COG_OPTS, "-co", "PREDICTOR=3",
@@ -446,18 +531,20 @@ def sample_bilinear(path, lon, lat):
 
 def check_benchmarks(path=OUT, tol=BENCHMARK_TOL):
     """The composed reference against published CO-OPS separations. The sign is the point: the
-    file holds -S, so a station's separation reads back as the negated sample."""
+    file holds -S, so a station's separation reads back as the negated sample. Each station is
+    checked against the datum its own chart uses, which is also what fixes the CRD envelope's
+    edge in place — Astoria must keep reading MLLW, Skamokawa must have crossed to CRD."""
     worst = 0.0
-    for station, name, lon, lat, published in BENCHMARKS:
+    for station, name, lon, lat, published, datum in BENCHMARKS:
         value = sample_bilinear(path, lon, lat)
         if value is None:
             raise AssertionError(f"{name} ({station}): no reference coverage at {lon},{lat}")
         got = -value
         residual = got - published
         worst = max(worst, abs(residual))
-        print(f"  {name:22s} {station}  S={got:+.4f}  published={published:+.3f}  "
+        print(f"  {name:22s} {station}  {datum:4s}  S={got:+.4f}  published={published:+.3f}  "
               f"residual={residual:+.4f}")
-        assert abs(residual) <= tol, f"{name}: |{residual:.4f}| > {tol} m"
+        assert abs(residual) <= tol, f"{name} ({datum}): |{residual:.4f}| > {tol} m"
     print(f"benchmark stations ok (worst |residual| = {worst:.4f} m)")
 
 
@@ -486,6 +573,9 @@ def _check():
     assert not wanted_member("vdatum/CAsfdel00_8301/CAsfdel00_8301_mllw_unc.gtx")
     assert not wanted_member("vdatum/lib/jre/bin/java")
     assert not wanted_member("vdatum/core/ncla/ncla.gtx")
+    assert wanted_member("vdatum/CRD/crd.gtx")
+    assert wanted_member("vdatum/CRD/CRD.bnd")
+    assert not wanted_member("vdatum/CRD/CRD.kml")
 
     # nearest_fill: a hole inside the radius takes its neighbour, one outside stays nodata.
     values = np.array([[1.0, 0.0, 0.0, 0.0, 2.0]], dtype="float32")
@@ -530,6 +620,33 @@ def _check():
             filled_grid = src.read(1)
         assert (filled_grid[70:, 70:] == -1.0).all(), filled_grid[70:, 70:]
         assert (filled_grid[:40, :40] == -2.0).all(), filled_grid[:40, :40]
+
+        # The CRD override, on an envelope covering the mosaic's top-left quadrant only. The
+        # river grid spans the WHOLE mosaic, as crd.gtx does out over the open Pacific: the
+        # envelope, not the grid's footprint, has to be what stops the repaint.
+        with open("crd.bnd", "w") as f:  # lon 0..2, lat 3..4 — rows 0:20, cols 0:40
+            f.write("0.0 4.0 1 0\n2.0 4.0 0 0\n\n2.0 3.0 0 0\n0.0 3.0 0 0\n0.0 4.0 1 0\n")
+        assert read_bnd("crd.bnd")[:2] == [(0.0, 4.0), (2.0, 4.0)]
+        synth("crd.tif", np.full((8, 8), -3.0), 0.0, 4.0, 0.5)
+        crd_override("crd.bnd", "crd.tif", "m.tif", res=0.05, fill_km=200.0)
+        with rasterio.open("m.tif") as src:
+            out = src.read(1)
+        assert (out[:20, :40] == -3.0).all(), out[:20, :40]    # envelope: CRD wins outright
+        assert (out[:20, 40:] == -1.0).all(), out[:20, 40:]    # beyond it: CRD values ignored
+        assert (out[20:40, :40] == -2.0).all(), out[20:40, :40]
+        assert (out[70:, 70:] == -1.0).all(), out[70:, 70:]    # the filled hole, untouched
+
+        # An envelope the river grid only partly covers: its holes fill from CRD's own values,
+        # never from the MLLW underneath — a datum step at the water's edge, otherwise.
+        river = np.full((8, 8), GTX_NODATA)
+        river[:, :2] = -4.0                                    # CRD data over lon 0..1 only
+        synth("crd2.tif", river, 0.0, 4.0, 0.5)
+        crd_override("crd.bnd", "crd2.tif", "m.tif", res=0.05, fill_km=200.0)
+        with rasterio.open("m.tif") as src:
+            out = src.read(1)
+        assert (out[:20, :40] == -4.0).all(), out[:20, :40]
+        assert (out[:20, 40:] == -1.0).all(), out[:20, 40:]
+        assert (out[20:40, :40] == -2.0).all(), out[20:40, :40]
     finally:
         os.chdir(cwd)
         shutil.rmtree(tmp, ignore_errors=True)

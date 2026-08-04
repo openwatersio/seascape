@@ -204,7 +204,35 @@ Everywhere else on the West Coast `S` is positive: Neah Bay +0.256, Westport +0.
 - Puget Sound, the Strait of Juan de Fuca and the outer WA/OR coast — the places one would call "the Pacific Northwest" on a chart — are all firmly positive, up to +0.73 m at Seattle.
 - The plan's Alternatives section says a scalar CONUS-east offset is "wrong sign in the Pacific NW". The stronger and correct objection is **magnitude, not sign**: a single scalar would be off by 1.5 m between Boston (+1.68) and San Diego (+0.13), and by 3.3 m if Alaska were in scope.
 
-Practical consequence for bias-shallow: in the Columbia River the correction makes charted depths **deeper** by up to 0.53 m. That is the unsafe direction and should be called out explicitly. The Columbia is also the one place VDatum ships a dedicated river chart datum (`CRD/crd.gtx`), which is what NOAA charts that reach on — a candidate override.
+Practical consequence for bias-shallow: MLLW is simply not the datum NOAA charts the Columbia against. The reach uses CRD (§4a), and correcting it to MLLW charts it deeper than its own datum — by 0.54 m at St Helens, growing upstream. Skamokawa's −0.53 m is the estuary end of that, not its worst case.
+
+## 4a. Columbia River Datum (`CRD/crd.gtx`)
+
+`vdatum/CRD/` sits outside the 52 tidal regions: no `.met`, an `.inf` sidecar instead (`horz=NAD83`, 11735×5023 at 0.0002035314°, released 2022-06-06), plus `CRD.bnd` and `CRD.kml`.
+
+**Frame, established empirically:** a `crd.gtx` value is the **height of the CRD surface above NAVD88** — i.e. it is already `−S` on the reference convention, so it is subtracted verbatim with no composition. It is *not* a height re LMSL like the tidal `.gtx` surfaces: at Skamokawa CRD−LMSL is −1.27 m while the grid reads +0.41.
+
+```
+S_crd = NAVD88 − CRD = −crd.gtx        reference = −S_crd = crd.gtx
+```
+
+**Ground truth.** CO-OPS publishes no CRD row; it publishes `CRD_OFFSET`, and the datum sits at that value **on the station's own datum**, so `S_crd = (NAVD88 − CRD_OFFSET) ft × 0.3048`. Three Columbia stations carry both rows:
+
+| station | id | lon | lat | NAVD88 (ft) | CRD_OFFSET (ft) | published S (m) | grid S (m) | diff |
+|---|---|---|---|---|---|---|---|---|
+| Skamokawa WA | 9440569 | −123.4565 | 46.2703 | −1.31 | −0.06 | −0.381 | −0.412 | −0.031 |
+| TEMCO Kalama Terminal WA | 9440357 | −122.8367 | 45.9867 | +2.38 | +5.95 | −1.088 | −1.063 | +0.025 |
+| St Helens OR | 9439201 | −122.7970 | 45.8650 | −4.26 | +0.02 | −1.305 | −1.287 | +0.018 |
+
+Kalama is the station that pins the reading: its 5.95 ft offset is large enough to separate interpretations that Skamokawa and St Helens (0.06 and 0.02 ft) cannot. Reading `CRD_OFFSET` as a correction *added to* station datum misses Kalama by 3.6 m; reading it as `CRD − MLLW` misses St Helens by 0.57 m. Only "CRD zero is at `CRD_OFFSET` on the station datum" fits all three, to ≤3.2 cm.
+
+A fourth, independent anchor comes free at the mouth: CRD is defined to equal MLLW at the river entrance, and at Astoria 9439040 the grid reads +0.0648 against a published MLLW−NAVD88 of +0.0640 — **0.8 mm**.
+
+NOAA's VDatum web API is *not* an arbiter here: `t_v_frame=CRD` returns error 412 for every region.
+
+**Extent vs. validity.** `crd.gtx`'s non-nodata footprint is much larger than `CRD.bnd`: it carries values west to lon −124.30, ~50 km out over the open Pacific, where MLLW is the charted datum and the CRD extrapolation disagrees by up to 9 cm. `CRD.bnd` (15 vertices, lon −123.727..−121.872, lat 45.302..46.410, covering the river to Bonneville plus the Willamette to Oregon City) is the datum boundary. Conversely the envelope is coarse — the grid fills only 29% of it, the rest being uplands inside the corridor — so inside the envelope the grid's holes must be filled from CRD itself rather than left on MLLW.
+
+**Seam at the boundary.** Sampling 1200 points around the ring, only 34 have both grids valid (the rest of the ring is on land); all lie on the seaward edge near lon −123.726. Median step 2.5 cm, max 11.0 cm, CRD the deeper — at or inside VDatum's own 9 cm uncertainty, because the boundary sits where the two datums have converged. Upstream the divergence grows monotonically: −0.12 m at Skamokawa, −0.67 m at Longview/Kalama, −0.56 m at Vancouver, with MLLW always the deeper of the two.
 
 ## 5. Territory chains
 

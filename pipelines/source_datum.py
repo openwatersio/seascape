@@ -8,8 +8,8 @@ Reads the knobs from ``metadata.json``:
     single scalar — right for a lake surface, useless for a tidal separation).
   - ``offset_surface``: a reference raster subtracted per pixel, for the tidal case a
     scalar can't express. The reference is the target datum's height in the SOURCE's own
-    vertical frame (``store/datum/navd88_mllw.tif``, built by ``datum_grid.py``, is MLLW
-    expressed in NAVD88), so::
+    vertical frame (``store/datum/navd88_chart.tif``, built by ``datum_grid.py``, is US chart
+    datum — MLLW, or CRD in the Columbia River — expressed in NAVD88), so::
 
         elevation_re_chart_datum = bed - reference
 
@@ -165,7 +165,7 @@ def write_sidecar(source, negate, offset, clamp_positive, surface=None):
     whose recipe calls source_datum always leaves a sidecar."""
     os.makedirs(f"store/source/{source}", exist_ok=True)
     # Canonical surface name, never a path: the value flows into the catalog as
-    # seascape:datum_surface, where "navd88_mllw" must compare equal however it was invoked.
+    # seascape:datum_surface, where "navd88_chart" must compare equal however it was invoked.
     name = os.path.splitext(os.path.basename(surface))[0] if surface else None
     with open(f"store/source/{source}/datum.json", "w") as f:
         json.dump({"negate": bool(negate), "offset_m": float(offset),
@@ -251,7 +251,7 @@ def _check():
     assert o2[1, 0] == nodata and o2[1, 1] == nodata, o2  # +5 land clamped; nodata untouched
 
     # A bare name resolves in the datum store; a path is taken as given.
-    assert surface_path("navd88_mllw") == f"{DATUM_STORE}/navd88_mllw.tif"
+    assert surface_path("navd88_chart") == f"{DATUM_STORE}/navd88_chart.tif"
     assert surface_path("/tmp/ref.tif") == "/tmp/ref.tif"
 
     # offset_surface: a reference covering the west half only, at -1 m (chart datum 1 m below

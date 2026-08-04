@@ -1,7 +1,7 @@
 # NOAA CUDEM 1/9 arc-second national topobathy — a *filelist* (manifest), not a
 # data file: each line is an NCEI urllist the engine fetches, 965 tiles across the 18
 # US coastal regions (Atlantic, Gulf, Pacific, AK) plus Puerto Rico and the USVI.
-# Each tile is fetched, corrected onto MLLW against store/datum/navd88_mllw.tif
+# Each tile is fetched, corrected onto local chart datum against store/datum/navd88_chart.tif
 # (metadata `offset_surface`) and normalized to a COG — no build-time NOAA reads.
 # NAD83 (EPSG:4269) horizontal throughout, which is what lets the whole source mosaic
 # through one VRT; vertical is NAVD88, or PRVD02/VIVD09 in PR/USVI (both ≡ LMSL, so

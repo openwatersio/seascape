@@ -279,8 +279,8 @@ def _check():
         # can't describe it, and the correction leaves no trace in the pixels themselves.
         with open(f"store/source/{sid}/datum.json", "w") as f:
             json.dump({"negate": False, "offset_m": 0.0, "clamp_positive": False,
-                       "offset_surface": "navd88_mllw"}, f)
-        assert build_item(sid, rows)["properties"]["seascape:datum_surface"] == "navd88_mllw"
+                       "offset_surface": "navd88_chart"}, f)
+        assert build_item(sid, rows)["properties"]["seascape:datum_surface"] == "navd88_chart"
         # bbox is 4326 and covers the union (w≈0, e≈2, s≈0, n≈0.5), west of east, south of north
         w, s, e, n = item["bbox"]
         assert w < e and s < n and -0.01 < w < 0.01 and 1.9 < e < 2.1, item["bbox"]
