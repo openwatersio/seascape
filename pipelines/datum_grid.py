@@ -352,11 +352,13 @@ def fill_holes(path, res=RES, fill_km=FILL_KM):
           f"(<= {fill_km:g} km)")
 
     patched = 0
+    valid = 0
     inverse = ~coarse_transform
     with rasterio.open(path, "r+") as dst:
         for _, window in dst.block_windows(1):
             block = dst.read(1, window=window)
             holes = block == NODATA
+            valid += block.size - int(holes.sum())
             if not holes.any():
                 continue
             rows, cols = np.mgrid[window.row_off:window.row_off + window.height,
@@ -375,6 +377,9 @@ def fill_holes(path, res=RES, fill_km=FILL_KM):
             patched += int(take.sum())
     os.remove(coarse_path)
     print(f"  fill: patched {patched} fine pixels")
+    # Counted while the fill already had every block decompressed — a rescan of the
+    # billions-of-pixel COG just for this number is not affordable.
+    return valid + patched
 
 
 def build(bundle, out=OUT):
@@ -401,15 +406,16 @@ def build(bundle, out=OUT):
     merged = os.path.join(work, "mosaic.tif")
     width, height = mosaic(tifs, bounds, merged)
     print(f"mosaic {width}x{height} at {RES} deg, bounds {bounds}")
-    fill_holes(merged)
+    valid = fill_holes(merged)
 
     tmp = out + ".tmp.tif"
     subprocess.run(["gdal_translate", "-of", "COG", *COG_OPTS, "-co", "PREDICTOR=3",
                     merged, tmp], check=True)
+    # Gate publication on the benchmark stations: a formula/mosaic/input regression must fail
+    # the build here, never ship a surface that silently mis-corrects every CUDEM depth.
+    check_benchmarks(tmp)
     os.replace(tmp, out)
     shutil.rmtree(work, ignore_errors=True)
-    with rasterio.open(out) as src:
-        valid = sum(int((src.read(1, window=w) != NODATA).sum()) for _, w in src.block_windows(1))
     print(f"{out}: {width}x{height}, {valid} valid px, "
           f"{os.path.getsize(out) / 1e6:.1f} MB")
 
