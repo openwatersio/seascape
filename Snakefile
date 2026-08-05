@@ -116,6 +116,8 @@ rule prep_source:
         "store/source/{source}/catalog.json"
     wildcard_constraints:
         source=pat(LOCAL_PROCESSED)
+    params:
+        version=1, # increment to force a rebuild
     priority: source_priority
     # One worker per thread over the source's staged files (source_prep.DEFAULT_WORKERS holds
     # the workers x GDAL-threads arithmetic). 4 is the box's own half-the-vCPUs figure.
