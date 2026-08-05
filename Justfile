@@ -79,7 +79,8 @@ test-sources:
     uv run snakemake -s ../Snakefile -n sources > /dev/null
 
 # Build self-checks: the e2e (real stage-1 CLIs + the unified DAG), the `cover` checkpoint
-# seam (test_build), and each module's --check.
+# seam (test_build), each module's --check, and the cross-layer agreement of the three
+# products that reduce the mosaic separately (test_consistency).
 test-engine:
     uv run python test_engine.py
     uv run python aggregation_reproject.py --check
@@ -89,6 +90,7 @@ test-engine:
     uv run python bundle.py --check
     uv run python test_build.py
     uv run python terrain.py --check
+    uv run python test_consistency.py
 
 # Lint the GitHub Actions workflows.
 test-workflows:
