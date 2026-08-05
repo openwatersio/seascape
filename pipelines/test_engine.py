@@ -173,7 +173,9 @@ def _job_counts(dry_stdout):
 
 def check_priority():
     """get_grouped_source_items merge order: a metadata `priority` source wins overlap even
-    over a finer (higher-maxzoom) source; without priority, native resolution decides."""
+    over a finer (higher-maxzoom) source; without priority, native resolution decides — and
+    that ordering is per FILE, so a source carrying two resolutions (CUDEM's 1/9" and 1/3"
+    bands) still merges its finer files first."""
     import utils
     import config
     orig = config.load_metadata
@@ -181,6 +183,10 @@ def check_priority():
     csv = os.path.join(d, "x.csv")
     with open(csv, "w") as f:
         f.write("source,filename,maxzoom\nB,b.tif,13\nA,a.tif,11\n")  # B finer, A coarser
+    mixed = os.path.join(d, "mixed.csv")
+    with open(mixed, "w") as f:  # ONE source, both bands, as a merged CUDEM tile registers
+        f.write("source,filename,maxzoom\ncudem,ncei13_third.tif,12\n"
+                "cudem,ncei19_ninth.tif,13\n")
     try:
         config.load_metadata = lambda s: {"priority": 1} if s == "A" else {}
         order = [g[0]["source"] for g in utils.get_grouped_source_items(csv)]
@@ -188,7 +194,11 @@ def check_priority():
         config.load_metadata = lambda s: {}  # no priority anywhere
         order = [g[0]["source"] for g in utils.get_grouped_source_items(csv)]
         assert order[0] == "B", f"without priority, finer (maxzoom 13) wins: {order}"
-        print("priority ok — datum-authoritative source wins merge order; else maxzoom")
+        groups = utils.get_grouped_source_items(mixed)
+        assert [(g[0]["maxzoom"], g[0]["filename"]) for g in groups] == \
+            [(13, "ncei19_ninth.tif"), (12, "ncei13_third.tif")], groups
+        print("priority ok — datum-authoritative source wins merge order; else maxzoom, "
+              "per file within a source")
     finally:
         config.load_metadata = orig
         shutil.rmtree(d, ignore_errors=True)

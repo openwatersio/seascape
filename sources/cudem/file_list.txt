@@ -1,14 +1,25 @@
-# NOAA CUDEM 1/9 arc-second national topobathy — a *filelist* (manifest), not a
-# data file: each line is an NCEI urllist the engine fetches, 965 tiles across the 18
-# US coastal regions (Atlantic, Gulf, Pacific, AK) plus Puerto Rico and the USVI.
+# NOAA CUDEM national topobathy — a *filelist* (manifest), not a data file: each line is an
+# NCEI urllist the engine fetches, 1,382 tiles across the 18 US coastal regions (Atlantic,
+# Gulf, Pacific, AK) plus Puerto Rico and the USVI, in both published bands: 1/9 arc-second
+# (~3.4 m, 8112² tiles) nearshore and 1/3 arc-second (~10 m, 2712² tiles) telescoping out
+# beyond it, which is also the primary Alaska coverage (98 tiles vs 16 in 1/9). Build depth is
+# derived per FILE from its own pixel size — 1/9 registers at z15 native, 1/3 at z13 — so both
+# bands live in one source and the merge orders the finer files first; `max_zoom` caps that
+# derivation as a build budget, not as a claim about resolution.
 # Each tile is fetched, corrected onto local chart datum against store/datum/navd88_chart.tif
 # (metadata `offset_surface`) and normalized to a COG — no build-time NOAA reads.
-# NAD83 (EPSG:4269) horizontal throughout, which is what lets the whole source mosaic
-# through one VRT; vertical is NAVD88, or PRVD02/VIVD09 in PR/USVI (both ≡ LMSL, so
-# VDatum's `S = −mllw` branch corrects them with the rest). NOAA regenerates the
-# manifests as tiles are re-surveyed, so coverage stays current without re-listing here.
-# Hawaii, Guam, CNMI and American Samoa are their own source (cudem_pacific): different
-# horizontal frames, and no VDatum grid to correct against.
+# NAD83 (EPSG:4269) horizontal throughout, which is what lets the whole source mosaic through
+# one VRT; vertical is NAVD88, or PRVD02/VIVD09 in PR/USVI (both ≡ LMSL, so VDatum's
+# `S = −mllw` branch corrects them with the rest). Alaska outside the southeast panhandle has
+# no VDatum grid, so those tiles stay on NAVD88. NoData varies per tile (-9999 / -99999 /
+# -999999) and each file's header carries it.
+# NOAA regenerates the manifests as tiles are re-surveyed, so coverage stays current without
+# re-listing here.
+# Hawaii, Guam, the CNMI and American Samoa are their own sources (cudem_pacific_*): each sits
+# on its own island datum, which no VDatum grid reaches.
 https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_ninth_Topobathy_2014_8483/urllist8483.txt
+https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_third_Topobathy_2014_8580/urllist8580.txt
 https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_ninth_Topobathy_PuertoRico_9525/urllist9525.txt
+https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_third_Topobathy_PuertoRico_9524/urllist9524.txt
 https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_ninth_Topobathy_USVI_9529/urllist9529.txt
+https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_third_Topobathy_USVI_9528/urllist9528.txt

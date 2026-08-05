@@ -1,10 +1,11 @@
 {
-    "name": "NOAA CUDEM 1/9 arc-second (Guam)",
+    "name": "NOAA CUDEM (Guam)",
     "producer": "NOAA NCEI",
     "website": "https://www.ncei.noaa.gov/products/coastal-relief-model",
     "license": "public domain (U.S. Government work)",
     "max_zoom": 13,
     "datum": "MLLW via a +0.418 m scalar from GUVD04 (= local MSL to 3 mm at Apra); no VDatum grid",
     "datum_offset_m": 0.418,
+    "mixed_crs": true,
     "filter": "*.tif|*.tiff"
 }
