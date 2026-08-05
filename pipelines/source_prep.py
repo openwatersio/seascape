@@ -29,8 +29,7 @@ micro-syntax is `format[:glob][!N]`:
   e00               gunzip → ARC/INFO .e00 export → convert to <id>.tif (Lake Tahoe;
                     the export is gzip-wrapped and the unpacker handles the wrapper)
   netcdf            gdal_translate to a GeoTIFF, per-file CRS preserved (NOAA estuaries)
-  (absent)          a bare raster: hardlink to <id>_<index>.<ext> with the URL-derived
-                    extension (ext_for), keeping the store's historical file naming
+  (absent)          a bare raster: hardlink to <url-filename>_<item-hash>.<ext> (staged_name)
 
 Content sniffing (`_kind`) survives ONLY as validation: an asset whose leading bytes
 contradict its declaration (a truncated download, an upstream 200-with-error-page) is
@@ -77,12 +76,38 @@ from source_normalize import normalize_file
 DATA_EXTS = {"tif", "tiff", "zip", "nc", "asc", "xyz", "img", "gz", "7z", "grd"}
 
 
+def _url_name(url):
+    """The URL's filename: its last path segment, query + fragment stripped."""
+    return url.split("?")[0].split("#")[0].rsplit("/", 1)[-1]
+
+
 def ext_for(url):
-    last = url.split("?")[0].split("#")[0].rsplit("/", 1)[-1]
+    last = _url_name(url)
     ext = last.rsplit(".", 1)[-1].lower() if "." in last else ""
     if ext == "tiff":  # canonicalize to .tif — the staged extension the rest of the lane globs
         return "tif"
     return ext if ext in DATA_EXTS else "tif"
+
+
+# Cap on the legible half of a staged name: identity rides in the hash, so truncating a
+# pathological upstream filename can't collide, and the name stays inside the 255-byte limit.
+STEM_MAX = 100
+
+
+def staged_name(source, url):
+    """The staged basename for a bare raster: the URL's own filename beside the item hash that
+    names its raw/ download (config.item_hash), so the staged file and raw/<hash> read as a pair.
+
+    Derived from the item URL alone, never from its position in the enumeration: a positional
+    name re-keys every later file when upstream inserts or drops one, which re-registers the
+    whole source and re-aggregates its tiles. The hash also keeps two items that share a
+    filename apart — LINZ tiles the same national grid cell in adjacent surveys (23 such pairs
+    in nz_coastal), and NCEI names a tile only within its region directory. A URL that names no
+    data file (a weblink gateway, e.g. ddm's) has no filename to carry, so it takes the source id.
+    """
+    name, _, ext = _url_name(url).rpartition(".")
+    stem = re.sub(r"[^A-Za-z0-9._-]", "_", name).strip(".") if ext.lower() in DATA_EXTS else ""
+    return f"{(stem or source)[:STEM_MAX]}_{config.item_hash(url)}.{ext_for(url)}"
 
 
 def _kind(head):
@@ -140,11 +165,11 @@ def _parse_unpack(spec):
 
 
 def _claim(seen, name, origin):
-    """Register a staged basename; hard-error on a collision (two archive members or
-    nested paths sharing a basename would silently overwrite each other)."""
+    """Register a staged basename; hard-error on a collision (two archive members, nested
+    paths, or duplicate item URLs sharing a basename would silently overwrite each other)."""
     if name in seen:
-        sys.exit(f"{origin}: staged filename collision on {name!r} — two members would "
-                 "overwrite each other; the archives need distinct basenames")
+        sys.exit(f"{origin}: staged filename collision on {name!r} — two inputs would "
+                 "overwrite each other; they need distinct basenames")
     seen.add(name)
 
 
@@ -350,8 +375,8 @@ def _unpack_one(unpack, raw, root, source, index, url, asc_dir, seen, origin):
     The declared format's magic bytes are validated first, so bytes that contradict the
     declaration self-heal as a corrupt raw (raising CorruptRaw)."""
     if unpack is None:
-        base = f"{source}_{index}.{ext_for(url)}"
-        _claim(seen, base, origin)
+        base = staged_name(source, url)
+        _claim(seen, base, f"{origin} {url}")  # name the URL: a collision here is a duplicate item
         dest = f"{root}/{base}"
         if os.path.exists(dest):
             os.remove(dest)
@@ -386,8 +411,8 @@ def stage(source):
     asc_dir = f"{root}/asc"
     seen = set()  # staged basenames — collisions across raws/archives hard-error
     corrupt = []
-    # `pos` (enumeration position) names bare-raster stagings + archive scratch, so those
-    # stay stable across runs; the raw itself lives at raw/<hash>.
+    # `pos` (enumeration position) names archive scratch + the error origin only; staged
+    # basenames derive from the item URL, and the raw itself lives at raw/<hash>.
     for pos, (h, url) in enumerate(hashes):
         raw = f"{root}/raw/{h}"
         origin = f"{source}[{pos}]"
@@ -517,8 +542,10 @@ def main():
 def _check():
     """Synthetic sources end to end, driven by declared `unpack`. Raws live at raw/<hash>
     (config.item_hash of the item URL); items.txt is the enumeration. Common path: a declared
-    zip extracts its glob members, an undeclared raw hardlinks under the legacy <id>_<pos>
-    name, stale root tifs are cleared, the metadata knobs drive datum + normalize. Failure
+    zip extracts its glob members, an undeclared raw hardlinks under its URL-derived
+    staged_name — which an upstream insertion or removal leaves untouched, while the dropped
+    item's staged file goes and a duplicated item URL hard-errors by URL —
+    stale root tifs are cleared, the metadata knobs drive datum + normalize. Failure
     modes: a missing raw names what to fetch, an unexpected non-hash file in raw/ is a distinct
     error, an orphan (a hash no longer listed, or a stale legacy index) is deleted, and a
     staged-basename collision hard-errors. Format registry: a gzipped tar with `!1` stages
@@ -543,6 +570,22 @@ def _check():
     assert ext_for("https://x/a.TIFF?k=v") == "tif" and ext_for("https://x/page.html?z") == "tif"
     assert ext_for("https://x/a.zip") == "zip" and ext_for("https://x/a.nc") == "nc"
 
+    # staged_name: the URL's filename + the item hash naming its raw/ download, canonical
+    # extension, path-unsafe characters folded, and the source id where the URL names no data
+    # file. Two items sharing a filename (the real nz_coastal shape) get distinct names.
+    H = config.item_hash
+    u_nz = ["https://b/auckland/mangawhai_2025/dem_1m/2193/AY31_10000_0103.tiff",
+            "https://b/northland/whangarei_2025/dem_1m/2193/AY31_10000_0103.tiff"]
+    assert staged_name("s", u_nz[0]) == f"AY31_10000_0103_{H(u_nz[0])}.tif"
+    assert staged_name("s", u_nz[0]) != staged_name("s", u_nz[1]), "same filename, distinct items"
+    u_weblink = "https://f/main.html?weblink=abc"  # ddm's shape: a gateway URL, no filename
+    assert staged_name("ddm", u_weblink) == f"ddm_{H(u_weblink)}.tif"
+    assert staged_name("s", "https://x/a b%20c.tif").startswith("a_b_20c_"), \
+        staged_name("s", "https://x/a b%20c.tif")
+    assert staged_name("s", "https://x/../.tif").startswith("s_"), "no traversal out of the store"
+    long_url = "https://x/" + "n" * 300 + ".tif"
+    assert len(staged_name("s", long_url)) == STEM_MAX + len(H(long_url)) + len("_.tif")
+
     # _parse_unpack splits format/glob/!N and rejects an unknown format.
     assert _parse_unpack("zip:*.tif") == ("zip", "*.tif", None)
     assert _parse_unpack("tar.gz:*_lld.tif!1") == ("tar.gz", "*_lld.tif", 1)
@@ -561,8 +604,6 @@ def _check():
             assert False, f"expected {bad!r} to exit"
         except SystemExit as e:
             assert msg in str(e), (bad, e)
-
-    H = config.item_hash
 
     def seed(sid, urls, meta):
         """A synthetic source: metadata.json + items.txt (the enumeration) + an empty raw/."""
@@ -652,14 +693,49 @@ def _check():
         assert not os.path.exists(raw_of(sid, u1)), "orphan hash must be deleted"
         assert not os.path.exists(f"store/source/{sid}/raw/7"), "stale legacy index must be deleted"
 
-        # A bare raster (no `unpack`): the raw hardlinks under the legacy <id>_<pos>.<ext>.
+        # A bare raster (no `unpack`) hardlinks to its URL-derived name, and an upstream
+        # insertion or removal leaves the other files' names — and their inodes — alone. A
+        # positional name would re-key every file after the insertion, re-registering the source.
         bid = "_prep_bare"
-        bu = "https://x/dem.tif"
-        seed(bid, [bu], {"name": "Bare", "crs": "EPSG:4326"})
-        with open(raw_of(bid, bu), "wb") as f:
-            f.write(tif_bytes(7.0))
+        bus = [f"https://x/tiles/dem_{i}.tif" for i in range(3)]
+        seed(bid, bus, {"name": "Bare", "crs": "EPSG:4326"})
+        for u in bus:
+            with open(raw_of(bid, u), "wb") as f:
+                f.write(tif_bytes(7.0))
         stage(bid)
-        assert os.path.isfile(f"store/source/{bid}/{bid}_0.tif"), "bare raster stages under legacy name"
+        staged = {u: f"store/source/{bid}/{staged_name(bid, u)}" for u in bus}
+        for u, path in staged.items():
+            assert os.path.isfile(path), (u, path)
+            assert os.path.basename(path).endswith(f"_{H(u)}.tif"), path  # raw/<hash> ↔ staged
+            assert os.stat(path).st_ino == os.stat(raw_of(bid, u)).st_ino, "staged must hardlink raw"
+        inserted = "https://x/tiles/dem_new.tif"
+        with open(raw_of(bid, inserted), "wb") as f:
+            f.write(tif_bytes(8.0))
+        with open(f"store/source/{bid}/items.txt", "w") as f:  # inserted FIRST: the drift case
+            f.write("".join(u + "\n" for u in [inserted] + bus))
+        stage(bid)
+        for u, path in staged.items():
+            assert os.path.isfile(path), f"insertion re-keyed {u}"
+        assert os.path.isfile(f"store/source/{bid}/{staged_name(bid, inserted)}")
+        # Dropping an item clears its staged file (and its now-orphan raw) while the rest stand.
+        with open(f"store/source/{bid}/items.txt", "w") as f:
+            f.write("".join(u + "\n" for u in bus))
+        stage(bid)
+        assert not os.path.exists(f"store/source/{bid}/{staged_name(bid, inserted)}"), \
+            "a dropped item's staged file must be cleared"
+        assert not os.path.exists(raw_of(bid, inserted)), "orphan raw must be deleted"
+        for u, path in staged.items():
+            assert os.path.isfile(path), f"removal re-keyed {u}"
+        # A duplicated item URL would stage twice onto one name — hard-error, naming the URL.
+        with open(f"store/source/{bid}/items.txt", "w") as f:
+            f.write("".join(u + "\n" for u in bus + bus[:1]))
+        try:
+            stage(bid)
+            assert False, "expected a duplicated item URL to exit"
+        except SystemExit as e:
+            assert "collision" in str(e) and bus[0] in str(e), e
+        with open(f"store/source/{bid}/items.txt", "w") as f:
+            f.write("".join(u + "\n" for u in bus))
 
         # A source with NO datum knobs (the CUDEM-territory shape) still loses a compound
         # CRS's vertical half, with its values untouched — nothing downstream may see one.
@@ -677,10 +753,10 @@ def _check():
                 dst.write(np.full((2, 2), -4.5, dtype="float32"), 1)
         raw_bytes = open(raw_of(vid, vus[0]), "rb").read()
         prep(vid, 4)
-        for i in range(len(vus)):
-            with rasterio.open(f"store/source/{vid}/{vid}_{i}.tif") as src:
-                assert src.crs.to_epsg() == 4269, (i, src.crs)
-                assert (src.read(1) == -4.5).all(), (i, src.read(1))
+        for vu in vus:
+            with rasterio.open(f"store/source/{vid}/{staged_name(vid, vu)}") as src:
+                assert src.crs.to_epsg() == 4269, (vu, src.crs)
+                assert (src.read(1) == -4.5).all(), (vu, src.read(1))
         assert open(raw_of(vid, vus[0]), "rb").read() == raw_bytes, \
             "flattening a hardlinked bare raster must not write through into raw/"
 
@@ -705,7 +781,7 @@ def _check():
             sidecar_s = json.load(f)
         assert sidecar_s["offset_surface"] == "synth", sidecar_s
         assert sidecar_s["corrected_fraction"] == 0.5, sidecar_s
-        with rasterio.open(f"store/source/{sid_s}/{sid_s}_0.tif") as src:
+        with rasterio.open(f"store/source/{sid_s}/{staged_name(sid_s, su)}") as src:
             assert src.read(1)[0, 0] == -9.0, src.read(1)   # bed - (-1): shallower
             assert src.read(1)[0, 1] == -10.0, src.read(1)  # no coverage: passed through
         # A declared surface that isn't in the store must name itself, not silently no-op.
@@ -885,8 +961,8 @@ def _check():
             with open(f"store/source/{pid}/datum.json") as f:
                 sidecar = json.load(f)
             out = []
-            for i in range(len(pu)):
-                with rasterio.open(f"store/source/{pid}/{pid}_{i}.tif") as src:
+            for u in pu:
+                with rasterio.open(f"store/source/{pid}/{staged_name(pid, u)}") as src:
                     out.append(src.read(1).tolist())
             return sidecar, out
 
@@ -911,7 +987,7 @@ def _check():
                 prep(fid, workers)
                 assert False, f"expected a file with no nodata to fail prep (workers={workers})"
             except (RuntimeError, ValueError) as e:
-                assert f"{fid}_1.tif" in str(e), (workers, e)
+                assert staged_name(fid, fu[1]) in str(e), (workers, e)
 
         # Format registry: an asc-mosaic zip of ESRI ASCII tiles mosaics to <id>.tif (GDAL CLI).
         if shutil.which("gdalbuildvrt") and shutil.which("gdal_translate"):
