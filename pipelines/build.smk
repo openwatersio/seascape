@@ -144,6 +144,7 @@ def source_props(stem):
 # above, not here.
 MERGE_CFG = json.dumps({
     "resample": aggregation_reproject.RESAMPLE,
+    "feather_min_levels": aggregation_reproject.FEATHER_MIN_LEVELS,
     "macrotile_z": utils.macrotile_z,
     "macrotile_buffer_3857": utils.macrotile_buffer_3857,
     "num_overviews": utils.num_overviews,
