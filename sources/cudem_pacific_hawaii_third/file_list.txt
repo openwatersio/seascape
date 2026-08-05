@@ -1,0 +1,9 @@
+# NOAA CUDEM 1/3 arc-second, Hawaii — a *filelist* (manifest), not a data file: the line
+# below is an NCEI urllist the engine fetches, 79 tiles over the eight main islands
+# (lon -160.5..-154.5, lat 18.5..22.5). The offshore/deeper band that telescopes out
+# beyond the 1/9 nearshore zone, and a separate source id from cudem_pacific_hawaii
+# because the zoom cap follows the resolution (z12 vs z13). WGS 84 (EPSG:4326)
+# horizontal on every tile, vertical MSL height (EPSG:5714), nodata -9999.
+# Same island datum and therefore the same +0.351 m as the 1/9 source; the station
+# evidence is in sources/README.md.
+https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_third_Topobathy_Hawaii_9429/urllist9429.txt

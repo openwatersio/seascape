@@ -1,0 +1,9 @@
+{
+    "name": "NOAA CUDEM 1/3 arc-second (American Samoa)",
+    "producer": "NOAA NCEI",
+    "website": "https://www.ncei.noaa.gov/products/coastal-relief-model",
+    "license": "public domain (U.S. Government work)",
+    "max_zoom": 12,
+    "datum": "declared NAVD88, undefined in American Samoa; uncorrected — no VDatum grid and no published tie to MLLW; reads ~0.4 m deep",
+    "filter": "*.tif|*.tiff"
+}

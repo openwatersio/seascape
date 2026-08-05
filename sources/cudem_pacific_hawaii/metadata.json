@@ -1,10 +1,10 @@
 {
-    "name": "NOAA CUDEM 1/9 arc-second (Pacific territories)",
+    "name": "NOAA CUDEM 1/9 arc-second (Hawaii)",
     "producer": "NOAA NCEI",
     "website": "https://www.ncei.noaa.gov/products/coastal-relief-model",
     "license": "public domain (U.S. Government work)",
     "max_zoom": 13,
-    "datum": "local island datums (~MSL), uncorrected — no VDatum coverage",
-    "mixed_crs": true,
+    "datum": "MLLW via a +0.351 m scalar from local MSL (EPSG:5714); no VDatum grid",
+    "datum_offset_m": 0.351,
     "filter": "*.tif|*.tiff"
 }

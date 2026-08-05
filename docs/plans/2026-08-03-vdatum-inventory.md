@@ -264,7 +264,7 @@ For the uncovered Pacific territories, the only available reference is per-stati
 | Saipan 1633227 | NMVD03 | +0.396 | +0.393 |
 | Pago Pago, Am. Samoa 1770000 | ASVD02 | n/a | +0.415 |
 
-Guam varies by 0.18 m across a 15 km-wide island (windward vs leeward), so "one scalar per territory" carries ~0.2 m error there. All of these are small and positive, so a per-island scalar taken as the **minimum** across the island's stations would be conservative in the bias-shallow sense.
+Guam varies by 0.18 m across a 15 km-wide island (windward vs leeward), so "one scalar per territory" carries ~0.2 m error there. All of these are small and positive, and the scalar is *added* to raise the bed, so the conservative choice across an island's stations is the **maximum**: undershooting leaves part of the original deep bias in place, overshooting charts shallower than truth, and only the latter is the bias-shallow-safe direction.
 
 ## 6. Offshore coverage extent
 

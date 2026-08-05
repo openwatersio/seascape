@@ -1,0 +1,10 @@
+# NOAA CUDEM 1/9 arc-second, Guam — a *filelist* (manifest), not a data file: the line
+# below is an NCEI urllist the engine fetches, 4 tiles. NAD83(MA11) (EPSG:6325)
+# horizontal on every tile — geographic 2D, no vertical component declared at all — and
+# nodata -9999. 6325 is why Guam cannot join the NAD83 (EPSG:4269) territories in one
+# source: same values, genuinely different horizontal datum.
+# One source per NCEI territory dataset because `datum_offset_m` is per-source and each
+# territory sits on its own island datum; see sources/README.md for the station evidence
+# behind +0.418 m (CO-OPS Apra Harbor 1630000, larger than Pago Bay's +0.308 m 15 km
+# away — the larger is the bias-shallow-safe end of the range).
+https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_ninth_Topobathy_Guam_9462/urllist9462.txt

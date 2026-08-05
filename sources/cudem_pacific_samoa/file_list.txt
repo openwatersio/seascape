@@ -1,0 +1,12 @@
+# NOAA CUDEM 1/9 arc-second, American Samoa — a *filelist* (manifest), not a data file:
+# the line below is an NCEI urllist the engine fetches, 7 tiles over Tutuila and the
+# Manu'a group (lon -171.0..-169.25, lat -14.5..-14.0). NAD83 (EPSG:4269) horizontal on
+# every tile, vertical ASVD02 height (EPSG:6643), nodata -999999.
+# Alone among the Pacific territories this one carries no `datum_offset_m`: Pago Pago
+# 1770000 is the only station, it publishes no ASVD02 row to tie the DEM's own datum to
+# MLLW, and its datums sit on a modified 2011-2019 epoch rather than the 1983-2001 NTDE
+# every other Pacific station uses — the signature of the post-2009-earthquake
+# re-determination, whose subsidence offsets ASVD02 from present-day MSL by an unmeasured
+# amount. A scalar here would be a guess with an unbounded sign, so the ~0.4 m deep bias
+# stays documented instead. Manu'a has no station at all, 100 km from Tutuila.
+https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_ninth_Topobathy_AmSam_9460/urllist9460.txt

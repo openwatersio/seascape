@@ -1,0 +1,10 @@
+# NOAA CUDEM 1/9 arc-second, Hawaii — a *filelist* (manifest), not a data file: the line
+# below is an NCEI urllist the engine fetches, 54 tiles over the eight main islands
+# (lon -160.5..-154.5, lat 18.5..22.5 — no Northwestern Hawaiian Islands, so Midway's
+# +0.198 m is out of scope). WGS 84 (EPSG:4326) horizontal on every tile, vertical MSL
+# height (EPSG:5714), nodata -9999.
+# One source per NCEI territory dataset because `datum_offset_m` is per-source and each
+# territory sits on its own island datum; see sources/README.md for the station evidence
+# behind +0.351 m (CO-OPS Hilo 1617760, the largest MSL-MLLW of the 13 main-island
+# stations that publish both — the largest is the bias-shallow-safe end of the range).
+https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_ninth_Topobathy_Hawaii_9428/urllist9428.txt
