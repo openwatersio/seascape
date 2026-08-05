@@ -35,6 +35,37 @@ NODATA = -9999
 # AGG_RESAMPLE=bilinear to switch if that shows.
 RESAMPLE = os.environ.get("AGG_RESAMPLE", "cubicspline")
 
+# Coverage-edge feathering. A group whose native grid is >= FEATHER_MIN_LEVELS zoom levels
+# coarser than the render grid draws its valid/nodata boundary as source-cell staircases —
+# a 30 m S-102 cell is a 13-px block on a z15 grid, and land in S-102 is simply nodata, so
+# the shoreline itself staircases. Values interpolate smoothly (cubicspline) but validity
+# cannot: gdalwarp keeps the source's cell-quantized mask. The fix smooths the 0/1 mask
+# with a gaussian at the source-cell scale and re-thresholds at 0.5; the new boundary
+# is the level-set midline through the staircase corners, within half a source cell of the
+# original everywhere. Newly-covered fringe pixels copy their nearest valid neighbour
+# (the fringe is the shallowest edge, so extending it errs bias-shallow). Trimming a step
+# corner only re-draws a source cell's edge — the survey stays represented by the rest of
+# the cell.
+#
+# Coverage may never be disconnected, though: a creek narrower than a source cell, or a
+# short neck between two basins, is a passage, and erasing it would chart a closed channel.
+# So coverage first GROWS to the blur's level set (growth can only join), then the pixels
+# the blur wants gone are peeled off one topology-preserving layer at a time — a pixel is
+# removed only if the coverage around it is a single arc, which is false exactly at a neck.
+# Every pair of pixels connected before is still connected after, whatever the shape, so a
+# sub-cell passage survives as a thread rather than being erased. What this does NOT promise
+# is preserving the AREA of a feature smaller than the smoothing scale: a dead-end stub
+# narrower than a source cell erodes back toward what it hangs off. That direction is the
+# safe one — it charts as land or falls through to the next source, rather than inventing
+# navigable water — and it is the same call the pond fill in smooth.py already makes.
+FEATHER_MIN_LEVELS = int(os.environ.get("AGG_FEATHER_MIN_LEVELS", "2"))
+# Ceiling on the smoothing scale, in render pixels per source cell. The boundary can move
+# by up to half a source cell, so an unbounded factor would let a very coarse group (GEBCO
+# under a z15 tile is 7 levels down) redraw a coastline by hundreds of metres. Such groups
+# only ever fill gaps under a finer source anyway, and a global one has no coverage edge
+# to feather at all.
+FEATHER_MAX_FACTOR = 32
+
 
 def negate_band1(filepath):
     """Flip band-1 sign on valid pixels (depth +down -> elevation -down), leaving invalid
@@ -54,6 +85,108 @@ def negate_band1(filepath):
                 a = ds.read(1, window=window)
                 a[mask] = -a[mask]
                 ds.write(a, 1, window=window)
+
+
+def _peel_preserving_topology(start, removable, max_iters):
+    """Remove `removable` pixels from `start`, one topology-preserving layer at a time.
+
+    A pixel may go only when its 8-neighbourhood crossing number — the number of
+    background-to-coverage transitions around it — is exactly 1, i.e. the coverage touching
+    it forms a single arc. A neck pixel with water on two sides scores 2 and stays; an
+    isolated pixel and an interior pixel both score 0 and stay, so a component is never
+    deleted and a hole is never punched. Removals are taken in four subfields so two pixels
+    dropped in the same pass are never even diagonally adjacent and cannot interact.
+
+    Only candidate pixels are visited (a band a few px wide along the boundary), not the
+    whole window, which is what keeps this affordable at tile scale."""
+    cur = np.pad(start, 1, constant_values=False)
+    stride = cur.shape[1]
+    flat = cur.ravel()
+    ys, xs = np.nonzero(removable)
+    idx = (ys + 1) * stride + (xs + 1)
+    subfield = ((ys & 1) << 1) | (xs & 1)
+    # the 8 neighbours, clockwise from north — the cyclic order the crossing number needs
+    offsets = np.array([-stride, -stride + 1, 1, stride + 1,
+                        stride, stride - 1, -1, -stride - 1])
+    for _ in range(max_iters):
+        changed = False
+        for s in range(4):
+            sel = (subfield == s) & flat[idx]
+            if not sel.any():
+                continue
+            here = idx[sel]
+            neighbours = flat[here[:, None] + offsets]
+            crossings = (~neighbours & np.roll(neighbours, -1, axis=1)).sum(axis=1)
+            drop = crossings == 1
+            if drop.any():
+                flat[here[drop]] = False
+                changed = True
+        if not changed:
+            break
+    return cur[1:-1, 1:-1]
+
+
+def feather_coverage_edge(filepath, factor):
+    """Smooth `filepath`'s coverage boundary at the source-cell scale (`factor` render px
+    per source cell), writing a new raster and swapping it in.
+
+    Reads come only from the untouched input, so no block can observe another block's
+    output and the result does not depend on traversal order. Every written pixel is a
+    function of the input within `pad` px, and adjacent stems share far more halo than
+    that, so neighbouring stems draw the same fringe and the tile seams stay closed."""
+    from scipy.ndimage import distance_transform_edt, gaussian_filter
+
+    # Half a source cell keeps the 0.5-line within half a cell of the original boundary;
+    # measured on a 45-degree staircase it cuts the stair runs from `factor` px to <= 4.
+    sigma = factor / 2.0
+    # The blur can only want to peel within about 2 sigma of the boundary, and each pass
+    # takes one layer.
+    max_iters = int(2 * sigma) + 2
+    # Support of one written pixel: the blur's 4 sigma, plus one px per peeling pass.
+    pad = int(4.0 * sigma) + max_iters + 2
+    block = 2048
+    out_path = filepath + ".feather.tif"
+    with rasterio.env.Env(GDAL_CACHEMAX=256), rasterio.open(filepath) as src:
+        h, w = src.height, src.width
+        profile = src.profile
+        profile.update(driver="GTiff", tiled=True, blockxsize=512, blockysize=512,
+                       BIGTIFF="IF_SAFER", SPARSE_OK=True)
+        alpha_band = src.count if src.count >= 2 else None
+        with rasterio.open(out_path, "w", **profile) as dst:
+            dst.colorinterp = src.colorinterp
+            for row in range(0, h, block):
+                for col in range(0, w, block):
+                    r0, c0 = max(0, row - pad), max(0, col - pad)
+                    r1, c1 = min(h, row + block + pad), min(w, col + block + pad)
+                    pwin = rasterio.windows.Window(c0, r0, c1 - c0, r1 - r0)
+                    ir0, ic0 = row - r0, col - c0
+                    ir1 = ir0 + min(block, h - row)
+                    ic1 = ic0 + min(block, w - col)
+                    iwin = rasterio.windows.Window(col, row, ic1 - ic0, ir1 - ir0)
+                    bands = src.read(window=pwin)
+                    valid = src.read_masks(1, window=pwin) != 0
+                    if valid.any() and not valid.all():
+                        target = gaussian_filter(valid.astype(np.float32), sigma=sigma,
+                                                 mode="nearest") >= 0.5
+                        # Grow first: growth can only join coverage, never split it. Then
+                        # peel what the blur wants gone, topology-preserving, so everything
+                        # connected in `grown` — which contains all of `valid` — stays
+                        # connected. No passage can close.
+                        grown = valid | target
+                        final = _peel_preserving_topology(grown, grown & ~target, max_iters)
+                        added = final & ~valid
+                        if added.any():
+                            # nearest surveyed neighbour's value, read from the input, so
+                            # the fringe never inherits a value another block wrote
+                            _, (ir, ic) = distance_transform_edt(~valid, return_indices=True)
+                            bands[0][added] = bands[0][ir[added], ic[added]]
+                        removed = valid & ~final
+                        if alpha_band is not None:
+                            bands[alpha_band - 1] = np.where(final, 255, 0)
+                        else:
+                            bands[0][removed] = NODATA
+                    dst.write(bands[:, ir0:ir1, ic0:ic1], window=iwin)
+    os.replace(out_path, filepath)
 
 
 def band_select(source):
@@ -241,6 +374,12 @@ def reproject(filepath):
             translate(vrt_3857, out_tiff)
         if config.source_property(sid, "negate"):
             negate_band1(out_tiff)  # streamed positive-down source (S-102 depth) -> elevation
+        # Before the land clamps, never after: this smooths a boundary the SOURCE's own
+        # cells drew, while the clamps below cut nodata along the OSM water line, which is
+        # vector-precise and must not be re-drawn at some source's cell scale.
+        levels = maxzoom - source_items[0]["maxzoom"]
+        if levels >= FEATHER_MIN_LEVELS:
+            feather_coverage_edge(out_tiff, min(1 << levels, FEATHER_MAX_FACTOR))
         if config.source_property(sid, "land_clamp"):
             # Coarse source (GEBCO/EMODnet) with no land/water concept: its shoreline cells
             # read negative on land. Clamp valid ^ land ^ <0 -> 0 right after warp, so the
@@ -378,7 +517,101 @@ def _check():
     assert o[0, 0] == -5.0 and o[1, 0] == -10.0 and o[1, 1] == 3.0, o   # valid pixels flipped
     assert not valid[0, 1], "nodata cell must stay masked (and unflipped)"
 
-    print(f"aggregation_reproject.py self-check ok (valid pixels: A={va}, A+B={vboth})")
+    # feather_coverage_edge. Fixtures are 256px COGs at factor 16 (a source 4 zoom levels
+    # coarser than the render grid); the staircase is a 45-degree coverage edge quantized
+    # to 16px source cells, which is the artifact this removes.
+    F, N = 16, 256
+    def staircase():
+        a = np.full((N, N), NODATA, dtype="float32")
+        for cr in range(N // F):
+            for cc in range(N // F):
+                if cc <= cr:  # coverage below-left of the diagonal
+                    a[cr*F:(cr+1)*F, cc*F:(cc+1)*F] = -3.0
+        return a
+
+    def as_cog(arr, name):
+        raw = f"{d}/{name}.tif"
+        with rasterio.open(raw, "w", driver="GTiff", height=arr.shape[0], width=arr.shape[1],
+                           count=1, dtype="float32", nodata=NODATA, crs="EPSG:3857",
+                           transform=from_origin(0, arr.shape[0], 1, 1)) as dst:
+            dst.write(arr, 1)
+        cog = f"{d}/{name}_cog.tif"
+        translate(raw, cog)
+        return cog
+
+    def read(path):
+        with rasterio.open(path) as r:
+            return r.read(1), r.read_masks(1) != 0
+
+    def edge_runs(valid):
+        """Max vertical run of an identical boundary-x: the stair pitch (F before, a few
+        px after, since a feathered 45-degree boundary steps about one px per row)."""
+        flips = valid[:, 1:] != valid[:, :-1]
+        best, prev = 0, {}
+        for row in range(valid.shape[0]):
+            xs = set(np.nonzero(flips[row])[0].tolist())
+            for x in list(prev):
+                if x in xs:
+                    prev[x] += 1
+                    xs.discard(x)
+                else:
+                    best = max(best, prev.pop(x))
+            for x in xs:
+                prev[x] = 1
+        return max([best] + list(prev.values()))
+
+    def splits(before, after):
+        """Original coverage components that ended up in more than one final component.
+        Counting components is not the property — the feather may legitimately ADD one by
+        refusing to delete an isolated pixel, and may remove one by joining two across a
+        sub-cell gap. What must never happen is a component coming apart."""
+        from scipy.ndimage import label
+        lo, n = label(before)
+        ln, _ = label(after)
+        return sum(1 for c in range(1, n + 1)
+                   if len(np.unique(ln[lo == c])[np.unique(ln[lo == c]) > 0]) > 1)
+
+    # 1. the staircase alone: quantized boundary -> near-diagonal, added fringe pixels carry
+    #    real depths (never NODATA), and the whole op is deterministic.
+    plain = staircase()
+    cog_a, cog_b = as_cog(plain, "stair"), as_cog(plain, "stair2")
+    before = edge_runs(read(cog_a)[1])
+    feather_coverage_edge(cog_a, F)
+    out_data, out_valid = read(cog_a)
+    after = edge_runs(out_valid)
+    assert before >= F and after <= 6, (before, after)
+    assert (out_data[out_valid] != NODATA).all(), "no covered pixel may hold NODATA"
+    added = out_valid & (plain == NODATA)
+    assert added.any() and (out_data[added] < 0).all(), \
+        "added fringe pixels must carry a surveyed neighbour's depth"
+    feather_coverage_edge(cog_b, F)
+    again_data, again_valid = read(cog_b)
+    assert (again_data == out_data).all() and (again_valid == out_valid).all(), \
+        "feather must be deterministic"
+
+    # 2. connectivity, the case that matters for a chart: coverage that is connected before
+    #    must be connected after, whatever the shape. Three ways to break it, all of which a
+    #    distance-based guard misses, because every erased pixel sits near surviving water:
+    #    a long sub-cell creek, a passage crossing the window, and a short neck joining two
+    #    basins. The neck is the one a purely distance-based rule cannot see at all.
+    creek = staircase()
+    creek[2*F:2*F + F//2, 3*F:14*F] = -4.0                      # long, 11 cells
+    through = staircase()
+    through[6*F:6*F + F//2, 7*F:N] = -4.0                       # a passage leaving the window
+    neck = np.full((120, 200), NODATA, dtype="float32")
+    neck[40:80, 20:90] = -5.0
+    neck[40:80, 110:180] = -5.0
+    neck[57:63, 90:110] = -3.0                                  # one-cell bottleneck
+    for name, arr in (("creek", creek), ("through-creek", through), ("neck", neck)):
+        cog = as_cog(arr, name.replace("-", ""))
+        feather_coverage_edge(cog, F)
+        data, valid = read(cog)
+        broke = splits(arr != NODATA, valid)
+        assert broke == 0, f"{name}: feather split {broke} coverage component(s)"
+        assert (data[valid] != NODATA).all(), f"{name}: covered pixel holding NODATA"
+
+    print(f"aggregation_reproject.py self-check ok (valid pixels: A={va}, A+B={vboth}; "
+          f"feather stair {before}px -> {after}px)")
 
 
 if __name__ == "__main__":
