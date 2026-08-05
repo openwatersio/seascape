@@ -260,23 +260,39 @@ def _build_tile_vrt(cmd, tries=3):
             time.sleep(2 ** attempt)  # 2s, 4s
 
 
-def warp_mixed(inputs, out_tif, zoom, aggregation_tile, buffer):
-    """gdalwarp several heterogeneous-CRS inputs into one 3857 GTiff mosaic. A warped
-    VRT can't span source CRSs (it has one), so warp straight to a raster — each input
-    is reprojected from its own UTM zone, so a zone-crossing tile keeps every source.
-    No value transform: a source's datum correction is baked in at prep (source_datum),
-    never here; nan source-nodata maps to NODATA via -dstnodata."""
+def warp_mixed(tmp_folder, i, inputs, out_vrt, zoom, aggregation_tile, buffer):
+    """Mosaic heterogeneous-CRS inputs into one lazy 3857 VRT, warping each separately.
+
+    A warped VRT holds a single source CRS, so the mixed case can't be one warp — but it can
+    be one warp PER input (each of those is homogeneous), and the results all share 3857 and
+    one grid, so gdalbuildvrt will merge them. The chain stays lazy end to end: `translate` is
+    the only pass over the pixels, where warping straight to a raster wrote a multi-GB
+    transient that then had to be read back and recompressed.
+
+    Laziness is also what keeps a vertical datum shift out of reach. gdalwarp converts NAVD88
+    to ellipsoidal height when it writes real pixels — always deeper across CONUS — and a VRT
+    cannot express a pixel-value transform, so it cannot. Prep flattens compound CRSs
+    (source_datum.flatten_compound_crs); this is the second line, not the first.
+
+    -tap rather than a computed per-input window: the aggregation grid is already an integer
+    multiple of `res` from the mercator origin (a tile bound is `x*512*res` off `-half`, and
+    `half/res` == `256*2**z`), so aligning each input's own extent to multiples of -tr lands it
+    on that same grid. gdalbuildvrt's -te/-tr then pin the exact output window, reading every
+    contributing level 1:1."""
     left, bottom, right, top = buffered_bounds(aggregation_tile, buffer)
     res = get_resolution(zoom)
-    # ZSTD+predictor3 (single-band Float32) shrinks this transient ~4x; SPARSE_OK skips
-    # all-nodata blocks. Cuts the disk a deep z->z14 tile needs (a 32768px tile is ~4 GB
-    # uncompressed) and the I/O writing it.
-    _run(f"GDAL_CACHEMAX=512 gdalwarp -overwrite -t_srs EPSG:3857 -tr {res} {res} "
-         f"-te {left} {bottom} {right} {top} -r {RESAMPLE} -dstnodata {NODATA} "
-         "-co TILED=YES -co BIGTIFF=IF_SAFER -co SPARSE_OK=YES "
-         "-co COMPRESS=ZSTD -co PREDICTOR=3 -co NUM_THREADS=ALL_CPUS "
-         f"{' '.join(inputs)} {out_tif}",
-         f"gdalwarp(mixed) {out_tif}")
+    warped = []
+    for j, path in enumerate(inputs):
+        w = f"{tmp_folder}/{i}-{j}-3857.vrt"
+        _run(f"gdalwarp -of vrt -overwrite -t_srs EPSG:3857 -tr {res} {res} -tap "
+             f"-r {RESAMPLE} -dstnodata {NODATA} {path} {w}", f"gdalwarp(mixed) {w}")
+        warped.append(w)
+    listpath = f"{tmp_folder}/{i}-3857-list.txt"
+    with open(listpath, "w") as f:
+        f.write("".join(p + "\n" for p in warped))
+    utils.run_command(f"gdalbuildvrt -overwrite -te {left} {bottom} {right} {top} "
+                      f"-tr {res} {res} -input_file_list {listpath} {out_vrt}", silent=SILENT)
+    assert_vrt_complete(out_vrt, warped)
 
 
 def get_resolution(zoom):
@@ -379,20 +395,16 @@ def reproject(filepath):
     for i, source_items in enumerate(grouped):
         sid = source_items[0]["source"]
         out_tiff = f"{tmp_folder}/{i}-3857.tiff"
+        vrt_3857 = f"{tmp_folder}/{i}-3857.vrt"
         if config.source_property(sid, "mixed_crs"):
-            # Per-tile UTM zones: warp the per-tile VRTs straight to a raster (gdalwarp
-            # reprojects each input), then the same translate makes the COG.
-            merged = f"{tmp_folder}/{i}-3857-merged.tif"
-            warp_mixed(per_tile_vrts(tmp_folder, i, source_items), merged,
+            # Per-tile UTM zones: one warp per tile, recombined — gdalbuildvrt refuses the
+            # source CRSs but accepts the warped results.
+            warp_mixed(tmp_folder, i, per_tile_vrts(tmp_folder, i, source_items), vrt_3857,
                        maxzoom, aggregation_tile, buffer_3857_rounded)
-            translate(merged, out_tiff)
-            os.remove(merged)  # free the multi-GB warp intermediate now, not at end-of-tile
-                               # (rmtree) — it's never read again once the COG exists
         else:
-            vrt = create_virtual_raster(tmp_folder, i, source_items)
-            vrt_3857 = f"{tmp_folder}/{i}-3857.vrt"
-            create_warp(vrt, vrt_3857, maxzoom, aggregation_tile, buffer_3857_rounded)
-            translate(vrt_3857, out_tiff)
+            create_warp(create_virtual_raster(tmp_folder, i, source_items), vrt_3857,
+                        maxzoom, aggregation_tile, buffer_3857_rounded)
+        translate(vrt_3857, out_tiff)
         if config.source_property(sid, "negate"):
             negate_band1(out_tiff)  # streamed positive-down source (S-102 depth) -> elevation
         # Before the land clamps, never after: this smooths a boundary the SOURCE's own
@@ -467,11 +479,44 @@ def _check():
             arr = src.read(1)
         return int(np.count_nonzero((arr != NODATA) & ~np.isnan(arr)))
 
-    both, just_a = f"{d}/both.tif", f"{d}/a.tif"
-    warp_mixed([a, b], both, 9, tile, 0)
-    warp_mixed([a], just_a, 9, tile, 0)
+    both, just_a = f"{d}/both.vrt", f"{d}/a.vrt"
+    warp_mixed(d, 0, [a, b], both, 9, tile, 0)
+    warp_mixed(d, 1, [a], just_a, 9, tile, 0)
     va, vboth = valid(just_a), valid(both)
     assert vboth > va > 0, (va, vboth)
+
+    # ...and must not shift a value vertically. A materialized gdalwarp converts NAVD88 to
+    # ellipsoidal height (~-22 m in Puget Sound, always deeper); the warped-VRT mosaic cannot,
+    # which is the second line behind source_datum.flatten_compound_crs. The materialized warp
+    # is run first as a POSITIVE CONTROL: without a geoid grid installed PROJ applies nothing
+    # and the real assertion would pass vacuously, so skip loudly instead of claiming a pass.
+    # EPSG:5498 is NAD83 + NAVD88 height — the horizontal half is GEOGRAPHIC, so this box is
+    # placed in degrees (~11 km over Puget Sound), not in the eastings the UTM boxes above use.
+    compound = f"{d}/compound.tif"
+    utm_box(compound, 5498, -122.45, 48.45, -80.0, n=200, res=0.0005)
+    ptile = mercantile.tile(-122.4, 48.4, 11)
+    shifted = f"{d}/shifted.tif"
+    left, bottom, right, top = buffered_bounds(ptile, 0)
+    res13 = get_resolution(13)
+    _run(f"gdalwarp -overwrite -t_srs EPSG:3857 -tr {res13} {res13} -te {left} {bottom} "
+         f"{right} {top} -r {RESAMPLE} -dstnodata {NODATA} {compound} {shifted}",
+         "gdalwarp(control)")
+
+    def middle(path):
+        with rasterio.open(path) as src:
+            arr = src.read(1)
+        ok = (arr != NODATA) & ~np.isnan(arr)
+        return float(np.median(arr[ok])) if ok.any() else None
+
+    control = middle(shifted)
+    if control is None or abs(control - (-80.0)) <= 1.0:
+        print("  (skipped vertical-shift check: no geoid grid here, the control did not shift)")
+    else:
+        lazy = f"{d}/compound-3857.vrt"
+        warp_mixed(d, 2, [compound], lazy, 13, ptile, 0)
+        got = middle(lazy)
+        assert got is not None and abs(got - (-80.0)) <= 0.1, \
+            f"warp_mixed shifted a compound-CRS value: {got} (control {control}, source -80.0)"
 
     # assert_vrt_complete: same-CRS inputs all land in the VRT; a mixed pair (gdalbuildvrt
     # drops the off-CRS one with only a warning) must raise and name the missing file.
