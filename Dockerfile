@@ -116,6 +116,10 @@ RUN uv sync --frozen --no-install-project
 RUN uv pip install --python /opt/venv/bin/python py-spy==0.4.2 \
   && /opt/venv/bin/py-spy --version
 ENV PATH="/opt/venv/bin:${PATH}"
+# Snakemake discovers logger plugins by scanning sys.path for `snakemake_logger_plugin_*`
+# packages (pkgutil.iter_modules), and it chdirs to the workdir before doing so — the
+# mounted repo has to be on the path explicitly for `--logger seascape` to resolve.
+ENV PYTHONPATH=/app
 
 # The build is one Snakemake DAG (docker.sh fronts it). e.g.
 # `docker run -v "$PWD:/app" img snakemake planet` (BBOX=… scopes a region);

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Live view of a dispatched build. Resolves the box from the `build` commit status
-# (the heartbeat carries `root@<ip> · N of M steps`) and tails the build container's
+# (the heartbeat carries `root@<ip> · N/M, P%, R running`) and tails the build container's
 # log on the box. No arguments needed for the common case.
 #
 #   scripts/watch-build              # follow the current build for HEAD, errors + progress
@@ -27,10 +27,10 @@ SSH=(ssh -i "$HOME/.ssh/seascape-build"
      -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR
      "root@$ip")
 if [ -n "$filter" ]; then
-  # Progress lines + anything that reads as trouble. The container name is Docker-random;
-  # the build container is the only one running.
+  # Job lines (✓/✗), periodic status, and anything that reads as trouble. The container
+  # name is Docker-random; the build container is the only one running.
   "${SSH[@]}" 'docker logs -f --tail 100 $(docker ps -lq) 2>&1' |
-    grep --line-buffered -E "of [0-9]+ steps|Error|error in rule|Traceback|MissingOutputException|failed|Killed|oom|Exception|reason:|Job stats|^total|did not simplify|fell back|WARNING"
+    grep --line-buffered -E "✓|✗|──|Error|Traceback|MissingOutputException|failed|Killed|oom|Exception|Job stats|^total|did not simplify|fell back|WARNING"
 else
   exec "${SSH[@]}" 'docker logs -f --tail 200 $(docker ps -lq) 2>&1'
 fi
