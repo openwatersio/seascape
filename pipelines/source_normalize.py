@@ -27,8 +27,11 @@ import utils
 # ~2.7x faster on GEBCO Int16, and it's in the stock Ubuntu/Homebrew GDAL builds
 # (unlike LERC). The predictor is chosen per file: 3 (floating-point) only works
 # on Float32/64; integer rasters (e.g. GEBCO's Int16) need 2 (horizontal differencing).
-COG_OPTS = ["-co", "BLOCKSIZE=512", "-co", "SPARSE_OK=YES",
-            "-co", "BIGTIFF=IF_NEEDED", "-co", "COMPRESS=ZSTD", "-co", "NUM_THREADS=ALL_CPUS"]
+COG_OPTS = ["-co", "BLOCKSIZE=512", "-co", "SPARSE_OK=YES", "-co", "BIGTIFF=IF_NEEDED",
+            "-co", "COMPRESS=ZSTD",
+            # not ALL_CPUS: prep normalizes files in parallel, so the compressor pool is
+            # per-worker (utils.GDAL_WORKER_THREADS)
+            "-co", f"NUM_THREADS={utils.GDAL_WORKER_THREADS}"]
 
 
 def predictor_for(filepath):

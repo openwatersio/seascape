@@ -44,10 +44,15 @@ raw/. Every derived intermediate (tifs, .nc, gzip spools, VRT/7z scratch, asc/ t
 removed at entry — all are re-derivable from raw/ + this module — and orphan raws (a hash no
 longer enumerated, or a stale legacy index name) are deleted rather than wedging the source.
 
-Run from pipelines/:  uv run python source_prep.py <source-id>
+Staging is serial (basename collisions and corrupt-raw self-heal are order-dependent, and it is
+a hardlink or an archive read per asset); everything after it — datum, CRS flatten, normalize —
+runs one worker per staged file.
+
+Run from pipelines/:  uv run python source_prep.py <source-id> [workers]
 """
 
 import fnmatch
+import functools
 import gzip
 import lzma
 import os
@@ -56,6 +61,7 @@ import shutil
 import sys
 import tarfile
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from glob import glob
 
 import config
@@ -412,7 +418,61 @@ def _check_raster(path):
         raise CorruptRaw(f"not a readable raster: {e}") from e
 
 
-def prep(source):
+def prep_file(tif, transform, negate, offset, clamp, surface, crs, nodata):
+    """One staged raster end to end: datum transform → compound-CRS flatten → normalize to a COG.
+    The unit the pool fans out over, so it touches no file but its own — every step writes a
+    sibling temp and os.replaces it, and rasterio's GDAL config Env is thread-local.
+    Returns (basename, reference-corrected px, valid px, whether a vertical CRS was dropped)."""
+    corrected = valid = 0
+    if transform:
+        corrected, valid = transform_file(tif, negate, offset, clamp, surface)
+    # After the transform, which already reduces the CRS on the files it rewrites; this catches
+    # the rest, so no staged raster reaches a warp carrying a vertical CRS.
+    flattened = flatten_compound_crs(tif)
+    normalize_file(tif, crs, nodata)
+    return os.path.basename(tif), corrected, valid, flattened
+
+
+# The per-file pipeline is embarrassingly parallel, and THREADS carry it: GDAL's read/write and
+# numpy's ufuncs both drop the GIL, and the COG write is a subprocess. Measured on 16 real 1/9"
+# CUDEM tiles (3.3 GB), 4 workers: 70s threaded vs 84s with a process pool, at 2.5 GB peak RSS
+# vs 3.2 GB — one shared GDAL block cache instead of one per worker, and no start-method
+# portability surface (fork vs spawn vs forkserver) around the worker bootstrap.
+#
+# Each worker still runs GDAL with its own utils.GDAL_WORKER_THREADS compressor pool, so a prep
+# job's real thread demand is workers x GDAL_WORKER_THREADS: half the cores keeps that product at
+# the 2x oversubscription the box already declares (--cores 16 on 8 vCPU), and lands on the same
+# 4 the Snakemake rule passes as {threads}. Past that it flattens — 8 workers bought 5%.
+DEFAULT_WORKERS = max(1, (os.cpu_count() or 4) // 2)
+
+PROGRESS_EVERY = 25  # a listed source is ~1,000 files and hours long; log that it is moving
+
+
+def _fan_out(source, tifs, workers, job):
+    """Run `job(tif)` over every staged tif, `workers` at a time, and return the results in
+    `tifs` order — the aggregates (coverage report, sidecar) must not depend on who finished
+    first. The first failure names its file and stops the source: a partially prepped source
+    that registered anyway would ship a datum-uncorrected tile as if it were corrected."""
+    if workers == 1:
+        return [job(tif) for tif in tifs]
+    results, done_n = {}, 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(job, tif): tif for tif in tifs}
+        for future in as_completed(futures):
+            tif = futures[future]
+            try:
+                results[tif] = future.result()
+            except BaseException as e:
+                for pending in futures:
+                    pending.cancel()
+                raise RuntimeError(f"{source}: {os.path.basename(tif)}: {e}") from e
+            done_n += 1
+            if len(tifs) >= PROGRESS_EVERY * 2 and done_n % PROGRESS_EVERY == 0:
+                print(f"{source}: prepped {done_n}/{len(tifs)} file(s)", flush=True)
+    return [results[tif] for tif in tifs]
+
+
+def prep(source, workers=DEFAULT_WORKERS):
     meta = config.load_metadata(source)
     stage(source)
     tifs = sorted(glob(f"store/source/{source}/*.tif"))  # staging canonicalizes .tiff -> .tif (ext_for)
@@ -426,35 +486,32 @@ def prep(source):
     if surface and not os.path.isfile(surface):
         sys.exit(f"{source}: offset surface {surface} is not in the store — "
                  "build it with datum_grid.py")
-    if negate or offset or clamp or surface:
+    transform = bool(negate or offset or clamp or surface)
+    if transform:
         print(f"{source}: datum negate={negate} offset={offset} surface={name} "
               f"clamp_positive={clamp}")
-        per_file = []
-        for tif in tifs:
-            corrected, valid = transform_file(tif, negate, offset, clamp, surface)
-            per_file.append((os.path.basename(tif), corrected, valid))
-        if surface:
-            # Rewritten with the measured coverage: how much of the source actually moved is
-            # only known once every file is transformed.
-            write_sidecar(source, negate, offset, clamp, name,
-                          coverage_report(source, per_file))
+    crs, nodata = meta.get("crs"), meta.get("nodata")
+    print(f"{source}: prep {len(tifs)} file(s) on {workers} worker(s) "
+          f"(crs={crs} nodata={nodata})", flush=True)
 
-    # After the transform, which already reduces the CRS on the files it rewrites; this
-    # catches the rest, so no staged raster reaches a warp carrying a vertical CRS.
-    flattened = sum(flatten_compound_crs(tif) for tif in tifs)
+    job = functools.partial(prep_file, transform=transform, negate=negate, offset=offset,
+                            clamp=clamp, surface=surface, crs=crs, nodata=nodata)
+    per_file = _fan_out(source, tifs, workers, job)
+
+    if surface:
+        # Rewritten with the measured coverage: how much of the source actually moved is
+        # only known once every file is transformed.
+        write_sidecar(source, negate, offset, clamp, name,
+                      coverage_report(source, [r[:3] for r in per_file]))
+    flattened = sum(r[3] for r in per_file)
     if flattened:
         print(f"{source}: dropped the vertical CRS from {flattened}/{len(tifs)} file(s)")
 
-    crs, nodata = meta.get("crs"), meta.get("nodata")
-    print(f"{source}: normalize {len(tifs)} file(s) (crs={crs} nodata={nodata})")
-    for tif in tifs:
-        normalize_file(tif, crs, nodata)
-
 
 def main():
-    if len(sys.argv) != 2:
-        sys.exit("usage: source_prep.py <source-id>")
-    prep(sys.argv[1])
+    if len(sys.argv) not in (2, 3):
+        sys.exit("usage: source_prep.py <source-id> [workers]")
+    prep(sys.argv[1], int(sys.argv[2]) if len(sys.argv) == 3 else DEFAULT_WORKERS)
 
 
 def _check():
@@ -468,7 +525,10 @@ def _check():
     exactly its one *_lld.tif (0 → error), a 7z glob filters its members, a gzipped .e00 stages
     to <id>.tif (pure-Python), and — when the GDAL CLI is present — an asc-mosaic zip mosaics to
     <id>.tif. Corrupt raws self-heal: a truncated declared zip, a declared zip whose bytes are
-    not a zip, and an undeclared raw that is a server error page are all deleted with a refetch."""
+    not a zip, and an undeclared raw that is a server error page are all deleted with a refetch.
+    Fan-out: results come back in input order however the workers finish, a multi-file source
+    preps identically on 1 and 4 workers (pixels and the coverage fraction alike), and one
+    unpreppable file fails the whole source by name on either."""
     import io
     import json
     import tempfile
@@ -605,20 +665,23 @@ def _check():
         # CRS's vertical half, with its values untouched — nothing downstream may see one.
         # A bare raster stages as a HARDLINK to its raw, so this also pins the raw bytes:
         # an in-place header edit here would rewrite the verbatim download.
+        # Three files, so the flatten runs in the workers rather than only on the serial path.
         vid = "_prep_vertical"
-        vu = "https://x/compound.tif"
-        seed(vid, [vu], {"name": "Compound"})
-        with rasterio.open(raw_of(vid, vu), "w", driver="GTiff", height=2, width=2, count=1,
-                           dtype="float32", nodata=-9999.0,
-                           crs=rasterio.crs.CRS.from_epsg(5498),  # NAD83 + NAVD88 height
-                           transform=from_origin(0, 2, 1, 1)) as dst:
-            dst.write(np.full((2, 2), -4.5, dtype="float32"), 1)
-        raw_bytes = open(raw_of(vid, vu), "rb").read()
-        prep(vid)
-        with rasterio.open(f"store/source/{vid}/{vid}_0.tif") as src:
-            assert src.crs.to_epsg() == 4269, src.crs
-            assert (src.read(1) == -4.5).all(), src.read(1)
-        assert open(raw_of(vid, vu), "rb").read() == raw_bytes, \
+        vus = [f"https://x/compound{i}.tif" for i in range(3)]
+        seed(vid, vus, {"name": "Compound"})
+        for vu in vus:
+            with rasterio.open(raw_of(vid, vu), "w", driver="GTiff", height=2, width=2, count=1,
+                               dtype="float32", nodata=-9999.0,
+                               crs=rasterio.crs.CRS.from_epsg(5498),  # NAD83 + NAVD88 height
+                               transform=from_origin(0, 2, 1, 1)) as dst:
+                dst.write(np.full((2, 2), -4.5, dtype="float32"), 1)
+        raw_bytes = open(raw_of(vid, vus[0]), "rb").read()
+        prep(vid, 4)
+        for i in range(len(vus)):
+            with rasterio.open(f"store/source/{vid}/{vid}_{i}.tif") as src:
+                assert src.crs.to_epsg() == 4269, (i, src.crs)
+                assert (src.read(1) == -4.5).all(), (i, src.read(1))
+        assert open(raw_of(vid, vus[0]), "rb").read() == raw_bytes, \
             "flattening a hardlinked bare raster must not write through into raw/"
 
         # `offset_surface` drives the per-pixel datum correction (the CUDEM shape: bare rasters,
@@ -792,6 +855,63 @@ def _check():
             assert "deleted 1 corrupt raw asset(s)" in str(e), e
         assert not os.path.exists(raw_of(gid, gu)), "garbage raster raw must be deleted"
         assert not os.path.exists(f"store/source/{gid}/{gid}_0.tif"), "bad staged tif must be removed"
+
+        # _fan_out returns in INPUT order however the workers finish — the coverage report and
+        # the sidecar fraction it feeds must not depend on the race. Reversed completion order.
+        import time
+        order = ["c", "a", "b", "d"]
+        assert _fan_out("s", order, 4, lambda x: (time.sleep(0.05 * order.index(x)), x)[1]) == order
+
+        # The parallel path must be indistinguishable from the serial one: same pixels, same
+        # ordered aggregates. Three tiles sit exactly on the reference grid and two sit far
+        # outside it, so the source's corrected fraction is a ratio a reordering would disturb.
+        pid = "_prep_parallel"
+        pu = [f"https://x/t{i}.tif" for i in range(5)]
+        seed(pid, pu, {"name": "Parallel", "offset_surface": "synth2"})
+        with rasterio.open("store/datum/synth2.tif", "w", driver="GTiff", height=4, width=4,
+                           count=1, dtype="float32", crs="EPSG:4326", nodata=-9999.0,
+                           transform=from_origin(0.0, 4.0, 1.0, 1.0)) as dst:
+            dst.write(np.full((4, 4), -1.0, dtype="float32"), 1)  # chart datum 1 m below zero
+        origins = [(0.0, 4.0), (2.0, 4.0), (0.0, 2.0), (50.0, 4.0), (60.0, 4.0)]
+        depths = [-10.0, -20.0, -30.0, -40.0, -50.0]  # distinct, so a crossed result is visible
+        for u, (x, y), v in zip(pu, origins, depths):
+            with rasterio.open(raw_of(pid, u), "w", driver="GTiff", height=2, width=2, count=1,
+                               dtype="float32", nodata=-9999.0, crs="EPSG:4326",
+                               transform=from_origin(x, y, 1.0, 1.0)) as dst:
+                dst.write(np.full((2, 2), v, dtype="float32"), 1)
+
+        def prepped(workers):
+            prep(pid, workers)
+            with open(f"store/source/{pid}/datum.json") as f:
+                sidecar = json.load(f)
+            out = []
+            for i in range(len(pu)):
+                with rasterio.open(f"store/source/{pid}/{pid}_{i}.tif") as src:
+                    out.append(src.read(1).tolist())
+            return sidecar, out
+
+        serial, parallel = prepped(1), prepped(4)
+        assert serial == parallel, (serial, parallel)
+        assert serial[0]["corrected_fraction"] == 0.6, serial[0]  # 12 of 20 px reached
+        for i, want in enumerate([-9.0, -19.0, -29.0, -40.0, -50.0]):  # covered rise 1 m
+            assert serial[1][i] == [[want] * 2] * 2, (i, serial[1][i])
+
+        # One bad file fails the SOURCE, named — never a partial prep that registers anyway.
+        fid = "_prep_fail"
+        fu = [f"https://x/f{i}.tif" for i in range(3)]
+        seed(fid, fu, {"name": "Fail", "clamp_positive": True})
+        for i, u in enumerate(fu):
+            with rasterio.open(raw_of(fid, u), "w", driver="GTiff", height=2, width=2, count=1,
+                               dtype="float32", crs="EPSG:4326",  # the middle tile declares none
+                               nodata=None if i == 1 else -9999.0,
+                               transform=from_origin(0, 2, 1, 1)) as dst:
+                dst.write(np.full((2, 2), -5.0, dtype="float32"), 1)
+        for workers in (1, 4):
+            try:
+                prep(fid, workers)
+                assert False, f"expected a file with no nodata to fail prep (workers={workers})"
+            except (RuntimeError, ValueError) as e:
+                assert f"{fid}_1.tif" in str(e), (workers, e)
 
         # Format registry: an asc-mosaic zip of ESRI ASCII tiles mosaics to <id>.tif (GDAL CLI).
         if shutil.which("gdalbuildvrt") and shutil.which("gdal_translate"):

@@ -117,14 +117,20 @@ rule prep_source:
     wildcard_constraints:
         source=pat(LOCAL_PROCESSED)
     priority: source_priority
+    # One worker per thread over the source's staged files (source_prep.DEFAULT_WORKERS holds
+    # the workers x GDAL-threads arithmetic). 4 is the box's own half-the-vCPUs figure.
+    threads: 4
     resources:
-        mem_gb=8  # asc-mosaic / archive-extract jobs hold whole rasters in flight
+        # Staging still bounds this: a zip member is read whole into memory, and asc-mosaic
+        # holds a raster. The fan-out fits inside it — 4 workers measured 2.5 GB peak RSS on
+        # 1/9" CUDEM (both transforms stripe, so a worker scales with raster WIDTH, not size).
+        mem_gb=8
     benchmark:
         f"{TMP}/bench/prep/{{source}}.tsv"
     log:
         f"{TMP}/logs/prep/{{source}}.log"
     shell:
-        "( {PY}/source_prep.py {wildcards.source} && "
+        "( {PY}/source_prep.py {wildcards.source} {threads} && "
         "{PY}/source_catalog.py {wildcards.source} --hash-recipe ) 2> {log}"
 
 

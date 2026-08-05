@@ -385,6 +385,14 @@ def get_grouped_source_items(filepath):
 COG_MIN_OVERVIEW_PX = 512  # the COG driver's own stopping rule: one 512 block
 _SHOAL_STRIPE_BYTES = 1 << 28  # read budget per stripe; a stripe is 2 source rows per output row
 
+# GDAL's (de)compression thread pool inside ONE worker of a fan-out. Multi-threaded ZSTD is worth
+# having — single-threaded, the full-res read of a pyramid pass is 4x slower (measured 8.2s vs 1.3s
+# on a 32768 px mosaic tile) — but ALL_CPUS is not: many jobs run this concurrently on a
+# deliberately-oversubscribed box, and N x 48 decode threads thrash instead of helping. A caller
+# that fans out over files multiplies this: keep workers x GDAL_WORKER_THREADS at the box's
+# oversubscription target (see source_prep.DEFAULT_WORKERS).
+GDAL_WORKER_THREADS = 4
+
 
 def _block_reduce(src_path, dst_path, nodata):
     """Decimate `src_path` 2:1 into a fresh GTiff at `dst_path`, class-aware and nodata-aware.
@@ -400,11 +408,7 @@ def _block_reduce(src_path, dst_path, nodata):
     Streamed in stripes of whole 2-row pairs — a full mosaic level is gigapixels, and blocks never
     straddle a stripe, so per-stripe output is identical to whole-array."""
     import config
-    # Multi-threaded block (de)compression: the full-res read is this pass's dominant cost, and
-    # single-threaded ZSTD makes it 4x slower (measured 8.2s vs 1.3s on a 32768 px mosaic tile).
-    # 4, not ALL_CPUS: many jobs run this concurrently on a deliberately-oversubscribed box
-    # (see the mosaic window materializer), and N x 48 decode threads thrash instead of helping.
-    with rasterio.Env(GDAL_NUM_THREADS="4"), rasterio.open(src_path) as src:
+    with rasterio.Env(GDAL_NUM_THREADS=str(GDAL_WORKER_THREADS)), rasterio.open(src_path) as src:
         w, h = src.width, src.height
         ow, oh = -(-w // 2), -(-h // 2)  # ceil, matching GDAL's overview sizing
         dtype = src.dtypes[0]
