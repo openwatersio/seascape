@@ -24,10 +24,17 @@ tiled GeoTIFF; source_normalize makes the final LERC COG.
 
 ``flatten_compound_crs`` lives here too: every staged raster loses the vertical half of a
 compound CRS, whether or not a value transform applies.
+
+The same pass counts ``dome_candidates`` — NCEI-gridder interpolation domes, isolated at-datum
+patches standing in deep water. It rides this stripe loop because the pixels are already in
+hand; the count reaches ``datum.json`` -> ``seascape:dome_candidates`` as a source-quality
+signal. Counted only: filtering a false shoal is the one edit that charts deeper than the
+source, which the bias-shallow rule forbids.
 """
 
 import argparse
 import json
+import math
 import os
 import shutil
 import sys
@@ -38,12 +45,29 @@ import rasterio
 from pyproj import CRS as ProjCRS
 from rasterio.warp import Resampling, reproject
 from rasterio.windows import Window
+from scipy.ndimage import find_objects, label
 
 DATUM_STORE = "store/datum"
 
 # A single file can be tens of gigapixels (CUDEM ships 8112x8112 tiles, and the reference
 # resampled onto one is a second array that size), so the transform runs in row stripes.
 STRIPE_ROWS = 512
+
+# Interpolation-dome detector — a source-quality COUNT, never a filter: a flagged pixel keeps
+# its value, because removing a false shoal is the one edit that charts deeper than the source.
+# NCEI's gridder drapes smooth radial cones over spurious ~0 m soundings inside dredged
+# channels; measured on ncei19_n37x00_w076x25_2019v1 they are ~70 m wide, peak +0.09…+0.78 m
+# out of −16 m water, and none is charted. What separates them from the real drying rocks the
+# pyramid must keep is the SURROUNDINGS: a charted rock belongs to a reef or shore platform, so
+# something within a ring of it is shallow, while a dome stands alone in a dredged channel.
+DOME_APEX_M = 0.0    # the drying domain's floor — a candidate apex stands at or above chart datum
+DOME_SPAN_M = 25.0   # …across no more than this, below chart legibility at any scale
+DOME_RING_M = 50.0   # the ring sits outside the cone (measured ~70 m wide, so ~35 m of radius)
+# Every ring pixel must be at least this deep. Sits in the measured gap between real drying
+# rocks (3.4-7.0 m of water) and the artifacts (10.8-14.5 m).
+DOME_DEEP_M = -8.0
+
+M_PER_DEG = 111320.0  # a degree of latitude, for sizing the detector on a geographic grid
 
 
 def surface_path(name):
@@ -107,10 +131,100 @@ def _stripes(height, width):
         yield Window(0, top, width, min(STRIPE_ROWS, height - top))
 
 
+def pixel_metres(crs, transform, lat):
+    """(row, column) pixel size in metres on a file's own grid, or None when its CRS can't be
+    sized (no CRS, or a projected one PROJ won't give linear units for). ``lat`` is the file's
+    centre latitude, which sets how much a degree of longitude is worth. Anisotropic on purpose:
+    at 60 deg N a geographic pixel is twice as wide in rows as in columns, and a metre-shaped
+    detector must not become an ellipse."""
+    if crs is None:
+        return None
+    if crs.is_geographic:
+        size = (abs(transform.e) * M_PER_DEG,
+                abs(transform.a) * M_PER_DEG * math.cos(math.radians(lat)))
+    else:
+        try:
+            factor = crs.linear_units_factor[1]  # upstream grids in US survey feet exist
+        except rasterio.errors.CRSError:
+            return None
+        size = (abs(transform.e) * factor, abs(transform.a) * factor)
+    return size if min(size) > 0 else None
+
+
+def _frame(a, r0, r1, c0, c1):
+    """The one-pixel border of ``a[r0:r1, c0:c1]``, flattened."""
+    return np.concatenate((a[r0, c0:c1], a[r1 - 1, c0:c1],
+                           a[r0 + 1:r1 - 1, c0], a[r0 + 1:r1 - 1, c1 - 1]))
+
+
+def dome_candidates(data, valid, row_m, col_m, core=None):
+    """Count interpolation-dome candidates in ``data`` (elevation, metres, chart datum, negative
+    down) — an isolated at-or-above-datum patch under ``DOME_SPAN_M`` across whose whole
+    ``DOME_RING_M`` ring is deeper than ``DOME_DEEP_M``.
+
+    ``core`` is the (start, stop) row range this call OWNS; rows outside it are context carried
+    from the neighbouring stripes, and a patch is counted by the stripe holding its first row, so
+    striping can neither double-count a dome nor split one. A patch whose ring runs off the array
+    is skipped rather than judged on half a ring, which leaves a ring-wide blind border at the
+    file's own edges (0.7 % of an 8112 px CUDEM tile)."""
+    above = valid & (data >= DOME_APEX_M)
+    if not above.any() or not (valid & (data <= DOME_DEEP_M)).any():
+        return 0
+    ring_r, ring_c = max(1, round(DOME_RING_M / row_m)), max(1, round(DOME_RING_M / col_m))
+    span_r, span_c = max(1, int(DOME_SPAN_M / row_m)), max(1, int(DOME_SPAN_M / col_m))
+    r_start, r_stop = core if core else (0, data.shape[0])
+    height, width = data.shape
+    count = 0
+    labels, _n = label(above, structure=np.ones((3, 3), bool))  # 8-connected: a cone apex is a blob
+    for box in find_objects(labels):
+        if box is None:
+            continue
+        rows, cols = box
+        if not (r_start <= rows.start < r_stop):
+            continue  # another stripe owns it
+        if rows.stop - rows.start > span_r or cols.stop - cols.start > span_c:
+            continue
+        r0, r1 = rows.start - ring_r, rows.stop + ring_r
+        c0, c1 = cols.start - ring_c, cols.stop + ring_c
+        if r0 < 0 or c0 < 0 or r1 > height or c1 > width:
+            continue  # no complete ring to judge it by
+        ring_valid = _frame(valid, r0, r1, c0, c1)
+        ring = _frame(data, r0, r1, c0, c1)[ring_valid]
+        if ring.size * 2 < ring_valid.size:  # a ring mostly outside the survey says nothing
+            continue
+        if ring.max() <= DOME_DEEP_M:
+            count += 1
+    return count
+
+
+def _scan_stripe(lead, held, trail, row_m, col_m):
+    """Dome candidates owned by the ``held`` stripe, scored against as much of its neighbours
+    (``lead`` before, ``trail`` after) as a patch's ring can reach. Each argument is a
+    (values, valid) pair, or None at the file's ends."""
+    if held is None:
+        return 0
+    margin = max(1, round(DOME_RING_M / row_m)) + max(1, int(DOME_SPAN_M / row_m))
+    parts = [held]
+    if lead is not None:
+        parts.insert(0, (lead[0][-margin:], lead[1][-margin:]))
+    if trail is not None:
+        parts.append((trail[0][:margin], trail[1][:margin]))
+    start = parts[0][0].shape[0] if lead is not None else 0
+    return dome_candidates(np.vstack([p[0] for p in parts]),
+                           np.vstack([p[1] for p in parts]),
+                           row_m, col_m, core=(start, start + held[0].shape[0]))
+
+
 def transform_file(filepath, negate, offset, clamp_positive=False, surface=None):
     """Rewrite one file with the value transform applied. Returns (pixels the reference
-    actually corrected — 0 when no ``surface`` is given, valid pixels in the file), the pair
-    whose ratio is this file's datum coverage."""
+    actually corrected — 0 when no ``surface`` is given, valid pixels in the file,
+    interpolation-dome candidates): the first pair's ratio is this file's datum coverage, the
+    third is the source-quality count ``dome_candidates`` scores on the transformed values
+    (None where the grid can't be sized in metres).
+
+    The dome scan rides this pass rather than adding one of its own, so it needs the
+    neighbourhood a stripe cuts through: each stripe is scored one iteration late, between the
+    tail of the stripe before it and the head of the one after."""
     ref = rasterio.open(surface) if surface else None
     corrected = valid = 0
     try:
@@ -123,10 +237,14 @@ def transform_file(filepath, negate, offset, clamp_positive=False, surface=None)
             nodata = profile.get("nodata")
             if clamp_positive and nodata is None:
                 raise ValueError(f"{filepath}: --clamp-positive needs a nodata value set")
+            centre = (src.bounds.bottom + src.bounds.top) / 2
+            metres = pixel_metres(crs, src.transform, centre)
+            domes = 0 if metres else None
             profile.update(driver="GTiff", dtype="float32", tiled=True, blockxsize=512,
                            blockysize=512, compress="deflate", crs=crs)
             tmp = filepath + ".datum.tif"
             with rasterio.open(tmp, "w", **profile) as dst:
+                lead = held = None  # the stripe before last's tail, and the stripe awaiting scoring
                 for window in _stripes(src.height, src.width):
                     data = src.read(1, window=window).astype("float32")
                     mask = src.read_masks(1, window=window) != 0  # True where valid
@@ -151,13 +269,20 @@ def transform_file(filepath, negate, offset, clamp_positive=False, surface=None)
                         # After the offset, 0 = water surface; anything > 0 is the surrounding
                         # terrain (a lake DEM's land fringe, or a topobathy playa) — drop it to
                         # nodata so it can't bleed into the water layer as false land.
-                        data[mask & (data > 0)] = np.float32(nodata)
+                        drop = mask & (data > 0)
+                        data[drop] = np.float32(nodata)
+                        mask &= ~drop
                     dst.write(data, 1, window=window)
+                    if metres:
+                        domes += _scan_stripe(lead, held, (data, mask), *metres)
+                        lead, held = held, (data, mask)
+                if metres:
+                    domes += _scan_stripe(lead, held, None, *metres)
         os.replace(tmp, filepath)
     finally:
         if ref is not None:
             ref.close()
-    return corrected, valid
+    return corrected, valid, domes
 
 
 # The reference's coverage edge is a smooth line hundreds of km long, so a file crossing it
@@ -203,7 +328,24 @@ def coverage_report(source, per_file):
     return fraction
 
 
-def write_sidecar(source, negate, offset, clamp_positive, surface=None, corrected=None):
+def dome_report(source, per_file):
+    """Log the files carrying interpolation-dome candidates from [(name, domes), …] and return
+    the source's total (None when any file went unscored, so "not measured" can't read as
+    "clean"). A count, not a verdict: nothing is filtered, and a source can be perfectly good
+    and still carry a handful."""
+    if any(domes is None for _, domes in per_file):
+        return None
+    for name, domes in per_file:
+        if domes:
+            print(f"{source}: {name} {domes} interpolation-dome candidate(s)")
+    total = sum(domes for _, domes in per_file)
+    hits = sum(1 for _, domes in per_file if domes)
+    print(f"{source}: {total} interpolation-dome candidate(s) in {hits}/{len(per_file)} file(s)")
+    return total
+
+
+def write_sidecar(source, negate, offset, clamp_positive, surface=None, corrected=None,
+                  domes=None):
     """Record the applied transform in store/source/<id>/datum.json — the machine-readable
     provenance source_catalog folds into the catalog item (vertical-datum offset was invisible
     downstream when it lived only in this CLI arg). Written whenever the step runs, so a source
@@ -211,7 +353,8 @@ def write_sidecar(source, negate, offset, clamp_positive, surface=None, correcte
 
     ``corrected`` is the fraction of the source's valid pixels the reference reached: pixels
     inside one source sit on different datums wherever coverage ends, and the surface name
-    alone reads as if all of them moved."""
+    alone reads as if all of them moved. ``domes`` is the interpolation-dome candidate count the
+    same pass scored, None where it did not run."""
     os.makedirs(f"store/source/{source}", exist_ok=True)
     # Canonical surface name, never a path: the value flows into the catalog as
     # seascape:datum_surface, where "navd88_chart" must compare equal however it was invoked.
@@ -220,7 +363,8 @@ def write_sidecar(source, negate, offset, clamp_positive, surface=None, correcte
         json.dump({"negate": bool(negate), "offset_m": float(offset),
                    "clamp_positive": bool(clamp_positive),
                    "offset_surface": name,
-                   "corrected_fraction": None if corrected is None else round(corrected, 4)},
+                   "corrected_fraction": None if corrected is None else round(corrected, 4),
+                   "dome_candidates": None if domes is None else int(domes)},
                   f, indent=2)
 
 
@@ -254,12 +398,12 @@ def main():
           f"clamp_positive={a.clamp_positive} on {len(filepaths)} file(s)")
     per_file = []
     for filepath in filepaths:
-        corrected, valid = transform_file(filepath, a.negate, a.offset, a.clamp_positive,
-                                          surface)
-        per_file.append((os.path.basename(filepath), corrected, valid))
-    if surface:
-        write_sidecar(a.source, a.negate, a.offset, a.clamp_positive, a.offset_surface,
-                      coverage_report(a.source, per_file))
+        per_file.append((os.path.basename(filepath),
+                         *transform_file(filepath, a.negate, a.offset, a.clamp_positive,
+                                         surface)))
+    write_sidecar(a.source, a.negate, a.offset, a.clamp_positive, a.offset_surface,
+                  coverage_report(a.source, [r[:3] for r in per_file]) if surface else None,
+                  dome_report(a.source, [(r[0], r[3]) for r in per_file]))
 
 
 def _check():
@@ -267,7 +411,12 @@ def _check():
     clamp_positive, and the offset-surface subtract — including the reference-nodata
     pass-through, the source's own nodata staying untouched, the corrected/valid pair each
     file reports, the coverage report built from those pairs, and the unconditional
-    compound-CRS reduction (standalone, and through transform_file's no-surface path)."""
+    compound-CRS reduction (standalone, and through transform_file's no-surface path).
+
+    Then the dome detector on planted fixtures: the same cone is a candidate in 16 m of water and
+    not in 5 m, nor when a reef crosses its ring; a mound above chart legibility and a drying flat
+    never are; a ring mostly outside the survey is not judged; and striping — including two domes
+    straddling a stripe boundary — leaves the count identical to a whole-array scan."""
     import os
     import tempfile
     from rasterio.transform import from_origin
@@ -321,7 +470,7 @@ def _check():
                        dtype="float32", crs="EPSG:4326", nodata=nodata,
                        transform=from_origin(0.0, 4.0, 1.0, 1.0)) as dst:
         dst.write(bed, 1)
-    corrected, valid = transform_file(path3, negate=False, offset=0.0, surface=ref_path)
+    corrected, valid, _domes = transform_file(path3, negate=False, offset=0.0, surface=ref_path)
     with rasterio.open(path3) as src:
         o3 = src.read(1)
     assert corrected == 8, corrected  # the two western columns of four rows
@@ -336,7 +485,7 @@ def _check():
                        dtype="float32", crs="EPSG:4326", nodata=nodata,
                        transform=from_origin(50.0, 4.0, 1.0, 1.0)) as dst:
         dst.write(np.full((2, 2), -5.0, dtype="float32"), 1)
-    assert transform_file(path4, False, 0.0, surface=ref_path) == (0, 4)
+    assert transform_file(path4, False, 0.0, surface=ref_path) == (0, 4, 0)
     with rasterio.open(path4) as src:
         assert (src.read(1) == -5.0).all(), src.read(1)
 
@@ -405,6 +554,73 @@ def _check():
     transform_file(tall, negate=False, offset=-2.0)
     with rasterio.open(tall) as src:
         assert (src.read(1) == -12.0).all(), src.read(1)
+
+    # ── interpolation domes ──
+    # pixel_metres sizes the detector on the file's own grid: a geographic pixel is anisotropic
+    # away from the equator (a degree of longitude shrinks by cos(lat)), a projected one is its
+    # linear unit, and a grid with no CRS can't be sized at all.
+    geo = pixel_metres(rasterio.crs.CRS.from_epsg(4326), from_origin(0, 0, 1e-4, 1e-4), 60.0)
+    assert abs(geo[0] - 11.132) < 1e-3 and abs(geo[1] - 5.566) < 1e-3, geo
+    utm = pixel_metres(rasterio.crs.CRS.from_epsg(32618), from_origin(0, 0, 3.0, 3.0), 40.0)
+    assert utm == (3.0, 3.0), utm
+    assert pixel_metres(None, from_origin(0, 0, 3.0, 3.0), 0.0) is None
+
+    PX = 3.0  # metres, close to CUDEM 1/9 arc-second
+
+    def cone(arr, row, col, radius_m, apex):
+        """A smooth radial cone — the shape NCEI's gridder drapes over a spurious sounding."""
+        rr, cc = np.ogrid[:arr.shape[0], :arr.shape[1]]
+        d = np.hypot(rr - row, cc - col) * PX
+        np.maximum(arr, arr + (apex - arr) * np.clip(1 - d / radius_m, 0, 1), out=arr)
+
+    # A 70 m cone peaking +0.5 m out of 16 m of water is flagged; the SAME cone in 5 m of water
+    # (a drying rock on a shore platform) and one whose ring clips a −3 m reef (the Carmel Bay
+    # shape) are not — the ring, not the apex, is what separates an artifact from a charted rock.
+    for bed, reef, want in ((-16.0, None, 1), (-5.0, None, 0), (-16.0, -3.0, 0)):
+        field = np.full((200, 200), bed, dtype="float32")
+        if reef is not None:
+            field[100 + int(40 / PX), :] = reef  # a ridge crossing the ring 40 m away
+        cone(field, 100, 100, 70.0, 0.5)
+        got = dome_candidates(field, np.ones(field.shape, bool), PX, PX)
+        assert got == want, (bed, reef, got)
+
+    # Size and isolation: a 60 m mound (above chart legibility) and a whole drying flat are not
+    # dome candidates however deep the water around them.
+    big = np.full((200, 200), -16.0, dtype="float32")
+    cone(big, 100, 100, 200.0, 0.5)  # 60 m of it stands above datum
+    assert dome_candidates(big, np.ones(big.shape, bool), PX, PX) == 0
+    flat = np.full((200, 200), -16.0, dtype="float32")
+    flat[80:120, 80:120] = 0.5
+    assert dome_candidates(flat, np.ones(flat.shape, bool), PX, PX) == 0
+
+    # Nodata is not deep water: a cone at the edge of the survey, whose ring is mostly outside
+    # it, is not judged at all.
+    edge = np.full((200, 200), -16.0, dtype="float32")
+    cone(edge, 100, 100, 70.0, 0.5)
+    edge_valid = np.zeros(edge.shape, bool)
+    edge_valid[95:, 95:] = True  # the survey stops just short of the apex, in both axes
+    assert dome_candidates(edge, edge_valid, PX, PX) == 0
+
+    # Striping must not change the count: four domes on a file taller than three stripes, two of
+    # them straddling a stripe boundary (rows 511/512), come out the same through transform_file's
+    # carried context as they do from one whole-array scan.
+    striped = os.path.join(d, "domes.tif")
+    tall_field = np.full((STRIPE_ROWS * 3 + 40, 400), -16.0, dtype="float32")
+    for row, col in ((100, 100), (STRIPE_ROWS - 1, 100), (STRIPE_ROWS, 300), (1300, 200)):
+        cone(tall_field, row, col, 70.0, 0.5)
+    with rasterio.open(striped, "w", driver="GTiff", height=tall_field.shape[0],
+                       width=tall_field.shape[1], count=1, dtype="float32", nodata=nodata,
+                       crs=rasterio.crs.CRS.from_epsg(32618),
+                       transform=from_origin(500000.0, 4000000.0, PX, PX)) as dst:
+        dst.write(tall_field, 1)
+    whole = dome_candidates(tall_field, np.ones(tall_field.shape, bool), PX, PX)
+    assert whole == 4, whole
+    assert transform_file(striped, negate=False, offset=0.0)[2] == whole, "striping changed the count"
+
+    # A source is scored only where every file was: an unscored file makes the total None, so
+    # "not measured" can never read as "clean".
+    assert dome_report("s", [("a.tif", 3), ("b.tif", 0)]) == 3
+    assert dome_report("s", [("a.tif", 3), ("b.tif", None)]) is None
     print("source_datum.py self-check ok")
 
 

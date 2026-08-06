@@ -66,8 +66,8 @@ from glob import glob
 import config
 import utils
 from convert_e00 import e00_to_tif
-from source_datum import (coverage_report, flatten_compound_crs, surface_path, transform_file,
-                          write_sidecar)
+from source_datum import (coverage_report, dome_report, flatten_compound_crs, surface_path,
+                          transform_file, write_sidecar)
 from source_normalize import normalize_file
 
 # Only trust a URL's trailing extension when it names a real data/archive format;
@@ -447,15 +447,17 @@ def prep_file(tif, transform, negate, offset, clamp, surface, crs, nodata):
     """One staged raster end to end: datum transform → compound-CRS flatten → normalize to a COG.
     The unit the pool fans out over, so it touches no file but its own — every step writes a
     sibling temp and os.replaces it, and rasterio's GDAL config Env is thread-local.
-    Returns (basename, reference-corrected px, valid px, whether a vertical CRS was dropped)."""
+    Returns (basename, reference-corrected px, valid px, whether a vertical CRS was dropped,
+    interpolation-dome candidates)."""
     corrected = valid = 0
+    domes = None  # only the value transform streams the pixels; without it nothing is scored
     if transform:
-        corrected, valid = transform_file(tif, negate, offset, clamp, surface)
+        corrected, valid, domes = transform_file(tif, negate, offset, clamp, surface)
     # After the transform, which already reduces the CRS on the files it rewrites; this catches
     # the rest, so no staged raster reaches a warp carrying a vertical CRS.
     flattened = flatten_compound_crs(tif)
     normalize_file(tif, crs, nodata)
-    return os.path.basename(tif), corrected, valid, flattened
+    return os.path.basename(tif), corrected, valid, flattened, domes
 
 
 # The per-file pipeline is embarrassingly parallel, and THREADS carry it: GDAL's read/write and
@@ -523,11 +525,12 @@ def prep(source, workers=DEFAULT_WORKERS):
                             clamp=clamp, surface=surface, crs=crs, nodata=nodata)
     per_file = _fan_out(source, tifs, workers, job)
 
-    if surface:
-        # Rewritten with the measured coverage: how much of the source actually moved is
-        # only known once every file is transformed.
+    if transform:
+        # Rewritten with what the pass measured: how much of the source actually moved, and its
+        # dome-candidate count, are only known once every file is transformed.
         write_sidecar(source, negate, offset, clamp, name,
-                      coverage_report(source, [r[:3] for r in per_file]))
+                      coverage_report(source, [r[:3] for r in per_file]) if surface else None,
+                      dome_report(source, [(r[0], r[4]) for r in per_file]))
     flattened = sum(r[3] for r in per_file)
     if flattened:
         print(f"{source}: dropped the vertical CRS from {flattened}/{len(tifs)} file(s)")
@@ -657,8 +660,11 @@ def _check():
             "in-place steps must never write through into raw/"
         with open(f"store/source/{sid}/datum.json") as f:
             sidecar = json.load(f)
+        # dome_candidates is None here, not 0: these staged tifs carry no CRS of their own (the
+        # metadata one is assigned at normalize), so the detector has no metres to size itself by.
         assert sidecar == {"negate": True, "offset_m": -1.0, "clamp_positive": False,
-                           "offset_surface": None, "corrected_fraction": None}, sidecar
+                           "offset_surface": None, "corrected_fraction": None,
+                           "dome_candidates": None}, sidecar
         for name, want in (("a.tif", -6.0), ("b.tif", -11.0)):  # -(v) - 1
             with rasterio.open(f"store/source/{sid}/{name}") as src:
                 assert src.crs.to_epsg() == 28992, (name, src.crs)
@@ -971,6 +977,33 @@ def _check():
         assert serial[0]["corrected_fraction"] == 0.6, serial[0]  # 12 of 20 px reached
         for i, want in enumerate([-9.0, -19.0, -29.0, -40.0, -50.0]):  # covered rise 1 m
             assert serial[1][i] == [[want] * 2] * 2, (i, serial[1][i])
+
+        # Interpolation-dome candidates aggregate over the source and are a sum, not a race: three
+        # tiles carrying 1, 0 and 2 planted domes report 3 on one worker and on four.
+        did = "_prep_domes"
+        dus = [f"https://x/d{i}.tif" for i in range(3)]
+        seed(did, dus, {"name": "Domes", "datum_offset_m": 0.5})
+        PX = 3.0  # metres, close to CUDEM 1/9 arc-second
+        for u, centres in zip(dus, ([(100, 100)], [], [(60, 60), (60, 160)])):
+            field = np.full((220, 220), -16.5, dtype="float32")
+            rr, cc = np.ogrid[:220, :220]
+            for row, col in centres:  # a 70 m cone peaking at datum once the +0.5 m offset lands
+                dist = np.hypot(rr - row, cc - col) * PX
+                np.maximum(field, field + (0.0 - field) * np.clip(1 - dist / 70.0, 0, 1),
+                           out=field)
+            with rasterio.open(raw_of(did, u), "w", driver="GTiff", height=220, width=220,
+                               count=1, dtype="float32", nodata=-9999.0,
+                               crs=rasterio.crs.CRS.from_epsg(32618),
+                               transform=from_origin(500000.0, 4000000.0, PX, PX)) as dst:
+                dst.write(field, 1)
+
+        def dome_count(workers):
+            prep(did, workers)
+            with open(f"store/source/{did}/datum.json") as f:
+                return json.load(f)["dome_candidates"]
+
+        assert dome_count(1) == 3, dome_count(1)
+        assert dome_count(4) == 3, dome_count(4)
 
         # One bad file fails the SOURCE, named — never a partial prep that registers anyway.
         fid = "_prep_fail"

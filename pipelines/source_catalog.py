@@ -140,7 +140,7 @@ def _crs_epsg(source, mixed_crs):
 
 def _datum(source):
     """The datum facts downstream reads: (negate, offset_m, clamp_positive, offset_surface,
-    corrected_fraction).
+    corrected_fraction, dome_candidates).
 
     ``negate`` is the one field with a machine consumer — aggregation_reproject flips band 1
     when it's true — so it must mean "negate at aggregation", which only a raw/streamed
@@ -152,16 +152,20 @@ def _datum(source):
     source has a sidecar (source_prep writes one even for a no-op transform); no sidecar
     means a raw source, whose negate comes from metadata. ``corrected_fraction`` is None
     wherever no reference applied; where one did, the pixels a source ships are not all on
-    its datum, and the fraction is how much of it moved."""
+    its datum, and the fraction is how much of it moved. ``dome_candidates`` is the
+    interpolation-dome count the prep pass scored, None where it never ran — a quality signal
+    for the confidence grade, never a gate."""
     sidecar = f"store/source/{source}/datum.json"
     if os.path.isfile(sidecar):
         with open(sidecar) as f:
             d = json.load(f)
         corrected = d.get("corrected_fraction")
+        domes = d.get("dome_candidates")
         return (False, float(d.get("offset_m", 0.0)), bool(d.get("clamp_positive", False)),
-                d.get("offset_surface"), None if corrected is None else float(corrected))
+                d.get("offset_surface"), None if corrected is None else float(corrected),
+                None if domes is None else int(domes))
     meta = config.load_metadata(source)
-    return bool(meta.get("negate", False)), 0.0, False, None, None
+    return bool(meta.get("negate", False)), 0.0, False, None, None, None
 
 
 def build_item(source, rows, recipe_hash=None):
@@ -170,7 +174,7 @@ def build_item(source, rows, recipe_hash=None):
     violated — a source can't register without a complete item."""
     meta = config.load_metadata(source)  # raises FileNotFoundError if absent
     bbox, file_count = _bbox_and_count(rows)
-    negate, offset_m, clamp_positive, offset_surface, datum_corrected = _datum(source)
+    negate, offset_m, clamp_positive, offset_surface, datum_corrected, domes = _datum(source)
     producer = meta.get("producer")
     website = meta.get("website")
     return {
@@ -200,6 +204,10 @@ def build_item(source, rows, recipe_hash=None):
             # Fraction of the source's valid pixels that reference reached: the rest stayed on
             # the source's own vertical datum (VDatum covers no Alaska off the SE panhandle).
             "seascape:datum_corrected": datum_corrected,
+            # Isolated at-datum patches standing in deep water — NCEI's gridder drapes them over
+            # spurious soundings in dredged channels. Counted, never removed (removing a false
+            # shoal charts deeper); None where the prep pass never scored the source.
+            "seascape:dome_candidates": domes,
             "seascape:negate": negate,  # negate at aggregation — false once baked at prep
             "seascape:clamp_positive": clamp_positive,
             "seascape:file_count": file_count,
@@ -278,6 +286,7 @@ def _check():
         assert p["seascape:clamp_positive"] is False, p
         assert p["seascape:datum_surface"] is None, p
         assert p["seascape:datum_corrected"] is None, p  # no reference: no fraction to publish
+        assert p["seascape:dome_candidates"] is None, p  # never scored: not the same as clean
         assert p["seascape:land_clamp"] is True and p["seascape:max_zoom"] == 12, p
         assert p["seascape:vertical_datum"] == "MSL (approx)", p
         assert p["seascape:file_count"] == 2, p
@@ -290,10 +299,13 @@ def _check():
         # shipping two vertical datums.
         with open(f"store/source/{sid}/datum.json", "w") as f:
             json.dump({"negate": False, "offset_m": 0.0, "clamp_positive": False,
-                       "offset_surface": "navd88_chart", "corrected_fraction": 0.8123}, f)
+                       "offset_surface": "navd88_chart", "corrected_fraction": 0.8123,
+                       "dome_candidates": 7}, f)
         ps = build_item(sid, rows)["properties"]
         assert ps["seascape:datum_surface"] == "navd88_chart", ps
         assert ps["seascape:datum_corrected"] == 0.8123, ps
+        # The prep pass's source-quality count reaches the catalog as a plain integer.
+        assert ps["seascape:dome_candidates"] == 7, ps
         # bbox is 4326 and covers the union (w≈0, e≈2, s≈0, n≈0.5), west of east, south of north
         w, s, e, n = item["bbox"]
         assert w < e and s < n and -0.01 < w < 0.01 and 1.9 < e < 2.1, item["bbox"]

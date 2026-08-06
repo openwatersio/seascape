@@ -13,6 +13,10 @@ Checks, in order:
      ``objects/`` or ``/vsi`` are remote (raw/streamed collections) and skip the on-disk raster
      checks — their bytes live outside the store.
 
+Then it REPORTS the interpolation-dome count prep scored (``seascape:dome_candidates``). A
+quality signal for the confidence grade, not a gate: the domes are real source defects, but
+removing them would chart deeper than the source, so they are counted and surfaced instead.
+
 Run from pipelines/:  uv run python source_check.py <source-id>
 """
 
@@ -74,6 +78,12 @@ def check(source):
                 fail(source, f"{filename} has no nodata value")
         checked += 1
     print(f"{source}: contract ok ({count} file(s), {checked} local raster(s) verified, bbox={cat_bbox})")
+    domes = catalog.get("properties", {}).get("seascape:dome_candidates")
+    if domes is not None:
+        # Reported, never a gate: the count feeds the confidence grade, and a source can carry
+        # a handful of them and still be the best data available for its coast.
+        print(f"{source}: {domes} interpolation-dome candidate(s) — source-quality signal, "
+              "nothing is filtered")
 
 
 def main():
@@ -84,9 +94,10 @@ def main():
 
 
 def _check():
-    """Offline: a synthetic source passes, then each of two contract violations (a missing
+    """Offline: a synthetic source passes, then each of three contract violations (a missing
     attribution field, a catalog bbox that disagrees with bounds.csv, and a raster with no
-    nodata) is caught as a hard error."""
+    nodata) is caught as a hard error — while a source carrying dome candidates passes with
+    them reported."""
     import shutil
     import tempfile
 
@@ -161,6 +172,22 @@ def _check():
         # (3) a raster with no nodata → hard error
         write_tif(tif, None)
         rechecking_fails("nodata")
+        write_tif(tif, -9999.0)
+
+        # The dome count is REPORTED, never gated: a source carrying candidates still passes, and
+        # the line names them so the confidence work has somewhere to start.
+        import contextlib
+        import io as _io
+        with open(f"store/source/{sid}/datum.json", "w") as f:
+            json.dump({"negate": False, "offset_m": 0.0, "clamp_positive": False,
+                       "dome_candidates": 7}, f)
+        with open(f"store/source/{sid}/catalog.json", "w") as f:
+            json.dump(source_catalog.build_item(sid, source_catalog.scan_local_files(sid)), f)
+        config._catalog_cache.clear()
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            check(sid)
+        assert "7 interpolation-dome candidate(s)" in buf.getvalue(), buf.getvalue()
         print("source_check.py self-check ok")
     finally:
         os.chdir(cwd)
