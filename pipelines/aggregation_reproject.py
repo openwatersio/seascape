@@ -48,10 +48,10 @@ MIXED_WORKERS = int(os.environ.get("AGG_MIXED_WORKERS", "8"))
 # combine has always given.
 COMBINE_FANOUT = 16
 
-# Coverage-edge feathering. A group whose native grid is >= FEATHER_MIN_LEVELS zoom levels
-# coarser than the render grid draws its valid/nodata boundary as source-cell staircases —
-# a 30 m S-102 cell is a 13-px block on a z15 grid, and land in S-102 is simply nodata, so
-# the shoreline itself staircases. Values interpolate smoothly (cubicspline) but validity
+# Coverage-edge feathering. A group whose source cells span at least FEATHER_MIN_CELL_PX
+# render pixels draws its valid/nodata boundary as source-cell staircases — a 16 m S-102
+# cell is a 7.8-px block on a z15 grid, and land in S-102 is simply nodata, so the
+# shoreline itself staircases. Values interpolate smoothly (cubicspline) but validity
 # cannot: gdalwarp keeps the source's cell-quantized mask. The fix smooths the 0/1 mask
 # with a gaussian at the source-cell scale and re-thresholds at 0.5; the new boundary
 # is the level-set midline through the staircase corners, within half a source cell of the
@@ -71,7 +71,11 @@ COMBINE_FANOUT = 16
 # narrower than a source cell erodes back toward what it hangs off. That direction is the
 # safe one — it charts as land or falls through to the next source, rather than inventing
 # navigable water — and it is the same call the pond fill in smooth.py already makes.
-FEATHER_MIN_LEVELS = int(os.environ.get("AGG_FEATHER_MIN_LEVELS", "2"))
+# Gate, in render pixels per source cell: below this a cell draws 1-2 px treads, which is not
+# a staircase and is not worth moving a boundary for. It is a cell size rather than a count of
+# zoom levels because the same shoreline must be drawn the same way at neighbouring zooms —
+# the 16 m S-102 cells off Jacksonville are 7.8 px on a z15 grid and 3.9 px on the z14 one.
+FEATHER_MIN_CELL_PX = float(os.environ.get("AGG_FEATHER_MIN_CELL_PX", "3"))
 # Ceiling on the smoothing scale, in render pixels per source cell. The boundary can move
 # by up to half a source cell, so an unbounded factor would let a very coarse group (GEBCO
 # under a z15 tile is 7 levels down) redraw a coastline by hundreds of metres. Such groups
@@ -143,6 +147,28 @@ def _peel_preserving_topology(start, removable, max_iters):
         if not changed:
             break
     return cur[1:-1, 1:-1]
+
+
+def group_cell_px(source_items, resolution):
+    """The group's coarsest source cell in render pixels — the pitch of the staircase its
+    validity boundary draws, and so the scale feather_coverage_edge smooths at.
+
+    Zoom levels cannot stand in for this. resolved_maxzoom rounds a cell UP to the next finer
+    grid, so a group `levels` below the render grid holds cells anywhere in
+    (1 << levels, 2 << levels] px: the 16 m S-102 files off Jacksonville resolve to z13 and
+    measure 7.8 px against a z15 grid, where `1 << 2` guesses 4. Registration rows carry
+    EPSG:3857 bounds and pixel dimensions and the catalog is already hydrated for
+    source_path, so the true ratio costs nothing.
+
+    Coarsest, because a group's external boundary is drawn by its coarsest files — a fine
+    file surrounded by coarse ones in the same VRT has no nodata edge of its own — and
+    because the coarser axis is what set the group's maxzoom in the first place."""
+    sid = source_items[0]["source"]
+    cell = {}
+    for filename, left, bottom, right, top, width, height in config.source_files(sid):
+        cell[filename] = max(abs(right - left) / width, abs(top - bottom) / height)
+    return max((cell[it["filename"]] for it in source_items if it["filename"] in cell),
+               default=0.0) / resolution
 
 
 def feather_coverage_edge(filepath, factor):
@@ -454,9 +480,9 @@ def reproject(filepath):
         # Before the land clamps, never after: this smooths a boundary the SOURCE's own
         # cells drew, while the clamps below cut nodata along the OSM water line, which is
         # vector-precise and must not be re-drawn at some source's cell scale.
-        levels = maxzoom - source_items[0]["maxzoom"]
-        if levels >= FEATHER_MIN_LEVELS:
-            feather_coverage_edge(out_tiff, min(1 << levels, FEATHER_MAX_FACTOR))
+        cell_px = group_cell_px(source_items, resolution)
+        if cell_px >= FEATHER_MIN_CELL_PX:
+            feather_coverage_edge(out_tiff, min(cell_px, FEATHER_MAX_FACTOR))
         if config.source_property(sid, "land_clamp"):
             # Coarse source (GEBCO/EMODnet) with no land/water concept: its shoreline cells
             # read negative on land. Clamp valid ^ land ^ <0 -> 0 right after warp, so the
@@ -700,6 +726,19 @@ def _check():
                     a[cr*F:(cr+1)*F, cc*F:(cc+1)*F] = -3.0
         return a
 
+    def cell_quantized(cell, n, seed=7):
+        """An irregular coverage boundary snapped to `cell`-px source cells — a smooth random
+        field thresholded on the cell lattice, then blown up by nearest. A monotone diagonal
+        is not a fair fixture: it is already half-removed at half the right factor, while real
+        coverage (and this) still carries most of its boundary in long runs there."""
+        from scipy.ndimage import gaussian_filter
+        rng = np.random.default_rng(seed)
+        coarse = gaussian_filter(rng.standard_normal((n // cell, n // cell)).astype("float32"),
+                                 1.2) > 0
+        a = np.full((n, n), NODATA, dtype="float32")
+        a[np.repeat(np.repeat(coarse, cell, axis=0), cell, axis=1)] = -3.0
+        return a
+
     def as_cog(arr, name):
         raw = f"{d}/{name}.tif"
         with rasterio.open(raw, "w", driver="GTiff", height=arr.shape[0], width=arr.shape[1],
@@ -730,6 +769,27 @@ def _check():
             for x in xs:
                 prev[x] = 1
         return max([best] + list(prev.values()))
+
+    def long_run_fraction(valid, min_run=6):
+        """Share of the coverage boundary drawn in straight runs of >= min_run px — the
+        staircase metric measured on the real 16 m S-102 file at Jacksonville, warped to the
+        production z15 grid: 98.5% raw, 73.1% at factor 4, 39.1% at factor 8 for a cell that
+        measures 7.8 px."""
+        total = in_long = 0
+        for m in (valid, valid.T):
+            flips = m[:, 1:] != m[:, :-1]
+            active, runs = {}, []
+            for i in range(m.shape[0]):
+                xs = set(np.flatnonzero(flips[i]).tolist())
+                for x in list(active):
+                    if x not in xs:
+                        runs.append(i - active.pop(x))
+                for x in xs:
+                    active.setdefault(x, i)
+            runs += [m.shape[0] - start for start in active.values()]
+            total += sum(runs)
+            in_long += sum(r for r in runs if r >= min_run)
+        return in_long / total if total else 0.0
 
     def splits(before, after):
         """Original coverage components that ended up in more than one final component.
@@ -781,8 +841,47 @@ def _check():
         assert broke == 0, f"{name}: feather split {broke} coverage component(s)"
         assert (data[valid] != NODATA).all(), f"{name}: covered pixel holding NODATA"
 
+    # 3. sizing, against the registration rows the covering CSV names. A zoom-level count
+    #    rounds the wrong way: the 16 m S-102 files off Jacksonville resolve to z13, whose
+    #    bracket bottoms out at 4 px on the z15 grid while the cells measure 7.8 — the blur
+    #    would run at half the staircase's scale. Bounds and dimensions here are those two
+    #    files' real ones (18.636 m and 4.652 m per cell in 3857).
+    rows = [("coarse.tif", 0.0, 0.0, 18.636 * 1000, 18.636 * 1000, 1000, 1000),
+            ("fine.tif", 0.0, 0.0, 4.652 * 1000, 4.652 * 1000, 1000, 1000)]
+    real_source_files = config.source_files
+    try:
+        config.source_files = lambda _sid: rows
+        group = [{"source": "s102", "filename": n, "maxzoom": 13}
+                 for n in ("coarse.tif", "fine.tif")]
+        cz15, cz14 = get_resolution(15), get_resolution(14)
+        cell_px = group_cell_px(group, cz15)
+        assert 7.7 < cell_px < 7.9, cell_px                # measured lattice at z15: 7.788 px
+        assert cell_px > 1.9 * (1 << (15 - 13)), cell_px   # nearly twice the bracket's floor
+        # the same cells one zoom down are the same shoreline, so they must still be feathered
+        assert group_cell_px(group, cz14) >= FEATHER_MIN_CELL_PX, group_cell_px(group, cz14)
+        # ...while the 4 m file on its own draws no staircase and must stay untouched
+        assert group_cell_px(group[1:], cz15) < FEATHER_MIN_CELL_PX, group_cell_px(group[1:], cz15)
+        # an unregistered file has no known cell, and an unknown cell must not be smoothed
+        assert group_cell_px([{"source": "s102", "filename": "unregistered.tif"}], cz15) == 0.0
+    finally:
+        config.source_files = real_source_files
+
+    # 4. ...and that ratio is the factor that clears the staircase: 8-px cells feathered at
+    #    the ratio against the same cells feathered at their zoom bracket's floor.
+    ratio8 = cell_quantized(8, 512)
+    raw_frac = long_run_fraction(ratio8 != NODATA)
+    fracs = {}
+    for factor in (4, 8):
+        cog = as_cog(ratio8, f"ratio8f{factor}")
+        feather_coverage_edge(cog, factor)
+        fracs[factor] = long_run_fraction(read(cog)[1])
+    assert raw_frac > 0.9, raw_frac
+    assert fracs[8] < 0.45 and fracs[8] < 0.8 * fracs[4], (raw_frac, fracs)
+
     print(f"aggregation_reproject.py self-check ok (valid pixels: A={va}, A+B={vboth}; "
-          f"feather stair {before}px -> {after}px)")
+          f"feather stair {before}px -> {after}px; 8px-cell boundary in >=6px runs "
+          f"{raw_frac*100:.0f}% raw -> {fracs[4]*100:.0f}% at factor 4 -> "
+          f"{fracs[8]*100:.0f}% at factor 8)")
 
 
 if __name__ == "__main__":
