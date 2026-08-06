@@ -16,6 +16,7 @@ import re
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from xml.sax.saxutils import unescape
 
 import mercantile
@@ -36,6 +37,16 @@ NODATA = -9999
 # Bathymetry note: cubicspline can ring near steep escarpments; set
 # AGG_RESAMPLE=bilinear to switch if that shows.
 RESAMPLE = os.environ.get("AGG_RESAMPLE", "cubicspline")
+
+# What the mixed-CRS chain costs is one /vsicurl open per input per pass — measured at ~1.15 s
+# each against ~0.09 s of CPU, and an S-102 z14 tile carries 131 of them. So the per-input warps
+# fan out; the threads sit on sockets, not cores.
+MIXED_WORKERS = int(os.environ.get("AGG_MIXED_WORKERS", "8"))
+# gdalbuildvrt opens its inputs one at a time in a single process, so a flat combine of that many
+# warped VRTs is that many serial round trips (measured 104 s vs 15 s chunked). Chunking overlaps
+# them; contiguous slices keep "last input wins" on an overlap, which is the precedence the flat
+# combine has always given.
+COMBINE_FANOUT = 16
 
 # Coverage-edge feathering. A group whose native grid is >= FEATHER_MIN_LEVELS zoom levels
 # coarser than the render grid draws its valid/nodata boundary as source-cell staircases —
@@ -246,39 +257,42 @@ def intersects(a, b):
     return a[2] > b[0] and a[0] < b[2] and a[3] > b[1] and a[1] < b[3]
 
 
-def per_tile_vrts(tmp_folder, i, source_items):
-    """One single-band VRT per tile, for a `mixed_crs` source (per-tile UTM zones, e.g.
-    NOAA S-102). gdalbuildvrt refuses to merge differing CRS into one VRT — it silently
-    drops the off-CRS tiles, holing zone seams — so each tile gets its own VRT and
-    gdalwarp (which does reproject per input) mosaics them into 3857 in warp_mixed."""
-    source = source_items[0]["source"]
-    bsel = band_select(source)
-    vrts = []
-    for j, item in enumerate(source_items):
-        path = config.source_path(source, item["filename"])
-        vrt = f"{tmp_folder}/{i}-{j}.vrt"
-        _build_tile_vrt(f"gdalbuildvrt -overwrite {bsel}{vrt} {path}")
-        vrts.append(vrt)
-    return vrts
+def _fan_out(job, args):
+    """Run `job` over `args`, MIXED_WORKERS at a time, results in `args` order. Threads rather
+    than processes: every worker is a subprocess blocked on a socket, so there is no GIL to
+    fight and one shared GDAL block cache. The first failure re-raises."""
+    if MIXED_WORKERS <= 1 or len(args) <= 1:
+        return [job(a) for a in args]
+    with ThreadPoolExecutor(max_workers=MIXED_WORKERS) as pool:
+        return list(pool.map(job, args))
 
 
-def _build_tile_vrt(cmd, tries=3):
-    """Run a per-tile gdalbuildvrt, retrying on a transient /vsicurl read. Each tile is a
-    separate range read over public HTTPS; a momentary blip (connection reset, "HTTP
-    response code 0") makes gdalbuildvrt exit 1 with no VRT, and GDAL's own HTTP retry
-    doesn't reliably catch transport-level errors. Re-running is a fresh attempt; raise
-    after `tries` so a tile that's genuinely gone (a real 404) still fails loudly."""
-    for attempt in range(1, tries + 1):
-        try:
-            utils.run_command(cmd, silent=SILENT)
-            return
-        except RuntimeError:
-            if attempt == tries:
-                raise
-            time.sleep(2 ** attempt)  # 2s, 4s
+def combine_warped(tmp_folder, i, warped, out_vrt, window, res):
+    """Mosaic same-grid 3857 warped VRTs into `out_vrt`, chunking the combine past
+    COMBINE_FANOUT inputs so their opens overlap.
+
+    assert_vrt_complete runs at every level, so a silently-dropped input is still caught where
+    it was dropped — chunking moves the gate, it doesn't weaken it."""
+    left, bottom, right, top = window
+
+    def build(out, paths, te=""):
+        listpath = f"{out}-list.txt"
+        with open(listpath, "w") as f:
+            f.write("".join(p + "\n" for p in paths))
+        _run(f"gdalbuildvrt -overwrite {te}-tr {res} {res} -input_file_list {listpath} {out}",
+             f"gdalbuildvrt(mixed) {out}")
+        assert_vrt_complete(out, paths)
+        return out
+
+    roots = warped
+    if len(warped) > COMBINE_FANOUT:
+        chunks = [warped[a:a + COMBINE_FANOUT] for a in range(0, len(warped), COMBINE_FANOUT)]
+        roots = _fan_out(lambda nc: build(f"{tmp_folder}/{i}-chunk{nc[0]}.vrt", nc[1]),
+                         list(enumerate(chunks)))
+    build(out_vrt, roots, te=f"-te {left} {bottom} {right} {top} ")
 
 
-def warp_mixed(tmp_folder, i, inputs, out_vrt, zoom, aggregation_tile, buffer):
+def warp_mixed(tmp_folder, i, inputs, out_vrt, zoom, aggregation_tile, buffer, band=None):
     """Mosaic heterogeneous-CRS inputs into one lazy 3857 VRT, warping each separately.
 
     A warped VRT holds a single source CRS, so the mixed case can't be one warp — but it can
@@ -298,29 +312,29 @@ def warp_mixed(tmp_folder, i, inputs, out_vrt, zoom, aggregation_tile, buffer):
     on that same grid. gdalbuildvrt's -te/-tr then pin the exact output window, reading every
     contributing level 1:1."""
     window = buffered_bounds(aggregation_tile, buffer)
-    left, bottom, right, top = window
     res = get_resolution(zoom)
-    warped = []
-    for j, path in enumerate(inputs):
+    # -srcband on the object itself, not a band-selecting VRT in front of it: that VRT would
+    # double this phase's /vsicurl opens and it is the opens that this phase costs.
+    bsel = f"-srcband {band} " if band else ""
+
+    def warp(indexed):
+        j, path = indexed
         w = f"{tmp_folder}/{i}-{j}-3857.vrt"
-        _run(f"gdalwarp -of vrt -overwrite -t_srs EPSG:3857 -tr {res} {res} -tap "
+        _run(f"gdalwarp -of vrt -overwrite {bsel}-t_srs EPSG:3857 -tr {res} {res} -tap "
              f"-r {RESAMPLE} -dstnodata {NODATA} {path} {w}", f"gdalwarp(mixed) {w}")
-        # The covering registers every file within 2*macrotile_buffer_3857 of the macrotile,
-        # which is wider than this warp's buffer_pixels*res halo, so an edge file can land
-        # wholly outside the window. It contributes no pixel and gdalbuildvrt -te drops it
-        # silently (exit 0, no warning) — drop it here instead, or assert_vrt_complete reads
-        # that as the heterogeneous-CRS drop it exists to catch.
-        if intersects(vrt_bounds(w), window):
-            warped.append(w)
+        return w
+
+    # The covering registers every file within 2*macrotile_buffer_3857 of the macrotile, which is
+    # wider than this warp's buffer_pixels*res halo, so an edge file can land wholly outside the
+    # window. It contributes no pixel and gdalbuildvrt -te drops it silently (exit 0, no warning)
+    # — drop it here instead, or assert_vrt_complete reads that as the heterogeneous-CRS drop it
+    # exists to catch.
+    warped = [w for w in _fan_out(warp, list(enumerate(inputs)))
+              if intersects(vrt_bounds(w), window)]
     if not warped:
         raise RuntimeError(f"no input of group {i} reaches {window} — every one of "
                            f"{len(inputs)} is outside the warp window")
-    listpath = f"{tmp_folder}/{i}-3857-list.txt"
-    with open(listpath, "w") as f:
-        f.write("".join(p + "\n" for p in warped))
-    utils.run_command(f"gdalbuildvrt -overwrite -te {left} {bottom} {right} {top} "
-                      f"-tr {res} {res} -input_file_list {listpath} {out_vrt}", silent=SILENT)
-    assert_vrt_complete(out_vrt, warped)
+    combine_warped(tmp_folder, i, warped, out_vrt, window, res)
 
 
 def get_resolution(zoom):
@@ -427,8 +441,10 @@ def reproject(filepath):
         if config.source_property(sid, "mixed_crs"):
             # Per-tile UTM zones: one warp per tile, recombined — gdalbuildvrt refuses the
             # source CRSs but accepts the warped results.
-            warp_mixed(tmp_folder, i, per_tile_vrts(tmp_folder, i, source_items), vrt_3857,
-                       maxzoom, aggregation_tile, buffer_3857_rounded)
+            warp_mixed(tmp_folder, i, [config.source_path(sid, it["filename"])
+                                       for it in source_items],
+                       vrt_3857, maxzoom, aggregation_tile, buffer_3857_rounded,
+                       band=config.source_property(sid, "band"))
         else:
             create_warp(create_virtual_raster(tmp_folder, i, source_items), vrt_3857,
                         maxzoom, aggregation_tile, buffer_3857_rounded)
@@ -531,6 +547,60 @@ def _check():
     except RuntimeError as e:
         assert "outside the warp window" in str(e), e
 
+    # Chunking the combine past COMBINE_FANOUT must change nothing a caller can see: the same
+    # pixels, including who wins an overlap (the chunks are contiguous, so the last input still
+    # does). Overlapping boxes marching east, each carrying its own constant, make that visible.
+    boxes = []
+    for k in range(10):
+        p = f"{d}/fan{k}_z17.tif"
+        utm_box(p, 32617, 748000 + k * 6000, 4438000, float(k + 1), n=120, res=100)
+        boxes.append(p)
+    chunked, one_shot = f"{d}/chunked.vrt", f"{d}/oneshot.vrt"
+    real_fanout = COMBINE_FANOUT
+    try:
+        globals()["COMBINE_FANOUT"] = 3                # 4 chunks over the 10 boxes
+        warp_mixed(d, 5, boxes, chunked, 9, tile, 0)
+        globals()["COMBINE_FANOUT"] = len(boxes) + 1   # same inputs, one flat combine
+        warp_mixed(d, 6, boxes, one_shot, 9, tile, 0)
+    finally:
+        globals()["COMBINE_FANOUT"] = real_fanout
+    with rasterio.open(chunked) as c, rasterio.open(one_shot) as o:
+        ca, oa = c.read(1), o.read(1)
+    assert (ca == oa).all(), "chunked combine is not pixel-identical to the flat one"
+    assert set(np.unique(ca[ca != NODATA]).tolist()) == set(float(k + 1) for k in range(10)), \
+        f"every chunked input must reach the mosaic: {np.unique(ca[ca != NODATA])}"
+    with open(chunked) as f:
+        assert "chunk" in f.read(), "expected the root to reference chunk VRTs"
+
+    # ...and an input the combine cannot open must still raise from inside a chunk: gdalbuildvrt
+    # skips it with exit 0, which is the silent-drop shape assert_vrt_complete exists to catch.
+    junk = f"{d}/junk-3857.vrt"
+    with open(junk, "w") as f:
+        f.write("not a vrt")
+    try:
+        combine_warped(d, 7, [f"{d}/5-0-3857.vrt", junk], f"{d}/holed.vrt",
+                       buffered_bounds(tile, 0), get_resolution(9))
+        assert False, "expected a dropped input inside a chunk to raise"
+    except RuntimeError as e:
+        assert "dropped" in str(e) and "junk" in str(e), e
+
+    # band: a mixed_crs source can be multi-band (S-102 is depth + uncertainty), and the mosaic
+    # must carry the pinned band alone. -srcband replaces the band-selecting VRT that used to sit
+    # in front of every input, so this is what proves the right band still lands.
+    two = f"{d}/two_band_z17.tif"
+    with rasterio.open(two, "w", driver="GTiff", height=120, width=120, count=2, dtype="float32",
+                       nodata=NODATA, crs="EPSG:32617",
+                       transform=from_origin(748000, 4438000, 100, 100)) as dst:
+        dst.write(np.full((120, 120), 7.0, dtype="float32"), 1)
+        dst.write(np.full((120, 120), 99.0, dtype="float32"), 2)
+    picked = f"{d}/picked.vrt"
+    warp_mixed(d, 8, [two], picked, 9, tile, 0, band=1)
+    with rasterio.open(picked) as src:
+        arr, count = src.read(1), src.count
+    assert count == 1, f"band-pinned mosaic must be single-band, got {count}"
+    got = arr[(arr != NODATA) & ~np.isnan(arr)]
+    assert got.size and (got == 7.0).all(), f"expected band 1 (7.0), got {np.unique(got)[:5]}"
+
     # ...and must not shift a value vertically. A materialized gdalwarp converts NAVD88 to
     # ellipsoidal height (~-22 m in Puget Sound, always deeper); the warped-VRT mosaic cannot,
     # which is the second line behind source_datum.flatten_compound_crs. The materialized warp
@@ -586,31 +656,6 @@ def _check():
         assert False, "expected run_command to raise on a failed gdalbuildvrt"
     except RuntimeError:
         assert not os.path.exists(miss)
-
-    # _build_tile_vrt retries a transient failure then succeeds, and raises once exhausted.
-    # (mock run_command + sleep so it's offline and instant)
-    real_run, real_sleep, calls = utils.run_command, time.sleep, []
-    try:
-        time.sleep = lambda s: None
-        def fail_once(cmd, silent=True):
-            calls.append(cmd)
-            if len(calls) < 2:
-                raise RuntimeError("transient")
-            return "", ""
-        utils.run_command = fail_once
-        _build_tile_vrt("noop", tries=3)
-        assert len(calls) == 2, calls  # failed once, recovered on retry
-
-        def always_fail(cmd, silent=True):
-            raise RuntimeError("persistent")
-        utils.run_command = always_fail
-        try:
-            _build_tile_vrt("noop", tries=2)
-            assert False, "expected _build_tile_vrt to raise after exhausting retries"
-        except RuntimeError:
-            pass
-    finally:
-        utils.run_command, time.sleep = real_run, real_sleep
 
     # _run retries the same transient class (warp/translate over /vsicurl dying
     # mid-transfer) then succeeds; a deterministic failure exhausts and raises.
