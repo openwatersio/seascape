@@ -57,7 +57,9 @@ macrotile_z = int(os.environ.get("MACROTILE_Z", "8"))
 macrotile_buffer_3857 = 150
 num_overviews = int(os.environ.get("NUM_OVERVIEWS", "4"))
 
-ATTRIBUTION = '<a href="https://openwaters.io/charts/seascape#license">© Open Waters</a> '
+# Must match the Worker's ATTRIBUTION (worker/src/index.ts): byte-identical
+# strings are what let MapLibre's attribution control dedupe across sources.
+ATTRIBUTION = '© <a href="https://openwaters.io/charts/seascape">Open Waters: Seascape</a>'
 
 X_MIN_3857, _, X_MAX_3857, __ = transform_bounds('EPSG:4326', 'EPSG:3857', -180, 0, 180, 0)
 

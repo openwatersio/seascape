@@ -86,7 +86,7 @@ interface Manifest {
   planet: BundleMeta;
   overlay: OverlayIndex; // {split_z, cells: {"z-x-y": max_zoom}}
   source_ids?: string[]; // every configured source (the viewer's provenance palette)
-  attribution?: string; // combined HTML credit for every contributing dataset
+  attribution?: string; // HTML credit baked at bundle time (superseded by ATTRIBUTION below)
   // Authoritative serving maxzoom for the VECTOR archive, set from the covering's
   // max child_z. Under variable depth the archive header records only the deepest
   // baked LEAF, which can be shallower than the covering (a deep region whose
@@ -99,6 +99,11 @@ interface Manifest {
 }
 
 const TILE = 512;
+
+// The single on-map credit; the linked page carries the full per-source list.
+// Byte-identical everywhere it appears (see pipelines/utils.py ATTRIBUTION) so
+// MapLibre's attribution control collapses it to one entry.
+const ATTRIBUTION = '© <a href="https://openwaters.io/charts/seascape">Open Waters: Seascape</a>';
 
 class R2Source implements Source {
   constructor(
@@ -607,7 +612,7 @@ export default {
           Math.max(mf.planet.max_zoom, ...Object.values(mf.overlay.cells)) + 3,
         bounds: mf.planet.bbox,
         encoding: "terrarium",
-        attribution: mf.attribution ?? "",
+        attribution: ATTRIBUTION,
       });
     }
     if (rel === "/vector.json") {
@@ -657,7 +662,7 @@ export default {
             },
           },
         ],
-        attribution: mf.attribution ?? "",
+        attribution: ATTRIBUTION,
       });
     }
     // Source-provenance footprints — their own tileset with a low maxzoom that
@@ -671,7 +676,7 @@ export default {
       const h = await pm(renv, "coverage.pmtiles")
         .getHeader()
         .catch(() => null);
-      return json(coverageTileJSON(h, tilesBase, mf.attribution ?? ""));
+      return json(coverageTileJSON(h, tilesBase, ATTRIBUTION));
     }
     // Tiles validate by CONTENT, not release: ETag = hash of the tile bytes
     // (or of the native ancestor a synthesized tile is a pure function of).

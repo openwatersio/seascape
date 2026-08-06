@@ -577,8 +577,9 @@ export function style({
           type: "raster",
           tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
           tileSize: 256,
+          // byte-identical to the VersaTiles credit so MapLibre dedupes it
           attribution:
-            "&copy; <a href='https://www.openstreetmap.org/copyright'>OpenStreetMap</a>",
+            '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
         },
       }
     : {};

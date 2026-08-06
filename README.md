@@ -180,10 +180,10 @@ The build pipeline, local development, container usage, and CI/deploy live in
 **Tiles** — the tile compilation published at `tiles.openwaters.io/seascape` is licensed [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/): free for any use with the following attribution:
 
 ```
-© Open Waters (https://openwaters.io/charts/seascape#license)
+Attribute "© Open Waters: Seascape <https://openwaters.io/charts/seascape>"
 ```
 
-The underlying data remains under each source's own open terms. The full attribution list is available in the `attribution` field of the TileJSON endpoints ([raster.json](https://tiles.openwaters.io/seascape/raster.json), [vector.json](https://tiles.openwaters.io/seascape/vector.json)). It is displayed by MapLibre's attribution control automatically, which satisfies each source's terms.
+The underlying data remains under each source's own open terms; the full per-source attribution list lives on the linked page. The credit is carried in the `attribution` field of the TileJSON endpoints ([raster.json](https://tiles.openwaters.io/seascape/raster.json), [vector.json](https://tiles.openwaters.io/seascape/vector.json)), so MapLibre's attribution control displays it automatically.
 
 ## Prior art
 
