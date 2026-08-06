@@ -68,9 +68,11 @@ FEATHER_MIN_LEVELS = int(os.environ.get("AGG_FEATHER_MIN_LEVELS", "2"))
 # to feather at all.
 FEATHER_MAX_FACTOR = 32
 
-# The VRT's input references, read by regex rather than an XML parser (the same XXE-avoidance
-# source_enumerate makes for bucket listings).
+# The VRT's input references and its own extent, read by regex rather than an XML parser (the
+# same XXE-avoidance source_enumerate makes for bucket listings).
 _SOURCE_FILENAME_RE = re.compile(r"<SourceFilename[^>]*>([^<]*)</SourceFilename>")
+_GEOTRANSFORM_RE = re.compile(r"<GeoTransform>([^<]*)</GeoTransform>")
+_RASTER_SIZE_RE = re.compile(r'rasterXSize="(\d+)"\s+rasterYSize="(\d+)"')
 
 
 def negate_band1(filepath):
@@ -228,6 +230,22 @@ def assert_vrt_complete(vrt, paths):
                            f"{vrt} — heterogeneous CRS? e.g. {dropped[:3]}")
 
 
+def vrt_bounds(vrt):
+    """A VRT's own extent, (left, bottom, right, top) in its own CRS. Every VRT this reads is a
+    north-up EPSG:3857 warp output, so the rotation terms are zero."""
+    with open(vrt) as f:
+        xml = f.read()
+    gt = [float(v) for v in _GEOTRANSFORM_RE.search(xml).group(1).split(",")]
+    width, height = (int(v) for v in _RASTER_SIZE_RE.search(xml).groups())
+    return gt[0], gt[3] + height * gt[5], gt[0] + width * gt[1], gt[3]
+
+
+def intersects(a, b):
+    """Do two (left, bottom, right, top) boxes share area? Touching is not sharing — a source
+    that only abuts the window contributes no pixel."""
+    return a[2] > b[0] and a[0] < b[2] and a[3] > b[1] and a[1] < b[3]
+
+
 def per_tile_vrts(tmp_folder, i, source_items):
     """One single-band VRT per tile, for a `mixed_crs` source (per-tile UTM zones, e.g.
     NOAA S-102). gdalbuildvrt refuses to merge differing CRS into one VRT — it silently
@@ -279,14 +297,24 @@ def warp_mixed(tmp_folder, i, inputs, out_vrt, zoom, aggregation_tile, buffer):
     `half/res` == `256*2**z`), so aligning each input's own extent to multiples of -tr lands it
     on that same grid. gdalbuildvrt's -te/-tr then pin the exact output window, reading every
     contributing level 1:1."""
-    left, bottom, right, top = buffered_bounds(aggregation_tile, buffer)
+    window = buffered_bounds(aggregation_tile, buffer)
+    left, bottom, right, top = window
     res = get_resolution(zoom)
     warped = []
     for j, path in enumerate(inputs):
         w = f"{tmp_folder}/{i}-{j}-3857.vrt"
         _run(f"gdalwarp -of vrt -overwrite -t_srs EPSG:3857 -tr {res} {res} -tap "
              f"-r {RESAMPLE} -dstnodata {NODATA} {path} {w}", f"gdalwarp(mixed) {w}")
-        warped.append(w)
+        # The covering registers every file within 2*macrotile_buffer_3857 of the macrotile,
+        # which is wider than this warp's buffer_pixels*res halo, so an edge file can land
+        # wholly outside the window. It contributes no pixel and gdalbuildvrt -te drops it
+        # silently (exit 0, no warning) — drop it here instead, or assert_vrt_complete reads
+        # that as the heterogeneous-CRS drop it exists to catch.
+        if intersects(vrt_bounds(w), window):
+            warped.append(w)
+    if not warped:
+        raise RuntimeError(f"no input of group {i} reaches {window} — every one of "
+                           f"{len(inputs)} is outside the warp window")
     listpath = f"{tmp_folder}/{i}-3857-list.txt"
     with open(listpath, "w") as f:
         f.write("".join(p + "\n" for p in warped))
@@ -484,6 +512,24 @@ def _check():
     warp_mixed(d, 1, [a], just_a, 9, tile, 0)
     va, vboth = valid(just_a), valid(both)
     assert vboth > va > 0, (va, vboth)
+
+    # An input the covering registered (its bounds are within 2*macrotile_buffer_3857 of the
+    # macrotile) but that lands outside this warp's narrower halo must be dropped quietly, not
+    # read as a silent CRS drop: gdalbuildvrt -te discards it with exit 0 and no warning, so
+    # asserting on the unfiltered list turns a legal edge file into a failed build. A handful of
+    # S-102 macrotiles hold one.
+    far = f"{d}/far_z17.tif"
+    utm_box(far, 32617, 400000, 4800000, 40.0)  # ~500 km away, nowhere near `tile`
+    edge = f"{d}/edge.vrt"
+    warp_mixed(d, 3, [a, far], edge, 9, tile, 0)
+    assert valid(edge) == va, (valid(edge), va)  # same pixels as `a` alone
+    with open(edge) as f:
+        assert "far_z17" not in f.read()
+    try:
+        warp_mixed(d, 4, [far], f"{d}/allfar.vrt", 9, tile, 0)
+        assert False, "expected a wholly-outside group to raise"
+    except RuntimeError as e:
+        assert "outside the warp window" in str(e), e
 
     # ...and must not shift a value vertically. A materialized gdalwarp converts NAVD88 to
     # ellipsoidal height (~-22 m in Puget Sound, always deeper); the warped-VRT mosaic cannot,
