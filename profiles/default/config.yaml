@@ -16,3 +16,6 @@ scheduler: greedy
 # Engine triggers match the declared policy: code changes are force-only (-R/-F),
 # never auto-invalidation — a shell-string edit must not re-merge the planet.
 rerun-triggers: [mtime, params, input, software-env]
+# Benchmark TSVs name their own job (jobid, rule, wildcards, threads, resources,
+# input_size_mb) instead of only the stem in the filename — the artifact reads standalone.
+benchmark-extended: true

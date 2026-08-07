@@ -356,16 +356,18 @@ jobs:
               mkdir -p "$TMP/logs"
               free -m | awk -v t="$(date -u +%FT%TZ)" 'NR==2{u=$3;a=$7} NR==3{print t" used_mb="u" avail_mb="a" swap_used_mb="$3}' \
                 >> "$TMP/logs/memory.log"
-              p=$(grep -oE "[0-9]+ of [0-9]+ steps" "$buildlog" | tail -1)
+              # The seascape logger closes every job line with the whole counter, so the
+              # status is one grep — no step arithmetic, and `running` is exact rather than
+              # inferred from unmatched jobids.
+              p=$(grep -oE "\[[0-9]+/[0-9]+, [0-9]+%, [0-9]+ running\]" "$buildlog" | tail -1)
               [ -n "$p" ] || continue
-              n=${p%% *}; m=${p##*of }; m=${m%% *}
-              run=$(( $(grep -oE "^    jobid: [0-9]+" "$buildlog" | sort -u | wc -l) - $(grep -oE "^Finished jobid: [0-9]+" "$buildlog" | sort -u | wc -l) ))
+              p=${p#[}; p=${p%]}
               # curl, not gh: the self-hosted box has no gh CLI. Failures land in the
               # artifact via heartbeat.log instead of /dev/null.
               curl -fsS -X POST -H "Authorization: Bearer $GH_TOKEN" \
                 -H "Accept: application/vnd.github+json" \
                 "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
-                -d "{\"state\":\"pending\",\"context\":\"build\",\"description\":\"root@$BOX_IP · $p ($((n * 100 / m))%), ~$run running\",\"target_url\":\"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\"}" \
+                -d "{\"state\":\"pending\",\"context\":\"build\",\"description\":\"root@$BOX_IP · $p\",\"target_url\":\"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\"}" \
                 >/dev/null 2>>"$TMP/logs/heartbeat.log"
             done ) &
           hb=$!
@@ -412,6 +414,7 @@ jobs:
           # priority bands (index > merges > vector > terrain) order the chain instead.
           ./docker.sh snakemake "${targets[@]}" "${extra[@]}" "${force[@]}" \
             --keep-going --rerun-incomplete \
+            --logger seascape --logger-seascape-events /app/tmp/logs/events.jsonl \
             --cores "$cores" --resources mem_gb="$budget_gb" disk_mb="$disk_budget_mb" \
             --config workdir=/app/state tmp=/app/tmp 2>&1 | tee "$buildlog"
       # Close the `build` status to success so it never lingers at pending, pointing at the

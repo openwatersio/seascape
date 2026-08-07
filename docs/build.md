@@ -67,6 +67,35 @@ There is **no prune step** — deletion of *store* artifacts is out-of-band (`gc
 
 **No `timeout-minutes`.** A self-hosted job is **not** subject to the 6 h cap that GitHub-*hosted* runners impose — the ceiling is now the 72 h workflow limit, which is effectively non-binding, so a forced full planet rebuild runs to completion in one window regardless of size (no resume-on-re-dispatch needed). The incremental store still makes re-dispatches cheap (a re-dispatch hydrates the last completed build's manifest and rebuilds only what changed), but a build no longer *has* to fit a window. `ccx63` (48 vCPU / 192 GB) is the default now the dedicated-vCPU quota is approved; `ccx33` is a cheaper smoke.
 
+## Watching a build
+
+The run log is produced by `snakemake_logger_plugin_seascape`, a logger plugin that
+replaces Snakemake's default console handler (`--logger seascape`, wired into build.yml
+and sources.yml; the container puts the repo on `PYTHONPATH` so Snakemake's plugin scan
+finds it). Snakemake's own output costs ~16 lines per job — a field block per job, a bare
+timestamp per event, `Select jobs to execute...` and `Execute N jobs...` per scheduling
+round — which is ~200k lines at planet scale, past what the GitHub UI serves, and it
+still never prints a job's runtime or peak RSS. `--quiet` can't trim it: `rules` also
+suppresses job errors, `progress` also suppresses the counter the heartbeat reads, and
+neither level reaches the two scheduler lines.
+
+What the plugin emits instead:
+
+- **One line per finished job** — `✓ mosaic_tile 8-70-105-15 25m08s rss=7.2G cpu=18m00s [2/113, 2%, 15 running]`. Runtime is measured by the handler (JOB_FINISHED carries only a jobid); RSS and CPU come from the job's own `benchmark:` TSV, which the job process flushes before the scheduler handles success. `--logger-seascape-starts` adds a `▸` line at job start with its `mem_gb`/`disk_mb` reservation.
+- **A failure line** naming the rule, its wildcards, and its log path. Snakemake reports each failure twice (once live, once in the exit summary, the second time without wildcards); the plugin keeps the first.
+- **A periodic status line** every 5 minutes (`--logger-seascape-status-interval`): elapsed, the counter, which rules are in flight, and the oldest running job — the line that says whether a build is progressing or wedged on one long-tail stem.
+- **An end-of-run rollup**: per-rule count, total, mean and max runtime, plus the failure list. GitHub truncates the middle of a long log but serves the end, so this always survives.
+- **A JSONL event stream** (`--logger-seascape-events`), written to `$TMP/logs/events.jsonl` and shipped in the `snakemake-bench-<run_id>` artifact alongside the benchmark TSVs. Every event carries its full record — jobid, rule, wildcards, reason, resources, duration, the whole benchmark row — so post-run analysis is `jq`, not log scraping. Long `input:`/`reason:` lists live here and never reach the console.
+
+The heartbeat reads the counter straight off the console line, and
+[`scripts/watch-build`](../scripts/watch-build) tails the box's container log filtered to
+`✓`/`✗`/status lines. Benchmarks are written with `--benchmark-extended`
+(`profiles/default/config.yaml`), so each TSV names its own jobid, rule, wildcards,
+threads and resources rather than relying on the filename.
+
+The scope-gate dry run deliberately keeps the default logger — it parses `^Job stats` and
+the `total` row out of that output.
+
 ## The incremental model
 
 Rebuilds are cheap because every store artifact is **content-addressed** ([pipelines/keys.py](../pipelines/keys.py)): its key — a short hash of its inputs ‖ the pipeline modules that produce it ‖ the resolved config the stage read ‖ the toolchain image tag — rides IN its filename (`<stem>-<key12>.<ext>`). Freshness is "the named file exists"; there is no sidecar to match. Anything that moves the key — changed input, code, config, bumped toolchain — writes a NEW name, and a stage rebuilds a name that isn't present. The old covering diff, its `.done` markers, the `.key` sidecars, and the downsample mtime cascade are all gone.
