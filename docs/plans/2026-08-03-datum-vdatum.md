@@ -101,7 +101,7 @@ GEBCO (and any MSL fallback water) stays ~MSL for now: the separation is navigat
 - ~~The exact implementation of the reference subtract~~ — resolved: `source_datum --offset-surface`, striped so peak memory tracks the stripe (382 MB measured on an 8112² tile) rather than the tile.
 - How far offshore to nearest-fill before falling back to 0 — pick from CUDEM's actual footprint overlap with VDatum coverage.
 - ~~Whether `cudem_third`'s territory files need separate handling~~ — resolved: PR/USVI are horizontal NAD83 like CONUS (verified across all 1,382 `cudem` tile headers) and correct via the `S = −mllw` branch (PRVD02/VIVD09 ≡ LMSL), so they stay put; Hawaii, Guam, CNMI and American Samoa are one `cudem_pacific_*` source per island group, on CO-OPS scalars rather than the grid, and non-SE Alaska stays a no-op.
-- Whether `raw/` survives prep for the CUDEM sources. Keeping it costs ~197 GB of the 750 GB volume and buys a re-prep with no refetch (which a grid rebuild needs); dropping it inverts both. Keep for now, revisit when the volume tightens.
+- ~~Whether `raw/` survives prep for the CUDEM sources~~ — decided 2026-08-07 when the volume hit 95% mid-planet-build: `cudem/raw` (189 GB) was deleted from the store. The next sources run that needs to re-prep cudem refetches from NOAA first (~1 h) — Snakemake sees the missing `fetch_item` outputs and rebuilds them, which also re-preps. Other sources keep their raws (single-digit GB each).
 - Whether the store's copy of the reference should be publishable at all. Nothing outside the source lane reads it, so a laptop `--config stream=1` preview never needs it — but a _local_ prep of a CUDEM tile does, and composing it locally means the 3.2 GB bundle.
 
 ## Follow-ups
