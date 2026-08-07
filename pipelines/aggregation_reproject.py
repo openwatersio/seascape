@@ -463,18 +463,24 @@ def reproject(filepath):
     buffer_pixels = int(utils.macrotile_buffer_3857 / resolution)
     buffer_3857_rounded = buffer_pixels * resolution
 
+    # Output indices are assigned only to groups that produce pixels, so a skipped group
+    # leaves NO gap: aggregation_merge names its output {len(tiffs)}-3857.tiff and
+    # mosaic._merged_dem picks {count-1} — both assume the indices are contiguous from 0,
+    # and a gap makes the merge's output name collide with a later group's input.
+    out_i = 0
     for i, source_items in enumerate(grouped):
         sid = source_items[0]["source"]
-        out_tiff = f"{tmp_folder}/{i}-3857.tiff"
-        vrt_3857 = f"{tmp_folder}/{i}-3857.vrt"
+        out_tiff = f"{tmp_folder}/{out_i}-3857.tiff"
+        vrt_3857 = f"{tmp_folder}/{out_i}-3857.vrt"
         if config.source_property(sid, "mixed_crs"):
             # Per-tile UTM zones: one warp per tile, recombined — gdalbuildvrt refuses the
-            # source CRSs but accepts the warped results.
+            # source CRSs but accepts the warped results. Per-input warp temps stay keyed on
+            # the GROUP index i, so a skipped group's temps never collide with a later group's.
             if not warp_mixed(tmp_folder, i, [config.source_path(sid, it["filename"])
                                               for it in source_items],
                               vrt_3857, maxzoom, aggregation_tile, buffer_3857_rounded,
                               band=config.source_property(sid, "band")):
-                continue  # nothing reaches the window; the group fills nothing (merge globs)
+                continue  # nothing reaches the window; out_i is not consumed
         else:
             create_warp(create_virtual_raster(tmp_folder, i, source_items), vrt_3857,
                         maxzoom, aggregation_tile, buffer_3857_rounded)
@@ -520,6 +526,7 @@ def reproject(filepath):
             # Deliberately discards coarse "drying": these flagged sources can't resolve the
             # foreshore, and trusted topobathy sources are unflagged, so genuine drying survives.
             landmask.clamp_positive_ocean(out_tiff, mask_tif, water_tif)
+        out_i += 1
         if len(grouped) > 1 and not contains_nodata_pixels(out_tiff):
             break
 
