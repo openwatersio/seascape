@@ -29,13 +29,14 @@ What is asserted, and the bound each rests on:
      while the partition edge was cut at native resolution, so the class line each product draws
      can differ by the width of the pixel the raster reduced into, and no further.
   3. ZOOMING OUT MUST NOT DEEPEN. The coarse tile against the shoalest water the native tiles
-     hold under it. Bounded by ZOOM_SMOOTHING_SLACK_M rather than 0 — see that constant: this is
-     a known defect, not a designed tolerance.
+     hold under it, at zero tolerance: terrain._FinerTiles clamps every rendered tile shoal-ward
+     against exactly that reduction, so the served pyramid is monotone by construction.
   4. BAND BRACKETING. The raster's charted depth at a pixel lies between the shallowest drval1
      and the deepest drval2 of the depare bands under that pixel's footprint, per ladder — the
      guaranteed form of "the band contains the pyramid's value", since both reductions are
-     shoal-biased but neither is the other's decimation. Exact at the native zoom; one zoom out
-     it carries ZOOM_SMOOTHING_SLACK_M, and below the deep-coarsening threshold no bracket
+     shoal-biased but neither is the other's decimation. The deep side is exact at every zoom
+     (it rides property 3's clamp); the shallow side is exact at the native zoom and carries
+     COARSE_SHOAL_ALLOWANCE_M one zoom out, and below the deep-coarsening threshold no bracket
      exists by design.
   5. THE CHANNEL STAYS OPEN. Along the channel centreline the raster charts water domain (never
      the land code) at BOTH zooms, and the depare water coverage contains the whole line.
@@ -123,25 +124,14 @@ CONTOUR_BAND_TOL_PX = 3.0         # + the coverage simplify (DEPARE_SIMPLIFY_MM 
 
 SWEEP_STRIDE_PX = 4               # native pixels between whole-raster samples
 
-# How far a COARSE zoom's raster may disagree with vectors cut at native resolution. Zero at the
-# native zoom, where the products share one array — this budget exists only because every zoom
-# smooths independently at a sigma measured in ITS OWN pixels (smooth.py: "sigma is in merged-DEM
-# pixels"), so the same seabed gets a different physical blur at each level.
-#
-# The shoaling half is licensed: a generalization is allowed to shoal, and the coarse blur pulls
-# harder toward datum near land (measured 1.75 m over this fixture's drying flat).
-#
-# The DEEPENING half is a KNOWN DEFECT, not a tolerance. Zooming out is a generalization and must
-# never deepen, yet the served raster does for water narrower than the smoothing kernel: the
-# mosaic's class-aware reduction widens water into every mixed block it decimates, so this
-# fixture's 2 px channel is attenuated to -4.1..-4.5 m at child_z but survives at -7.0 m one zoom
-# out — the coarse tile charting 2.9 m deeper than the fine one over the same water, and 2.0 m
-# deeper than the depth-area band cut from it. Neither product charts deeper than the source, so
-# nothing here is unsafe; the layers simply contradict each other, and the raster contradicts
-# itself between zooms. Bounded rather than ignored, so any worsening fails. Fixing the root cause
-# (a physical-scale sigma, or one smooth at native resolution that every zoom decimates) should
-# drive both halves to 0 and retire the constant.
-ZOOM_SMOOTHING_SLACK_M = 3.0
+# How far a COARSE zoom's raster may sit SHOALER than vectors cut at native resolution. Zero at
+# the native zoom, where the products share one array. One zoom out the raster is smoothed at a
+# sigma measured in ITS OWN pixels (smooth.py: "sigma is in merged-DEM pixels"), so the same
+# seabed gets a physically wider blur, which pulls harder toward datum near land — measured 1.75 m
+# over this fixture's drying flat. A generalization is licensed to shoal, so this is a tolerance
+# and not a defect; the DEEPENING direction carries no budget at any zoom (properties 3 and 4),
+# because terrain._FinerTiles clamps every tile against the shoal reduction of the zoom below it.
+COARSE_SHOAL_ALLOWANCE_M = 2.0
 
 
 def _res(zoom):
@@ -415,11 +405,14 @@ def check_bracketing(tiles, z, bands):
     from 8x block means, which move in BOTH directions against the raster's un-coarsened value, so
     no bracket exists there by design (measured 116 m on this fixture's noisy deep basin).
 
-    Both bounds are exact at the native zoom; above it they carry ZOOM_SMOOTHING_SLACK_M.
+    The deeper-than-the-band bound is exact at every zoom — a coarse tile is clamped against the
+    shoal reduction of the zoom below (property 3), and the native zoom brackets exactly, so the
+    coarse value can be no deeper than a band under its own footprint. Only the shallower-than-
+    the-band bound loosens above the native zoom, by the licensed COARSE_SHOAL_ALLOWANCE_M.
     """
     from shapely.geometry import box
     from shapely.strtree import STRtree
-    allow = 0.0 if z == CHILD_Z else ZOOM_SMOOTHING_SLACK_M
+    allow = 0.0 if z == CHILD_Z else COARSE_SHOAL_ALLOWANCE_M
     n, worst, worst_shoal = 0, 0.0, 0.0
     for sys_tag in ("m", "ft"):
         sub = bands[bands["sys"] == sys_tag]
@@ -435,26 +428,27 @@ def check_bracketing(tiles, z, bands):
             assert len(under), \
                 f"z{z} {sys_tag} row {row} col {col}: charted {v} m with no depare band beneath it"
             lo, hi = float(drval1[under].min()), float(drval2[under].max())
-            assert -v <= hi + allow + 1e-6, \
+            assert -v <= hi + 1e-6, \
                 (f"z{z} {sys_tag} row {row} col {col}: charted {-v:.3f} m is DEEPER than the deepest "
-                 f"band under it ({hi} m) by more than the per-zoom smoothing slack ({allow} m)")
+                 f"band under it ({hi} m) — the raster may never chart past its own depth areas")
             assert -v >= lo - _quant_step(v, z) - allow - 1e-6, \
                 (f"z{z} {sys_tag} row {row} col {col}: charted {-v:.3f} m is shallower than the "
-                 f"shoalest band under it ({lo} m) by more than the per-zoom smoothing slack ({allow} m)")
+                 f"shoalest band under it ({lo} m) by more than the coarse generalization is "
+                 f"licensed to shoal ({allow} m)")
             worst = max(worst, -v - hi)
             worst_shoal = max(worst_shoal, lo - _quant_step(v, z) + v)
             n += 1
     print(f"  z{z} bracketing ok — {n} charted depths lie inside their ladder's bands; worst "
-          f"{worst:.2f} m deeper / {worst_shoal:.2f} m shoaler than the bands (budget {allow:.1f} m)")
+          f"{worst:.2f} m deeper (budget 0) / {worst_shoal:.2f} m shoaler (budget {allow:.1f} m)")
 
 
 def check_zoom_monotone(fine, coarse, z):
-    """3. Zooming out must not deepen — the root cause behind ZOOM_SMOOTHING_SLACK_M.
+    """3. Zooming out must not deepen, at zero tolerance.
 
-    The coarse tile's value against the SHOALEST water value the fine tiles hold under it, which is
-    what the mosaic's class-aware reduction picks out of the same block. Both are shoal-biased
-    against the source, so neither is unsafe; what this measures is how far the served pyramid
-    contradicts itself between adjacent zooms.
+    The coarse tile's value against the SHOALEST water value the fine tiles hold under it — which
+    is exactly the reduction terrain._FinerTiles clamps the coarse render against, and the encode
+    only ever rounds shoal-ward from there, so any deepening at all means the clamp did not reach
+    that tile (a finer stem missing from the render's inputs, or the cascade mis-derived).
     """
     span = 2 ** (CHILD_Z - ANCHOR.z)
     f = np.empty((CORE, CORE))
@@ -474,11 +468,10 @@ def check_zoom_monotone(fine, coarse, z):
                 coarse[(z, ANCHOR.x * cspan + i, ANCHOR.y * cspan + j)]
     deepened = (c < 0) & wet & (c < shoalest - 1e-6)
     worst = float(np.max((shoalest - c)[deepened])) if deepened.any() else 0.0
-    assert worst <= ZOOM_SMOOTHING_SLACK_M, \
+    assert not deepened.any(), \
         (f"z{z} charts up to {worst:.2f} m DEEPER than the shoalest water z{CHILD_Z} holds under it "
-         f"— zooming out must not deepen (budget {ZOOM_SMOOTHING_SLACK_M} m)")
-    print(f"  z{z} vs z{CHILD_Z}: {int(deepened.sum())} of {int((wet & (c < 0)).sum())} water px "
-          f"deepen on zoom-out, worst {worst:.2f} m (budget {ZOOM_SMOOTHING_SLACK_M} m)")
+         f"over {int(deepened.sum())} px — zooming out must not deepen")
+    print(f"  z{z} vs z{CHILD_Z}: 0 of {int((wet & (c < 0)).sum())} water px deepen on zoom-out")
 
 
 def check_channel(tiles, z, water):
