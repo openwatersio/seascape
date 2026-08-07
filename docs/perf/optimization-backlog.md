@@ -386,12 +386,17 @@ mosaic_tile content-hash guard above).
    are not rule inputs, and deliberate Dockerfile changes bump the affected rules' `version`
    params (mapping documented in the Dockerfile stanzas). Remaining: scope MASKS to
    intersecting tiles.
-4. **Serial-tail box right-sizing**: the vector phase measured 6–9 GiB at 1–6 cores — a CX53
-   (€0.047/hr) instead of the ccx63 (€1.37/hr post-reprice) if the tail survives sharding.
-   Update 2026-07-29: the sharded tail is measured and it is not the vector phase — cells run
-   2–3 min overlapped mid-build; the real tail is the z15 depare residue, which is memory-bound,
-   not box-class-bound and now addressed by the priority bands + fitted reservations (see
-   optimization-history.md). Re-check the tail shape on the next planet run.
+4. **Serial-tail box right-sizing — landed structurally 2026-08-07**: `build.yml` calls
+   `build-phase.yml` twice, so the serial bundle rules (`vector_shallow`, `vector_join`,
+   `vector_selfcheck`, `terrain_planet_bundle`, the `overlay_bundle` fan, `publish_mosaic`,
+   `stage_build`) run on their own ccx33 after the wide phase's ccx63 is destroyed. The saving is
+   `tail_hours x (ccx63 rate - ccx33 rate)`; the wide phase pays one extra boot (~3–4 min) and one
+   extra DAG plan. Still open: measure `tail_hours` on the next planet run and decide whether the
+   tail box can drop further (the vector phase measured 6–9 GiB at 1–6 cores, which a CX53 at
+   €0.047/hr would carry, against the ccx63's €1.37/hr post-reprice). The 2026-07-29 measurement
+   stands — the sharded vector cells run 2–3 min overlapped mid-build, so they stay in the wide
+   phase, and the real long tail is the z15 depare residue, which is memory-bound and belongs on
+   the big box.
 5. **Coverage-safe pre-generalization for the bundle** — the depare pipeline now
    coverage-simplifies bands to the S-58 floor in shapely before tippecanoe (the marsh item
    above), which delivers most of what the `ST_CoverageSimplify` prototype was after. Re-profile

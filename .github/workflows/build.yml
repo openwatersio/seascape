@@ -1,17 +1,28 @@
 name: Build
 
-# Runs the planet build on ONE ephemeral Hetzner box against the persistent store volume, in ONE
-# Snakemake invocation over ONE DAG: `snakemake bundles publish_mosaic`. The `cover` checkpoint
-# runs first (the covering, from the volume's canonical registrations), then the graph
-# re-evaluates into the per-stem mosaic → forks → bundles → publish. No fetch runs: every source
-# byte streams from R2 via /vsicurl (SOURCE_VSI_BASE), and cover is up-to-date on a warm volume,
-# so its stage-1 producers never fire.
+# Runs the build against the persistent store volume as TWO Snakemake invocations over ONE DAG,
+# one per ephemeral box (build-phase.yml holds the boot/attach/teardown machinery):
+#
+#   build-wide — the dispatched server_type (ccx63 for a planet run), target `prebundle`: the
+#     `cover` checkpoint, then every parallel job (merges → forks → terrain renders → per-cell
+#     vector archives → mosaic index). This is the whole DAG except its serial finish.
+#   build-tail — a ccx33, targets `bundles publish_mosaic stage_build vector_selfcheck`: the
+#     singleton tippecanoe/pmtiles-merge/upload rules, which are serial and IO-bound and would
+#     otherwise hold the big box idle for hours. The wide phase's outputs re-plan as current at
+#     the invocation boundary, so this replans to exactly the tail.
+#
+# `needs: build-wide` is the failure gate — a red wide phase skips the tail entirely — and, since
+# a called workflow completes only once its own teardown job has, it is also the volume handoff:
+# the tail cannot attach until the wide box is gone.
+#
+# No fetch runs: every source byte streams from R2 via /vsicurl (SOURCE_VSI_BASE), and cover is
+# up-to-date on a warm volume, so its stage-1 producers never fire.
 #
 # Every job runs isolated with a benchmark: directive, so per-tile max-RSS lands in the box's
-# local-disk scratch (TMP) and ships as an artifact. Tiles are plain-named on the volume; publish_mosaic
-# content-addresses them to R2 under hashed names with a CANDIDATE pointer (index + gti) — the
-# serving pointer mosaic.gti is never written from here, so serving state is structurally
-# untouchable.
+# local-disk scratch (TMP) and ships as a per-phase artifact. Tiles are plain-named on the volume;
+# publish_mosaic content-addresses them to R2 under hashed names with a CANDIDATE pointer
+# (index + gti) — the serving pointer mosaic.gti is never written from here, so serving state is
+# structurally untouchable.
 #
 # A warm volume is assumed: the fetch/prep rules now live in the same graph, so a MISSING
 # registration would let cover cascade into them. The step guards refuse a blank volume / absent
@@ -34,7 +45,7 @@ on:
         type: boolean
         default: false
       server_type:
-        description: "Hetzner type — ccx33 (8/32) fits incremental/bundle-tail builds; pick ccx63 (48/192) for wide runs (cold builds, big invalidations)"
+        description: "Hetzner type for the WIDE phase — ccx33 (8/32) fits incremental builds; pick ccx63 (48/192) for wide runs (cold builds, big invalidations). The bundle tail always runs on a ccx33."
         required: false
         default: ccx33
       snakemake_args:
@@ -42,34 +53,20 @@ on:
         required: false
         default: ""
       max_jobs:
-        description: "Scope gate: dry-run first and abort if the planned job count exceeds this or is zero (empty = no gate). State the expected DAG size here so a planner surprise dies in minutes, not on box time."
+        description: "Scope gate on the WIDE phase: dry-run first and abort if the planned job count exceeds this or is zero (empty = no gate). State the expected DAG size here so a planner surprise dies in minutes, not on box time."
         required: false
         default: ""
       targets:
-        description: "Snakemake targets (default: the full build). e.g. soundings_all for an isolated leaf-product rebuild that must not cascade."
+        description: "Snakemake targets (empty = the standard two-phase build). Naming targets, e.g. soundings_all for an isolated leaf-product rebuild that must not cascade, runs them WHOLE on the dispatched server_type with no bundle tail."
         required: false
-        default: "bundles publish_mosaic stage_build vector_selfcheck"
+        default: ""
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
-  SERVER_TYPE: ${{ github.event.inputs.server_type }}
-  SERVER_IMAGE: ubuntu-24.04
-  SERVER_LOCATION: fsn1
-  # The persistent store volume: reads the canonical stage-1 store and adds store/mosaic/.
-  STORE_VOLUME: seascape-store
-  STORE_VOLUME_GB: "750"
-  NAME: seascape-build-${{ github.run_id }}
-  # The publish rule content-addresses tiles to this bucket and stamps the CANDIDATE index/GTI
-  # with these public URLs (mosaic.public_base); the serving pointer is never written from here.
-  DATA_BUCKET: data
-  PUBLIC_BASE: https://data.openwaters.io/bathymetry
-  # DEPARE is gated by the `depare` dispatch input, not a workflow-level env: the enable value
-  # must be EMPTY (build.smk treats any non-empty SKIP_DEPARE as skip), which a GitHub Actions
-  # `&& '' || '1'` ternary can't produce (empty is falsy → always yields '1'). So the build step
-  # exports SKIP_DEPARE=1 unless the input is set. See docs/perf/optimization-backlog.md.
 
 # One store-mutating workflow at a time, globally: builds, sources runs, and GC share this
-# group. NOTE: a second queued dispatch EVICTS the first — one dispatch at a time.
+# group, and a run-level group covers every job of a called workflow — so both phases of a build
+# hold it. NOTE: a second queued dispatch EVICTS the first — one dispatch at a time.
 concurrency:
   group: r2-store
   cancel-in-progress: false
@@ -101,421 +98,43 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # Boot the Hetzner box, register it as a self-hosted runner, attach the store volume.
-  create-runner:
-    runs-on: ubuntu-latest
-    permissions: { contents: read, statuses: write }
-    outputs:
-      label: ${{ steps.runner.outputs.label }}
-      server_id: ${{ steps.runner.outputs.server_id }}
-      ip: ${{ steps.attach.outputs.ip }}
-    steps:
-      # The runner action takes a numeric SSH key ID only; resolve the friendlier key NAME
-      # in vars.HCLOUD_SSH_KEY (empty var -> "null" = no key).
-      - name: Resolve SSH key id
-        id: sshkey
-        env:
-          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
-          KEY_NAME: ${{ vars.HCLOUD_SSH_KEY }}
-        run: |
-          set -euo pipefail
-          id=null
-          if [ -n "$KEY_NAME" ]; then
-            id=$(curl -fsS -H "Authorization: Bearer $HCLOUD_TOKEN"               "https://api.hetzner.cloud/v1/ssh_keys?name=$KEY_NAME" | jq -r '.ssh_keys[0].id // "null"')
-          fi
-          echo "id=$id" >> "$GITHUB_OUTPUT"
-      - name: Create runner
-        id: runner
-        uses: Cyclenerd/hcloud-github-runner@v1.4.1
-        with:
-          mode: create
-          github_token: ${{ secrets.RUNNER_PAT }}
-          hcloud_token: ${{ secrets.HCLOUD_TOKEN }}
-          name: ${{ env.NAME }}
-          server_type: ${{ env.SERVER_TYPE }}
-          location: ${{ env.SERVER_LOCATION }}
-          image: ${{ env.SERVER_IMAGE }}
-          # Repo variable HCLOUD_SSH_KEY = an SSH key ID/name in the hcloud project; lets
-          # operators (and Claude, via the root@<ip> in the build status) ssh in for live diagnosis.
-          ssh_key: ${{ steps.sshkey.outputs.id }}
-          volume: "null"
-      # The store volume holds the canonical stage-1 sources the build reads FROM — attached
-      # for bbox smokes too: the build always reads the volume's catalogs and writes plain-named
-      # tiles beside them.
-      - name: Attach persistent store volume
-        id: attach
-        env:
-          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
-          SERVER_ID: ${{ steps.runner.outputs.server_id }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          curl -fsSL -o /tmp/hcloud.tgz https://github.com/hetznercloud/cli/releases/download/v1.66.0/hcloud-linux-amd64.tar.gz
-          echo "8b1a8598858232c491f58cbf65ce1bd0ec6f725114bb62ec967a20ab03e29a86  /tmp/hcloud.tgz" | sha256sum -c
-          tar xzf /tmp/hcloud.tgz -C /tmp hcloud
-          sudo mv /tmp/hcloud /usr/local/bin/
-          hcloud volume attach "$STORE_VOLUME" --server "$SERVER_ID"
-          echo "volume $STORE_VOLUME attached to server $SERVER_ID"
-          ip=$(hcloud server ip "$SERVER_ID")
-          echo "ip=$ip" >> "$GITHUB_OUTPUT"
-          # One `build` status for the whole lifecycle: seed it pending here (root@<ip> lets
-          # operators ssh in for live diagnosis), the heartbeat carries it, the final step
-          # flips it to success with the bundle URL.
-          curl -fsS -X POST -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
-            -d "{\"state\":\"pending\",\"context\":\"build\",\"description\":\"root@$ip · booting\",\"target_url\":\"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\"}" \
-            >/dev/null
-
-  # The build: covering (catalogs invocation) then bundles + publish (build invocation), natively
-  # on the box. timeout-minutes REQUIRED even self-hosted (default per-job timeout is 360 min).
-  build:
-    needs: [image, create-runner]
-    runs-on: ${{ needs.create-runner.outputs.label }}
-    timeout-minutes: 2880
+  build-wide:
+    needs: image
+    uses: ./.github/workflows/build-phase.yml
+    secrets: inherit
     permissions: { contents: read, packages: read, statuses: write }
-    # R2 via rclone's env-var remote (remote "r2" exists ambiently in every rclone call) —
-    # scoped to this job, the only one that publishes.
-    env:
-      RCLONE_CONFIG_R2_TYPE: s3
-      RCLONE_CONFIG_R2_PROVIDER: Cloudflare
-      RCLONE_CONFIG_R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
-      RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-      RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
-      # The build/<sha>/ release prefix (stage_build); dispatch-only, so unset elsewhere.
-      # A bbox run stages under <sha>-bbox: previewable at the same Worker route, invisible
-      # to release.yml (which promotes the bare sha), so a regional stage can never ship.
-      SHA: ${{ github.event.inputs.bbox && format('{0}-bbox', github.sha) || github.sha }}
-    steps:
-      - uses: actions/checkout@v6
-      # Idempotent box setup — docker + the store volume mount. STATE is the volume root
-      # (contains store/ and .snakemake/), mounted whole so both persist. A build assumes a
-      # warm volume — refuse to run against a blank one (that's sources.yml's job).
-      - name: Set up box (docker + store volume)
-        run: |
-          set -euo pipefail
-          export DEBIAN_FRONTEND=noninteractive
-          command -v docker >/dev/null || curl -fsSL https://get.docker.com | sh
-          if ! mountpoint -q /mnt/seascape-store; then
-            dev=""
-            for _ in $(seq 1 30); do
-              for d in /dev/disk/by-id/scsi-0HC_Volume_*; do [ -e "$d" ] && dev="$d" && break; done
-              [ -n "$dev" ] && break
-              sleep 2
-            done
-            [ -n "$dev" ] || { echo "store volume device never appeared — attach step skipped or volume held elsewhere?" >&2; exit 1; }
-            mkdir -p /mnt/seascape-store
-            mount -o noatime "$dev" /mnt/seascape-store
-            # A Hetzner volume resize grows the block device, not the filesystem — grow it to
-            # match (idempotent: a no-op at full size). Without this the extra capacity is invisible
-            # and the headroom guard still trips at the old size.
-            if [ "$(blkid -o value -s TYPE "$dev" 2>/dev/null)" = xfs ]; then
-              command -v xfs_growfs >/dev/null || { apt-get update -qq && apt-get install -y -qq xfsprogs; }
-              xfs_growfs /mnt/seascape-store || true
-            else
-              resize2fs "$dev" || true  # ext4: online-grow to fill the resized device
-            fi
-          fi
-          STATE=/mnt/seascape-store
-          # Merge-job tmp dirs are transient (each job recreates its own); a killed run
-          # strands them at planet width, which can fill the volume entirely.
-          rm -rf "$STATE"/store/aggregation/*-tmp "$STATE"/store/mosaic/publish
-          # Where the bytes live — first thing to read when the headroom guard trips.
-          df -h "$STATE" | tail -1
-          du -x -BG -d1 "$STATE/store" 2>/dev/null | sort -rn | head -12
-          du -x -BG -d1 "$STATE/store/aggregation" 2>/dev/null | sort -rn | head -4
-          [ -d "$STATE/store/source" ] || { echo "volume has no store/source — run sources.yml first (a build assumes a warm volume)" >&2; exit 1; }
-          [ -f "$STATE/store/aggregation/covering.txt" ] || { echo "volume has no covering — run sources.yml first (the covering is a stage-1 product; builds consume it read-only)" >&2; exit 1; }
-          echo "STATE=$STATE" >> "$GITHUB_ENV"
-      - uses: ./.github/actions/ghcr-login
-      # A SIGKILLed previous run leaves .snakemake locks on the volume; safe to clear here —
-      # the r2-store concurrency group guarantees no other lane run holds the store. One
-      # unlock covers both invocations (same workdir, same lock directory).
-      - name: Unlock a stale workflow lock (crash recovery)
-        # TMP is the box's LOCAL-disk per-run scratch (docker.sh mounts it at /app/tmp): logs +
-        # benchmarks land here, off the network store volume. Step-scoped, not job-wide — a
-        # job-wide TMP would silently redirect other steps' Python tempfile writes.
-        env:
-          TMP: /var/tmp/seascape-tmp
-        run: |
-          mkdir -p "$TMP"  # first snakemake step; the mount source must exist before docker run
-          ./docker.sh snakemake --unlock --config workdir=/app/state tmp=/app/tmp
-      - name: Hot landmask masks on NVMe
-        # Every fork's clamp rasterize range-reads land/water FGBs thousands of times; serve
-        # them from local NVMe via a bind mount so the DAG sees identical paths AND mtimes
-        # (cp -p) — provenance untouched. The bind must land before docker run so the
-        # container's /app/state view includes it. Rebuilt masks (rare) write to the NVMe
-        # copy; the sync-back step below persists them to the volume.
-        run: |
-          src=/mnt/seascape-store/store/landmask
-          mkdir -p /var/tmp/seascape-landmask
-          # Per-FILE binds, not a directory shadow: the dir also holds the landmask rule's
-          # inputs (e.g. land-polygons-split-4326/), which must stay reachable. nsenter into
-          # PID 1's mount namespace: the runner service has its own, and a bind made there
-          # is invisible to the docker daemon (and thus every container).
-          for f in "$src"/*.fgb; do
-            [ -f "$f" ] || continue
-            cp -p "$f" /var/tmp/seascape-landmask/
-            nsenter -t 1 -m mount --bind "/var/tmp/seascape-landmask/$(basename "$f")" "$f"
-            nsenter -t 1 -m mountpoint -q "$f" || { echo "bind failed for $f" >&2; exit 1; }
-            echo "serving $(basename "$f") from NVMe"
-          done
-      - name: Build the mosaic (Snakemake)
-        env:
-          # Dispatch inputs reach the shell as env vars, never interpolated into a shell line.
-          BBOX: ${{ github.event.inputs.bbox }}
-          INPUT_FORCE: ${{ github.event.inputs.force }}
-          INPUT_DEPARE: ${{ github.event.inputs.depare }}
-          INPUT_ARGS: ${{ github.event.inputs.snakemake_args }}
-          INPUT_MAX_JOBS: ${{ github.event.inputs.max_jobs }}
-          INPUT_TARGETS: ${{ github.event.inputs.targets }}
-          GH_TOKEN: ${{ github.token }} # the progress-heartbeat gh api calls
-          BOX_IP: ${{ needs.create-runner.outputs.ip }} # carried in the build status desc
-          # Raw sources (CUDEM/S-102) stream from the public mirror; processed sources
-          # read the volume (source_path: a local file wins per file). Curl caches sized to
-          # fit inside the global reserve below.
-          SOURCE_VSI_BASE: /vsicurl/https://data.openwaters.io/bathymetry/source
-          CPL_VSIL_CURL_CHUNK_SIZE: "5242880"
-          CPL_VSIL_CURL_CACHE_SIZE: "268435456"
-          VSI_CACHE: "TRUE"
-          VSI_CACHE_SIZE: "33554432"
-          # LOCAL-disk per-run scratch (docker.sh mounts it at /app/tmp): logs + benchmarks land
-          # here, off the network store volume. Step-scoped to avoid redirecting other steps'
-          # Python tempfile writes.
-          TMP: /var/tmp/seascape-tmp
-        run: |
-          set -euo pipefail
-          mkdir -p "$TMP"
-          # DEPARE gate: skip unless the depare input is set. docker.sh forwards SKIP_DEPARE via
-          # `-e SKIP_DEPARE`, so an unset var (depare=true) reaches the container as enabled.
-          if [ "$INPUT_DEPARE" != "true" ]; then export SKIP_DEPARE=1; fi
-          # Per-gdal_contour bound for depare tiles: p99 of completed tiles is ~40 min, so only
-          # the pathological deep/complex stems hit this — they retry coarser instead of pinning
-          # a core for 8 h+ (depare_run.tile).
-          export DEPARE_TIMEOUT="${DEPARE_TIMEOUT:-3600}"
-          # Patched-appender polygon contour tool (Dockerfile; exact-geometry-equivalent to
-          # gdal_contour -p, near-linear on marsh-coast ring counts that make stock quadratic).
-          export DEPARE_CONTOUR_BIN="${DEPARE_CONTOUR_BIN:-contour-p}"
-          # Per-phase wall marks in every depare log (depare_run._mark) — ~17 lines per stem,
-          # and the only way to attribute a slow stem to its phase without a local reproduction.
-          export DEPARE_TIMING="${DEPARE_TIMING:-1}"
-          # Disk headroom: warn-only — the disk_mb budget below is the admission control that
-          # actually bounds concurrent tmp usage to real free space, and a rebuild that rewrites
-          # layers in place can legitimately start below the comfortable floor.
-          free_gb=$(df -BG --output=avail "$STATE" | tail -1 | tr -dc '0-9')
-          [ "$free_gb" -ge 50 ] || echo "WARNING: only ${free_gb}G free on the store volume — tight; the disk budget will throttle concurrency" >&2
-          # Swap SAFETY NET on the LOCAL NVMe root disk (never the store volume) — insurance,
-          # not headroom: the mem_gb budget stays sized to physical RAM, and reservations sit
-          # ~10% over measured max, so this only turns a rare over-peak from an arbitrary
-          # OOM kill into a brief spill. swappiness=10 keeps the working set in RAM.
-          if [ ! -e /swapfile ]; then
-            fallocate -l 64G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=65536
-            chmod 600 /swapfile
-            mkswap /swapfile
-            swapon /swapfile
-            sysctl vm.swappiness=10
-          fi
-          # Global budget: RAM minus a reserve (OS + Snakemake + curl/VSI caches +
-          # page-cache headroom) that SCALES with the box — an eighth of RAM, floor 4 GB:
-          # ccx33 -> 28 GB budget (sources.yml's proven number), ccx63 -> 168 GB. A flat
-          # big-box reserve on a small box starves merge concurrency for no protection.
-          # Scheduling only — no per-job kernel cap.
-          total_gb=$(awk '/MemTotal/ {print int($2/1024/1024)}' /proc/meminfo)
-          reserve_gb=$((total_gb / 8)); [ "$reserve_gb" -ge 4 ] || reserve_gb=4
-          budget_gb=$((total_gb - reserve_gb))
-          # --cores 2x vCPUs: width for IO-bound tiles (streamed source reads, Ceph-volume
-          # writes) — heavy merges are admitted by the mem_gb budget long before cores bind,
-          # so the extra width goes to light deep-ocean tiles backfilling blocked IO time.
-          # Same knob sources.yml uses for its fetches (16 on 8 vCPUs).
-          cores=$(( $(nproc) * 2 ))
-          # Jobs declare disk_mb for their tmp working set, which lives on box-local NVMe
-          # (merge scratch via utils.merge_scratch -> the container tmpdir), not the store
-          # volume — budget against the NVMe root's free space (80%, minus 20 G for docker
-          # layers/logs). The store volume no longer hosts transient scratch, so its free
-          # space stops throttling merge concurrency.
-          avail_mb=$(df -BM --output=avail / | tail -1 | tr -dc '0-9')
-          disk_budget_mb=$(( (avail_mb - 20480) * 8 / 10 ))
-          echo "box: ${total_gb} GB RAM, --cores ${cores} -> budget ${budget_gb} GB (reserve ${reserve_gb} GB)"
-          force=()
-          if [ "$INPUT_FORCE" = "true" ]; then force=(-F); fi
-          # Extra args reach the command as separate words; reject anything shell-active.
-          case "$INPUT_ARGS" in *[!-A-Za-z0-9_=\ .]*) echo "invalid snakemake_args" >&2; exit 1 ;; esac
-          read -r -a extra <<<"$INPUT_ARGS"
-          # extra/force ride BEFORE --config: a bare extra target after it is swallowed
-          # as a config pair.
-          # Progress heartbeat: the run log at planet scale exceeds what the GitHub UI
-          # serves, so the step-counter also goes out as a commit status every minute.
-          buildlog=/var/tmp/build-progress.log
-          : > "$buildlog"
-          # set +e: the step's set -e is inherited and the first no-match grep (during DAG
-          # build) would kill the loop — exactly how the heartbeat silently died before.
-          ( set +e
-            while sleep 60; do
-              # memory/swap time series (Hetzner's metrics API has neither) — logs/ ships in the artifact
-              mkdir -p "$TMP/logs"
-              free -m | awk -v t="$(date -u +%FT%TZ)" 'NR==2{u=$3;a=$7} NR==3{print t" used_mb="u" avail_mb="a" swap_used_mb="$3}' \
-                >> "$TMP/logs/memory.log"
-              # The seascape logger closes every job line with the whole counter, so the
-              # status is one grep — no step arithmetic, and `running` is exact rather than
-              # inferred from unmatched jobids.
-              p=$(grep -oE "\[[0-9]+/[0-9]+, [0-9]+%, [0-9]+ running\]" "$buildlog" | tail -1)
-              [ -n "$p" ] || continue
-              p=${p#[}; p=${p%]}
-              # curl, not gh: the self-hosted box has no gh CLI. Failures land in the
-              # artifact via heartbeat.log instead of /dev/null.
-              curl -fsS -X POST -H "Authorization: Bearer $GH_TOKEN" \
-                -H "Accept: application/vnd.github+json" \
-                "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
-                -d "{\"state\":\"pending\",\"context\":\"build\",\"description\":\"root@$BOX_IP · $p\",\"target_url\":\"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\"}" \
-                >/dev/null 2>>"$TMP/logs/heartbeat.log"
-            done ) &
-          hb=$!
-          trap 'kill "$hb" 2>/dev/null || true' EXIT
-          # A hard teardown can strand unreadable tiles that look done (mtime valid, data lost);
-          # drop them so the engine re-merges instead of poisoning downstream VRT reads.
-          # cd /app/state: docker.sh starts in /app; only snakemake chdirs to the state mount
-          # Tool versions into the run log: toolchain skew is diagnosable, never a rerun trigger.
-          ./docker.sh run sh -c "gdal-config --version; tippecanoe --version 2>&1 | head -1" || true
-          ./docker.sh run sh -c "cd /app/state && uv run --project /app /app/pipelines/mosaic.py verify"
-          # ONE invocation, one DAG: the `cover` checkpoint runs first, then the build
-          # re-evaluates into bundles + the mosaic publish (publish_mosaic — `publish` is the
-          # per-source push in publish.smk, run by sources.yml). stage_build always runs; a
-          # bbox run stages under build/<sha>-bbox (see SHA above), so the regional archives
-          # are previewable but can never be promoted by release.yml.
-          case "$INPUT_TARGETS" in *[!-A-Za-z0-9_\ ]*) echo "invalid targets" >&2; exit 1 ;; esac
-          read -r -a targets <<<"${INPUT_TARGETS:-bundles publish_mosaic stage_build vector_selfcheck}"
-          # Scope gate: the dispatcher states the expected DAG size; if the planner disagrees
-          # (a staleness-trigger surprise: param re-key, rename cascade, temp regeneration —
-          # or a zero-job plan from a mis-scoped isolation target), the run aborts on the
-          # dry-run — before any box-scale execution.
-          case "$INPUT_MAX_JOBS" in *[!0-9]*) echo "invalid max_jobs" >&2; exit 1 ;; esac
-          if [ -n "$INPUT_MAX_JOBS" ]; then
-            ./docker.sh snakemake "${targets[@]}" "${extra[@]}" "${force[@]}" \
-              -n \
-              --cores "$cores" --resources mem_gb="$budget_gb" disk_mb="$disk_budget_mb" \
-              --config workdir=/app/state tmp=/app/tmp > /var/tmp/scope-gate.txt 2>&1 \
-              || { tail -50 /var/tmp/scope-gate.txt >&2; echo "scope-gate dry-run failed" >&2; exit 1; }
-            sed -n '/^Job stats/,/^total/p' /var/tmp/scope-gate.txt | tail -40
-            total=$(awk '$1=="total"{n=$2} END{print n+0}' /var/tmp/scope-gate.txt)
-            if [ "$total" -gt "$INPUT_MAX_JOBS" ]; then
-              echo "planned $total jobs exceeds max_jobs=$INPUT_MAX_JOBS — scope mismatch; sample reasons:" >&2
-              grep -h "reason:" /var/tmp/scope-gate.txt | sed 's/[0-9]\{1,\}//g' | sort | uniq -c | sort -rn | head -12 >&2
-              exit 1
-            fi
-            if [ "$total" -eq 0 ]; then
-              echo "planner found NOTHING to do for '${targets[*]}' — a scope-stating dispatch expects work; if a no-op is intentional, dispatch without max_jobs" >&2
-              exit 1
-            fi
-            echo "scope gate ok: $total planned jobs <= max_jobs=$INPUT_MAX_JOBS"
-          fi
-          # No --prioritize: it flattens the index's whole merge chain to one priority, which
-          # lets the scheduler pack small merges ahead of the heavy ones. build.smk's explicit
-          # priority bands (index > merges > vector > terrain) order the chain instead.
-          ./docker.sh snakemake "${targets[@]}" "${extra[@]}" "${force[@]}" \
-            --keep-going --rerun-incomplete \
-            --logger seascape --logger-seascape-events /app/tmp/logs/events.jsonl \
-            --cores "$cores" --resources mem_gb="$budget_gb" disk_mb="$disk_budget_mb" \
-            --config workdir=/app/state tmp=/app/tmp 2>&1 | tee "$buildlog"
-      # Close the `build` status to success so it never lingers at pending, pointing at the
-      # published prefix — build/<sha> for planet, build/<sha>-bbox for a bbox preview.
-      - name: Sync rebuilt masks back to the volume
-        if: always()
-        # Unmount first: writes can't reach the shadowed volume dir while the bind is up.
-        # cp -pu persists only files the run actually rebuilt (newer mtime); a no-op else.
-        run: |
-          src=/mnt/seascape-store/store/landmask
-          for f in "$src"/*.fgb; do
-            if nsenter -t 1 -m mountpoint -q "$f" 2>/dev/null; then
-              nsenter -t 1 -m umount "$f"
-              cp -pu "/var/tmp/seascape-landmask/$(basename "$f")" "$f" 2>/dev/null || true
-            fi
-          done
-      - name: Publish build status
-        if: success()
-        env:
-          GH_TOKEN: ${{ github.token }}
-          BBOX: ${{ github.event.inputs.bbox }}
-        run: |
-          if [ -z "$BBOX" ]; then
-            desc="published build/$GITHUB_SHA"; url="$PUBLIC_BASE/build/$GITHUB_SHA"
-          else
-            desc="published build/$GITHUB_SHA-bbox (regional preview)"; url="$PUBLIC_BASE/build/$GITHUB_SHA-bbox"
-          fi
-          curl -fsS -X POST -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
-            -d "{\"state\":\"success\",\"context\":\"build\",\"description\":\"$desc\",\"target_url\":\"$url\"}" \
-            >/dev/null
-      # Per-job wall/CPU/max-RSS from the benchmark: directives, plus per-job stderr logs —
-      # both live in the box's local-disk scratch (TMP), the durable home is this artifact.
-      - name: Upload snakemake benchmarks + logs
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: snakemake-bench-${{ github.run_id }}
-          path: |
-            /var/tmp/seascape-tmp/bench/
-            /var/tmp/seascape-tmp/logs/
-          if-no-files-found: ignore
-          retention-days: 90
+    with:
+      phase: wide
+      server_type: ${{ inputs.server_type }}
+      # A named target set has no bundle tail to hand off, and a bbox slice is small enough that a
+      # second boot costs more than the box-size delta saves — both run the whole thing here.
+      targets: ${{ inputs.targets != '' && inputs.targets || (inputs.bbox != '' && 'bundles publish_mosaic stage_build vector_selfcheck' || 'prebundle') }}
+      final: ${{ inputs.targets != '' || inputs.bbox != '' }}
+      bbox: ${{ inputs.bbox }}
+      depare: ${{ inputs.depare }}
+      force: ${{ inputs.force }}
+      snakemake_args: ${{ inputs.snakemake_args }}
+      max_jobs: ${{ inputs.max_jobs }}
 
-  # Provider-side CPU/disk/network series while the server still exists (same as sources.yml).
-  collect-metrics:
-    needs: [create-runner, build]
-    if: ${{ always() && needs.create-runner.outputs.server_id != '' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v6
-      - name: Fetch Hetzner host metrics
-        continue-on-error: true
-        env:
-          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
-          SERVER_ID: ${{ needs.create-runner.outputs.server_id }}
-        run: scripts/collect-hcloud-metrics "$SERVER_ID"
-      - name: Upload Hetzner host metrics
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: hcloud-metrics-${{ github.run_id }}-${{ needs.create-runner.outputs.server_id }}
-          path: hcloud-metrics/
-          if-no-files-found: ignore
-          retention-days: 90
-
-  # Destroy the box + deregister the runner, ALWAYS. The store volume is never deleted.
-  delete-runner:
-    needs: [create-runner, build, collect-metrics]
-    if: always()
-    runs-on: ubuntu-latest
-    permissions: { contents: read }
-    steps:
-      - name: Delete runner + server
-        if: ${{ needs.create-runner.outputs.server_id != '' }}
-        uses: Cyclenerd/hcloud-github-runner@v1.4.1
-        with:
-          mode: delete
-          github_token: ${{ secrets.RUNNER_PAT }}
-          hcloud_token: ${{ secrets.HCLOUD_TOKEN }}
-          name: ${{ env.NAME }}
-          server_id: ${{ needs.create-runner.outputs.server_id }}
-      - name: Verify no leaked resources
-        if: always()
-        env:
-          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
-        run: |
-          set -euo pipefail
-          curl -fsSL -o /tmp/hcloud.tgz https://github.com/hetznercloud/cli/releases/download/v1.66.0/hcloud-linux-amd64.tar.gz
-          echo "8b1a8598858232c491f58cbf65ce1bd0ec6f725114bb62ec967a20ab03e29a86  /tmp/hcloud.tgz" | sha256sum -c
-          tar xzf /tmp/hcloud.tgz -C /tmp hcloud
-          sudo mv /tmp/hcloud /usr/local/bin/
-          fail=0
-          if hcloud server describe "$NAME" >/dev/null 2>&1; then
-            echo "::error::leaked billable resource: Hetzner server $NAME still exists — delete it manually"
-            fail=1
-          fi
-          if hcloud volume describe "$NAME" >/dev/null 2>&1; then
-            echo "::error::leaked billable resource: Hetzner volume $NAME still exists — delete it manually"
-            fail=1
-          fi
-          exit "$fail"
+  build-tail:
+    needs: [image, build-wide]
+    if: ${{ inputs.targets == '' && inputs.bbox == '' }}
+    uses: ./.github/workflows/build-phase.yml
+    secrets: inherit
+    permissions: { contents: read, packages: read, statuses: write }
+    with:
+      phase: tail
+      # The tail is serial and IO-bound (one tippecanoe run, pmtiles concats, R2 uploads); cores
+      # and RAM past a ccx33 buy it nothing.
+      server_type: ccx33
+      targets: bundles publish_mosaic stage_build vector_selfcheck
+      final: true
+      bbox: ${{ inputs.bbox }}
+      depare: ${{ inputs.depare }}
+      force: ${{ inputs.force }}
+      snakemake_args: ${{ inputs.snakemake_args }}
+      # A job-count gate needs a number nobody can state (the overlay-cell count moves with the
+      # covering); the rule allowlist is the sharper guard — it fails on WHAT would run, not how
+      # much. `cover` is deliberately absent: a tail plan that reschedules the checkpoint hides
+      # its real size behind it, and that is exactly the case to refuse.
+      allow_rules: bundles overlay_bundle publish_mosaic stage_build terrain_planet_bundle vector_join vector_selfcheck vector_shallow

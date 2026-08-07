@@ -168,6 +168,19 @@ def main():
         assert p.returncode == 0, p.stderr
         assert job_counts(p.stdout).get("stage_build") == 1, \
             f"expected 1 stage_build job:\n{p.stdout}"
+
+        # prebundle is the wide/tail seam build.yml splits on: it must reach every parallel
+        # producer the tail reads, and NONE of the serial tail rules that run on the small box.
+        p = snakemake(d, sources_dir, "-n", "prebundle")
+        assert p.returncode == 0, p.stderr
+        counts = job_counts(p.stdout)
+        for wide in ("mosaic_tile", "mosaic_index", "contour_tile", "soundings_tile",
+                     "depare_tile", "terrain_render", "vector_cell"):
+            assert counts.get(wide, 0) > 0, f"prebundle must plan {wide}: {counts}"
+        for tail in ("vector_shallow", "vector_join", "vector_selfcheck",
+                     "terrain_planet_bundle", "overlay_bundle", "publish_mosaic",
+                     "bundles", "stage_build"):
+            assert counts.get(tail, 0) == 0, f"tail rule {tail} in the prebundle plan: {counts}"
         assert store_tree(store) == before, "a dry run must not touch the store"
     finally:
         shutil.rmtree(d, ignore_errors=True)
