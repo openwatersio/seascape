@@ -233,7 +233,10 @@ jobs:
           trap 'kill "$mem" 2>/dev/null || true' EXIT
           # Optional target args, collected into an array so an empty one contributes nothing
           # (no unquoted word-splitting) and a source id can't smuggle extra tokens.
-          extra=(--config workdir=/app/state tmp=/app/tmp)
+          # One line per job with its runtime and peak RSS, plus a JSONL event stream in the
+          # artifact; rides all three invocations, which append to the same file.
+          extra=(--logger seascape --logger-seascape-events /app/tmp/logs/events.jsonl
+                 --config workdir=/app/state tmp=/app/tmp)
           if [ -n "$INPUT_SOURCE" ]; then
             # source ids are directory names ([a-z0-9_]); reject anything else before it
             # reaches the docker/snakemake command line.
