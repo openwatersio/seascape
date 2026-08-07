@@ -101,9 +101,11 @@ def check():
     handler.emit(record(LogEvent.JOB_ERROR, level=logging.ERROR, jobid=42, rule_name="depare_tile"))
     assert len(handler.stream.getvalue().splitlines()) == before, "failure reported twice"
 
-    # Warnings survive; plain info chatter does not.
+    # Warnings reach the console and the JSONL both; a plain info line only the console.
     handler.emit(record(msg="WARNING: only 12G free", level=logging.WARNING))
     assert "only 12G free" in handler.stream.getvalue()
+    handler.emit(record(msg="Nothing to be done (all requested files are present)."))
+    assert "Nothing to be done" in handler.stream.getvalue()
 
     status = handler.status_line()
     assert "1/113" in status and "1 failed" in status, status
@@ -114,15 +116,22 @@ def check():
     assert handler.stream.getvalue().count("build summary") == 1, "rollup printed twice"
     assert "mosaic_tile" in handler.stream.getvalue()
 
-    rows = [json.loads(line) for line in open(events)]
+    with open(events) as f:
+        rows = [json.loads(line) for line in f]
     kinds = [row["event"] for row in rows]
     assert kinds == ["job_started", "job_finished", "job_error", "message"], kinds
     assert rows[0]["reason"].startswith("Updated input files"), rows[0]
     assert rows[1]["benchmark"]["max_rss"] == "7372.80", rows[1]
     assert rows[1]["duration"] >= 0, rows[1]
 
-    # A job with no benchmark file finishes cleanly rather than raising.
+    # No measurement is better than a fabricated one: a missing file, an empty file, and
+    # the header-with-no-row a killed job leaves behind all read as "nothing recorded".
     assert read_benchmark(os.path.join(tmp, "nope.tsv")) == {}
+    for content in ("", BENCHMARK.splitlines()[0] + "\n", "s\th:m:s\n0.5\n"):
+        partial = os.path.join(tmp, "partial.tsv")
+        with open(partial, "w") as f:
+            f.write(content)
+        assert read_benchmark(partial) == {}, content
 
     print("snakemake_logger_plugin_seascape: ok")
 

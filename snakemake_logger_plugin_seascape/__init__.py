@@ -108,13 +108,17 @@ def read_benchmark(path: str) -> dict[str, str]:
 
     The job process flushes this before exiting, and JOB_FINISHED fires after the
     scheduler has handled success, so it is on disk by the time this is called.
-    Anything unreadable (no benchmark: directive, a killed job) yields {}.
+    Anything short of one complete row yields {} — an OOM-killed job leaves the header
+    with no row behind it, and a half-row would report fabricated measurements for
+    exactly the job whose numbers matter most.
     """
     try:
         with open(path) as f:
-            header = f.readline().strip().split("\t")
-            values = f.readline().strip().split("\t")
+            header = f.readline().rstrip("\n").split("\t")
+            values = f.readline().rstrip("\n").split("\t")
     except OSError:
+        return {}
+    if len(values) != len(header) or not any(values):
         return {}
     return dict(zip(header, values))
 
