@@ -182,6 +182,17 @@ def _check():
                 assert step[0, 0] == 30.0, \
                     (f"level {2 ** level}: an all-land block must stay land", step[0, 0])
 
+        # The symmetric sacrifice, asserted so it is a documented trade-off rather than a
+        # surprise: an isolated land feature narrower than a block (a sea stack over deep
+        # water) is ERASED by the reduction — water wins any mixed block, at every level.
+        # The render restores it only where the OSM mask says land (terrain's <=0 nudge);
+        # over open water it is gone from coarse zooms by design, the price of channels
+        # never closing.
+        stack = np.full((8, 8), -20.0, dtype="float32")
+        stack[3, 3] = 30.0
+        eroded, _ = _reduce_ref(stack, ND, CAP)
+        assert (eroded == -20.0).all(), ("the isolated stack must erode to water", eroded)
+
         # One pixel of water through solid land, reduced by the REAL kernel to a single pixel: the
         # channel is the only water in its block at every level, and land never takes a block.
         chan = np.full((N, N), 30.0, dtype="float32")

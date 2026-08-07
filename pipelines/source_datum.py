@@ -226,6 +226,13 @@ def transform_file(filepath, negate, offset, clamp_positive=False, surface=None)
     neighbourhood a stripe cuts through: each stripe is scored one iteration late, between the
     tail of the stripe before it and the head of the one after."""
     ref = rasterio.open(surface) if surface else None
+    if ref is not None and ref.nodata is not None and np.float32(ref.nodata) != ref.nodata:
+        # reference_on honors src_nodata only when the sentinel round-trips float32 exactly
+        # (reproject on a band source matches by value; datum_grid.sample_onto documents the
+        # -88.8888 failure). A non-exact sentinel would interpolate into the correction as a
+        # height, so refuse it here rather than chart the coverage edge wrong.
+        raise ValueError(f"{surface}: nodata {ref.nodata} is not float32-exact — "
+                         "reference_on would interpolate it into the correction")
     corrected = valid = 0
     try:
         with rasterio.open(filepath) as src:

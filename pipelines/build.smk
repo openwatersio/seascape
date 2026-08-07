@@ -161,6 +161,9 @@ MERGE_CFG = json.dumps({
     "macrotile_z": utils.macrotile_z,
     "macrotile_buffer_3857": utils.macrotile_buffer_3857,
     "num_overviews": utils.num_overviews,
+    # The class-aware reduction branches on the cap, so it shapes mosaic-tile pyramid
+    # VALUES (which the aggregation warp reads back), not just display classification.
+    "drying_cap": pipeline_config.DRYING_CAP,
 }, sort_keys=True)
 
 

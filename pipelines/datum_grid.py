@@ -541,7 +541,10 @@ def build(bundle, out=OUT):
               "bounds": list(bounds), "size": [width, height], "bundle": BUNDLE_URL}
 
     tmp = out + ".tmp.tif"
-    subprocess.run(["gdal_translate", "-of", "COG", *COG_OPTS, "-co", "PREDICTOR=3",
+    # OVERVIEWS=NONE: nothing reads a pyramid of the reference (reference_on and the checks
+    # read full res), and COG_OPTS no longer suppresses overviews itself.
+    subprocess.run(["gdal_translate", "-of", "COG", *COG_OPTS, "-co", "OVERVIEWS=NONE",
+                    "-co", "PREDICTOR=3",
                     merged, tmp], check=True)
     # Gate publication on the benchmark stations AND on coverage: a formula/mosaic/input
     # regression must fail the build here, never ship a surface that silently mis-corrects
@@ -791,6 +794,12 @@ def main():
                                          "(default: fetch and extract the pinned zip)")
     parser.add_argument("--out", default=OUT)
     args = parser.parse_args()
+    # This module composes exactly one surface. The datum_surface rule templates --out from
+    # its {name} wildcard, so a second registered surface would silently receive THIS
+    # surface's content — refuse any name this build doesn't produce.
+    if os.path.basename(args.out) != os.path.basename(OUT):
+        sys.exit(f"datum_grid composes {os.path.basename(OUT)}, not "
+                 f"{os.path.basename(args.out)} — a new surface needs its own composer")
     bundle = args.bundle or harvest(STORE)
     build(bundle, args.out)
 

@@ -272,6 +272,9 @@ def _build_planet(stems, out_tmp):
     utils.run_command(
         f"gdalbuildvrt -q -overwrite -resolution user -tr {res8} {res8} -vrtnodata {NODATA} "
         f"-input_file_list {listing} {vrt}")
+    # gdalbuildvrt skips an unopenable input at exit 0; a dropped tile here is a nodata hole
+    # z0-z7 renders resolve to shoreline-coloured 0, with nothing naming the tile.
+    aggregation_reproject.assert_vrt_complete(vrt, [tile_artifact(s) for s in stems])
     utils.run_command(
         f"GDAL_CACHEMAX=512 gdal_translate -q -of GTiff -a_nodata {NODATA} "
         "-co BIGTIFF=YES -co COMPRESS=ZSTD -co PREDICTOR=3 "

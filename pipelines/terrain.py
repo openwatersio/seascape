@@ -246,7 +246,12 @@ def _encode_tile(i, j, src_path, halo, out_webp, cz, mask_path=None, finer=None,
         drying = pos & ~land & (data <= config.DRYING_CAP)
         data[pos] = LAND
         data[drying] = DRYING
-        data[(data == 0) & land] = LAND
+        # <=0, not ==0: the class-aware reduction hands a mixed block to its water, so a
+        # land feature narrower than a block (sea stack, cliff toe) reads negative at coarse
+        # zooms and would chart as depth. OSM land is authoritative here exactly as it is for
+        # the vector layers (clamp_dem_to_land, the depare land cut); a genuine below-datum
+        # bed is on the water side of the mask and untouched.
+        data[(data <= 0) & land] = LAND
     else:
         data[pos] = LAND  # maskless (coarse stems / no feed): drying is sub-pixel there anyway
     utils.save_terrarium_tile(data, out_webp)  # utils parses zoom from the {cz}-{x}-{y}.webp name
