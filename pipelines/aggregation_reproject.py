@@ -415,7 +415,7 @@ def translate(in_filepath, out_filepath):
     # inherits the profile into the merged DEM, so compressing here propagates downstream.
     # IF_SAFER, not IF_NEEDED: with compression IF_NEEDED never fires, and z15 grids
     # whose ZSTD output still crosses 4 GB die mid-write in TIFFAppendToStrip.
-    _run("GDAL_CACHEMAX=512 gdal_translate -of COG -co BIGTIFF=IF_SAFER -co ADD_ALPHA=YES "
+    _run("gdal_translate -of COG -co BIGTIFF=IF_SAFER -co ADD_ALPHA=YES "
          "-co OVERVIEWS=NONE -co SPARSE_OK=YES -co BLOCKSIZE=512 "
          f"-co COMPRESS=ZSTD -co NUM_THREADS=ALL_CPUS {in_filepath} {out_filepath}",
          f"gdal_translate {in_filepath}")

@@ -125,7 +125,7 @@ def _read_window(anchor, cz, halo, out_tif, src=None):
     right = left + (core + 2 * halo) * res
     bottom = top - (core + 2 * halo) * res
     aggregation_reproject._run(
-        f"GDAL_CACHEMAX=512 gdalwarp -q -overwrite -r {READ_RESAMPLE} -t_srs EPSG:3857 "
+        f"gdalwarp -q -overwrite -r {READ_RESAMPLE} -t_srs EPSG:3857 "
         f"-tr {res} {res} -te {left} {bottom} {right} {top} -dstnodata {NODATA} "
         f"-of GTiff -co TILED=YES -co BLOCKXSIZE=512 -co BLOCKYSIZE=512 -co COMPRESS=ZSTD -co PREDICTOR=3 "
         f"-co NUM_THREADS=ALL_CPUS {_q(src or gti_abspath())} {out_tif}",

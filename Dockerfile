@@ -36,6 +36,12 @@ ENV GDAL_HTTP_MAX_RETRY=5 \
   GDAL_HTTP_RETRY_DELAY=1 \
   GDAL_HTTP_USERAGENT="seascape/1.0 (+https://github.com/openwatersio/seascape)"
 
+# Default block-cache bound: GDAL's default is 5% of RAM (9.6 GB on a ccx63), and an
+# unbounded gdal_rasterize -init 0 parks a whole 65k² Byte raster in cache (~6 GB RSS
+# for an 11 MB mask; measured 5.3x smaller and faster at 512). Call sites needing a
+# different bound override per invocation.
+ENV GDAL_CACHEMAX=512
+
 # tippecanoe (Felt fork) — vector tiles. Pinned at felt/tippecanoe#399 (variable-depth
 # pyramids must honor per-feature tippecanoe.minzoom and never prune children a pending minzoom
 # still needs; the vector bundle depends on both). patches/ carries fixes not yet upstream:

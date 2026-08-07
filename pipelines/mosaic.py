@@ -143,7 +143,7 @@ def _translate(filepath, tmp_folder):
             f"-srcwin {buffer_pixels} {buffer_pixels} {w} {h}")
     with utils.shoal_cog_source(merged, args) as src:
         utils.run_command(
-            f"GDAL_CACHEMAX=512 gdal_translate -q -of COG -a_nodata {NODATA} "
+            f"gdal_translate -q -of COG -a_nodata {NODATA} "
             # IF_SAFER: IF_NEEDED never fires on compressed output, and >4 GB kills the write
             "-co BIGTIFF=IF_SAFER -co COMPRESS=ZSTD -co PREDICTOR=3 -co BLOCKSIZE=512 "
             "-co OVERVIEWS=FORCE_USE_EXISTING -co NUM_THREADS=ALL_CPUS "
@@ -276,13 +276,13 @@ def _build_planet(stems, out_tmp):
     # z0-z7 renders resolve to shoreline-coloured 0, with nothing naming the tile.
     aggregation_reproject.assert_vrt_complete(vrt, [tile_artifact(s) for s in stems])
     utils.run_command(
-        f"GDAL_CACHEMAX=512 gdal_translate -q -of GTiff -a_nodata {NODATA} "
+        f"gdal_translate -q -of GTiff -a_nodata {NODATA} "
         "-co BIGTIFF=YES -co COMPRESS=ZSTD -co PREDICTOR=3 "
         "-co TILED=YES -co BLOCKXSIZE=512 -co BLOCKYSIZE=512 -co NUM_THREADS=ALL_CPUS "
         f"{vrt} {base}")
     with utils.shoal_cog_source(base, min_levels=utils.macrotile_z) as src:
         utils.run_command(
-            f"GDAL_CACHEMAX=512 gdal_translate -q -of COG -a_nodata {NODATA} "
+            f"gdal_translate -q -of COG -a_nodata {NODATA} "
             "-co BIGTIFF=YES -co COMPRESS=ZSTD -co PREDICTOR=3 -co BLOCKSIZE=512 "
             "-co OVERVIEWS=FORCE_USE_EXISTING -co NUM_THREADS=ALL_CPUS "
             f"{src} {out_tmp}")
@@ -567,7 +567,7 @@ def window_dem(stem, out_tif):
                       f"-r bilinear {vrt} {tiles}")
     # NUM_THREADS=4, not ALL_CPUS: dozens of windows materialize concurrently, and 48
     # compressor threads each just thrash the box.
-    utils.run_command(f"GDAL_CACHEMAX=512 gdal_translate -q -ot Float32 -a_nodata {NODATA} "
+    utils.run_command(f"gdal_translate -q -ot Float32 -a_nodata {NODATA} "
                       "-co TILED=YES -co BIGTIFF=IF_SAFER -co BLOCKSIZE=512 "
                       "-co COMPRESS=ZSTD -co PREDICTOR=3 -co NUM_THREADS=4 "
                       f"{vrt} {out_tif}")
