@@ -358,9 +358,12 @@ def warp_mixed(tmp_folder, i, inputs, out_vrt, zoom, aggregation_tile, buffer, b
     warped = [w for w in _fan_out(warp, list(enumerate(inputs)))
               if intersects(vrt_bounds(w), window)]
     if not warped:
-        raise RuntimeError(f"no input of group {i} reaches {window} — every one of "
-                           f"{len(inputs)} is outside the warp window")
+        # A legitimate edge case, not an error: a group whose only files sit in the covering's
+        # margin contributes no pixel, exactly as the materialized warp used to emit all-nodata.
+        print(f"group {i}: all {len(inputs)} input(s) outside the warp window — skipped")
+        return False
     combine_warped(tmp_folder, i, warped, out_vrt, window, res)
+    return True
 
 
 def get_resolution(zoom):
@@ -467,10 +470,11 @@ def reproject(filepath):
         if config.source_property(sid, "mixed_crs"):
             # Per-tile UTM zones: one warp per tile, recombined — gdalbuildvrt refuses the
             # source CRSs but accepts the warped results.
-            warp_mixed(tmp_folder, i, [config.source_path(sid, it["filename"])
-                                       for it in source_items],
-                       vrt_3857, maxzoom, aggregation_tile, buffer_3857_rounded,
-                       band=config.source_property(sid, "band"))
+            if not warp_mixed(tmp_folder, i, [config.source_path(sid, it["filename"])
+                                              for it in source_items],
+                              vrt_3857, maxzoom, aggregation_tile, buffer_3857_rounded,
+                              band=config.source_property(sid, "band")):
+                continue  # nothing reaches the window; the group fills nothing (merge globs)
         else:
             create_warp(create_virtual_raster(tmp_folder, i, source_items), vrt_3857,
                         maxzoom, aggregation_tile, buffer_3857_rounded)
@@ -567,11 +571,11 @@ def _check():
     assert valid(edge) == va, (valid(edge), va)  # same pixels as `a` alone
     with open(edge) as f:
         assert "far_z17" not in f.read()
-    try:
-        warp_mixed(d, 4, [far], f"{d}/allfar.vrt", 9, tile, 0)
-        assert False, "expected a wholly-outside group to raise"
-    except RuntimeError as e:
-        assert "outside the warp window" in str(e), e
+    # A wholly-outside group SKIPS (False, no combined VRT) rather than raising: covering
+    # margins register edge files the warp halo never reaches, and the materialized warp
+    # used to emit an all-nodata group for exactly this case.
+    assert warp_mixed(d, 4, [far], f"{d}/allfar.vrt", 9, tile, 0) is False
+    assert not os.path.exists(f"{d}/allfar.vrt"), "all-outside group must not write a VRT"
 
     # Chunking the combine past COMBINE_FANOUT must change nothing a caller can see: the same
     # pixels, including who wins an overlap (the chunks are contiguous, so the last input still
