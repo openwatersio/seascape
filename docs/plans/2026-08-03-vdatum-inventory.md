@@ -328,7 +328,64 @@ curl -s 'https://vdatum.noaa.gov/vdatumweb/api/convert?s_x=-81.4133&s_y=30.4&s_z
 
 West Coast requires `region=westcoast` and `t_h_frame=IGS14`; PRVI requires `region=prvi` and `s_v_frame=PRVD02`.
 
-## 9. Artefacts left in the scratchpad
+## 9. Post-rollout GC
+
+The CUDEM renames (raw → prepared, the territory split, the 10 → 5 consolidation) retire source ids, and nothing sweeps a retired id automatically: `publish_source`'s `rclone sync` only visits ids that still exist under `sources/`, and `gc.yml` covers the content-addressed prefixes (`mosaic pmtiles contour soundings depare`) plus retired `bounds.csv` files — never whole `source/<id>/` prefixes. Three tiers, gated on different events.
+
+### Tier 1 — Hetzner store volume, after the first green 5-source run
+
+The box exists only while a run is up (the volume persists but needs an attached server); the IP is printed by the run's "Attach persistent store volume" step. Live-source staging cleans itself (`_clear_stale` removes old positional-name COGs during prep), so this is only the orphans:
+
+```sh
+ssh -i ~/.ssh/seascape-build root@<box-ip>
+
+# The seven store dirs whose sources/<id>/ recipe no longer exists, ~25-30 GB.
+# aggregation_covering skips them, so this is disk hygiene, not correctness.
+cd /mnt/seascape-store/store/source
+du -sh cudem_third cudem_pacific cudem_pacific_third \
+       cudem_pacific_{hawaii,guam,cnmi,samoa}_third 2>/dev/null   # look before deleting
+rm -rf cudem_third cudem_pacific cudem_pacific_third \
+       cudem_pacific_{hawaii,guam,cnmi,samoa}_third
+
+# The retired pre-CRD surface name, and the extracted bundle tree (the pinned zip is the
+# cache; harvest() re-extracts fresh on any rebuild).
+rm -f  /mnt/seascape-store/store/datum/navd88_mllw.tif
+rm -rf /mnt/seascape-store/store/datum/vdatum
+
+df -h /mnt/seascape-store
+```
+
+### Tier 2 — R2 retired source prefixes, after the same run
+
+Locally, via the `r2:` rclone remote (bucket `data`). The pre-split `cudem_pacific{,_third}` prefixes likely never published (no successful run existed in their window) — verify instead of assuming:
+
+```sh
+for p in cudem_third cudem_pacific cudem_pacific_third \
+         cudem_pacific_hawaii_third cudem_pacific_guam_third \
+         cudem_pacific_cnmi_third cudem_pacific_samoa_third; do
+  printf '%-32s ' "$p"; rclone size "r2:data/bathymetry/source/$p" --json; echo
+done                                                              # look before deleting
+
+for p in cudem_third cudem_pacific_hawaii_third cudem_pacific_guam_third \
+         cudem_pacific_cnmi_third cudem_pacific_samoa_third; do   # + the two pacific ids if non-empty
+  rclone purge "r2:data/bathymetry/source/$p"
+done
+```
+
+~10–15 GB, dominated by `cudem_third`'s prepared COGs. The raw-mirror `objects/` prefixes were already purged (2026-08-05).
+
+### Tier 3 — content-addressed store, after the planet build AND its release tag
+
+The planet rebuild writes a full new content-addressed tile set beside the old one (`mosaic/tiles/` was 1.15 TB before; peak ≈ double until GC). `gc.yml` sweeps everything unreferenced by the union of the last 3 store manifests — do NOT run it between the build and the release tag, the old tiles are the rollback headroom:
+
+```sh
+gh workflow run gc.yml -f dry_run=true    # inventory pass; inspect the log
+gh workflow run gc.yml -f dry_run=false   # the delete (the weekly cron also always deletes)
+```
+
+Optional, any time, out of GC scope by design: retired `build/<sha>-bbox/` preview prefixes (the ICW one is ~5 GB, mostly `land.pmtiles`) — `rclone purge r2:data/bathymetry/build/<sha>-bbox` once no longer inspected.
+
+## 10. Artefacts left in the scratchpad
 
 - `vdatum_all_20250917.zip`, extracted to `vdatum/` (JRE excluded)
 - `region_index.json` / `region_index.txt` / `region_table.txt` — parsed `.met` index
