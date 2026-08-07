@@ -15,6 +15,8 @@ Snakemake job identity is **params + inputs + code**, and the planner is the onl
 
 **The gate:** every dispatch states its expected DAG size in the `max_jobs` workflow input. The build then dry-runs the exact invocation first and aborts — printing the job-stats table and a reason census — if the planner disagrees. Rough sizes for calibration: full planet rebuild ≈ 16,400; one stage across the covering ≈ 3,300; vector tail (cells + shallow + join + bundles + stage) ≈ 3,300; incremental after a code-only change ≈ single digits.
 
+`max_jobs` scopes the **wide** phase (`prebundle`) — everything above except the serial finish. The wide phase tolerates a zero plan, because a change that only touches the bundle rules legitimately leaves it nothing to do. The `build-tail` phase states no number: its size moves with the overlay-cell count, so it is gated on rule *identity* instead — the dry run aborts if the plan names any rule outside the tail set. `cover` is deliberately not in that set: a tail plan that reschedules the checkpoint hides its real size behind it, which is exactly the case to refuse.
+
 To predict scope before dispatching, dry-run locally against a representative store (the bbox root in `pipelines/`, with the same `BBOX` its provenance records) and read the job stats **and** the `reason:` lines per rule — the reasons, not the counts, tell you whether the plan matches your intent.
 
 ## Rebuilding a leaf product without the cascade
@@ -33,8 +35,8 @@ One dispatch at a time — planning phase 2 while phase 1 runs would see its hal
 Arm all of this at dispatch time, not when something looks wrong:
 
 - **`scripts/watch-build`** — resolves the box from the `build` commit status and tails the build container's log (filtered to progress + failure signatures; `-f` for the full stream).
-- **The `build` commit status** is the heartbeat: `root@<ip> · N of M steps (P%), ~R running`, updated every minute. `M` is the live check that the planned DAG matches `max_jobs` intent. A status that stops updating means the run died or the heartbeat did — either way, look.
+- **The `build` commit status** is the heartbeat: `root@<ip> · <phase> N of M steps (P%), ~R running`, updated every minute. `M` is the live check that the planned DAG matches `max_jobs` intent. The status re-seeds at `booting (tail)` on a new IP when the wide phase hands off, and only the last phase flips it green. A status that stops updating means the run died or the heartbeat did — either way, look.
 - The status may briefly show the **previous run's last heartbeat** (same commit, same context) — trust it only once it has changed after your dispatch.
 - Watch for the run's terminal states, not just successes: a watcher that only matches the happy path is silent through a crash.
 
-When a run fails or must be canceled: **pull evidence first** — the job-stats table, the `reason:` census, per-rule logs and benchmarks from `/var/tmp/seascape-tmp` (they ship as the `snakemake-bench-<run-id>` artifact, but the box copy dies with the box), and whatever the failing rule wrote — the box teardown destroys everything not on the store volume.
+When a run fails or must be canceled: **pull evidence first** — the job-stats table, the `reason:` census, per-rule logs and benchmarks from `/var/tmp/seascape-tmp` (each phase has its own box and ships its own `snakemake-bench-<run-id>-<phase>` artifact, but the box copy dies with the box), and whatever the failing rule wrote — the box teardown destroys everything not on the store volume.

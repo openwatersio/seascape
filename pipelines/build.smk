@@ -667,6 +667,26 @@ rule bundles:
         bundle_inputs
 
 
+def prebundle_inputs(wc):
+    """Everything the serial bundle tail reads but does not produce: the per-stem cartographic
+    products (tile_inputs), the per-cell vector archives the join concatenates, and the mosaic
+    index publish_mosaic uploads. Checkpoint-derived like every aggregate here, so it is a
+    function — the stem/cell sets are unknown until `cover` lands."""
+    cells = sorted(vector_cells())
+    return (tile_inputs(wc)
+            + expand("store/bundle/vector-cell-{cell}.pmtiles", cell=cells)
+            + expand("store/bundle/vector-cell-{cell}.ids.json", cell=cells)
+            + list(rules.mosaic_index.output))
+
+
+# The wide half of a split dispatch: everything parallel, so the serial tail
+# (vector_shallow/vector_join/vector_selfcheck, terrain_planet_bundle/overlay_bundle,
+# bundles/publish_mosaic/stage_build) can run as its own invocation on a smaller box.
+rule prebundle:
+    input:
+        prebundle_inputs
+
+
 # Dispatch-only isolation target: rebuild every per-stem soundings file (and the temp() windows
 # they need) WITHOUT entering the vector bundles' closure, so window regeneration cannot cascade
 # into banked contour/depare outputs (docs/runbooks/build-dispatch.md). NOTE: --until cannot do
