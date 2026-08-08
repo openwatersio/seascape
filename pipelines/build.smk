@@ -83,6 +83,18 @@ def render_stems(wc=None):
     return _RENDER_STEMS[key]
 
 
+_FINER = {}
+
+
+def finer_stems():
+    """stem -> [render stems one zoom finer], built once per DAG evaluation: the terrain_render
+    input function needs it per job, and deriving it per call would scan the whole render set."""
+    _, key = _covering_key()
+    if key not in _FINER:
+        _FINER[key] = terrain_mod.finer_index(render_stems())
+    return _FINER[key]
+
+
 def cell_stems():
     """cell -> [render stems] for the overlay bundles, built once per DAG evaluation: deriving it
     per input-function call costs O(cells x render_stems), minutes at planet scale."""
@@ -144,10 +156,14 @@ def source_props(stem):
 # above, not here.
 MERGE_CFG = json.dumps({
     "resample": aggregation_reproject.RESAMPLE,
-    "feather_min_levels": aggregation_reproject.FEATHER_MIN_LEVELS,
+    "feather_min_cell_px": aggregation_reproject.FEATHER_MIN_CELL_PX,
+    "feather_max_factor": aggregation_reproject.FEATHER_MAX_FACTOR,
     "macrotile_z": utils.macrotile_z,
     "macrotile_buffer_3857": utils.macrotile_buffer_3857,
     "num_overviews": utils.num_overviews,
+    # The class-aware reduction branches on the cap, so it shapes mosaic-tile pyramid
+    # VALUES (which the aggregation warp reads back), not just display classification.
+    "drying_cap": pipeline_config.DRYING_CAP,
 }, sort_keys=True)
 
 
@@ -220,7 +236,7 @@ rule mosaic_tile:
     output:
         "store/mosaic/tiles/{stem}.tif"
     params:
-        version=1, # increment to force a rebuild
+        version=2, # increment to force a rebuild
         sources=lambda wc: source_props(wc.stem),
         merge=MERGE_CFG,
     priority: mosaic_tile_priority  # mosaic band, interleaved heavy-first within it
@@ -455,10 +471,16 @@ def terrain_inputs(wc):
     """cz>=8 renders read a per-stem VRT of their halo-buffered tile set, so they run the
     moment their neighborhood merges; cz<8 needs the GTI's planet-z8-COG fall-through. The masks
     ride too: cz>=8 rasterizes the vector land mask to nudge land-side exact-0 pixels to land,
-    cz<8 windows the prepped land-z8 raster for the same nudge."""
+    cz<8 windows the prepped land-z8 raster for the same nudge.
+
+    The stems one zoom finer ride as well: each tile is clamped shoal-ward against their shoal
+    reduction (terrain._FinerTiles), so the served pyramid cascades from the native zoom out and
+    a render must not start before the level below it lands."""
+    finer = [f"store/pmtiles/{s}.pmtiles" for s in finer_stems().get(wc.stem, [])]
     if int(wc.stem.split("-")[3]) >= 8:
-        return [f"store/mosaic/tiles/{s}.tif" for s in terrain_mod.window_tiles(wc.stem)] + MASKS
-    return list(rules.mosaic_index.output) + MASKS + RASTER_MASK
+        return [f"store/mosaic/tiles/{s}.tif"
+                for s in terrain_mod.window_tiles(wc.stem)] + MASKS + finer
+    return list(rules.mosaic_index.output) + MASKS + RASTER_MASK + finer
 
 
 rule terrain_render:

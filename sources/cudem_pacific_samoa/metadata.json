@@ -1,10 +1,9 @@
 {
-    "name": "NOAA CUDEM (NCEI Topobathy 2014)",
+    "name": "NOAA CUDEM (American Samoa)",
     "producer": "NOAA NCEI",
     "website": "https://www.ncei.noaa.gov/products/coastal-relief-model",
     "license": "public domain (U.S. Government work)",
     "max_zoom": 13,
-    "datum": "MLLW where VDatum covers, CRD in the Columbia River; NAVD88 uncorrected elsewhere (most of Alaska)",
-    "offset_surface": "navd88_chart",
+    "datum": "ASVD02 (EPSG:6643), uncorrected — no VDatum grid and no published ASVD02-MLLW tie; reads ~0.4 m deep",
     "filter": "*.tif|*.tiff"
 }

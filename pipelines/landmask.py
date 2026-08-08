@@ -218,20 +218,31 @@ def prep_water(processes=8):
                 f"ogr2ogr -f GPKG {'-overwrite' if i == 0 else '-update -append'} "
                 f"-nln water {merged} {t}", silent=True)
         # _water_tile's -clipsrc runs AFTER its polygon filter, so a clipped feature can
-        # re-enter as a collection/empty; those crash tippecanoe's FlatGeobuf reader
-        # (exit 106) and leave the header untyped. Final conversion re-filters + types,
-        # re-applies the kind drops in case the tile pass predates them, and applies the
-        # area floor. ST_Area here is EPSG:3857 m² (lat-inflated), so the floor loosens
-        # toward the poles — the conservative direction, more features kept.
+        # re-enter as a GEOMETRYCOLLECTION (polygons + stray cut-line fragments) or empty —
+        # GEOS does this to complex polygons cut at a window edge (Lake Huron at lon -80).
+        # A bare polygon-type filter would DROP such a feature wholesale — that erased Lake
+        # Huron from the mask — so extract the polygonal part instead; only then filter
+        # empties (which also drops any pure-line leftovers). ST_Area here is EPSG:3857 m²
+        # (lat-inflated), so the floor loosens toward the poles — the conservative
+        # direction, more features kept.
+        tmp_out = out + ".tmp.fgb"
+        if os.path.isfile(tmp_out):
+            os.remove(tmp_out)  # FlatGeobuf cannot -overwrite in place
         utils.run_command(
-            f"ogr2ogr -f FlatGeobuf -overwrite -nln water -nlt PROMOTE_TO_MULTI "
-            f"-dialect SQLITE -sql \"SELECT * FROM water WHERE "
-            f"GeometryType(geometry) LIKE '%POLYGON%' AND NOT ST_IsEmpty(geometry) "
+            f"ogr2ogr -f FlatGeobuf -nln water -nlt PROMOTE_TO_MULTI "
+            f"-dialect SQLITE -sql \"SELECT ST_CollectionExtract(geometry, 3) AS geometry, "
+            f"kind, class, is_salt, is_intermittent, tidal FROM water WHERE "
+            f"NOT ST_IsEmpty(ST_CollectionExtract(geometry, 3)) "
             f"AND kind NOT IN {EXCLUDED_SUBTYPES} "
-            f"AND (kind IN {CHANNEL_KINDS} OR ST_Area(geometry) >= {MIN_AREA_M2})\" "
-            f"{out} {merged}", silent=False)
+            # the floor must measure the EXTRACTED polygon: ST_Area of a raw collection is 0
+            f"AND (kind IN {CHANNEL_KINDS} OR ST_Area(ST_CollectionExtract(geometry, 3)) >= {MIN_AREA_M2})\" "
+            f"{tmp_out} {merged}", silent=False)
+        _check_water(tmp_out, merged, windows)
+        os.replace(tmp_out, out)  # gates passed — only now does the mask exist complete
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+        if os.path.isfile(out + ".tmp.fgb"):
+            os.remove(out + ".tmp.fgb")
     print(f"inland-water mask ready: {out}")
 
 
@@ -262,16 +273,23 @@ def tiles(out=LAND_TILES):
             # An already-published water.fgb can carry clip artifacts (empty/collection
             # geometries an older container GDAL wrote) that tippecanoe's FlatGeobuf reader
             # hard-fails on ("unsupported geometry type 0", exit 106) — GDAL reads them fine,
-            # so sanitize through it: polygonal + non-empty only, header typed via promote.
-            # land.fgb needs none of this: its header is typed Polygon, so nothing
-            # non-conforming could have been written into it.
+            # so sanitize through it: extract the polygonal part (dropping a collection
+            # wholesale would erase real lakes — see prep_water), filter empties, header
+            # typed via promote. land.fgb needs none of this: its header is typed Polygon,
+            # so nothing non-conforming could have been written into it.
             # kind <> 'physical': Overture's marine polygons (bays/straits/fjärdar) are
             # drawn without island holes, so subtracting them erases real islands from
             # the mask; genuine inland water is lake/pond/river/canal/reservoir.
+            # column list from the layer itself: published/synthetic masks carry attribute subsets
+            stdout, _ = utils.run_command(f"ogrinfo -so -ro {water} water", silent=True)
+            have = {line.split(":")[0].strip() for line in stdout.splitlines() if ":" in line}
+            cols = ", ".join(
+                f for f in ("kind", "class", "is_salt", "is_intermittent", "tidal") if f in have)
             utils.run_command(
                 f"ogr2ogr -f FlatGeobuf -overwrite -nln water -nlt PROMOTE_TO_MULTI "
-                f"-dialect SQLITE -sql \"SELECT * FROM water WHERE "
-                f"GeometryType(geometry) LIKE '%POLYGON%' AND NOT ST_IsEmpty(geometry) "
+                f"-dialect SQLITE -sql \"SELECT ST_CollectionExtract(geometry, 3) AS geometry, "
+                f"{cols} FROM water WHERE "
+                f"NOT ST_IsEmpty(ST_CollectionExtract(geometry, 3)) "
                 f"AND kind <> 'physical'\" "
                 f"{tmp_water} {water}")
             layers += f" -L water:{tmp_water}"
@@ -297,6 +315,61 @@ EXCLUDED_SUBTYPES = "('ocean','physical','human_made','wastewater','spring')"
 # Kinds exempt from the area floor: a tiny river/canal/stream polygon is usually a segment of a
 # connected waterway, and a dropped segment punches a gap in the channel.
 CHANNEL_KINDS = "('river','canal','stream')"
+
+# Probe fixture for the presence gate: every Natural Earth 10m lake >= 300 km² (interior
+# point + area), 542 rows. All were present in the mask except Lake Huron when the gate was
+# introduced, so the gate expects ALL of them — a miss is always a defect, never a known gap.
+WATER_PROBES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "water_probes.csv")
+
+
+def _check_water(fgb, merged, windows):
+    """Executable gates before the mask is published, in the datum-gate mold.
+
+    (1) Conservation: every feature the final filter deems eligible in the merged concat
+    must have landed in the FGB — Lake Huron was lost to a silent filter drop (clip-produced
+    GEOMETRYCOLLECTION failed a polygon-type test), and a count mismatch turns any such
+    silent drop into a loud rule failure.
+    (2) Presence: every water_probes.csv lake whose probe point lies inside a read window
+    must contain that point in the finished mask."""
+    import csv
+    import math
+    eligible = (
+        f"SELECT COUNT(*) AS n FROM water WHERE "
+        f"NOT ST_IsEmpty(ST_CollectionExtract(geometry, 3)) "
+        f"AND kind NOT IN {EXCLUDED_SUBTYPES} "
+        f"AND (kind IN {CHANNEL_KINDS} OR ST_Area(ST_CollectionExtract(geometry, 3)) >= {MIN_AREA_M2})")
+    def count(path, sql):
+        stdout, _ = utils.run_command(
+            f"ogrinfo -q -ro -dialect SQLITE -sql \"{sql}\" {path}", silent=True)
+        for tok in stdout.split():
+            if tok.isdigit():
+                return int(tok)
+        raise SystemExit(f"water gate: could not read a count from {path}")
+    n_in = count(merged, eligible)
+    n_out = count(fgb, "SELECT COUNT(*) AS n FROM water")
+    if n_in != n_out:
+        raise SystemExit(
+            f"water gate: conversion dropped {n_in - n_out} of {n_in} eligible features")
+    missing = []
+    probed = 0
+    with open(WATER_PROBES) as f:
+        for row in csv.DictReader(f):
+            lon, lat = float(row["lon"]), float(row["lat"])
+            if not any(w <= lon <= e and s <= lat <= n for w, s, e, n in windows):
+                continue
+            probed += 1
+            x = lon * MERC_X / 180
+            y = math.log(math.tan(math.pi / 4 + math.radians(lat) / 2)) * 6378137.0
+            stdout, _ = utils.run_command(
+                f"ogrinfo -q -ro {fgb} water -spat {x - 500} {y - 500} {x + 500} {y + 500}",
+                silent=True)
+            if "OGRFeature" not in stdout:
+                missing.append(row["name"] or f"({lon},{lat})")
+    if missing:
+        raise SystemExit(
+            f"water gate: {len(missing)} of {probed} probe lakes missing from the mask: "
+            + ", ".join(missing[:10]))
+    print(f"water gates ok ({n_out} features conserved, {probed} probe lakes present)")
 
 # Area floor (EPSG:3857 m²) for compact kinds — sub-pixel even at z14, and dominated by
 # retention ponds and farm dams that read as noise on a chart.

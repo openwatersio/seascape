@@ -12,9 +12,12 @@ the catalog's seascape:files feeds); shells out via utils.run_command.
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
+from xml.sax.saxutils import unescape
 
 import mercantile
 import numpy as np
@@ -35,10 +38,20 @@ NODATA = -9999
 # AGG_RESAMPLE=bilinear to switch if that shows.
 RESAMPLE = os.environ.get("AGG_RESAMPLE", "cubicspline")
 
-# Coverage-edge feathering. A group whose native grid is >= FEATHER_MIN_LEVELS zoom levels
-# coarser than the render grid draws its valid/nodata boundary as source-cell staircases —
-# a 30 m S-102 cell is a 13-px block on a z15 grid, and land in S-102 is simply nodata, so
-# the shoreline itself staircases. Values interpolate smoothly (cubicspline) but validity
+# What the mixed-CRS chain costs is one /vsicurl open per input per pass — measured at ~1.15 s
+# each against ~0.09 s of CPU, and an S-102 z14 tile carries 131 of them. So the per-input warps
+# fan out; the threads sit on sockets, not cores.
+MIXED_WORKERS = int(os.environ.get("AGG_MIXED_WORKERS", "8"))
+# gdalbuildvrt opens its inputs one at a time in a single process, so a flat combine of that many
+# warped VRTs is that many serial round trips (measured 104 s vs 15 s chunked). Chunking overlaps
+# them; contiguous slices keep "last input wins" on an overlap, which is the precedence the flat
+# combine has always given.
+COMBINE_FANOUT = 16
+
+# Coverage-edge feathering. A group whose source cells span at least FEATHER_MIN_CELL_PX
+# render pixels draws its valid/nodata boundary as source-cell staircases — a 16 m S-102
+# cell is a 7.8-px block on a z15 grid, and land in S-102 is simply nodata, so the
+# shoreline itself staircases. Values interpolate smoothly (cubicspline) but validity
 # cannot: gdalwarp keeps the source's cell-quantized mask. The fix smooths the 0/1 mask
 # with a gaussian at the source-cell scale and re-thresholds at 0.5; the new boundary
 # is the level-set midline through the staircase corners, within half a source cell of the
@@ -58,13 +71,23 @@ RESAMPLE = os.environ.get("AGG_RESAMPLE", "cubicspline")
 # narrower than a source cell erodes back toward what it hangs off. That direction is the
 # safe one — it charts as land or falls through to the next source, rather than inventing
 # navigable water — and it is the same call the pond fill in smooth.py already makes.
-FEATHER_MIN_LEVELS = int(os.environ.get("AGG_FEATHER_MIN_LEVELS", "2"))
+# Gate, in render pixels per source cell: below this a cell draws 1-2 px treads, which is not
+# a staircase and is not worth moving a boundary for. It is a cell size rather than a count of
+# zoom levels because the same shoreline must be drawn the same way at neighbouring zooms —
+# the 16 m S-102 cells off Jacksonville are 7.8 px on a z15 grid and 3.9 px on the z14 one.
+FEATHER_MIN_CELL_PX = float(os.environ.get("AGG_FEATHER_MIN_CELL_PX", "3"))
 # Ceiling on the smoothing scale, in render pixels per source cell. The boundary can move
 # by up to half a source cell, so an unbounded factor would let a very coarse group (GEBCO
 # under a z15 tile is 7 levels down) redraw a coastline by hundreds of metres. Such groups
 # only ever fill gaps under a finer source anyway, and a global one has no coverage edge
 # to feather at all.
 FEATHER_MAX_FACTOR = 32
+
+# The VRT's input references and its own extent, read by regex rather than an XML parser (the
+# same XXE-avoidance source_enumerate makes for bucket listings).
+_SOURCE_FILENAME_RE = re.compile(r"<SourceFilename[^>]*>([^<]*)</SourceFilename>")
+_GEOTRANSFORM_RE = re.compile(r"<GeoTransform>([^<]*)</GeoTransform>")
+_RASTER_SIZE_RE = re.compile(r'rasterXSize="(\d+)"\s+rasterYSize="(\d+)"')
 
 
 def negate_band1(filepath):
@@ -124,6 +147,28 @@ def _peel_preserving_topology(start, removable, max_iters):
         if not changed:
             break
     return cur[1:-1, 1:-1]
+
+
+def group_cell_px(source_items, resolution):
+    """The group's coarsest source cell in render pixels — the pitch of the staircase its
+    validity boundary draws, and so the scale feather_coverage_edge smooths at.
+
+    Zoom levels cannot stand in for this. resolved_maxzoom rounds a cell UP to the next finer
+    grid, so a group `levels` below the render grid holds cells anywhere in
+    (1 << levels, 2 << levels] px: the 16 m S-102 files off Jacksonville resolve to z13 and
+    measure 7.8 px against a z15 grid, where `1 << 2` guesses 4. Registration rows carry
+    EPSG:3857 bounds and pixel dimensions and the catalog is already hydrated for
+    source_path, so the true ratio costs nothing.
+
+    Coarsest, because a group's external boundary is drawn by its coarsest files — a fine
+    file surrounded by coarse ones in the same VRT has no nodata edge of its own — and
+    because the coarser axis is what set the group's maxzoom in the first place."""
+    sid = source_items[0]["source"]
+    cell = {}
+    for filename, left, bottom, right, top, width, height in config.source_files(sid):
+        cell[filename] = max(abs(right - left) / width, abs(top - bottom) / height)
+    return max((cell[it["filename"]] for it in source_items if it["filename"] in cell),
+               default=0.0) / resolution
 
 
 def feather_coverage_edge(filepath, factor):
@@ -200,62 +245,125 @@ def create_virtual_raster(tmp_folder, i, source_items):
     source = source_items[0]["source"]
     vrt = f"{tmp_folder}/{i}.vrt"
     listpath = f"{tmp_folder}/{i}-file-list.txt"
+    paths = [config.source_path(source, item["filename"]) for item in source_items]
     with open(listpath, "w") as f:
-        for item in source_items:
-            f.write(config.source_path(source, item["filename"]) + "\n")
+        f.write("".join(p + "\n" for p in paths))
     utils.run_command(f"gdalbuildvrt -overwrite {band_select(source)}-input_file_list {listpath} {vrt}", silent=SILENT)
+    assert_vrt_complete(vrt, paths)
     return vrt
 
 
-def per_tile_vrts(tmp_folder, i, source_items):
-    """One single-band VRT per tile, for a `mixed_crs` source (per-tile UTM zones, e.g.
-    NOAA S-102). gdalbuildvrt refuses to merge differing CRS into one VRT — it silently
-    drops the off-CRS tiles, holing zone seams — so each tile gets its own VRT and
-    gdalwarp (which does reproject per input) mosaics them into 3857 in warp_mixed."""
-    source = source_items[0]["source"]
-    bsel = band_select(source)
-    vrts = []
-    for j, item in enumerate(source_items):
-        path = config.source_path(source, item["filename"])
-        vrt = f"{tmp_folder}/{i}-{j}.vrt"
-        _build_tile_vrt(f"gdalbuildvrt -overwrite {bsel}{vrt} {path}")
-        vrts.append(vrt)
-    return vrts
+def assert_vrt_complete(vrt, paths):
+    """Raise unless the built VRT references every input. gdalbuildvrt skips an input whose
+    CRS differs from the first with a warning and exit 0 — and the warning can read "expected
+    NAD83, got NAD83" when the two differ only by an attached vertical component, so a third of
+    a source's coverage can vanish from the mosaic with nothing in the log naming it. Matched on
+    basename: gdalbuildvrt may store a path relative to the VRT."""
+    with open(vrt) as f:
+        referenced = {os.path.basename(unescape(m)) for m in _SOURCE_FILENAME_RE.findall(f.read())}
+    dropped = [p for p in paths if os.path.basename(p) not in referenced]
+    if dropped:
+        raise RuntimeError(f"gdalbuildvrt dropped {len(dropped)}/{len(paths)} input(s) from "
+                           f"{vrt} — heterogeneous CRS? e.g. {dropped[:3]}")
 
 
-def _build_tile_vrt(cmd, tries=3):
-    """Run a per-tile gdalbuildvrt, retrying on a transient /vsicurl read. Each tile is a
-    separate range read over public HTTPS; a momentary blip (connection reset, "HTTP
-    response code 0") makes gdalbuildvrt exit 1 with no VRT, and GDAL's own HTTP retry
-    doesn't reliably catch transport-level errors. Re-running is a fresh attempt; raise
-    after `tries` so a tile that's genuinely gone (a real 404) still fails loudly."""
-    for attempt in range(1, tries + 1):
-        try:
-            utils.run_command(cmd, silent=SILENT)
-            return
-        except RuntimeError:
-            if attempt == tries:
-                raise
-            time.sleep(2 ** attempt)  # 2s, 4s
+def vrt_bounds(vrt):
+    """A VRT's own extent, (left, bottom, right, top) in its own CRS. Every VRT this reads is a
+    north-up EPSG:3857 warp output, so the rotation terms are zero."""
+    with open(vrt) as f:
+        xml = f.read()
+    gt = [float(v) for v in _GEOTRANSFORM_RE.search(xml).group(1).split(",")]
+    width, height = (int(v) for v in _RASTER_SIZE_RE.search(xml).groups())
+    return gt[0], gt[3] + height * gt[5], gt[0] + width * gt[1], gt[3]
 
 
-def warp_mixed(inputs, out_tif, zoom, aggregation_tile, buffer):
-    """gdalwarp several heterogeneous-CRS inputs into one 3857 GTiff mosaic. A warped
-    VRT can't span source CRSs (it has one), so warp straight to a raster — each input
-    is reprojected from its own UTM zone, so a zone-crossing tile keeps every source.
-    No value transform: streamed sources skip source_datum, MLLW->MSL is a future
-    VDatum job; nan source-nodata maps to NODATA via -dstnodata."""
-    left, bottom, right, top = buffered_bounds(aggregation_tile, buffer)
+def intersects(a, b):
+    """Do two (left, bottom, right, top) boxes share area? Touching is not sharing — a source
+    that only abuts the window contributes no pixel."""
+    return a[2] > b[0] and a[0] < b[2] and a[3] > b[1] and a[1] < b[3]
+
+
+def _fan_out(job, args):
+    """Run `job` over `args`, MIXED_WORKERS at a time, results in `args` order. Threads rather
+    than processes: every worker is a subprocess blocked on a socket, so there is no GIL to
+    fight and one shared GDAL block cache. The first failure re-raises."""
+    if MIXED_WORKERS <= 1 or len(args) <= 1:
+        return [job(a) for a in args]
+    with ThreadPoolExecutor(max_workers=MIXED_WORKERS) as pool:
+        return list(pool.map(job, args))
+
+
+def combine_warped(tmp_folder, i, warped, out_vrt, window, res):
+    """Mosaic same-grid 3857 warped VRTs into `out_vrt`, chunking the combine past
+    COMBINE_FANOUT inputs so their opens overlap.
+
+    assert_vrt_complete runs at every level, so a silently-dropped input is still caught where
+    it was dropped — chunking moves the gate, it doesn't weaken it."""
+    left, bottom, right, top = window
+
+    def build(out, paths, te=""):
+        listpath = f"{out}-list.txt"
+        with open(listpath, "w") as f:
+            f.write("".join(p + "\n" for p in paths))
+        _run(f"gdalbuildvrt -overwrite {te}-tr {res} {res} -input_file_list {listpath} {out}",
+             f"gdalbuildvrt(mixed) {out}")
+        assert_vrt_complete(out, paths)
+        return out
+
+    roots = warped
+    if len(warped) > COMBINE_FANOUT:
+        chunks = [warped[a:a + COMBINE_FANOUT] for a in range(0, len(warped), COMBINE_FANOUT)]
+        roots = _fan_out(lambda nc: build(f"{tmp_folder}/{i}-chunk{nc[0]}.vrt", nc[1]),
+                         list(enumerate(chunks)))
+    build(out_vrt, roots, te=f"-te {left} {bottom} {right} {top} ")
+
+
+def warp_mixed(tmp_folder, i, inputs, out_vrt, zoom, aggregation_tile, buffer, band=None):
+    """Mosaic heterogeneous-CRS inputs into one lazy 3857 VRT, warping each separately.
+
+    A warped VRT holds a single source CRS, so the mixed case can't be one warp — but it can
+    be one warp PER input (each of those is homogeneous), and the results all share 3857 and
+    one grid, so gdalbuildvrt will merge them. The chain stays lazy end to end: `translate` is
+    the only pass over the pixels, where warping straight to a raster wrote a multi-GB
+    transient that then had to be read back and recompressed.
+
+    Laziness is also what keeps a vertical datum shift out of reach. gdalwarp converts NAVD88
+    to ellipsoidal height when it writes real pixels — always deeper across CONUS — and a VRT
+    cannot express a pixel-value transform, so it cannot. Prep flattens compound CRSs
+    (source_datum.flatten_compound_crs); this is the second line, not the first.
+
+    -tap rather than a computed per-input window: the aggregation grid is already an integer
+    multiple of `res` from the mercator origin (a tile bound is `x*512*res` off `-half`, and
+    `half/res` == `256*2**z`), so aligning each input's own extent to multiples of -tr lands it
+    on that same grid. gdalbuildvrt's -te/-tr then pin the exact output window, reading every
+    contributing level 1:1."""
+    window = buffered_bounds(aggregation_tile, buffer)
     res = get_resolution(zoom)
-    # ZSTD+predictor3 (single-band Float32) shrinks this transient ~4x; SPARSE_OK skips
-    # all-nodata blocks. Cuts the disk a deep z->z14 tile needs (a 32768px tile is ~4 GB
-    # uncompressed) and the I/O writing it.
-    _run(f"GDAL_CACHEMAX=512 gdalwarp -overwrite -t_srs EPSG:3857 -tr {res} {res} "
-         f"-te {left} {bottom} {right} {top} -r {RESAMPLE} -dstnodata {NODATA} "
-         "-co TILED=YES -co BIGTIFF=IF_SAFER -co SPARSE_OK=YES "
-         "-co COMPRESS=ZSTD -co PREDICTOR=3 -co NUM_THREADS=ALL_CPUS "
-         f"{' '.join(inputs)} {out_tif}",
-         f"gdalwarp(mixed) {out_tif}")
+    # -srcband on the object itself, not a band-selecting VRT in front of it: that VRT would
+    # double this phase's /vsicurl opens and it is the opens that this phase costs.
+    bsel = f"-srcband {band} " if band else ""
+
+    def warp(indexed):
+        j, path = indexed
+        w = f"{tmp_folder}/{i}-{j}-3857.vrt"
+        _run(f"gdalwarp -of vrt -overwrite {bsel}-t_srs EPSG:3857 -tr {res} {res} -tap "
+             f"-r {RESAMPLE} -dstnodata {NODATA} {path} {w}", f"gdalwarp(mixed) {w}")
+        return w
+
+    # The covering registers every file within 2*macrotile_buffer_3857 of the macrotile, which is
+    # wider than this warp's buffer_pixels*res halo, so an edge file can land wholly outside the
+    # window. It contributes no pixel and gdalbuildvrt -te drops it silently (exit 0, no warning)
+    # — drop it here instead, or assert_vrt_complete reads that as the heterogeneous-CRS drop it
+    # exists to catch.
+    warped = [w for w in _fan_out(warp, list(enumerate(inputs)))
+              if intersects(vrt_bounds(w), window)]
+    if not warped:
+        # A legitimate edge case, not an error: a group whose only files sit in the covering's
+        # margin contributes no pixel, exactly as the materialized warp used to emit all-nodata.
+        print(f"group {i}: all {len(inputs)} input(s) outside the warp window — skipped")
+        return False
+    combine_warped(tmp_folder, i, warped, out_vrt, window, res)
+    return True
 
 
 def get_resolution(zoom):
@@ -307,7 +415,7 @@ def translate(in_filepath, out_filepath):
     # inherits the profile into the merged DEM, so compressing here propagates downstream.
     # IF_SAFER, not IF_NEEDED: with compression IF_NEEDED never fires, and z15 grids
     # whose ZSTD output still crosses 4 GB die mid-write in TIFFAppendToStrip.
-    _run("GDAL_CACHEMAX=512 gdal_translate -of COG -co BIGTIFF=IF_SAFER -co ADD_ALPHA=YES "
+    _run("gdal_translate -of COG -co BIGTIFF=IF_SAFER -co ADD_ALPHA=YES "
          "-co OVERVIEWS=NONE -co SPARSE_OK=YES -co BLOCKSIZE=512 "
          f"-co COMPRESS=ZSTD -co NUM_THREADS=ALL_CPUS {in_filepath} {out_filepath}",
          f"gdal_translate {in_filepath}")
@@ -355,31 +463,36 @@ def reproject(filepath):
     buffer_pixels = int(utils.macrotile_buffer_3857 / resolution)
     buffer_3857_rounded = buffer_pixels * resolution
 
+    # Output indices are assigned only to groups that produce pixels, so a skipped group
+    # leaves NO gap: aggregation_merge names its output {len(tiffs)}-3857.tiff and
+    # mosaic._merged_dem picks {count-1} — both assume the indices are contiguous from 0,
+    # and a gap makes the merge's output name collide with a later group's input.
+    out_i = 0
     for i, source_items in enumerate(grouped):
         sid = source_items[0]["source"]
-        out_tiff = f"{tmp_folder}/{i}-3857.tiff"
+        out_tiff = f"{tmp_folder}/{out_i}-3857.tiff"
+        vrt_3857 = f"{tmp_folder}/{out_i}-3857.vrt"
         if config.source_property(sid, "mixed_crs"):
-            # Per-tile UTM zones: warp the per-tile VRTs straight to a raster (gdalwarp
-            # reprojects each input), then the same translate makes the COG.
-            merged = f"{tmp_folder}/{i}-3857-merged.tif"
-            warp_mixed(per_tile_vrts(tmp_folder, i, source_items), merged,
-                       maxzoom, aggregation_tile, buffer_3857_rounded)
-            translate(merged, out_tiff)
-            os.remove(merged)  # free the multi-GB warp intermediate now, not at end-of-tile
-                               # (rmtree) — it's never read again once the COG exists
+            # Per-tile UTM zones: one warp per tile, recombined — gdalbuildvrt refuses the
+            # source CRSs but accepts the warped results. Per-input warp temps stay keyed on
+            # the GROUP index i, so a skipped group's temps never collide with a later group's.
+            if not warp_mixed(tmp_folder, i, [config.source_path(sid, it["filename"])
+                                              for it in source_items],
+                              vrt_3857, maxzoom, aggregation_tile, buffer_3857_rounded,
+                              band=config.source_property(sid, "band")):
+                continue  # nothing reaches the window; out_i is not consumed
         else:
-            vrt = create_virtual_raster(tmp_folder, i, source_items)
-            vrt_3857 = f"{tmp_folder}/{i}-3857.vrt"
-            create_warp(vrt, vrt_3857, maxzoom, aggregation_tile, buffer_3857_rounded)
-            translate(vrt_3857, out_tiff)
+            create_warp(create_virtual_raster(tmp_folder, i, source_items), vrt_3857,
+                        maxzoom, aggregation_tile, buffer_3857_rounded)
+        translate(vrt_3857, out_tiff)
         if config.source_property(sid, "negate"):
             negate_band1(out_tiff)  # streamed positive-down source (S-102 depth) -> elevation
         # Before the land clamps, never after: this smooths a boundary the SOURCE's own
         # cells drew, while the clamps below cut nodata along the OSM water line, which is
         # vector-precise and must not be re-drawn at some source's cell scale.
-        levels = maxzoom - source_items[0]["maxzoom"]
-        if levels >= FEATHER_MIN_LEVELS:
-            feather_coverage_edge(out_tiff, min(1 << levels, FEATHER_MAX_FACTOR))
+        cell_px = group_cell_px(source_items, resolution)
+        if cell_px >= FEATHER_MIN_CELL_PX:
+            feather_coverage_edge(out_tiff, min(cell_px, FEATHER_MAX_FACTOR))
         if config.source_property(sid, "land_clamp"):
             # Coarse source (GEBCO/EMODnet) with no land/water concept: its shoreline cells
             # read negative on land. Clamp valid ^ land ^ <0 -> 0 right after warp, so the
@@ -413,6 +526,7 @@ def reproject(filepath):
             # Deliberately discards coarse "drying": these flagged sources can't resolve the
             # foreshore, and trusted topobathy sources are unflagged, so genuine drying survives.
             landmask.clamp_positive_ocean(out_tiff, mask_tif, water_tif)
+        out_i += 1
         if len(grouped) > 1 and not contains_nodata_pixels(out_tiff):
             break
 
@@ -446,11 +560,130 @@ def _check():
             arr = src.read(1)
         return int(np.count_nonzero((arr != NODATA) & ~np.isnan(arr)))
 
-    both, just_a = f"{d}/both.tif", f"{d}/a.tif"
-    warp_mixed([a, b], both, 9, tile, 0)
-    warp_mixed([a], just_a, 9, tile, 0)
+    both, just_a = f"{d}/both.vrt", f"{d}/a.vrt"
+    warp_mixed(d, 0, [a, b], both, 9, tile, 0)
+    warp_mixed(d, 1, [a], just_a, 9, tile, 0)
     va, vboth = valid(just_a), valid(both)
     assert vboth > va > 0, (va, vboth)
+
+    # An input the covering registered (its bounds are within 2*macrotile_buffer_3857 of the
+    # macrotile) but that lands outside this warp's narrower halo must be dropped quietly, not
+    # read as a silent CRS drop: gdalbuildvrt -te discards it with exit 0 and no warning, so
+    # asserting on the unfiltered list turns a legal edge file into a failed build. A handful of
+    # S-102 macrotiles hold one.
+    far = f"{d}/far_z17.tif"
+    utm_box(far, 32617, 400000, 4800000, 40.0)  # ~500 km away, nowhere near `tile`
+    edge = f"{d}/edge.vrt"
+    warp_mixed(d, 3, [a, far], edge, 9, tile, 0)
+    assert valid(edge) == va, (valid(edge), va)  # same pixels as `a` alone
+    with open(edge) as f:
+        assert "far_z17" not in f.read()
+    # A wholly-outside group SKIPS (False, no combined VRT) rather than raising: covering
+    # margins register edge files the warp halo never reaches, and the materialized warp
+    # used to emit an all-nodata group for exactly this case.
+    assert warp_mixed(d, 4, [far], f"{d}/allfar.vrt", 9, tile, 0) is False
+    assert not os.path.exists(f"{d}/allfar.vrt"), "all-outside group must not write a VRT"
+
+    # Chunking the combine past COMBINE_FANOUT must change nothing a caller can see: the same
+    # pixels, including who wins an overlap (the chunks are contiguous, so the last input still
+    # does). Overlapping boxes marching east, each carrying its own constant, make that visible.
+    boxes = []
+    for k in range(10):
+        p = f"{d}/fan{k}_z17.tif"
+        utm_box(p, 32617, 748000 + k * 6000, 4438000, float(k + 1), n=120, res=100)
+        boxes.append(p)
+    chunked, one_shot = f"{d}/chunked.vrt", f"{d}/oneshot.vrt"
+    real_fanout = COMBINE_FANOUT
+    try:
+        globals()["COMBINE_FANOUT"] = 3                # 4 chunks over the 10 boxes
+        warp_mixed(d, 5, boxes, chunked, 9, tile, 0)
+        globals()["COMBINE_FANOUT"] = len(boxes) + 1   # same inputs, one flat combine
+        warp_mixed(d, 6, boxes, one_shot, 9, tile, 0)
+    finally:
+        globals()["COMBINE_FANOUT"] = real_fanout
+    with rasterio.open(chunked) as c, rasterio.open(one_shot) as o:
+        ca, oa = c.read(1), o.read(1)
+    assert (ca == oa).all(), "chunked combine is not pixel-identical to the flat one"
+    assert set(np.unique(ca[ca != NODATA]).tolist()) == set(float(k + 1) for k in range(10)), \
+        f"every chunked input must reach the mosaic: {np.unique(ca[ca != NODATA])}"
+    with open(chunked) as f:
+        assert "chunk" in f.read(), "expected the root to reference chunk VRTs"
+
+    # ...and an input the combine cannot open must still raise from inside a chunk: gdalbuildvrt
+    # skips it with exit 0, which is the silent-drop shape assert_vrt_complete exists to catch.
+    junk = f"{d}/junk-3857.vrt"
+    with open(junk, "w") as f:
+        f.write("not a vrt")
+    try:
+        combine_warped(d, 7, [f"{d}/5-0-3857.vrt", junk], f"{d}/holed.vrt",
+                       buffered_bounds(tile, 0), get_resolution(9))
+        assert False, "expected a dropped input inside a chunk to raise"
+    except RuntimeError as e:
+        assert "dropped" in str(e) and "junk" in str(e), e
+
+    # band: a mixed_crs source can be multi-band (S-102 is depth + uncertainty), and the mosaic
+    # must carry the pinned band alone. -srcband replaces the band-selecting VRT that used to sit
+    # in front of every input, so this is what proves the right band still lands.
+    two = f"{d}/two_band_z17.tif"
+    with rasterio.open(two, "w", driver="GTiff", height=120, width=120, count=2, dtype="float32",
+                       nodata=NODATA, crs="EPSG:32617",
+                       transform=from_origin(748000, 4438000, 100, 100)) as dst:
+        dst.write(np.full((120, 120), 7.0, dtype="float32"), 1)
+        dst.write(np.full((120, 120), 99.0, dtype="float32"), 2)
+    picked = f"{d}/picked.vrt"
+    warp_mixed(d, 8, [two], picked, 9, tile, 0, band=1)
+    with rasterio.open(picked) as src:
+        arr, count = src.read(1), src.count
+    assert count == 1, f"band-pinned mosaic must be single-band, got {count}"
+    got = arr[(arr != NODATA) & ~np.isnan(arr)]
+    assert got.size and (got == 7.0).all(), f"expected band 1 (7.0), got {np.unique(got)[:5]}"
+
+    # ...and must not shift a value vertically. A materialized gdalwarp converts NAVD88 to
+    # ellipsoidal height (~-22 m in Puget Sound, always deeper); the warped-VRT mosaic cannot,
+    # which is the second line behind source_datum.flatten_compound_crs. The materialized warp
+    # is run first as a POSITIVE CONTROL: without a geoid grid installed PROJ applies nothing
+    # and the real assertion would pass vacuously, so skip loudly instead of claiming a pass.
+    # EPSG:5498 is NAD83 + NAVD88 height — the horizontal half is GEOGRAPHIC, so this box is
+    # placed in degrees (~11 km over Puget Sound), not in the eastings the UTM boxes above use.
+    compound = f"{d}/compound.tif"
+    utm_box(compound, 5498, -122.45, 48.45, -80.0, n=200, res=0.0005)
+    ptile = mercantile.tile(-122.4, 48.4, 11)
+    shifted = f"{d}/shifted.tif"
+    left, bottom, right, top = buffered_bounds(ptile, 0)
+    res13 = get_resolution(13)
+    _run(f"gdalwarp -overwrite -t_srs EPSG:3857 -tr {res13} {res13} -te {left} {bottom} "
+         f"{right} {top} -r {RESAMPLE} -dstnodata {NODATA} {compound} {shifted}",
+         "gdalwarp(control)")
+
+    def middle(path):
+        with rasterio.open(path) as src:
+            arr = src.read(1)
+        ok = (arr != NODATA) & ~np.isnan(arr)
+        return float(np.median(arr[ok])) if ok.any() else None
+
+    control = middle(shifted)
+    if control is None or abs(control - (-80.0)) <= 1.0:
+        print("  (skipped vertical-shift check: no geoid grid here, the control did not shift)")
+    else:
+        lazy = f"{d}/compound-3857.vrt"
+        warp_mixed(d, 2, [compound], lazy, 13, ptile, 0)
+        got = middle(lazy)
+        assert got is not None and abs(got - (-80.0)) <= 0.1, \
+            f"warp_mixed shifted a compound-CRS value: {got} (control {control}, source -80.0)"
+
+    # assert_vrt_complete: same-CRS inputs all land in the VRT; a mixed pair (gdalbuildvrt
+    # drops the off-CRS one with only a warning) must raise and name the missing file.
+    c, mixed_vrt = f"{d}/c_z17.tif", f"{d}/mixed.vrt"
+    utm_box(c, 32617, 760000, 4438000, 30.0)
+    same_vrt = f"{d}/same.vrt"
+    utils.run_command(f"gdalbuildvrt -overwrite {same_vrt} {a} {c}")
+    assert_vrt_complete(same_vrt, [a, c])
+    utils.run_command(f"gdalbuildvrt -overwrite {mixed_vrt} {a} {b}")
+    try:
+        assert_vrt_complete(mixed_vrt, [a, b])
+        assert False, "expected a dropped off-CRS input to raise"
+    except RuntimeError as e:
+        assert "b_z18.tif" in str(e) and "1/2" in str(e), e
 
     # run_command must RAISE on a failed gdalbuildvrt (not swallow it) — the bug that let a
     # missing VRT reach gdalwarp as a baffling "No such file" and kill an hour-long aggregate.
@@ -460,31 +693,6 @@ def _check():
         assert False, "expected run_command to raise on a failed gdalbuildvrt"
     except RuntimeError:
         assert not os.path.exists(miss)
-
-    # _build_tile_vrt retries a transient failure then succeeds, and raises once exhausted.
-    # (mock run_command + sleep so it's offline and instant)
-    real_run, real_sleep, calls = utils.run_command, time.sleep, []
-    try:
-        time.sleep = lambda s: None
-        def fail_once(cmd, silent=True):
-            calls.append(cmd)
-            if len(calls) < 2:
-                raise RuntimeError("transient")
-            return "", ""
-        utils.run_command = fail_once
-        _build_tile_vrt("noop", tries=3)
-        assert len(calls) == 2, calls  # failed once, recovered on retry
-
-        def always_fail(cmd, silent=True):
-            raise RuntimeError("persistent")
-        utils.run_command = always_fail
-        try:
-            _build_tile_vrt("noop", tries=2)
-            assert False, "expected _build_tile_vrt to raise after exhausting retries"
-        except RuntimeError:
-            pass
-    finally:
-        utils.run_command, time.sleep = real_run, real_sleep
 
     # _run retries the same transient class (warp/translate over /vsicurl dying
     # mid-transfer) then succeeds; a deterministic failure exhausts and raises.
@@ -529,6 +737,19 @@ def _check():
                     a[cr*F:(cr+1)*F, cc*F:(cc+1)*F] = -3.0
         return a
 
+    def cell_quantized(cell, n, seed=7):
+        """An irregular coverage boundary snapped to `cell`-px source cells — a smooth random
+        field thresholded on the cell lattice, then blown up by nearest. A monotone diagonal
+        is not a fair fixture: it is already half-removed at half the right factor, while real
+        coverage (and this) still carries most of its boundary in long runs there."""
+        from scipy.ndimage import gaussian_filter
+        rng = np.random.default_rng(seed)
+        coarse = gaussian_filter(rng.standard_normal((n // cell, n // cell)).astype("float32"),
+                                 1.2) > 0
+        a = np.full((n, n), NODATA, dtype="float32")
+        a[np.repeat(np.repeat(coarse, cell, axis=0), cell, axis=1)] = -3.0
+        return a
+
     def as_cog(arr, name):
         raw = f"{d}/{name}.tif"
         with rasterio.open(raw, "w", driver="GTiff", height=arr.shape[0], width=arr.shape[1],
@@ -559,6 +780,27 @@ def _check():
             for x in xs:
                 prev[x] = 1
         return max([best] + list(prev.values()))
+
+    def long_run_fraction(valid, min_run=6):
+        """Share of the coverage boundary drawn in straight runs of >= min_run px — the
+        staircase metric measured on the real 16 m S-102 file at Jacksonville, warped to the
+        production z15 grid: 98.5% raw, 73.1% at factor 4, 39.1% at factor 8 for a cell that
+        measures 7.8 px."""
+        total = in_long = 0
+        for m in (valid, valid.T):
+            flips = m[:, 1:] != m[:, :-1]
+            active, runs = {}, []
+            for i in range(m.shape[0]):
+                xs = set(np.flatnonzero(flips[i]).tolist())
+                for x in list(active):
+                    if x not in xs:
+                        runs.append(i - active.pop(x))
+                for x in xs:
+                    active.setdefault(x, i)
+            runs += [m.shape[0] - start for start in active.values()]
+            total += sum(runs)
+            in_long += sum(r for r in runs if r >= min_run)
+        return in_long / total if total else 0.0
 
     def splits(before, after):
         """Original coverage components that ended up in more than one final component.
@@ -610,8 +852,47 @@ def _check():
         assert broke == 0, f"{name}: feather split {broke} coverage component(s)"
         assert (data[valid] != NODATA).all(), f"{name}: covered pixel holding NODATA"
 
+    # 3. sizing, against the registration rows the covering CSV names. A zoom-level count
+    #    rounds the wrong way: the 16 m S-102 files off Jacksonville resolve to z13, whose
+    #    bracket bottoms out at 4 px on the z15 grid while the cells measure 7.8 — the blur
+    #    would run at half the staircase's scale. Bounds and dimensions here are those two
+    #    files' real ones (18.636 m and 4.652 m per cell in 3857).
+    rows = [("coarse.tif", 0.0, 0.0, 18.636 * 1000, 18.636 * 1000, 1000, 1000),
+            ("fine.tif", 0.0, 0.0, 4.652 * 1000, 4.652 * 1000, 1000, 1000)]
+    real_source_files = config.source_files
+    try:
+        config.source_files = lambda _sid: rows
+        group = [{"source": "s102", "filename": n, "maxzoom": 13}
+                 for n in ("coarse.tif", "fine.tif")]
+        cz15, cz14 = get_resolution(15), get_resolution(14)
+        cell_px = group_cell_px(group, cz15)
+        assert 7.7 < cell_px < 7.9, cell_px                # measured lattice at z15: 7.788 px
+        assert cell_px > 1.9 * (1 << (15 - 13)), cell_px   # nearly twice the bracket's floor
+        # the same cells one zoom down are the same shoreline, so they must still be feathered
+        assert group_cell_px(group, cz14) >= FEATHER_MIN_CELL_PX, group_cell_px(group, cz14)
+        # ...while the 4 m file on its own draws no staircase and must stay untouched
+        assert group_cell_px(group[1:], cz15) < FEATHER_MIN_CELL_PX, group_cell_px(group[1:], cz15)
+        # an unregistered file has no known cell, and an unknown cell must not be smoothed
+        assert group_cell_px([{"source": "s102", "filename": "unregistered.tif"}], cz15) == 0.0
+    finally:
+        config.source_files = real_source_files
+
+    # 4. ...and that ratio is the factor that clears the staircase: 8-px cells feathered at
+    #    the ratio against the same cells feathered at their zoom bracket's floor.
+    ratio8 = cell_quantized(8, 512)
+    raw_frac = long_run_fraction(ratio8 != NODATA)
+    fracs = {}
+    for factor in (4, 8):
+        cog = as_cog(ratio8, f"ratio8f{factor}")
+        feather_coverage_edge(cog, factor)
+        fracs[factor] = long_run_fraction(read(cog)[1])
+    assert raw_frac > 0.9, raw_frac
+    assert fracs[8] < 0.45 and fracs[8] < 0.8 * fracs[4], (raw_frac, fracs)
+
     print(f"aggregation_reproject.py self-check ok (valid pixels: A={va}, A+B={vboth}; "
-          f"feather stair {before}px -> {after}px)")
+          f"feather stair {before}px -> {after}px; 8px-cell boundary in >=6px runs "
+          f"{raw_frac*100:.0f}% raw -> {fracs[4]*100:.0f}% at factor 4 -> "
+          f"{fracs[8]*100:.0f}% at factor 8)")
 
 
 if __name__ == "__main__":

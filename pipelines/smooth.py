@@ -17,7 +17,11 @@ so peak memory is one padded block, not the whole raster — a z14 macrotile is
 Sigma is in merged-DEM pixels, so the physical blur scale tracks the tile's zoom
 (coarse base tiles blur more in metres, fine regional tiles less) — roughly what we
 want (coarse data is noisier). Revisit with a physical-scale sigma if it
-over/under-blurs. SKIP_SMOOTH=1 disables it.
+over/under-blurs — but not for cross-zoom agreement: measured, a metre-scale sigma
+WIDENS the served pyramid's zoom-to-zoom disagreement instead of closing it, because
+the class-aware reduction doubles narrow water's physical width at every level, so an
+identical kernel attenuates the coarse copy less. terrain._FinerTiles carries that
+invariant instead. SKIP_SMOOTH=1 disables it.
 """
 
 import glob

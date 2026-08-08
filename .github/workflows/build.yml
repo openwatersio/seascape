@@ -383,7 +383,8 @@ jobs:
           # per-source push in publish.smk, run by sources.yml). stage_build always runs; a
           # bbox run stages under build/<sha>-bbox (see SHA above), so the regional archives
           # are previewable but can never be promoted by release.yml.
-          case "$INPUT_TARGETS" in *[!-A-Za-z0-9_\ ]*) echo "invalid targets" >&2; exit 1 ;; esac
+          # / and . admit file targets (a scoped heal names store paths); still shell-inert.
+          case "$INPUT_TARGETS" in *[!-A-Za-z0-9_/.\ ]*) echo "invalid targets" >&2; exit 1 ;; esac
           read -r -a targets <<<"${INPUT_TARGETS:-bundles publish_mosaic stage_build vector_selfcheck}"
           # Scope gate: the dispatcher states the expected DAG size; if the planner disagrees
           # (a staleness-trigger surprise: param re-key, rename cascade, temp regeneration —

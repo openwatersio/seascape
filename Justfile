@@ -71,12 +71,16 @@ test-sources:
     uv run python source_remote.py
     uv run python source_fetch.py --check
     uv run python source_prep.py --check
+    uv run python source_normalize.py --check
     uv run python source_polygonize.py --check
     uv run python source_check.py --check
+    uv run python source_datum.py --check
+    uv run python datum_grid.py --check
     uv run snakemake -s ../Snakefile -n sources > /dev/null
 
 # Build self-checks: the e2e (real stage-1 CLIs + the unified DAG), the `cover` checkpoint
-# seam (test_build), and each module's --check.
+# seam (test_build), each module's --check, and the cross-layer agreement of the three
+# products that reduce the mosaic separately (test_consistency).
 test-engine:
     uv run python test_engine.py
     uv run python aggregation_reproject.py --check
@@ -86,6 +90,7 @@ test-engine:
     uv run python bundle.py --check
     uv run python test_build.py
     uv run python terrain.py --check
+    uv run python test_consistency.py
     # Repo root: the logger plugin has to sit on sys.path under its discoverable name.
     cd "{{justfile_directory()}}" && uv run python -m snakemake_logger_plugin_seascape --check
 
