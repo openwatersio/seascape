@@ -525,7 +525,12 @@ def reproject(filepath):
             # reads this unclamped mosaic in (0, DRYING_CAP]. Clamp positive ocean to 0 so it can't.
             # Deliberately discards coarse "drying": these flagged sources can't resolve the
             # foreshore, and trusted topobathy sources are unflagged, so genuine drying survives.
-            landmask.clamp_positive_ocean(out_tiff, mask_tif, water_tif)
+            # Eroded by the group's own cell (same measure the feather uses), because rasterize
+            # samples centres: a straddling cell that centres on land keeps its positive value here
+            # and re-cuts as drying against the render's finer mask. At least one pixel — a flagged
+            # source is coarse by definition, and a cell finer than the grid still straddles.
+            landmask.clamp_positive_ocean(out_tiff, mask_tif, water_tif,
+                                          erode_px=max(1.0, min(cell_px, FEATHER_MAX_FACTOR)))
         out_i += 1
         if len(grouped) > 1 and not contains_nodata_pixels(out_tiff):
             break
