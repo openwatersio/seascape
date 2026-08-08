@@ -79,9 +79,10 @@ export const day: Flavor = {
   // Land above datum: translucent buff wash (paper-chart figure-ground — white
   // stays unambiguously "deep water"); a raster base reads through it.
   land: "rgba(247,240,221,0.66)",
-  // Drying areas (INT-1 foreshore green): seabed above chart datum that covers
-  // and uncovers with the tide.
-  drying: "#a8d5ba",
+  // Drying areas (S-52 DEPIT day green): seabed above chart datum that covers
+  // and uncovers with the tide. Darker than the shoalest band — charts weight
+  // the foreshore as the heaviest tint in the shoaling sequence.
+  drying: "#58af9c",
   // Unknown-depth water (ENC DEPARE nodata): mapped water we hold no depth for. Painted
   // the hazard tint — unsurveyed water warrants the same caution as known-unsafe water
   // (ECDIS treats it as unsafe for the safety check; S-52 hatching is the eventual upgrade).
