@@ -280,10 +280,15 @@ def tiles(out=LAND_TILES):
             # kind <> 'physical': Overture's marine polygons (bays/straits/fjärdar) are
             # drawn without island holes, so subtracting them erases real islands from
             # the mask; genuine inland water is lake/pond/river/canal/reservoir.
+            # column list from the layer itself: published/synthetic masks carry attribute subsets
+            stdout, _ = utils.run_command(f"ogrinfo -so -ro {water} water", silent=True)
+            have = {line.split(":")[0].strip() for line in stdout.splitlines() if ":" in line}
+            cols = ", ".join(
+                f for f in ("kind", "class", "is_salt", "is_intermittent", "tidal") if f in have)
             utils.run_command(
                 f"ogr2ogr -f FlatGeobuf -overwrite -nln water -nlt PROMOTE_TO_MULTI "
                 f"-dialect SQLITE -sql \"SELECT ST_CollectionExtract(geometry, 3) AS geometry, "
-                f"kind, class, is_salt, is_intermittent, tidal FROM water WHERE "
+                f"{cols} FROM water WHERE "
                 f"NOT ST_IsEmpty(ST_CollectionExtract(geometry, 3)) "
                 f"AND kind <> 'physical'\" "
                 f"{tmp_water} {water}")
