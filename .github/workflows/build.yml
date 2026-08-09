@@ -247,14 +247,17 @@ jobs:
         # (land-z8.tif is ~93 MB, max-age 4h), and a build that silently reads a stale mask is
         # the failure this whole lane exists to prevent. --size-only skips an already-current
         # file, so a warm volume pays nothing.
+        env:
+          STATE: /mnt/seascape-store
         run: |
-          dst=/mnt/seascape-store/store/landmask
-          mkdir -p "$dst"
+          mkdir -p /mnt/seascape-store/store/landmask
+          # rclone lives in the toolchain image, not on the host — STATE mounts the volume at
+          # /app/state, and docker.sh forwards the R2 credentials.
           for f in land.fgb water.fgb land-z8.tif; do
-            rclone copyto "r2:$DATA_BUCKET/bathymetry/landmask/$f" "$dst/$f" \
-              --size-only --retries 5 --stats 30s --stats-one-line
+            ./docker.sh rclone copyto "r2:$DATA_BUCKET/bathymetry/landmask/$f" \
+              "/app/state/store/landmask/$f" --size-only --retries 5 --stats 30s --stats-one-line
           done
-          ls -l "$dst"
+          ls -l /mnt/seascape-store/store/landmask
       - name: Hot landmask masks on NVMe
         # Every fork's clamp rasterize range-reads land/water FGBs thousands of times; serve
         # them from local NVMe via a bind mount so the DAG sees identical paths AND mtimes
