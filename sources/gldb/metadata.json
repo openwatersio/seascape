@@ -1,0 +1,12 @@
+{
+    "name": "GLDBv2 Lake Bathymetry (30 arcsec, 25 large lakes)",
+    "producer": "E. Kourzeneva & M. Choulga — Global Lake Database v2, Adv. Sci. Res. 16:57, 2019",
+    "website": "http://www.flake.igb-berlin.de/",
+    "license": "CC-BY",
+    "datum": "depth below local lake surface — depth, so negate; no offset",
+    "negate": true,
+    "land_clamp": true,
+    "priority": 1,
+    "crs": "EPSG:4326",
+    "unpack": "gldb"
+}

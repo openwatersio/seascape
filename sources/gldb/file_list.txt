@@ -1,0 +1,10 @@
+# Global Lake Database v2 (GLDBv2), Kourzeneva & Choulga — one 10 MB tar.gz holding a
+# 30 arcsec global lake-depth grid (little-endian Int16 decimetres). Only the 36 lakes in
+# LargeLakesWithBathymetry_v2.txt carry digitised bathymetry; everywhere else the grid is a
+# per-lake mean, a modeled estimate or the 10 m default, so `unpack: "gldb"` cuts out the 25
+# components no dedicated source already covers (the Great Lakes come from great_lakes,
+# Victoria/Albert/Edward from african_great_lakes) and drops the rest. Values are depth below
+# the lake surface, positive down → negate, no offset. CC-BY per the Data Availability of
+# https://asr.copernicus.org/articles/16/57/2019/ — cite Kourzeneva/Choulga and the per-lake
+# references bundled in the archive.
+http://www.flake.igb-berlin.de/data/gldbv2.tar.gz
