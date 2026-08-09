@@ -251,10 +251,11 @@ jobs:
           STATE: /mnt/seascape-store
         run: |
           mkdir -p /mnt/seascape-store/store/landmask
-          # rclone lives in the toolchain image, not on the host — STATE mounts the volume at
-          # /app/state, and docker.sh forwards the R2 credentials.
+          # rclone lives in the toolchain image, not on the host; `docker.sh run` is the
+          # verbatim-argv form (a bare first arg would be routed to a just recipe). STATE mounts
+          # the volume at /app/state and docker.sh forwards the R2 credentials.
           for f in land.fgb water.fgb land-z8.tif; do
-            ./docker.sh rclone copyto "r2:$DATA_BUCKET/bathymetry/landmask/$f" \
+            ./docker.sh run rclone copyto "r2:$DATA_BUCKET/bathymetry/landmask/$f" \
               "/app/state/store/landmask/$f" --size-only --retries 5 --stats 30s --stats-one-line
           done
           ls -l /mnt/seascape-store/store/landmask
