@@ -358,7 +358,9 @@ jobs:
           force=()
           if [ "$INPUT_FORCE" = "true" ]; then force=(-F); fi
           # Extra args reach the command as separate words; reject anything shell-active.
-          case "$INPUT_ARGS" in *[!-A-Za-z0-9_=\ .]*) echo "invalid snakemake_args" >&2; exit 1 ;; esac
+          # / admits path-taking args (--cleanup-metadata store/... clears the incomplete mark an
+          # interrupted rule leaves behind); still shell-inert — no globs, quotes, or redirection.
+          case "$INPUT_ARGS" in *[!-A-Za-z0-9_=/.\ ]*) echo "invalid snakemake_args" >&2; exit 1 ;; esac
           read -r -a extra <<<"$INPUT_ARGS"
           # extra/force ride BEFORE --config: a bare extra target after it is swallowed
           # as a config pair.
