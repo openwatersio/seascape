@@ -241,6 +241,20 @@ jobs:
         run: |
           mkdir -p "$TMP"  # first snakemake step; the mount source must exist before docker run
           ./docker.sh snakemake --unlock --config workdir=/app/state tmp=/app/tmp
+      - name: Hydrate landmask from R2
+        # The masks are build INPUTS, so they come from the bucket over the S3 API rather than
+        # the public HTTPS base: that base sits behind a CDN which caches anything small enough
+        # (land-z8.tif is ~93 MB, max-age 4h), and a build that silently reads a stale mask is
+        # the failure this whole lane exists to prevent. --size-only skips an already-current
+        # file, so a warm volume pays nothing.
+        run: |
+          dst=/mnt/seascape-store/store/landmask
+          mkdir -p "$dst"
+          for f in land.fgb water.fgb land-z8.tif; do
+            rclone copyto "r2:$DATA_BUCKET/bathymetry/landmask/$f" "$dst/$f" \
+              --size-only --retries 5 --stats 30s --stats-one-line
+          done
+          ls -l "$dst"
       - name: Hot landmask masks on NVMe
         # Every fork's clamp rasterize range-reads land/water FGBs thousands of times; serve
         # them from local NVMe via a bind mount so the DAG sees identical paths AND mtimes
