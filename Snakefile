@@ -294,13 +294,11 @@ rule watermask:
     params:
         version=2, # increment to force a rebuild
     priority: 10_000_000  # see landmask
-    retries: 2
-    # Window reads are latency-bound, not CPU-bound: each one waits ~0.5 s per range request
-    # on the transatlantic hop to us-west-2, so workers sit on sockets and oversubscribing the
-    # 8-core box is the whole lever (measured 11 windows/h at 8 on a degraded route).
-    threads: 16
+    # No retries: the planet read is ~9 h, and every failure seen here has been deterministic
+    retries: 0
+    threads: 8  # the planet read is tiled + parallel (landmask._water_tile); IO-bound S3 reads
     resources:
-        mem_gb=25  # 12.4 GB measured at 8 workers; scaled, and the ceiling on a 32 GB box
+        mem_gb=8  # the planet Overture-water reproject; refine from the benchmark
     benchmark:
         f"{TMP}/bench/watermask.tsv"
     log:

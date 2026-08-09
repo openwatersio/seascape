@@ -57,6 +57,7 @@ HTTP-range friendly. LANDMASK / WATERMASK / LANDRASTER override the paths.
   python landmask.py --check      self-check
 """
 
+import math
 import os
 import sys
 import zipfile
@@ -316,9 +317,12 @@ EXCLUDED_SUBTYPES = "('ocean','physical','human_made','wastewater','spring')"
 # connected waterway, and a dropped segment punches a gap in the channel.
 CHANNEL_KINDS = "('river','canal','stream')"
 
-# Probe fixture for the presence gate: every Natural Earth 10m lake >= 300 km² (interior
-# point + area), 542 rows. All were present in the mask except Lake Huron when the gate was
-# introduced, so the gate expects ALL of them — a miss is always a defect, never a known gap.
+# Probe fixture for the presence gate: every Natural Earth 10m lake >= 300 km² (interior point
+# + area), 542 rows. `required` marks the 494 verified present in a built mask, so the gate is a
+# REGRESSION check — Overture is a different dataset from Natural Earth and legitimately lacks 48
+# of them (small reservoirs, and lakes whose Overture outline misses NE's interior point). The
+# Huron system is required because the clip fix restores it. Re-verify the column against a known
+# good mask before adding rows; an absolute-presence gate fails on Overture's coverage, not ours.
 WATER_PROBES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "water_probes.csv")
 
 
@@ -352,24 +356,30 @@ def _check_water(fgb, merged, windows):
             f"water gate: conversion dropped {n_in - n_out} of {n_in} eligible features")
     missing = []
     probed = 0
+    bonus = 0
     with open(WATER_PROBES) as f:
         for row in csv.DictReader(f):
             lon, lat = float(row["lon"]), float(row["lat"])
             if not any(w <= lon <= e and s <= lat <= n for w, s, e, n in windows):
                 continue
-            probed += 1
+            required = row.get("required") == "1"
+            probed += required
             x = lon * MERC_X / 180
             y = math.log(math.tan(math.pi / 4 + math.radians(lat) / 2)) * 6378137.0
             stdout, _ = utils.run_command(
                 f"ogrinfo -q -ro {fgb} water -spat {x - 500} {y - 500} {x + 500} {y + 500}",
                 silent=True)
-            if "OGRFeature" not in stdout:
+            hit = "OGRFeature" in stdout
+            if required and not hit:
                 missing.append(row["name"] or f"({lon},{lat})")
+            elif hit and not required:
+                bonus += 1  # a known-absent lake this build newly covers — report, never fail
     if missing:
         raise SystemExit(
-            f"water gate: {len(missing)} of {probed} probe lakes missing from the mask: "
+            f"water gate: {len(missing)} of {probed} required lakes missing from the mask: "
             + ", ".join(missing[:10]))
-    print(f"water gates ok ({n_out} features conserved, {probed} probe lakes present)")
+    print(f"water gates ok ({n_out} features conserved, {probed} required lakes present, "
+          f"{bonus} beyond the baseline)")
 
 # Area floor (EPSG:3857 m²) for compact kinds — sub-pixel even at z14, and dominated by
 # retention ponds and farm dams that read as noise on a chart.
@@ -599,6 +609,11 @@ def extract_raster(bounds_3857, res, out_tif):
         f"-co COMPRESS=DEFLATE -co TILED=YES -co SPARSE_OK=YES {raster_path()} {out_tif}")
 
 
+# Windowed-scan pitch, shared by the clamps. Module-level so the self-check can shrink it and prove
+# the ocean clamp's erosion halo makes the result independent of it.
+_SCAN_BLOCK = 2048
+
+
 def _clamp_negative_land(dem_path, mask_tif, valid):
     """Shared windowed clamp: where land (mask==1) AND valid(ds, win, a) AND value<0, set 0.
     Mask-first — read the cheap Byte mask window and skip landless blocks before decoding the
@@ -606,7 +621,7 @@ def _clamp_negative_land(dem_path, mask_tif, valid):
     contains_nodata_pixels (the block cache these windowed reads accumulate, per worker)."""
     with rasterio.open(mask_tif) as m:
         mask_shape = (m.height, m.width)
-    block = 2048
+    block = _SCAN_BLOCK
     with rasterio.env.Env(GDAL_CACHEMAX=64):
         with rasterio.open(dem_path, "r+", IGNORE_COG_LAYOUT_BREAK="YES") as ds, \
                 rasterio.open(mask_tif) as m:
@@ -681,7 +696,7 @@ def clamp_positive_water(cog_path, water_tif):
     from rasterio.enums import ColorInterp
     with rasterio.open(water_tif) as m:
         water_shape = (m.height, m.width)
-    block = 2048
+    block = _SCAN_BLOCK
     with rasterio.env.Env(GDAL_CACHEMAX=64):
         with rasterio.open(cog_path, "r+", IGNORE_COG_LAYOUT_BREAK="YES") as ds, \
                 rasterio.open(water_tif) as m:
@@ -710,7 +725,7 @@ def clamp_positive_water(cog_path, water_tif):
                             ds.write(al, alpha, window=win)
 
 
-def clamp_positive_ocean(cog_path, mask_tif, water_tif=None):
+def clamp_positive_ocean(cog_path, mask_tif, water_tif=None, erode_px=1):
     """4th-quadrant per-source clamp, sibling of clamp mirrored to the ocean side: on a flagged
     source's warped COG, where a valid pixel is > 0 AND seaward of the OSM land line (combined
     mask==0) AND outside mapped inland water, set it to 0. A coarse global source's shoreline cells
@@ -726,10 +741,24 @@ def clamp_positive_ocean(cog_path, mask_tif, water_tif=None):
     clamp_positive_water clears to nodata. Absent a water feed, ocean is just mask==0 (unmapped
     inland water then reads as ocean — the same land-only degrade the rest of the module takes).
 
+    `erode_px` shrinks the land side first, so a cell that merely TOUCHES water clamps rather than
+    only one centred on water. Rasterize samples pixel centres, so a source cell straddling the
+    coast lands wholly on whichever side its centre falls; a land-side one keeps its positive value
+    here and then meets the RENDER's mask, rasterized at the render zoom rather than this one — its
+    seaward remainder falls in (0, DRYING_CAP] and tints as drying, a fringe one source cell wide
+    along every coast (measured through the Stockholm archipelago, where the tide is 5 cm and no
+    foreshore can exist). Eroding by that same cell cuts the straddle at its own scale. It costs no
+    genuine drying: OSM draws the coastline at high water, so real foreshore is already seaward of
+    the line and already clamped. Land-side leftovers resolve as land downstream — the render nudges
+    a land-side <= 0 to the land sentinel off its finer mask, and the depare land cut is that same
+    OSM line.
+
     Same windowed, mask-first, GDAL_CACHEMAX-bounded scan as _clamp_negative_land."""
+    from scipy import ndimage
     with rasterio.open(mask_tif) as m:
         mask_shape = (m.height, m.width)
-    block = 2048
+    block = _SCAN_BLOCK
+    pad = int(math.ceil(erode_px)) if erode_px > 0 else 0
     with rasterio.env.Env(GDAL_CACHEMAX=64):
         water = rasterio.open(water_tif) if water_tif is not None else None
         with rasterio.open(cog_path, "r+", IGNORE_COG_LAYOUT_BREAK="YES") as ds, \
@@ -743,7 +772,19 @@ def clamp_positive_ocean(cog_path, mask_tif, water_tif=None):
                     for col in range(0, ds.width, block):
                         win = rasterio.windows.Window(
                             col, row, min(block, ds.width - col), min(block, ds.height - row))
-                        ocean = m.read(1, window=win) == 0
+                        if pad:
+                            # Read the erosion halo from the neighbouring blocks so the result is
+                            # block-size independent; off-raster reads fill LAND, the no-erosion
+                            # value, and the aggregation buffer keeps that out of the interior.
+                            phal = rasterio.windows.Window(
+                                win.col_off - pad, win.row_off - pad,
+                                win.width + 2 * pad, win.height + 2 * pad)
+                            land = m.read(1, window=phal, boundless=True, fill_value=1) == 1
+                            land = ndimage.binary_erosion(
+                                land, _disk(erode_px), border_value=1)[pad:-pad, pad:-pad]
+                            ocean = ~land
+                        else:
+                            ocean = m.read(1, window=win) == 0
                         if water is not None:
                             ocean &= water.read(1, window=win) == 0
                         if not ocean.any():
@@ -756,6 +797,14 @@ def clamp_positive_ocean(cog_path, mask_tif, water_tif=None):
             finally:
                 if water is not None:
                     water.close()
+
+
+def _disk(r):
+    """Euclidean disk of radius r as a binary structuring element — an isotropic erosion, so the
+    clamp reaches the same distance inland on a diagonal coast as on a north-south one."""
+    n = int(math.ceil(r))
+    y, x = np.ogrid[-n:n + 1, -n:n + 1]
+    return x * x + y * y <= r * r
 
 
 def _check():
@@ -927,12 +976,20 @@ def _check():
     # inland water burned to water; water_only (wonly) isolates inland water; ocean is the rest.
     iwy, iwx = np.where(wonly == 1)                   # inland water
     ocy, ocx = np.where((lw == 0) & (wonly == 0))     # ocean (not land, not inland water)
-    ldy, ldx = np.where(lw == 1)                      # land (not water)
-    assert len(iwy) > 1 and len(ocy) and len(ldy), "need inland-water, ocean, and land test pixels"
+    # Land pixels split by the clamp's erosion: rm* is land within ERODE of water (the straddling
+    # coastal cell the erosion exists to reach), ld* is land beyond its reach.
+    from scipy import ndimage
+    ERODE = 2
+    inner = ndimage.binary_erosion(lw == 1, _disk(ERODE), border_value=1)
+    rmy, rmx = np.where((lw == 1) & ~inner)
+    ldy, ldx = np.where(inner)
+    assert len(iwy) > 1 and len(ocy) and len(ldy) and len(rmy), \
+        "need inland-water, ocean, deep-land, and land-rim test pixels"
     dem2 = np.full((h, w), -5.0, dtype="float32")
     dem2[iwy[0], iwx[0]] = 42.0       # positive over inland water -> clears to nodata (#24)
     # dem2[iwy[1], iwx[1]] stays -5.0: negative in water (cryptodepression) -> survives
     dem2[ocy[0], ocx[0]] = 42.0       # positive over ocean -> clamps to 0 (4th quadrant)
+    dem2[rmy[0], rmx[0]] = 42.0       # positive on the land rim -> the erosion clamps it to 0
     dem2[ldy[0], ldx[0]] = 42.0       # positive over land -> survives (the sentinel's job, not here)
     src2 = f"{d}/dem2.tif"
     with rasterio.open(src2, "w", driver="GTiff", height=h, width=w, count=1, dtype="float32",
@@ -941,7 +998,7 @@ def _check():
     cog2 = f"{d}/dem2_cog.tif"
     aggregation_reproject.translate(src2, cog2)
     clamp_positive_water(cog2, water_only)
-    clamp_positive_ocean(cog2, mask_water, water_only)
+    clamp_positive_ocean(cog2, mask_water, water_only, erode_px=ERODE)
     with rasterio.open(cog2) as r:
         out2, valid2 = r.read(1), (r.read_masks(1) != 0)
     assert not valid2[iwy[0], iwx[0]], "positive over inland water must clear to nodata"
@@ -949,8 +1006,24 @@ def _check():
         "negative in water (cryptodepression) must survive — positive-only"
     assert valid2[ocy[0], ocx[0]] and out2[ocy[0], ocx[0]] == 0.0, \
         "positive over ocean must clamp to 0 (4th quadrant)"
+    assert valid2[rmy[0], rmx[0]] and out2[rmy[0], rmx[0]] == 0.0, \
+        "positive within erode_px of water must clamp — that straddling cell is the drying fringe"
     assert valid2[ldy[0], ldx[0]] and out2[ldy[0], ldx[0]] == 42.0, \
         "positive over land must survive (the terrain sentinel handles land, not this clamp)"
+
+    # Erosion is scan-block independent: a block smaller than the raster must give the same result
+    # as one covering it whole, or the clamp would draw a grid of seams at the block pitch.
+    global _SCAN_BLOCK
+    cog3 = f"{d}/dem3_cog.tif"
+    aggregation_reproject.translate(src2, cog3)
+    clamp_positive_water(cog3, water_only)  # same pair as cog2, so only the block size differs
+    _SCAN_BLOCK = 32
+    try:
+        clamp_positive_ocean(cog3, mask_water, water_only, erode_px=ERODE)
+    finally:
+        _SCAN_BLOCK = 2048
+    with rasterio.open(cog3) as r:
+        assert np.array_equal(r.read(1), out2), "erosion must not depend on the scan block size"
 
     # tiles: the two masks tile into a two-layer land.pmtiles (guarded, degrade-to-land-only).
     # Needs a real tippecanoe; skip the burn assertion where it isn't installed locally.
