@@ -292,7 +292,7 @@ rule watermask:
     output:
         "store/landmask/water.fgb"
     params:
-        version=2, # increment to force a rebuild
+        version=3, # increment to force a rebuild
     priority: 10_000_000  # see landmask
     # No retries: the planet read is ~9 h, and every failure seen here has been deterministic
     retries: 0
