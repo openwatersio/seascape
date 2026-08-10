@@ -1,10 +1,11 @@
 {
-    "name": "NOAA CUDEM (NCEI Topobathy 2014)",
+    "name": "NOAA CUDEM (Guam)",
     "producer": "NOAA NCEI",
     "website": "https://www.ncei.noaa.gov/products/coastal-relief-model",
     "license": "public domain (U.S. Government work)",
     "max_zoom": 13,
-    "datum": "MLLW where VDatum covers, CRD in the Columbia River; NAVD88 uncorrected elsewhere (most of Alaska)",
-    "offset_surface": "navd88_chart",
+    "datum": "MLLW via a +0.418 m scalar from GUVD04 (= local MSL to 3 mm at Apra); no VDatum grid",
+    "datum_offset_m": 0.418,
+    "mixed_crs": true,
     "filter": "*.tif|*.tiff"
 }

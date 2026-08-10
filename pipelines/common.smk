@@ -37,6 +37,12 @@ def raw_assets(wc):
     return [f"store/source/{wc.source}/raw/{pipeline_config.item_hash(u)}" for u in urls]
 
 
+def offset_surface(wc):
+    """The chart-datum reference this source's prep subtracts, if metadata declares one."""
+    name = pipeline_config.load_metadata(wc.source).get("offset_surface")
+    return [f"store/datum/{name}.tif"] if name else []
+
+
 def recipe_files(wc):
     """Every file under sources/<id>/ — the exact set source_catalog.recipe_hash hashes."""
     root = SOURCES_DIR / wc.source

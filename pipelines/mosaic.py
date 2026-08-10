@@ -8,16 +8,19 @@ persists that exact array — unsmoothed, unencoded — as the survey-faithful t
     tiles/<stem>.tif          one Float32 COG per aggregation tile: the merged DEM cropped to the
                               tile's EXACT bounds (halo removed so the tiles partition the plane with
                               no overlap — a GTI requirement), nodata = -9999 (the sentinel the
-                              merge's hole detection uses), nodata-aware `average` internal overviews
-                              native -> z8 (the COG driver stops at the 512 block = one z8 tile).
-                              `average`, never `nearest`: decimation is the anti-alias prefilter.
+                              merge's hole detection uses), nodata-aware shoal-biased internal
+                              overviews native -> z8 (stopping at the 512 block = one z8 tile).
+                              Class-aware max of elevation, so a coarse read is never deeper than
+                              the finest data under it and never closes a channel the finest data
+                              holds open (utils.shoal_cog_source).
     index/covering.parquet    a GeoParquet tile index doubling as the manifest: rows are the tile
                               COGs with ABSOLUTE `location`s (+ per-tile resx/resy) the GTI driver
                               reads, plus `seascape:`-prefixed provenance columns it ignores (sources,
                               datum, offset, priority, maxzoom).
-    planet-z8.tif             the whole mosaic decimated to the GEBCO-native z8 base, registered as
-                              the mosaic's overview (GTI <Overview>) so a z0-z4 open reads it, not
-                              thousands of tile-COG top overviews.
+    planet-z8.tif             the whole mosaic at the GEBCO-native z8 base, assembled from each
+                              tile's own z8 pyramid level and registered as the mosaic's overview
+                              (GTI <Overview>) so a z0-z7 open reads it, not thousands of tile-COG
+                              top overviews.
     mosaic.gti                the pointer — a small XML naming the index + the z8 overview; GDAL opens
                               the planet mosaic straight from it. Written LAST.
 
@@ -114,8 +117,8 @@ def _merged_dem(tmp_folder):
 def _translate(filepath, tmp_folder):
     """Crop the halo off the tile's merged DEM and write the mosaic COG to a transient path inside
     tmp_folder. Crops buffer_pixels off every side so the tile carries EXACTLY its mercantile bounds
-    (the non-overlapping partition GTI needs). Float32, nodata = -9999, ZSTD, nodata-aware `average`
-    overviews (COG driver, native -> the 512 block = z8)."""
+    (the non-overlapping partition GTI needs). Float32, nodata = -9999, ZSTD, nodata-aware
+    shoal-biased overviews (native -> the 512 block = z8)."""
     stem = _stem(filepath)
     with open(f"{tmp_folder}/reprojection.json") as f:
         buffer_pixels = json.load(f)["buffer_pixels"]
@@ -132,15 +135,19 @@ def _translate(filepath, tmp_folder):
     tmp_cog = f"{tmp_folder}/mosaic.tif"
     # -b 1: drop any alpha band; -a_nodata -9999 + -ot Float32: one uniform sentinel + dtype across
     # every tile (GEBCO-only tiles are Int16 upstream). -srcwin adjusts the geotransform, so the
-    # output origin is the tile's exact bounds. COG default overviews stop at the 512 block (= z8),
-    # AVERAGE + the nodata make them nodata-aware; the transient smooth/encode never see this file.
-    utils.run_command(
-        f"GDAL_CACHEMAX=512 gdal_translate -q -of COG -b 1 -ot Float32 -a_nodata {NODATA} "
-        f"-srcwin {buffer_pixels} {buffer_pixels} {w} {h} "
-        # IF_SAFER: IF_NEEDED never fires on compressed output, and >4 GB kills the write
-        "-co BIGTIFF=IF_SAFER -co COMPRESS=ZSTD -co PREDICTOR=3 -co BLOCKSIZE=512 "
-        "-co RESAMPLING=AVERAGE -co OVERVIEW_RESAMPLING=AVERAGE -co NUM_THREADS=ALL_CPUS "
-        f"{merged} {tmp_cog}")
+    # output origin is the tile's exact bounds. The transient smooth/encode never see this file.
+    # The overviews stop at the 512 block (= z8) and ARE the charted depth at every zoom below the
+    # tile's native one, so they decimate by the class-aware shoal reduction, never `average`
+    # (utils.shoal_cog_source).
+    args = (f"-b 1 -ot Float32 -a_nodata {NODATA} "
+            f"-srcwin {buffer_pixels} {buffer_pixels} {w} {h}")
+    with utils.shoal_cog_source(merged, args) as src:
+        utils.run_command(
+            f"gdal_translate -q -of COG -a_nodata {NODATA} "
+            # IF_SAFER: IF_NEEDED never fires on compressed output, and >4 GB kills the write
+            "-co BIGTIFF=IF_SAFER -co COMPRESS=ZSTD -co PREDICTOR=3 -co BLOCKSIZE=512 "
+            "-co OVERVIEWS=FORCE_USE_EXISTING -co NUM_THREADS=ALL_CPUS "
+            f"{src} {tmp_cog}")
     return tmp_cog
 
 
@@ -238,17 +245,49 @@ def _write_index(filepath_out, features):
     os.remove(tmp_geojson)
 
 
-def _warp_planet(index_path, out_tmp):
-    """Decimate the whole mosaic (via the index-as-GTI, so the warp picks each tile's own
-    `average` overviews — never a full-res read) to the GEBCO-native z8 base."""
+def _build_planet(stems, out_tmp):
+    """Assemble the GEBCO-native z8 base from every tile's own z8 pyramid level.
+
+    A macrotile is 512 px at res(z8) by construction and its COG pyramid stops at that 512 block, so
+    a VRT pinned to res8 serves each tile from a level the class-aware shoal reduction produced —
+    exactly 512x512, 1:1, no resampling kernel and no full-res read anywhere. Reading the index as a
+    GTI instead reads every tile at its NATIVE resolution: a GTI exposes no per-tile overviews
+    (measured, GDAL 3.13), so the decimation would fall to a class-blind gdal kernel over blocks
+    that mix land and water.
+
+    The mosaic lands in a plain GTiff first: it is the one artifact here that cannot be a VRT
+    (re-reading a planet of tiles per pyramid level would cost far more than the file). Its own
+    pyramid runs to at least macrotile_z levels because the terrain render reads this COG for every
+    zoom down to z0, and a regional build's z8 base is far narrower than the 512 * 2**macrotile_z px
+    at which the 512-block rule alone would supply them."""
     res8 = aggregation_reproject.get_resolution(utils.macrotile_z)
-    if os.path.exists(out_tmp):
-        os.remove(out_tmp)
+    base = out_tmp + ".base.tif"
+    listing = out_tmp + ".txt"
+    vrt = out_tmp + ".vrt"
+    for stale in (out_tmp, base, listing, vrt):
+        if os.path.exists(stale):
+            os.remove(stale)
+    with open(listing, "w") as f:  # a file list, not argv: a planet covering runs to ~10^5 tiles
+        f.write("\n".join(tile_artifact(s) for s in stems) + "\n")
     utils.run_command(
-        f"GDAL_CACHEMAX=512 gdalwarp -q -overwrite -r average -tr {res8} {res8} "
-        f"-dstnodata {NODATA} -of COG -co BIGTIFF=YES -co COMPRESS=ZSTD -co PREDICTOR=3 "
-        "-co BLOCKSIZE=512 -co OVERVIEW_RESAMPLING=AVERAGE -co NUM_THREADS=ALL_CPUS "
-        f"GTI:{index_path} {out_tmp}")
+        f"gdalbuildvrt -q -overwrite -resolution user -tr {res8} {res8} -vrtnodata {NODATA} "
+        f"-input_file_list {listing} {vrt}")
+    # gdalbuildvrt skips an unopenable input at exit 0; a dropped tile here is a nodata hole
+    # z0-z7 renders resolve to shoreline-coloured 0, with nothing naming the tile.
+    aggregation_reproject.assert_vrt_complete(vrt, [tile_artifact(s) for s in stems])
+    utils.run_command(
+        f"gdal_translate -q -of GTiff -a_nodata {NODATA} "
+        "-co BIGTIFF=YES -co COMPRESS=ZSTD -co PREDICTOR=3 "
+        "-co TILED=YES -co BLOCKXSIZE=512 -co BLOCKYSIZE=512 -co NUM_THREADS=ALL_CPUS "
+        f"{vrt} {base}")
+    with utils.shoal_cog_source(base, min_levels=utils.macrotile_z) as src:
+        utils.run_command(
+            f"gdal_translate -q -of COG -a_nodata {NODATA} "
+            "-co BIGTIFF=YES -co COMPRESS=ZSTD -co PREDICTOR=3 -co BLOCKSIZE=512 "
+            "-co OVERVIEWS=FORCE_USE_EXISTING -co NUM_THREADS=ALL_CPUS "
+            f"{src} {out_tmp}")
+    for stale in (base, listing, vrt):
+        os.remove(stale)
 
 
 def _gti_xml(index_ref, planet_ref, resolution):
@@ -528,7 +567,7 @@ def window_dem(stem, out_tif):
                       f"-r bilinear {vrt} {tiles}")
     # NUM_THREADS=4, not ALL_CPUS: dozens of windows materialize concurrently, and 48
     # compressor threads each just thrash the box.
-    utils.run_command(f"GDAL_CACHEMAX=512 gdal_translate -q -ot Float32 -a_nodata {NODATA} "
+    utils.run_command(f"gdal_translate -q -ot Float32 -a_nodata {NODATA} "
                       "-co TILED=YES -co BIGTIFF=IF_SAFER -co BLOCKSIZE=512 "
                       "-co COMPRESS=ZSTD -co PREDICTOR=3 -co NUM_THREADS=4 "
                       f"{vrt} {out_tif}")
@@ -559,7 +598,7 @@ def build_index_stable():
     _write_index(index_path, features)
     planet_path = planet_artifact()
     tmp = planet_path + ".tmp"
-    _warp_planet(index_path, tmp)
+    _build_planet(stems, tmp)
     os.replace(tmp, planet_path)
     child_z = max(int(s.split("-")[3]) for s in stems)
     resolution = aggregation_reproject.get_resolution(child_z)
@@ -570,7 +609,7 @@ def build_index_stable():
 
 def _check():
     """One synthetic aggregation tile: persist its merged DEM to the plain tile COG (Float32,
-    nodata -9999, nodata-aware average overviews down to the 512 block), build the
+    nodata -9999, nodata-aware shoal-biased overviews down to the 512 block), build the
     --stable index + planet z8 + .gti, confirm the .gti opens as one raster with the z8 overview
     and the parquet carries the seascape: provenance columns (no key column), then stage the
     content-addressed publish set and assert its names/refs never touch the serving pointer."""
@@ -618,6 +657,10 @@ def _check():
         arr = np.full((full, full), -20.0, dtype="float32")
         arr[: full // 2, : full // 2] = -50.0
         arr[full - 100:, full - 100:] = NODATA  # a nodata hole
+        # A one-pixel shoal in the deep quadrant, at an interior pixel the halo crop keeps: the
+        # thing `average` overviews drown and the shoal-biased pyramid must carry to every level.
+        shoal_row, shoal_col = buffer_pixels + 200, buffer_pixels + 200
+        arr[shoal_row, shoal_col] = -1.0
         tmp_folder = f"store/aggregation/{stem}-tmp"
         os.makedirs(tmp_folder)
         with open(f"{tmp_folder}/reprojection.json", "w") as f:
@@ -646,15 +689,29 @@ def _check():
             assert abs(src.transform.c - b.left) < 1e-3 and abs(src.transform.f - b.top) < 1e-3, src.transform
             ovc = src.overviews(1)
             assert ovc == [2, 4], f"expected native->z8 overviews [2,4], got {ovc}"
-            # nodata-aware: the interior -50 quadrant averages to -50 in the coarsest overview (no
+            # nodata-aware: the interior -50 quadrant decimates to -50 in the coarsest overview (no
             # -9999 / 0 contamination), and the pure-nodata corner stays nodata.
             ov = src.read(1, out_shape=(1, src.height // 4, src.width // 4))
             assert abs(float(ov[10, 10]) - (-50.0)) < 1e-3, ov[10, 10]
             assert float(ov[-1, -1]) == NODATA, ov[-1, -1]
+            # Shoal bias, every level: the -1 m pixel survives decimation undiluted. `average`
+            # would read -15.25 at 2x and -18.8 at 4x — deeper than the truth under the pixel.
+            for factor in ovc:
+                lvl = src.read(1, out_shape=(1, src.height // factor, src.width // factor))
+                assert float(lvl[200 // factor, 200 // factor]) == -1.0, (factor, lvl[200 // factor,
+                                                                                      200 // factor])
 
         build_index_stable()
         assert os.path.isfile(planet_artifact()), "the plain-named planet z8 must exist"
         assert os.path.isfile(f"{index_dir()}/covering.parquet")
+        # The z8 base carries the tiles' own z8 level (the class-aware max, not a gdal kernel over
+        # native pixels) and a pyramid level for every zoom the terrain render reads it at (z8-1
+        # down to z0), which a regional mosaic only has because of min_levels.
+        with rasterio.open(planet_artifact()) as pl:
+            assert pl.res[0] == aggregation_reproject.get_resolution(utils.macrotile_z), pl.res
+            assert float(pl.read(1)[200 // 4, 200 // 4]) == -1.0, "the z8 base lost the shoal"
+            assert len(pl.overviews(1)) >= utils.macrotile_z, \
+                ("the z8 base needs a level for every zoom down to z0", pl.overviews(1))
         # The .gti opens as one raster with the z8 overview registered. Verified via the system
         # gdalinfo — the toolchain the pipeline shells out to — not rasterio's bundled GDAL: the
         # .gti's IndexDataset / Overview are RELATIVE (portable across store prefixes), which GDAL

@@ -8,17 +8,24 @@ Each output zoom renders by reading the MOSAIC at that zoom's resolution
   -> Terrarium encode (encode.py's conservative, bias-shallow quantization)
   -> single-zoom pmtiles bundle.py concatenates (store/pmtiles/<stem>.pmtiles).
 
-Reading the mosaic's nodata-aware `average` overviews at each zoom and smoothing there gives
+Reading the mosaic's nodata-aware overviews at each zoom and smoothing there gives
 f(depth, zoom) a real metre meaning at every level (the zoom-tier contour design assumes this).
-Consequence: coarse zooms are not a strict decimation of fine zooms, so features may shift slightly
-between levels — invisible in shading, intended for contours.
+Coarse zooms are therefore not a strict decimation of fine ones — features may shift slightly
+between levels — but they are BOUNDED by one: every rendered tile is clamped shoal-ward against
+the shoal reduction of the zoom below it (_FinerTiles), so zooming out can only ever shoal.
+Without that clamp a smoothing kernel measured in each zoom's own pixels reaches twice as far in
+metres at every step out, which holds a narrow channel at its raw depth one zoom after the finer
+tile has already attenuated it — the coarse tile then charts DEEPER than the fine one over the
+same water (measured 2.88 m on test_consistency's fixture), and deeper than the depth-area band
+cut from the same surface. A generalization may shoal; it may never deepen.
 
-Two pyramids: the mosaic COGs' internal overviews are the *access* pyramid (unsmoothed
-truth, `average`-resampled) — a decimated GTI read picks each tile's overview automatically, so the
-rule here is ALWAYS read at target resolution, never full-res-then-decimate. This module builds the
-*served* pyramid: smoothed, encoded, display-conditioned. z0-~z4 read the mosaic's own GTI-
+Two pyramids: the mosaic COGs' internal overviews are the *access* pyramid (unsmoothed truth,
+class-aware shoal reduction so no zoom charts water deeper than the survey under it, and no coarse
+pixel closes a channel its finest data holds open) — every read here is pinned to a level of it, so
+the rule is ALWAYS read at target resolution, never full-res-then-decimate. This module builds the
+*served* pyramid: smoothed, encoded, display-conditioned. z0-z7 read the mosaic's own GTI-
 registered planet z8 COG (the <Overview> in mosaic.gti), not thousands of tile-COG top overviews —
-that fallthrough is automatic in the GTI decimated read too.
+that fallthrough is automatic in the GTI decimated read.
 
 Reads the mosaic by ABSOLUTE path through the SYSTEM gdal (the toolchain the pipeline shells to),
 not rasterio's bundled GDAL — the GTI's RELATIVE IndexDataset/Overview refs resolve
@@ -37,6 +44,7 @@ build.smk derives the render stems (render_stems) at parse time and schedules on
 import os
 import shutil
 import tempfile
+import threading
 import sys
 
 import mercantile
@@ -52,6 +60,12 @@ import smooth
 import utils
 
 NODATA = -9999
+
+# Every window read lands 1:1 on a level of the mosaic's class-aware shoal pyramid (see
+# _read_window), so this kernel only ever replicates a coarser neighbour tile — it must not reduce.
+# A reducing kernel here would decimate a second time, class-blind, over whatever the pyramid
+# already decided. Carried into _config so changing it reruns every terrain stem.
+READ_RESAMPLE = "nearest"
 
 
 # ── the mosaic GTI, read through the system gdal by absolute path ──────────────────────────────
@@ -85,13 +99,23 @@ def window_tiles(stem):
 
 def _read_window(anchor, cz, halo, out_tif, src=None):
     """Warp a buffered window of the mosaic — the anchor tile's 3857 bounds expanded by `halo`
-    px on every side — to `out_tif` at zoom `cz` resolution, through the SYSTEM gdal. `-r average`
-    (the anti-alias prefilter decimation needs): a decimated read picks
-    each mosaic tile's own `average` overview, and z<=8 falls through to the planet z8 COG the .gti
-    registers — never a full-res-then-decimate. Exact grid registration: -te/-tr snap the window to
-    the global 3857 grid so the interior origin is EXACTLY the anchor's mercantile bounds (a slip
-    ceils the virtual extent to a 1-px overhang). -dstnodata fills the beyond-extent halo with the
-    one sentinel."""
+    px on every side — to `out_tif` at zoom `cz` resolution, through the SYSTEM gdal.
+
+    Every source pixel this reads comes off a pyramid level built by the class-aware shoal
+    reduction, at exactly res(cz), so the warp is a grid-aligned copy and never decimates:
+
+      cz >= 8   the window VRT is built AT res(cz) (see _render), and a VRT source at a coarser
+                target resolution is served from its own overview — one exists at factor
+                2**(tile child_z - cz) for every cz >= 8, because a tile COG is 512*2**(child_z-8)
+                px and its pyramid stops at the 512 block (= res(z8)).
+      cz < 8    the read goes through the .gti, whose <Overview> is the planet z8 COG; GDAL
+                cascades into that COG's own pyramid, which carries a level for every zoom down to
+                z0 (mosaic._build_planet).
+
+    A window tile COARSER than res(cz) is replicated, which is what READ_RESAMPLE is for. Exact grid
+    registration: -te/-tr snap the window to the global 3857 grid so the interior origin is EXACTLY
+    the anchor's mercantile bounds (a slip ceils the virtual extent to a 1-px overhang). -dstnodata
+    fills the beyond-extent halo with the one sentinel."""
     res = aggregation_reproject.get_resolution(cz)
     span = 2 ** (cz - anchor.z)
     core = span * 512
@@ -101,7 +125,7 @@ def _read_window(anchor, cz, halo, out_tif, src=None):
     right = left + (core + 2 * halo) * res
     bottom = top - (core + 2 * halo) * res
     aggregation_reproject._run(
-        f"GDAL_CACHEMAX=512 gdalwarp -q -overwrite -r average -t_srs EPSG:3857 "
+        f"gdalwarp -q -overwrite -r {READ_RESAMPLE} -t_srs EPSG:3857 "
         f"-tr {res} {res} -te {left} {bottom} {right} {top} -dstnodata {NODATA} "
         f"-of GTiff -co TILED=YES -co BLOCKXSIZE=512 -co BLOCKYSIZE=512 -co COMPRESS=ZSTD -co PREDICTOR=3 "
         f"-co NUM_THREADS=ALL_CPUS {_q(src or gti_abspath())} {out_tif}",
@@ -123,7 +147,70 @@ def _q(path):
 UNKNOWN, DRYING, LAND = 0.0, 1.0, 2.0
 
 
-def _encode_tile(i, j, src_path, halo, out_webp, cz, mask_path=None):
+class _FinerTiles:
+    """The already-served tiles one zoom finer, reduced to this zoom by the pyramid's shoal rule.
+
+    Open the finer stems' archives (`finer_stems`) and ask for the reduction under one output
+    tile; `_encode_tile` clamps the render shoal-ward against it, which makes the served pyramid
+    monotone by construction — utils._block_reduce's rule one level up, in the served domain.
+    A stem whose archive is absent (an ad-hoc render outside the DAG) simply contributes nothing,
+    and `_render` logs how many of the planned stems were actually read.
+    """
+
+    def __init__(self, stems):
+        from pmtiles.reader import MmapSource, Reader
+        self._files = []
+        self._archives = []  # (zoom, x0, y0, span, reader) — the tiles each stem's archive holds
+        for s in stems:
+            path = f"store/pmtiles/{s}.pmtiles"
+            if not os.path.exists(path):
+                continue
+            z, x, y, cz = (int(a) for a in s.split("-"))
+            span = 2 ** (cz - z)
+            f = open(path, "rb")
+            self._files.append(f)
+            self._archives.append((cz, x * span, y * span, span, Reader(MmapSource(f))))
+        self._lock = threading.Lock()  # one mmap per archive, read from the encode pool
+        self.count = len(self._files)
+
+    def close(self):
+        for f in self._files:
+            f.close()
+
+    def _tile(self, z, x, y):
+        import imagecodecs
+        # Address the one archive whose stem covers this tile: pmtiles.Reader.get walks the root
+        # directory on every call, so asking every open archive would cost that per miss.
+        for cz, x0, y0, span, reader in self._archives:
+            if cz == z and x0 <= x < x0 + span and y0 <= y < y0 + span:
+                break
+        else:
+            return None
+        with self._lock:
+            payload = reader.get(z, x, y)
+        if payload is None:
+            return None
+        return encode.decode(imagecodecs.webp_decode(payload).astype("float32"))
+
+    def under(self, cz, x, y):
+        """The shoalest WATER each pixel of tile (cz, x, y) holds one zoom finer, -inf where the
+        finer zoom charts none — so a plain maximum against it is a no-op there. None when the
+        finer zoom has no tile at all under this one (a build edge, or a native stem)."""
+        fine = np.full((1024, 1024), -np.inf, dtype="float32")
+        got = False
+        for dx in (0, 1):
+            for dy in (0, 1):
+                a = self._tile(cz + 1, 2 * x + dx, 2 * y + dy)
+                if a is not None:
+                    fine[dy * 512:(dy + 1) * 512, dx * 512:(dx + 1) * 512] = a
+                    got = True
+        if not got:
+            return None
+        q = [fine[a::2, b::2] for a in (0, 1) for b in (0, 1)]
+        return np.maximum.reduce([np.where(p < 0, p, -np.inf) for p in q])
+
+
+def _encode_tile(i, j, src_path, halo, out_webp, cz, mask_path=None, finer=None, tx=None, ty=None):
     """One 512-tile of the smoothed window -> a lossless Terrarium webp at zoom `cz`. The window's
     interior starts at `halo`; nodata (a build-edge hole the mosaic legitimately carries — GEBCO
     fills the ocean, so this is only the beyond-build fringe) resolves to 0 for the served render,
@@ -140,6 +227,12 @@ def _encode_tile(i, j, src_path, halo, out_webp, cz, mask_path=None):
     # value, and shoaling it is the conservative choice. (In practice this is only the beyond-build
     # fringe; true interior holes don't occur while GEBCO blankets the planet.)
     data[data == NODATA] = 0
+    if finer is not None:
+        under = finer.under(cz, tx, ty)
+        if under is not None:
+            # Shoal-ward only, and only against water: the finer zoom's flat codes carry no depth,
+            # and the encode's own rounding is shoal-biased, so the served value stays >= this.
+            np.maximum(data, under, out=data)
     pos = data > 0
     if mask_path is not None:
         with rasterio.open(mask_path) as m:
@@ -153,7 +246,12 @@ def _encode_tile(i, j, src_path, halo, out_webp, cz, mask_path=None):
         drying = pos & ~land & (data <= config.DRYING_CAP)
         data[pos] = LAND
         data[drying] = DRYING
-        data[(data == 0) & land] = LAND
+        # <=0, not ==0: the class-aware reduction hands a mixed block to its water, so a
+        # land feature narrower than a block (sea stack, cliff toe) reads negative at coarse
+        # zooms and would chart as depth. OSM land is authoritative here exactly as it is for
+        # the vector layers (clamp_dem_to_land, the depare land cut); a genuine below-datum
+        # bed is on the water side of the mask and untouched.
+        data[(data <= 0) & land] = LAND
     else:
         data[pos] = LAND  # maskless (coarse stems / no feed): drying is sub-pixel there anyway
     utils.save_terrarium_tile(data, out_webp)  # utils parses zoom from the {cz}-{x}-{y}.webp name
@@ -176,8 +274,13 @@ def _render(stem, out_pmtiles):
     if cz >= 8 and not os.environ.get("MOSAIC_GTI"):
         src = f"{tmp}/window.vrt"
         tiles = " ".join(mosaic.tile_artifact(s) for s in window_tiles(stem))
-        aggregation_reproject._run(f"gdalbuildvrt -q -overwrite -resolution highest {src} {tiles}",
-                                   f"terrain vrt {stem}")
+        # AT the target resolution, not the finest tile's: a VRT pinned to a resolution serves each
+        # source from its own overview at that resolution, so a tile finer than this zoom enters
+        # through its class-aware pyramid level instead of being decimated here.
+        res = aggregation_reproject.get_resolution(cz)
+        aggregation_reproject._run(
+            f"gdalbuildvrt -q -overwrite -resolution user -tr {res} {res} {src} {tiles}",
+            f"terrain vrt {stem}")
     # The RAM peak the terrain_render rule reserves (build.smk mem_gb=weight) is here — the gdalwarp
     # window read + the smooth hold the multi-GB window array (a native macrotile window is 32768²
     # float32). The engine schedules one process per stem, so the cgroup cap bounds each in isolation.
@@ -202,16 +305,25 @@ def _render(stem, out_pmtiles):
         landmask.extract_raster((b.left, b.bottom, b.right, b.top), wres, mask)
 
     x_min, y_min = x * span, y * span
+    planned = finer_stems(stem)
+    finer = _FinerTiles(planned)
     from concurrent.futures import ThreadPoolExecutor
     threads = min(os.cpu_count() or 1, 8)
-    with ThreadPoolExecutor(max_workers=threads) as pool:
-        futures = [
-            pool.submit(_encode_tile, i, j, window, halo, f"{tmp}/{cz}-{tx}-{ty}.webp", cz, mask)
-            for i, tx in enumerate(range(x_min, x_min + span))
-            for j, ty in enumerate(range(y_min, y_min + span))
-        ]
-        for f in futures:
-            f.result()
+    try:
+        with ThreadPoolExecutor(max_workers=threads) as pool:
+            futures = [
+                pool.submit(_encode_tile, i, j, window, halo, f"{tmp}/{cz}-{tx}-{ty}.webp", cz,
+                            mask, finer, tx, ty)
+                for i, tx in enumerate(range(x_min, x_min + span))
+                for j, ty in enumerate(range(y_min, y_min + span))
+            ]
+            for f in futures:
+                f.result()
+    finally:
+        finer.close()
+    if planned:
+        print(f"terrain render {stem}: clamped against {finer.count}/{len(planned)} z{cz + 1} stems",
+              flush=True)
 
     tmp_archive = f"{tmp}/terrain.pmtiles"  # not *.webp, so create_archive's glob skips it
     utils.create_archive(tmp, tmp_archive)
@@ -245,6 +357,10 @@ def _config():
         "shallow_rel": encode.SHALLOW_REL, "shallow_min_step": encode.SHALLOW_MIN_STEP,
         "macrotile_z": utils.macrotile_z, "num_overviews": utils.num_overviews,
         "resample": aggregation_reproject.RESAMPLE, "drying_cap": config.DRYING_CAP,
+        "read_resample": READ_RESAMPLE,
+        # Not a dial — the finer-zoom shoal clamp carries no knob, and a surface property with no
+        # dial would otherwise leave every rendered stem fresh across a change to it.
+        "finer_clamped": True,
     }
     if not os.environ.get("SKIP_SMOOTH"):
         cfg["smooth"] = {
@@ -274,6 +390,56 @@ def render_stems(covering_stems):
     return sorted(out)
 
 
+def finer_index(stems):
+    """{stem: [the render stems one zoom finer under it]} — the served pyramid's own edges, which
+    every tile is clamped shoal-ward against (_FinerTiles) and the DAG orders renders by.
+
+    Anchors nest, so a pair is found by walking either anchor up to the other's zoom; walking up
+    from BOTH sides catches the cascade's two shapes (a coalesced extent hands its PARENT tile the
+    coarser stem, while an extent below the overview depth is split into FINER anchors). One
+    linear pass, because a per-stem search would cost the DAG a scan of the whole render set per
+    job. A native stem's list is empty — nothing finer is rendered — which is what leaves the
+    finest zoom unclamped."""
+    by_anchor = {}
+    parsed = []
+    for s in stems:
+        z, x, y, cz = (int(a) for a in s.split("-"))
+        parsed.append((s, z, x, y, cz))
+        by_anchor[(cz, z, x, y)] = s
+    out = {s: [] for s in stems}
+    seen = set()
+
+    def link(coarse, fine):
+        if (coarse, fine) not in seen:
+            seen.add((coarse, fine))
+            out[coarse].append(fine)
+
+    for s, z, x, y, cz in parsed:
+        for up in range(z + 1):
+            anchor = (z - up, x >> up, y >> up)
+            finer = by_anchor.get((cz + 1,) + anchor)
+            if finer is not None:
+                link(s, finer)
+            coarser = by_anchor.get((cz - 1,) + anchor)
+            if coarser is not None:
+                link(coarser, s)
+    return {s: sorted(v) for s, v in out.items()}
+
+
+_FINER = {}
+
+
+def finer_stems(stem):
+    """This stem's entry in `finer_index` over the covering's whole render cascade. Memoized: a
+    render process handles one stem, and the DAG resolves the same edges through finer_index.
+
+    The stem joins the set it is indexed against, so a render outside the cascade (an ad-hoc or
+    fixture stem) still finds the finer stems nested under it through the one linear pass."""
+    if stem not in _FINER:
+        _FINER.update(finer_index(sorted(set(render_stems(mosaic.covering_stems())) | {stem})))
+    return _FINER[stem]
+
+
 def render(stem):
     """The stage-3 Snakemake job: render one stem from the mosaic (via the local GTI mosaic_index
     wrote) to store/pmtiles/<stem>.pmtiles — a flat name, not sharded (bundling globs it)."""
@@ -300,15 +466,22 @@ def _check():
     d = tempfile.mkdtemp()
     try:
         os.chdir(d)
-        # A z8 mosaic tile at child_z=10 (span 4 -> 2048 px native), constant -30 m with a nodata
-        # hole in one corner, built as a real COG with average overviews (mosaic.tile's shape).
+        # A z8 mosaic tile at child_z=10 (span 4 -> 2048 px native), -30 m with a nodata hole in one
+        # corner, a land block, and a one-pixel channel through it, built as a real COG with the
+        # class-aware shoal pyramid (mosaic.tile's shape).
         z, x, y, cz = 8, 75, 96, 10
         stem = f"{z}-{x}-{y}-{cz}"
         res = aggregation_reproject.get_resolution(cz)
         core = 4 * 512
-        b = mercantile.xy_bounds(mercantile.Tile(x=x, y=y, z=z))
+        anchor = mercantile.Tile(x=x, y=y, z=z)
+        b = mercantile.xy_bounds(anchor)
+        channel = 1836
         arr = np.full((core, core), -30.0, dtype="float32")
         arr[-200:, -200:] = NODATA
+        # A land block two 512-tiles clear of the interior tile the depth assertions read, so its
+        # smoothing halo cannot reach them.
+        arr[:512, 1536:] = 30.0
+        arr[:512, channel] = -10.0
         os.makedirs("store/mosaic/tiles")
         raw = "store/mosaic/tiles/raw.tif"
         with rasterio.open(raw, "w", driver="GTiff", height=core, width=core, count=1,
@@ -316,8 +489,9 @@ def _check():
                            transform=from_origin(b.left, b.top, res, res)) as dst:
             dst.write(arr, 1)
         cog = f"store/mosaic/tiles/{stem}.tif"
-        utils.run_command(f"gdal_translate -q -of COG -a_nodata {NODATA} -co RESAMPLING=AVERAGE "
-                          f"-co OVERVIEW_RESAMPLING=AVERAGE -co BLOCKSIZE=512 {raw} {cog}")
+        with utils.shoal_cog_source(raw) as src:
+            utils.run_command(f"gdal_translate -q -of COG -a_nodata {NODATA} "
+                              f"-co OVERVIEWS=FORCE_USE_EXISTING -co BLOCKSIZE=512 {src} {cog}")
         os.remove(raw)
         os.makedirs("store/aggregation")
         with open("store/aggregation/covering.txt", "w") as f:
@@ -339,6 +513,23 @@ def _check():
         stems = render_stems([stem])
         assert stem in stems, "native stem must be a render stem"
         assert any(s.endswith("-9") for s in stems), "an overview parent (z9) must be planned"
+
+        # finer_index's linear pass must equal its definition — the stems one zoom finer whose
+        # anchor nests with this one's — since the DAG orders renders by it and a missed edge
+        # silently leaves a tile unclamped.
+        def anchors_nest(a, b):
+            (az, ax, ay), (bz, bx, by) = a, b
+            k = abs(az - bz)
+            return (ax, ay) == (bx >> k, by >> k) if az <= bz else (ax >> k, ay >> k) == (bx, by)
+
+        parsed = {s: tuple(int(v) for v in s.split("-")) for s in stems}
+        index = finer_index(stems)
+        for s, (sz, sx, sy, scz) in parsed.items():
+            want = sorted(f for f, (fz, fx, fy, fcz) in parsed.items()
+                          if fcz == scz + 1 and anchors_nest((sz, sx, sy), (fz, fx, fy)))
+            assert index[s] == want, (s, index[s], want)
+        assert index[stem] == [], "a native stem has nothing finer to clamp against"
+        assert any(index[s] for s in stems), "the cascade must carry at least one pyramid edge"
 
         # render the native stem to its PLAIN name; assert the tiles register on the mercantile grid
         render(stem)
@@ -363,7 +554,38 @@ def _check():
         assert (np.abs(inner - (-30.0)) < 1e-3).all(), \
             f"interior served depth must track the mosaic (-30 m), got {np.unique(inner)[:5]}"
 
-        # render an overview stem too (reads the mosaic's average overview); it must decode to ~-30
+        # The window read is a 1:1 copy of the mosaic's class-aware pyramid level, never a second
+        # decimation of its own: at an overview zoom the one-pixel channel through the land block is
+        # still water, and the all-land blocks beside it are still land.
+        ozoom = cz - 1
+        ores = aggregation_reproject.get_resolution(ozoom)
+        wvrt, wtif = f"{d}/w.vrt", f"{d}/w.tif"
+        # With a COARSER neighbour in the window (a GEBCO-only z8 tile beside a surveyed one — the
+        # ordinary case at a coverage edge), a VRT resolved to its finest source cannot serve either
+        # from a pyramid level, and the warp does the decimating instead.
+        nb = mercantile.Tile(x=x + 1, y=y, z=z)
+        nbb = mercantile.xy_bounds(nb)
+        neighbour = f"store/mosaic/tiles/{z}-{nb.x}-{nb.y}-{z}.tif"
+        with rasterio.open(neighbour, "w", driver="GTiff", height=512, width=512, count=1,
+                           dtype="float32", nodata=NODATA, crs="EPSG:3857",
+                           transform=from_origin(nbb.left, nbb.top,
+                                                 aggregation_reproject.get_resolution(z),
+                                                 aggregation_reproject.get_resolution(z))) as dst:
+            dst.write(np.full((512, 512), -30.0, dtype="float32"), 1)
+        aggregation_reproject._run(
+            f"gdalbuildvrt -q -overwrite -resolution user -tr {ores} {ores} {wvrt} {cog} {neighbour}",
+            "check window vrt")
+        _read_window(anchor, ozoom, 0, wtif, wvrt)
+        with rasterio.open(wtif) as f:
+            win_arr = f.read(1)
+        assert win_arr.shape == (core // 2, core // 2), win_arr.shape
+        assert (win_arr[:256, channel // 2] == -10.0).all(), \
+            ("the channel closed in the window read", np.unique(win_arr[:256, channel // 2])[:4])
+        assert win_arr[0, 768] == 30.0 and win_arr[255, 1023] == 30.0, \
+            ("an all-land block must stay land in the window read", win_arr[0, 768], win_arr[255, 1023])
+        assert (win_arr[300:600, 300:600] == -30.0).all(), "measured depth must pass the read untouched"
+
+        # render an overview stem too (reads the mosaic's shoal-biased overview); it must decode to ~-30
         ostem = next(s for s in stems if s.endswith("-9"))
         render(ostem)
         with open(f"store/pmtiles/{ostem}.pmtiles", "r+b") as f:
@@ -374,6 +596,32 @@ def _check():
         wet = allpx[allpx < -1]  # the covered water (0 = beyond-build fill / nodata; ignore)
         assert len(wet) and abs(float(np.median(wet)) - (-30.0)) < 3.0, \
             f"overview served depth must track the mosaic (-30 m), median {np.median(wet):.1f}"
+
+        # Zooming out must not deepen: the _FinerTiles clamp holds every overview pixel at or
+        # shoaler than the shoalest water the four tiles below it chart — including the one-pixel
+        # channel, which a per-zoom smooth alone would leave deeper at z9 than at z10.
+        checked = 0
+        for (oz, otx, oty), payload in ot.items():
+            over = encode.decode(imagecodecs.webp_decode(payload).astype("float32"))
+            fine = np.full((1024, 1024), np.nan, dtype="float32")
+            for dx in (0, 1):
+                for dy in (0, 1):
+                    child = tiles.get((oz + 1, 2 * otx + dx, 2 * oty + dy))
+                    if child is not None:
+                        fine[dy * 512:(dy + 1) * 512, dx * 512:(dx + 1) * 512] = \
+                            encode.decode(imagecodecs.webp_decode(child).astype("float32"))
+            q = [fine[a::2, b::2] for a in (0, 1) for b in (0, 1)]
+            wet_px = np.logical_or.reduce([p < 0 for p in q])
+            if not wet_px.any():
+                continue
+            shoalest = np.maximum.reduce([np.where(p < 0, p, -np.inf) for p in q])
+            deepened = (over < 0) & wet_px & (over < shoalest - 1e-6)
+            assert not deepened.any(), \
+                (f"z{oz} tile {otx}/{oty} charts up to "
+                 f"{float(np.max((shoalest - over)[deepened])):.2f} m deeper than the water z{oz+1} "
+                 f"holds under it, over {int(deepened.sum())} px")
+            checked += 1
+        assert checked, "the overview stem must cover rendered z10 tiles to compare against"
 
         # _encode_tile's render-path classification. A window with a land-topo block, a land-side
         # lowland, a land-side 0, a water-side drying height, and a water-side 0, plus a matching

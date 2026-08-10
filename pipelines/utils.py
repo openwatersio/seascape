@@ -21,6 +21,7 @@ import time
 
 import numpy as np
 
+import rasterio
 from rasterio.warp import transform_bounds
 import mercantile
 import pmtiles.tile as _pmtiles_tile
@@ -361,6 +362,145 @@ def get_grouped_source_items(filepath):
         })
     grouped_source_items.append(current_group)
     return grouped_source_items
+
+
+# ── shoal-biased overview pyramid ────────────────────────────────────────────────────────────────
+# Elevation is negative-down, so the shallowest child of a 2x2 block is its MAXIMUM. Decimating a
+# depth raster by MAX is the only kernel that guarantees a coarse pixel never reads deeper than the
+# finest data under it — `average` crosses a shoal edge and charts water that isn't there.
+#
+# The reduction is CLASS-AWARE at config.DRYING_CAP, the same value-domain split the terrain render
+# classifies on: a plain max over a mixed land/water block hands the block to the land beside the
+# water, which closes narrow channels and harbour entrances level by level and mints drying or land
+# codes in navigable water. Water wins any block it appears in; land only wins blocks that are all
+# land (see _block_reduce).
+#
+# Neither gdaladdo nor the COG driver's OVERVIEW_RESAMPLING offers such a kernel (GDAL 3.13:
+# nearest|average|rms|gauss|bilinear|cubic|cubicspline|lanczos|average_magphase|mode), so the levels
+# are decimated here and handed to the COG driver through a VRT that names them as its own
+# <Overview> elements. The attach copies nothing and the VRT costs no I/O, so the COG write stays a
+# single full-res pass and the whole cost of the policy is the one extra full-res read the levels
+# need — measured +20% on a 32768 px mosaic tile, against +354% for materializing an intermediate.
+
+COG_MIN_OVERVIEW_PX = 512  # the COG driver's own stopping rule: one 512 block
+_SHOAL_STRIPE_BYTES = 1 << 28  # read budget per stripe; a stripe is 2 source rows per output row
+
+# GDAL's (de)compression thread pool inside ONE worker of a fan-out. Multi-threaded ZSTD is worth
+# having — single-threaded, the full-res read of a pyramid pass is 4x slower (measured 8.2s vs 1.3s
+# on a 32768 px mosaic tile) — but ALL_CPUS is not: many jobs run this concurrently on a
+# deliberately-oversubscribed box, and N x 48 decode threads thrash instead of helping. A caller
+# that fans out over files multiplies this: keep workers x GDAL_WORKER_THREADS at the box's
+# oversubscription target (see source_prep.DEFAULT_WORKERS).
+GDAL_WORKER_THREADS = 4
+
+
+def _block_reduce(src_path, dst_path, nodata):
+    """Decimate `src_path` 2:1 into a fresh GTiff at `dst_path`, class-aware and nodata-aware.
+
+    Over the VALID children of each 2x2 block: any child at or below config.DRYING_CAP is
+    water-domain (charted depth, drying foreshore, or datum-level water), and when the block holds
+    one the value is the MAX over those children ALONE — land can never leak into a block that holds
+    water, so a one-pixel channel stays open at every level while shoals and genuine drying still
+    bias shoal-ward. A block whose valid children are all land-domain takes the max of them, which
+    keeps ridgelines for the client hillshade. Only an all-nodata block stays nodata, so nodata can
+    never swallow a shoal.
+
+    Streamed in stripes of whole 2-row pairs — a full mosaic level is gigapixels, and blocks never
+    straddle a stripe, so per-stripe output is identical to whole-array."""
+    import config
+    with rasterio.Env(GDAL_NUM_THREADS=str(GDAL_WORKER_THREADS)), rasterio.open(src_path) as src:
+        w, h = src.width, src.height
+        ow, oh = -(-w // 2), -(-h // 2)  # ceil, matching GDAL's overview sizing
+        dtype = src.dtypes[0]
+        profile = src.profile
+        # The level's geotransform: same top-left corner, twice the pixel size. Anchoring on the
+        # corner (not the centre) is what keeps every level co-registered with the full-res grid.
+        t = src.transform
+        profile.update(driver="GTiff", width=ow, height=oh, count=1, tiled=True,
+                       blockxsize=512, blockysize=512, compress="zstd", zstd_level=1,
+                       bigtiff="IF_SAFER", nodata=nodata,
+                       transform=rasterio.Affine(t.a * 2, t.b, t.c, t.d, t.e * 2, t.f))
+        profile.pop("predictor", None)  # float-only, and these levels are read once then deleted
+        floor = np.array(-np.inf if "float" in dtype else np.iinfo(dtype).min, dtype=dtype)
+        # Compare in the raster's own dtype so an Int16 source (GEBCO) isn't promoted to float64 for
+        # the class test; flooring is the exact `<= cap` test on integers.
+        cap = np.array(math.floor(config.DRYING_CAP) if "int" in dtype else config.DRYING_CAP,
+                       dtype=dtype)
+        rows = max(1, _SHOAL_STRIPE_BYTES // (w * np.dtype(dtype).itemsize * 2))
+
+        def block_max(keep, quarters):
+            """Max over the children `keep` selects; `floor` where a block selects none."""
+            v = [np.where(k, x, floor) for k, x in zip(keep, quarters)]
+            return np.maximum(np.maximum(v[0], v[1]), np.maximum(v[2], v[3]))
+
+        with rasterio.open(dst_path, "w", **profile) as dst:
+            for oy in range(0, oh, rows):
+                n = min(rows, oh - oy)
+                a = src.read(1, window=rasterio.windows.Window(0, oy * 2, w, min(n * 2, h - oy * 2)))
+                # Pad an odd trailing row/column with nodata: the edge block then reduces over the
+                # one real pixel it covers, exactly as GDAL's ceil-sized overview does.
+                a = np.pad(a, ((0, n * 2 - a.shape[0]), (0, ow * 2 - a.shape[1])),
+                           constant_values=nodata)
+                # Four strided quarters, not a reshape-and-reduce: reducing over two non-adjacent
+                # axes of a 2x2-blocked view is 4.7x slower and allocates the whole stripe again.
+                quarters = [a[i::2, j::2] for i in (0, 1) for j in (0, 1)]
+                # `x == x` drops NaN, which would poison the max — and is the nodata test itself
+                # when a source declares nodata AS NaN.
+                good = [(x != nodata) & (x == x) for x in quarters]
+                wet = [g & (x <= cap) for g, x in zip(good, quarters)]
+                # An all-water stripe (open ocean) and an all-land stripe each need ONE masked max;
+                # only a stripe that actually straddles the coast pays for both.
+                anywet = wet[0] | wet[1] | wet[2] | wet[3]
+                if anywet.all():
+                    m = block_max(wet, quarters)
+                elif not anywet.any():
+                    m = block_max(good, quarters)
+                else:
+                    m = np.where(anywet, block_max(wet, quarters), block_max(good, quarters))
+                dst.write(np.where(good[0] | good[1] | good[2] | good[3], m, nodata).astype(dtype),
+                          1, window=rasterio.windows.Window(0, oy, ow, n))
+    return ow, oh
+
+
+@contextmanager
+def shoal_cog_source(src, translate_args="", min_size=COG_MIN_OVERVIEW_PX, min_levels=0):
+    """Yield a VRT over `src` (with any `gdal_translate` args applied) carrying a shoal-biased
+    class-aware pyramid as its <Overview> elements, down to `min_size` like the COG driver stops —
+    or further, to at least `min_levels` levels, for a raster a reader decimates past that point.
+    Feed it to `gdal_translate -of COG -co OVERVIEWS=FORCE_USE_EXISTING`, which adopts those levels
+    verbatim in a single full-res pass — do NOT materialize an intermediate GTiff to attach them to.
+
+    Levels cascade off each other: the reduction is idempotent under nesting (a block's water-domain
+    children are exactly the water-domain children of its children), so level k is the same array
+    whether taken from level k-1 or from the full-res grid, at a quarter of the reads. Only a
+    single-band raster with a declared nodata gets a pyramid — a max over an undeclared sentinel
+    would chart it as land — and anything else yields a plain VRT, which FORCE_USE_EXISTING turns
+    into no overviews.
+    """
+    tmp = tempfile.mkdtemp(prefix="seascape-shoal-", dir=os.path.dirname(os.path.abspath(src)))
+    try:
+        vrt = f"{tmp}/base.vrt"
+        run_command(f"gdal_translate -q -of VRT {translate_args} {src} {vrt}")
+        with rasterio.open(vrt) as ds:
+            eligible = ds.count == 1 and ds.nodata is not None
+            w, h, nodata = ds.width, ds.height, ds.nodata
+        levels, prev = [], vrt
+        while eligible and max(w, h) > 1 and (len(levels) < min_levels or max(w, h) > min_size):
+            level = f"{tmp}/ov{len(levels) + 1}.tif"
+            w, h = _block_reduce(prev, level, nodata)
+            levels.append(level)
+            prev = level
+        if levels:
+            refs = "".join(
+                f'<Overview><SourceFilename relativeToVRT="1">{os.path.basename(l)}'
+                f"</SourceFilename><SourceBand>1</SourceBand></Overview>" for l in levels)
+            with open(vrt) as f:
+                xml = f.read()
+            with open(vrt, "w") as f:
+                f.write(xml.replace("</VRTRasterBand>", f"{refs}</VRTRasterBand>", 1))
+        yield vrt
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ── merge-weight estimate (the mosaic_tile reservation seed) ─────────────────────────────────

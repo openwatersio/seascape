@@ -214,12 +214,24 @@ def _run_bounded(cmd, what, timeout):
 
 
 def _uniform_coarsen(dem, factor, out):
-    """Whole-window average downsample — the retry rescue when even the deep-coarsened window
+    """Whole-window shoal-biased downsample — the retry rescue when even the deep-coarsened window
     times out (shallow-complexity stems the depth gate can't help). gdal_contour reads the small
-    raster directly; _depare_dem re-reads res per file, so the sliver gate adapts."""
-    contour_run._run(
-        f"gdal_translate -q -r average -outsize {100 // factor}% {100 // factor}% {dem} {out}",
-        "gdal_translate -r average")
+    raster directly; _depare_dem re-reads res per file, so the sliver gate adapts.
+
+    utils' class-aware shoal reduction, `factor` halvings of it, rather than any gdal kernel:
+    coarsening the DEM these depth areas are cut from must never move a band edge into deeper water,
+    and a plain max would hand a coastal cell to the land beside the channel, cutting a DEPARE
+    band — and the drying bucket with it — straight across navigable water."""
+    assert factor >= 2 and factor & (factor - 1) == 0, f"coarsen factor must be a power of 2: {factor}"
+    with rasterio.open(dem) as src:
+        nodata = src.nodata
+    if nodata is None:
+        raise ValueError(f"{dem}: no declared nodata — the shoal reduction needs one to skip holes")
+    step, root = dem, out.rsplit(".", 1)[0]
+    for level in range(factor.bit_length() - 1):
+        halved = out if 2 ** (level + 1) == factor else f"{root}-{2 ** (level + 1)}x.tiff"
+        utils._block_reduce(step, halved, nodata)
+        step = halved
     return out
 
 
@@ -785,7 +797,7 @@ def tile(stem):
     import tempfile
 
     # DEPARE_TIMEOUT (seconds; unset = no bound): each gdal_contour -p pass runs under this
-    # bound; on expiry the tile retries once on a uniform 4x-average window, then fails
+    # bound; on expiry the tile retries once on a uniform 4x shoal-biased window, then fails
     # honestly. The SIGALRM backstop (8x: 2 ladders x 2 attempts x contour + GEOS slack) still
     # bounds the whole tile so no phase can hang a run (docs/plans/2026-07-21-depare-perf.md).
     timeout = int(os.environ.get("DEPARE_TIMEOUT", "0"))
@@ -811,7 +823,7 @@ def tile(stem):
         try:
             res = _depare_dem(dem, tile_obj, child_z, tmp, stem, timeout=timeout)
         except ContourTimeout as e:
-            print(f"depare tile {stem}: {e} — retrying on a uniform 4x-average window",
+            print(f"depare tile {stem}: {e} — retrying on a uniform 4x shoal-biased window",
                   file=sys.stderr, flush=True)
             dem = _uniform_coarsen(dem, 4, f"{tmp}/dem-4x.tiff")
             res = _depare_dem(dem, tile_obj, child_z, tmp, stem, timeout=timeout)
@@ -1007,6 +1019,22 @@ def _check():
     with rasterio.open(p, "w", driver="GTiff", height=h, width=w, count=1, dtype="float32",
                        nodata=-9999, crs="EPSG:3857", transform=tr) as dst:
         dst.write(dem, 1)
+
+    # The timeout rescue's coarsen is class-aware: a one-pixel channel through the land rows still
+    # reads as water in the 4x window, so the band it is cut from stays open, and the land beside it
+    # stays land. Its grid is the same corner at 4x the pixel.
+    cut = np.array(dem)
+    cut[:10, 24] = -7.0
+    cp = f"{d}/cut.tif"
+    with rasterio.open(cp, "w", driver="GTiff", height=h, width=w, count=1, dtype="float32",
+                       nodata=-9999, crs="EPSG:3857", transform=tr) as dst:
+        dst.write(cut, 1)
+    with rasterio.open(_uniform_coarsen(cp, 4, f"{d}/cut-4x.tiff")) as small:
+        coarse, ctr = small.read(1), small.transform
+    assert coarse.shape == (h // 4, w // 4), coarse.shape
+    assert (coarse[:2, 6] == -7.0).all(), ("the coarsen closed a channel", coarse[:2, 6])
+    assert (coarse[:2, :6] > cap).all(), ("land must stay land in the coarsen", coarse[0, :6])
+    assert (ctr.a, ctr.c, ctr.f) == (tr.a * 4, tr.c, tr.f), "the coarsen moved the grid"
 
     raw = partitions(p, levels_m, f"{d}/raw.fgb")
     bands = read_bucket(raw, "amax <= 0")

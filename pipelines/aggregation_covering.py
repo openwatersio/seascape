@@ -302,9 +302,10 @@ def main(stable=False):
 
 
 def _check():
-    """Offline: write_if_changed leaves mtimes alone on identical content, the
-    stable covering prunes a stale in-window tile while keeping an out-of-window one,
-    and MAX_CHILD_Z binds in the row derivation (not just source_maxzooms)."""
+    """Offline: build depth is derived per FILE (so one source carries several resolutions),
+    write_if_changed leaves mtimes alone on identical content, the stable covering prunes a
+    stale in-window tile while keeping an out-of-window one, and MAX_CHILD_Z binds in the row
+    derivation (not just source_maxzooms)."""
     # The shared derivation binds the ceiling: a file registering deeper than MAX_CHILD_Z
     # lands at the ceiling, a source cap below it still wins.
     resolutions = get_mercator_resolutions(0, 32)
@@ -312,6 +313,20 @@ def _check():
     assert native > config.MAX_CHILD_Z, f"fixture must exceed the ceiling (native {native})"
     assert resolved_maxzoom(native, None) == config.MAX_CHILD_Z
     assert resolved_maxzoom(native, config.MAX_CHILD_Z - 2) == config.MAX_CHILD_Z - 2
+
+    # Depth is a FILE property, not a source property: CUDEM's two bands — a 1/9" tile
+    # (8112 px) and a 1/3" tile (2712 px) over the same 0.25 deg cell — register two zooms
+    # apart, so both live in one source and the merge orders the finer first
+    # (utils.get_grouped_source_items, exercised in test_engine.check_priority). A cap at or
+    # below the coarser band's native depth flattens that distinction, which is what CUDEM's
+    # z13 budget does: the bands then share a group and their overlap falls to VRT order.
+    left, bottom = mercantile.xy(-81.50, 30.25)
+    right, top = mercantile.xy(-81.25, 30.50)
+    ninth = get_smallest_overzoom(left, bottom, right, top, 8112, 8112, resolutions)
+    third = get_smallest_overzoom(left, bottom, right, top, 2712, 2712, resolutions)
+    assert (ninth, third) == (15, 13), (ninth, third)
+    assert resolved_maxzoom(ninth, None) > resolved_maxzoom(third, None)
+    assert resolved_maxzoom(ninth, 13) == resolved_maxzoom(third, 13) == 13
     import shutil
     import tempfile
     import time

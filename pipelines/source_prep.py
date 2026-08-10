@@ -6,7 +6,10 @@ the per-source knobs that live in Justfile flags on the legacy chain:
   crs             horizontal CRS to assign (source_normalize --crs)
   nodata          nodata value to assign (source_normalize --nodata)
   negate          raw values are positive-down depth → flip (source_datum --negate)
-  datum_offset_m  constant shift to ~MSL (source_datum --offset)
+  datum_offset_m  constant shift to the target datum (source_datum --offset)
+  offset_surface  reference raster subtracted per pixel for a spatially-varying datum
+                  separation (source_datum --offset-surface); names a raster in the datum
+                  store, e.g. "navd88_chart" (built by datum_grid.py)
   clamp_positive  drop cells above the water surface (source_datum --clamp-positive)
   unpack          how to turn each raw asset into staged raster(s); absent = a bare
                   raster (see below)
@@ -26,8 +29,7 @@ micro-syntax is `format[:glob][!N]`:
   e00               gunzip → ARC/INFO .e00 export → convert to <id>.tif (Lake Tahoe;
                     the export is gzip-wrapped and the unpacker handles the wrapper)
   netcdf            gdal_translate to a GeoTIFF, per-file CRS preserved (NOAA estuaries)
-  (absent)          a bare raster: hardlink to <id>_<index>.<ext> with the URL-derived
-                    extension (ext_for), keeping the store's historical file naming
+  (absent)          a bare raster: hardlink to <url-filename>_<item-hash>.<ext> (staged_name)
 
 Content sniffing (`_kind`) survives ONLY as validation: an asset whose leading bytes
 contradict its declaration (a truncated download, an upstream 200-with-error-page) is
@@ -41,10 +43,15 @@ raw/. Every derived intermediate (tifs, .nc, gzip spools, VRT/7z scratch, asc/ t
 removed at entry — all are re-derivable from raw/ + this module — and orphan raws (a hash no
 longer enumerated, or a stale legacy index name) are deleted rather than wedging the source.
 
-Run from pipelines/:  uv run python source_prep.py <source-id>
+Staging is serial (basename collisions and corrupt-raw self-heal are order-dependent, and it is
+a hardlink or an archive read per asset); everything after it — datum, CRS flatten, normalize —
+runs one worker per staged file.
+
+Run from pipelines/:  uv run python source_prep.py <source-id> [workers]
 """
 
 import fnmatch
+import functools
 import gzip
 import lzma
 import os
@@ -53,12 +60,14 @@ import shutil
 import sys
 import tarfile
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from glob import glob
 
 import config
 import utils
 from convert_e00 import e00_to_tif
-from source_datum import transform_file, write_sidecar
+from source_datum import (coverage_report, dome_report, flatten_compound_crs, surface_path,
+                          transform_file, write_sidecar)
 from source_normalize import normalize_file
 
 # Only trust a URL's trailing extension when it names a real data/archive format;
@@ -67,12 +76,38 @@ from source_normalize import normalize_file
 DATA_EXTS = {"tif", "tiff", "zip", "nc", "asc", "xyz", "img", "gz", "7z", "grd"}
 
 
+def _url_name(url):
+    """The URL's filename: its last path segment, query + fragment stripped."""
+    return url.split("?")[0].split("#")[0].rsplit("/", 1)[-1]
+
+
 def ext_for(url):
-    last = url.split("?")[0].split("#")[0].rsplit("/", 1)[-1]
+    last = _url_name(url)
     ext = last.rsplit(".", 1)[-1].lower() if "." in last else ""
     if ext == "tiff":  # canonicalize to .tif — the staged extension the rest of the lane globs
         return "tif"
     return ext if ext in DATA_EXTS else "tif"
+
+
+# Cap on the legible half of a staged name: identity rides in the hash, so truncating a
+# pathological upstream filename can't collide, and the name stays inside the 255-byte limit.
+STEM_MAX = 100
+
+
+def staged_name(source, url):
+    """The staged basename for a bare raster: the URL's own filename beside the item hash that
+    names its raw/ download (config.item_hash), so the staged file and raw/<hash> read as a pair.
+
+    Derived from the item URL alone, never from its position in the enumeration: a positional
+    name re-keys every later file when upstream inserts or drops one, which re-registers the
+    whole source and re-aggregates its tiles. The hash also keeps two items that share a
+    filename apart — LINZ tiles the same national grid cell in adjacent surveys (23 such pairs
+    in nz_coastal), and NCEI names a tile only within its region directory. A URL that names no
+    data file (a weblink gateway, e.g. ddm's) has no filename to carry, so it takes the source id.
+    """
+    name, _, ext = _url_name(url).rpartition(".")
+    stem = re.sub(r"[^A-Za-z0-9._-]", "_", name).strip(".") if ext.lower() in DATA_EXTS else ""
+    return f"{(stem or source)[:STEM_MAX]}_{config.item_hash(url)}.{ext_for(url)}"
 
 
 def _kind(head):
@@ -130,11 +165,11 @@ def _parse_unpack(spec):
 
 
 def _claim(seen, name, origin):
-    """Register a staged basename; hard-error on a collision (two archive members or
-    nested paths sharing a basename would silently overwrite each other)."""
+    """Register a staged basename; hard-error on a collision (two archive members, nested
+    paths, or duplicate item URLs sharing a basename would silently overwrite each other)."""
     if name in seen:
-        sys.exit(f"{origin}: staged filename collision on {name!r} — two members would "
-                 "overwrite each other; the archives need distinct basenames")
+        sys.exit(f"{origin}: staged filename collision on {name!r} — two inputs would "
+                 "overwrite each other; they need distinct basenames")
     seen.add(name)
 
 
@@ -319,6 +354,8 @@ def _clear_stale(root):
         os.remove(stale)
     shutil.rmtree(f"{root}/asc", ignore_errors=True)
     shutil.rmtree(f"{root}/_7z_extract", ignore_errors=True)
+    for scratch in glob(f"{root}/seascape-shoal-*"):  # a crashed normalize's pyramid levels
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 class CorruptRaw(Exception):
@@ -338,8 +375,8 @@ def _unpack_one(unpack, raw, root, source, index, url, asc_dir, seen, origin):
     The declared format's magic bytes are validated first, so bytes that contradict the
     declaration self-heal as a corrupt raw (raising CorruptRaw)."""
     if unpack is None:
-        base = f"{source}_{index}.{ext_for(url)}"
-        _claim(seen, base, origin)
+        base = staged_name(source, url)
+        _claim(seen, base, f"{origin} {url}")  # name the URL: a collision here is a duplicate item
         dest = f"{root}/{base}"
         if os.path.exists(dest):
             os.remove(dest)
@@ -374,8 +411,8 @@ def stage(source):
     asc_dir = f"{root}/asc"
     seen = set()  # staged basenames — collisions across raws/archives hard-error
     corrupt = []
-    # `pos` (enumeration position) names bare-raster stagings + archive scratch, so those
-    # stay stable across runs; the raw itself lives at raw/<hash>.
+    # `pos` (enumeration position) names archive scratch + the error origin only; staged
+    # basenames derive from the item URL, and the raw itself lives at raw/<hash>.
     for pos, (h, url) in enumerate(hashes):
         raw = f"{root}/raw/{h}"
         origin = f"{source}[{pos}]"
@@ -406,7 +443,63 @@ def _check_raster(path):
         raise CorruptRaw(f"not a readable raster: {e}") from e
 
 
-def prep(source):
+def prep_file(tif, transform, negate, offset, clamp, surface, crs, nodata):
+    """One staged raster end to end: datum transform → compound-CRS flatten → normalize to a COG.
+    The unit the pool fans out over, so it touches no file but its own — every step writes a
+    sibling temp and os.replaces it, and rasterio's GDAL config Env is thread-local.
+    Returns (basename, reference-corrected px, valid px, whether a vertical CRS was dropped,
+    interpolation-dome candidates)."""
+    corrected = valid = 0
+    domes = None  # only the value transform streams the pixels; without it nothing is scored
+    if transform:
+        corrected, valid, domes = transform_file(tif, negate, offset, clamp, surface)
+    # After the transform, which already reduces the CRS on the files it rewrites; this catches
+    # the rest, so no staged raster reaches a warp carrying a vertical CRS.
+    flattened = flatten_compound_crs(tif)
+    normalize_file(tif, crs, nodata)
+    return os.path.basename(tif), corrected, valid, flattened, domes
+
+
+# The per-file pipeline is embarrassingly parallel, and THREADS carry it: GDAL's read/write and
+# numpy's ufuncs both drop the GIL, and the COG write is a subprocess. Measured on 16 real 1/9"
+# CUDEM tiles (3.3 GB), 4 workers: 70s threaded vs 84s with a process pool, at 2.5 GB peak RSS
+# vs 3.2 GB — one shared GDAL block cache instead of one per worker, and no start-method
+# portability surface (fork vs spawn vs forkserver) around the worker bootstrap.
+#
+# Each worker still runs GDAL with its own utils.GDAL_WORKER_THREADS compressor pool, so a prep
+# job's real thread demand is workers x GDAL_WORKER_THREADS: half the cores keeps that product at
+# the 2x oversubscription the box already declares (--cores 16 on 8 vCPU), and lands on the same
+# 4 the Snakemake rule passes as {threads}. Past that it flattens — 8 workers bought 5%.
+DEFAULT_WORKERS = max(1, (os.cpu_count() or 4) // 2)
+
+PROGRESS_EVERY = 25  # a listed source is ~1,000 files and hours long; log that it is moving
+
+
+def _fan_out(source, tifs, workers, job):
+    """Run `job(tif)` over every staged tif, `workers` at a time, and return the results in
+    `tifs` order — the aggregates (coverage report, sidecar) must not depend on who finished
+    first. The first failure names its file and stops the source: a partially prepped source
+    that registered anyway would ship a datum-uncorrected tile as if it were corrected."""
+    if workers == 1:
+        return [job(tif) for tif in tifs]
+    results, done_n = {}, 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(job, tif): tif for tif in tifs}
+        for future in as_completed(futures):
+            tif = futures[future]
+            try:
+                results[tif] = future.result()
+            except BaseException as e:
+                for pending in futures:
+                    pending.cancel()
+                raise RuntimeError(f"{source}: {os.path.basename(tif)}: {e}") from e
+            done_n += 1
+            if len(tifs) >= PROGRESS_EVERY * 2 and done_n % PROGRESS_EVERY == 0:
+                print(f"{source}: prepped {done_n}/{len(tifs)} file(s)", flush=True)
+    return [results[tif] for tif in tifs]
+
+
+def prep(source, workers=DEFAULT_WORKERS):
     meta = config.load_metadata(source)
     stage(source)
     tifs = sorted(glob(f"store/source/{source}/*.tif"))  # staging canonicalizes .tiff -> .tif (ext_for)
@@ -414,36 +507,58 @@ def prep(source):
     negate = bool(meta.get("negate", False))
     offset = float(meta.get("datum_offset_m", 0.0))
     clamp = bool(meta.get("clamp_positive", False))
-    write_sidecar(source, negate, offset, clamp)  # even for a no-op: the catalog's invariant
-    if negate or offset or clamp:
-        print(f"{source}: datum negate={negate} offset={offset} clamp_positive={clamp}")
-        for tif in tifs:
-            transform_file(tif, negate, offset, clamp)
-
+    name = meta.get("offset_surface")
+    write_sidecar(source, negate, offset, clamp, name)  # even for a no-op: the catalog's invariant
+    surface = surface_path(name) if name else None
+    if surface and not os.path.isfile(surface):
+        sys.exit(f"{source}: offset surface {surface} is not in the store — "
+                 "build it with datum_grid.py")
+    transform = bool(negate or offset or clamp or surface)
+    if transform:
+        print(f"{source}: datum negate={negate} offset={offset} surface={name} "
+              f"clamp_positive={clamp}")
     crs, nodata = meta.get("crs"), meta.get("nodata")
-    print(f"{source}: normalize {len(tifs)} file(s) (crs={crs} nodata={nodata})")
-    for tif in tifs:
-        normalize_file(tif, crs, nodata)
+    print(f"{source}: prep {len(tifs)} file(s) on {workers} worker(s) "
+          f"(crs={crs} nodata={nodata})", flush=True)
+
+    job = functools.partial(prep_file, transform=transform, negate=negate, offset=offset,
+                            clamp=clamp, surface=surface, crs=crs, nodata=nodata)
+    per_file = _fan_out(source, tifs, workers, job)
+
+    if transform:
+        # Rewritten with what the pass measured: how much of the source actually moved, and its
+        # dome-candidate count, are only known once every file is transformed.
+        write_sidecar(source, negate, offset, clamp, name,
+                      coverage_report(source, [r[:3] for r in per_file]) if surface else None,
+                      dome_report(source, [(r[0], r[4]) for r in per_file]))
+    flattened = sum(r[3] for r in per_file)
+    if flattened:
+        print(f"{source}: dropped the vertical CRS from {flattened}/{len(tifs)} file(s)")
 
 
 def main():
-    if len(sys.argv) != 2:
-        sys.exit("usage: source_prep.py <source-id>")
-    prep(sys.argv[1])
+    if len(sys.argv) not in (2, 3):
+        sys.exit("usage: source_prep.py <source-id> [workers]")
+    prep(sys.argv[1], int(sys.argv[2]) if len(sys.argv) == 3 else DEFAULT_WORKERS)
 
 
 def _check():
     """Synthetic sources end to end, driven by declared `unpack`. Raws live at raw/<hash>
     (config.item_hash of the item URL); items.txt is the enumeration. Common path: a declared
-    zip extracts its glob members, an undeclared raw hardlinks under the legacy <id>_<pos>
-    name, stale root tifs are cleared, the metadata knobs drive datum + normalize. Failure
+    zip extracts its glob members, an undeclared raw hardlinks under its URL-derived
+    staged_name — which an upstream insertion or removal leaves untouched, while the dropped
+    item's staged file goes and a duplicated item URL hard-errors by URL —
+    stale root tifs are cleared, the metadata knobs drive datum + normalize. Failure
     modes: a missing raw names what to fetch, an unexpected non-hash file in raw/ is a distinct
     error, an orphan (a hash no longer listed, or a stale legacy index) is deleted, and a
     staged-basename collision hard-errors. Format registry: a gzipped tar with `!1` stages
     exactly its one *_lld.tif (0 → error), a 7z glob filters its members, a gzipped .e00 stages
     to <id>.tif (pure-Python), and — when the GDAL CLI is present — an asc-mosaic zip mosaics to
     <id>.tif. Corrupt raws self-heal: a truncated declared zip, a declared zip whose bytes are
-    not a zip, and an undeclared raw that is a server error page are all deleted with a refetch."""
+    not a zip, and an undeclared raw that is a server error page are all deleted with a refetch.
+    Fan-out: results come back in input order however the workers finish, a multi-file source
+    preps identically on 1 and 4 workers (pixels and the coverage fraction alike), and one
+    unpreppable file fails the whole source by name on either."""
     import io
     import json
     import tempfile
@@ -457,6 +572,22 @@ def _check():
     assert ext_for("https://x/a.tiff") == "tif" and ext_for("https://x/a.tif") == "tif"
     assert ext_for("https://x/a.TIFF?k=v") == "tif" and ext_for("https://x/page.html?z") == "tif"
     assert ext_for("https://x/a.zip") == "zip" and ext_for("https://x/a.nc") == "nc"
+
+    # staged_name: the URL's filename + the item hash naming its raw/ download, canonical
+    # extension, path-unsafe characters folded, and the source id where the URL names no data
+    # file. Two items sharing a filename (the real nz_coastal shape) get distinct names.
+    H = config.item_hash
+    u_nz = ["https://b/auckland/mangawhai_2025/dem_1m/2193/AY31_10000_0103.tiff",
+            "https://b/northland/whangarei_2025/dem_1m/2193/AY31_10000_0103.tiff"]
+    assert staged_name("s", u_nz[0]) == f"AY31_10000_0103_{H(u_nz[0])}.tif"
+    assert staged_name("s", u_nz[0]) != staged_name("s", u_nz[1]), "same filename, distinct items"
+    u_weblink = "https://f/main.html?weblink=abc"  # ddm's shape: a gateway URL, no filename
+    assert staged_name("ddm", u_weblink) == f"ddm_{H(u_weblink)}.tif"
+    assert staged_name("s", "https://x/a b%20c.tif").startswith("a_b_20c_"), \
+        staged_name("s", "https://x/a b%20c.tif")
+    assert staged_name("s", "https://x/../.tif").startswith("s_"), "no traversal out of the store"
+    long_url = "https://x/" + "n" * 300 + ".tif"
+    assert len(staged_name("s", long_url)) == STEM_MAX + len(H(long_url)) + len("_.tif")
 
     # _parse_unpack splits format/glob/!N and rejects an unknown format.
     assert _parse_unpack("zip:*.tif") == ("zip", "*.tif", None)
@@ -476,8 +607,6 @@ def _check():
             assert False, f"expected {bad!r} to exit"
         except SystemExit as e:
             assert msg in str(e), (bad, e)
-
-    H = config.item_hash
 
     def seed(sid, urls, meta):
         """A synthetic source: metadata.json + items.txt (the enumeration) + an empty raw/."""
@@ -531,7 +660,11 @@ def _check():
             "in-place steps must never write through into raw/"
         with open(f"store/source/{sid}/datum.json") as f:
             sidecar = json.load(f)
-        assert sidecar == {"negate": True, "offset_m": -1.0, "clamp_positive": False}, sidecar
+        # dome_candidates is None here, not 0: these staged tifs carry no CRS of their own (the
+        # metadata one is assigned at normalize), so the detector has no metres to size itself by.
+        assert sidecar == {"negate": True, "offset_m": -1.0, "clamp_positive": False,
+                           "offset_surface": None, "corrected_fraction": None,
+                           "dome_candidates": None}, sidecar
         for name, want in (("a.tif", -6.0), ("b.tif", -11.0)):  # -(v) - 1
             with rasterio.open(f"store/source/{sid}/{name}") as src:
                 assert src.crs.to_epsg() == 28992, (name, src.crs)
@@ -566,14 +699,104 @@ def _check():
         assert not os.path.exists(raw_of(sid, u1)), "orphan hash must be deleted"
         assert not os.path.exists(f"store/source/{sid}/raw/7"), "stale legacy index must be deleted"
 
-        # A bare raster (no `unpack`): the raw hardlinks under the legacy <id>_<pos>.<ext>.
+        # A bare raster (no `unpack`) hardlinks to its URL-derived name, and an upstream
+        # insertion or removal leaves the other files' names — and their inodes — alone. A
+        # positional name would re-key every file after the insertion, re-registering the source.
         bid = "_prep_bare"
-        bu = "https://x/dem.tif"
-        seed(bid, [bu], {"name": "Bare", "crs": "EPSG:4326"})
-        with open(raw_of(bid, bu), "wb") as f:
-            f.write(tif_bytes(7.0))
+        bus = [f"https://x/tiles/dem_{i}.tif" for i in range(3)]
+        seed(bid, bus, {"name": "Bare", "crs": "EPSG:4326"})
+        for u in bus:
+            with open(raw_of(bid, u), "wb") as f:
+                f.write(tif_bytes(7.0))
         stage(bid)
-        assert os.path.isfile(f"store/source/{bid}/{bid}_0.tif"), "bare raster stages under legacy name"
+        staged = {u: f"store/source/{bid}/{staged_name(bid, u)}" for u in bus}
+        for u, path in staged.items():
+            assert os.path.isfile(path), (u, path)
+            assert os.path.basename(path).endswith(f"_{H(u)}.tif"), path  # raw/<hash> ↔ staged
+            assert os.stat(path).st_ino == os.stat(raw_of(bid, u)).st_ino, "staged must hardlink raw"
+        inserted = "https://x/tiles/dem_new.tif"
+        with open(raw_of(bid, inserted), "wb") as f:
+            f.write(tif_bytes(8.0))
+        with open(f"store/source/{bid}/items.txt", "w") as f:  # inserted FIRST: the drift case
+            f.write("".join(u + "\n" for u in [inserted] + bus))
+        stage(bid)
+        for u, path in staged.items():
+            assert os.path.isfile(path), f"insertion re-keyed {u}"
+        assert os.path.isfile(f"store/source/{bid}/{staged_name(bid, inserted)}")
+        # Dropping an item clears its staged file (and its now-orphan raw) while the rest stand.
+        with open(f"store/source/{bid}/items.txt", "w") as f:
+            f.write("".join(u + "\n" for u in bus))
+        stage(bid)
+        assert not os.path.exists(f"store/source/{bid}/{staged_name(bid, inserted)}"), \
+            "a dropped item's staged file must be cleared"
+        assert not os.path.exists(raw_of(bid, inserted)), "orphan raw must be deleted"
+        for u, path in staged.items():
+            assert os.path.isfile(path), f"removal re-keyed {u}"
+        # A duplicated item URL would stage twice onto one name — hard-error, naming the URL.
+        with open(f"store/source/{bid}/items.txt", "w") as f:
+            f.write("".join(u + "\n" for u in bus + bus[:1]))
+        try:
+            stage(bid)
+            assert False, "expected a duplicated item URL to exit"
+        except SystemExit as e:
+            assert "collision" in str(e) and bus[0] in str(e), e
+        with open(f"store/source/{bid}/items.txt", "w") as f:
+            f.write("".join(u + "\n" for u in bus))
+
+        # A source with NO datum knobs (the CUDEM-territory shape) still loses a compound
+        # CRS's vertical half, with its values untouched — nothing downstream may see one.
+        # A bare raster stages as a HARDLINK to its raw, so this also pins the raw bytes:
+        # an in-place header edit here would rewrite the verbatim download.
+        # Three files, so the flatten runs in the workers rather than only on the serial path.
+        vid = "_prep_vertical"
+        vus = [f"https://x/compound{i}.tif" for i in range(3)]
+        seed(vid, vus, {"name": "Compound"})
+        for vu in vus:
+            with rasterio.open(raw_of(vid, vu), "w", driver="GTiff", height=2, width=2, count=1,
+                               dtype="float32", nodata=-9999.0,
+                               crs=rasterio.crs.CRS.from_epsg(5498),  # NAD83 + NAVD88 height
+                               transform=from_origin(0, 2, 1, 1)) as dst:
+                dst.write(np.full((2, 2), -4.5, dtype="float32"), 1)
+        raw_bytes = open(raw_of(vid, vus[0]), "rb").read()
+        prep(vid, 4)
+        for vu in vus:
+            with rasterio.open(f"store/source/{vid}/{staged_name(vid, vu)}") as src:
+                assert src.crs.to_epsg() == 4269, (vu, src.crs)
+                assert (src.read(1) == -4.5).all(), (vu, src.read(1))
+        assert open(raw_of(vid, vus[0]), "rb").read() == raw_bytes, \
+            "flattening a hardlinked bare raster must not write through into raw/"
+
+        # `offset_surface` drives the per-pixel datum correction (the CUDEM shape: bare rasters,
+        # no crs/nodata override, a reference from the datum store) and lands in the sidecar.
+        sid_s = "_prep_surface"
+        su = "https://x/tile.tif"
+        seed(sid_s, [su], {"name": "Surface", "offset_surface": "synth"})
+        with rasterio.open(raw_of(sid_s, su), "w", driver="GTiff", height=2, width=2, count=1,
+                           dtype="float32", nodata=-9999.0, crs="EPSG:4326",
+                           transform=from_origin(0, 2, 1, 1)) as dst:
+            dst.write(np.full((2, 2), -10.0, dtype="float32"), 1)  # bed 10 m below zero
+        os.makedirs("store/datum", exist_ok=True)
+        with rasterio.open("store/datum/synth.tif", "w", driver="GTiff", height=2, width=2,
+                           count=1, dtype="float32", crs="EPSG:4326", nodata=-9999.0,
+                           transform=from_origin(0, 2, 1, 1)) as dst:
+            # Chart datum 1 m lower over the western column only: the coverage edge a real
+            # boundary tile sits on, so the source's corrected fraction is a ratio, not 1.
+            dst.write(np.array([[-1.0, -9999.0]] * 2, dtype="float32"), 1)
+        prep(sid_s)
+        with open(f"store/source/{sid_s}/datum.json") as f:
+            sidecar_s = json.load(f)
+        assert sidecar_s["offset_surface"] == "synth", sidecar_s
+        assert sidecar_s["corrected_fraction"] == 0.5, sidecar_s
+        with rasterio.open(f"store/source/{sid_s}/{staged_name(sid_s, su)}") as src:
+            assert src.read(1)[0, 0] == -9.0, src.read(1)   # bed - (-1): shallower
+            assert src.read(1)[0, 1] == -10.0, src.read(1)  # no coverage: passed through
+        # A declared surface that isn't in the store must name itself, not silently no-op.
+        os.remove("store/datum/synth.tif")
+        try:
+            prep(sid_s)
+            assert False, "expected a missing offset surface to exit"
+        except SystemExit as e:
+            assert "offset surface" in str(e) and "datum_grid.py" in str(e), e
 
         # Two archives whose members share a basename must hard-error, not silently overwrite.
         cid = "_prep_collide"
@@ -714,6 +937,90 @@ def _check():
             assert "deleted 1 corrupt raw asset(s)" in str(e), e
         assert not os.path.exists(raw_of(gid, gu)), "garbage raster raw must be deleted"
         assert not os.path.exists(f"store/source/{gid}/{gid}_0.tif"), "bad staged tif must be removed"
+
+        # _fan_out returns in INPUT order however the workers finish — the coverage report and
+        # the sidecar fraction it feeds must not depend on the race. Reversed completion order.
+        import time
+        order = ["c", "a", "b", "d"]
+        assert _fan_out("s", order, 4, lambda x: (time.sleep(0.05 * order.index(x)), x)[1]) == order
+
+        # The parallel path must be indistinguishable from the serial one: same pixels, same
+        # ordered aggregates. Three tiles sit exactly on the reference grid and two sit far
+        # outside it, so the source's corrected fraction is a ratio a reordering would disturb.
+        pid = "_prep_parallel"
+        pu = [f"https://x/t{i}.tif" for i in range(5)]
+        seed(pid, pu, {"name": "Parallel", "offset_surface": "synth2"})
+        with rasterio.open("store/datum/synth2.tif", "w", driver="GTiff", height=4, width=4,
+                           count=1, dtype="float32", crs="EPSG:4326", nodata=-9999.0,
+                           transform=from_origin(0.0, 4.0, 1.0, 1.0)) as dst:
+            dst.write(np.full((4, 4), -1.0, dtype="float32"), 1)  # chart datum 1 m below zero
+        origins = [(0.0, 4.0), (2.0, 4.0), (0.0, 2.0), (50.0, 4.0), (60.0, 4.0)]
+        depths = [-10.0, -20.0, -30.0, -40.0, -50.0]  # distinct, so a crossed result is visible
+        for u, (x, y), v in zip(pu, origins, depths):
+            with rasterio.open(raw_of(pid, u), "w", driver="GTiff", height=2, width=2, count=1,
+                               dtype="float32", nodata=-9999.0, crs="EPSG:4326",
+                               transform=from_origin(x, y, 1.0, 1.0)) as dst:
+                dst.write(np.full((2, 2), v, dtype="float32"), 1)
+
+        def prepped(workers):
+            prep(pid, workers)
+            with open(f"store/source/{pid}/datum.json") as f:
+                sidecar = json.load(f)
+            out = []
+            for u in pu:
+                with rasterio.open(f"store/source/{pid}/{staged_name(pid, u)}") as src:
+                    out.append(src.read(1).tolist())
+            return sidecar, out
+
+        serial, parallel = prepped(1), prepped(4)
+        assert serial == parallel, (serial, parallel)
+        assert serial[0]["corrected_fraction"] == 0.6, serial[0]  # 12 of 20 px reached
+        for i, want in enumerate([-9.0, -19.0, -29.0, -40.0, -50.0]):  # covered rise 1 m
+            assert serial[1][i] == [[want] * 2] * 2, (i, serial[1][i])
+
+        # Interpolation-dome candidates aggregate over the source and are a sum, not a race: three
+        # tiles carrying 1, 0 and 2 planted domes report 3 on one worker and on four.
+        did = "_prep_domes"
+        dus = [f"https://x/d{i}.tif" for i in range(3)]
+        seed(did, dus, {"name": "Domes", "datum_offset_m": 0.5})
+        PX = 3.0  # metres, close to CUDEM 1/9 arc-second
+        for u, centres in zip(dus, ([(100, 100)], [], [(60, 60), (60, 160)])):
+            field = np.full((220, 220), -16.5, dtype="float32")
+            rr, cc = np.ogrid[:220, :220]
+            for row, col in centres:  # a 70 m cone peaking at datum once the +0.5 m offset lands
+                dist = np.hypot(rr - row, cc - col) * PX
+                np.maximum(field, field + (0.0 - field) * np.clip(1 - dist / 70.0, 0, 1),
+                           out=field)
+            with rasterio.open(raw_of(did, u), "w", driver="GTiff", height=220, width=220,
+                               count=1, dtype="float32", nodata=-9999.0,
+                               crs=rasterio.crs.CRS.from_epsg(32618),
+                               transform=from_origin(500000.0, 4000000.0, PX, PX)) as dst:
+                dst.write(field, 1)
+
+        def dome_count(workers):
+            prep(did, workers)
+            with open(f"store/source/{did}/datum.json") as f:
+                return json.load(f)["dome_candidates"]
+
+        assert dome_count(1) == 3, dome_count(1)
+        assert dome_count(4) == 3, dome_count(4)
+
+        # One bad file fails the SOURCE, named — never a partial prep that registers anyway.
+        fid = "_prep_fail"
+        fu = [f"https://x/f{i}.tif" for i in range(3)]
+        seed(fid, fu, {"name": "Fail", "clamp_positive": True})
+        for i, u in enumerate(fu):
+            with rasterio.open(raw_of(fid, u), "w", driver="GTiff", height=2, width=2, count=1,
+                               dtype="float32", crs="EPSG:4326",  # the middle tile declares none
+                               nodata=None if i == 1 else -9999.0,
+                               transform=from_origin(0, 2, 1, 1)) as dst:
+                dst.write(np.full((2, 2), -5.0, dtype="float32"), 1)
+        for workers in (1, 4):
+            try:
+                prep(fid, workers)
+                assert False, f"expected a file with no nodata to fail prep (workers={workers})"
+            except (RuntimeError, ValueError) as e:
+                assert staged_name(fid, fu[1]) in str(e), (workers, e)
 
         # Format registry: an asc-mosaic zip of ESRI ASCII tiles mosaics to <id>.tif (GDAL CLI).
         if shutil.which("gdalbuildvrt") and shutil.which("gdal_translate"):
