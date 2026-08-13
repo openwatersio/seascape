@@ -34,7 +34,7 @@ else
 fi
 tty=""; if [ -t 0 ]; then tty="-it"; fi
 # `dev` serves the viewer/Worker — publish their ports to the host.
-ports=""; if [ "${1:-}" = "dev" ]; then ports="-p 5173:5173 -p 8787:8787"; fi
+ports=""; if [ "${1:-}" = "dev" ]; then ports="-p 5173:5173"; fi
 # CI mounts the persistent store volume at /app/state.
 state=""; if [ -n "${STATE:-}" ]; then state="-v $STATE:/app/state"; fi
 # CI points TMP (per-run logs/benchmarks) at local disk, off the network volume — forwarded

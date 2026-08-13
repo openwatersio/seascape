@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# Seed the local wrangler R2 simulation from pipelines/store/bundle so `wrangler
-# dev` serves the freshly-built bundles. Run after `snakemake preview` / `snakemake planet`.
+# Seed the local R2 simulation from pipelines/store/bundle so the dev server
+# (`just dev`) serves the freshly-built bundles. Run after `snakemake preview` /
+# `snakemake planet`. The Vite plugin reads the same state dir (vite.config.js
+# points persistState here), and dev serving is uncached, so a reseed is live on
+# plain refresh.
 set -euo pipefail
 cd "$(dirname "$0")"
 # Ensure wrangler is installed (fresh checkout, or the container's empty node_modules
