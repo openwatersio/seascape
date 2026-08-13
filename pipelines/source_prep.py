@@ -28,6 +28,8 @@ micro-syntax is `format[:glob][!N]`:
                     <id>.tif (swissBATHY / Bodensee)
   e00               gunzip → ARC/INFO .e00 export → convert to <id>.tif (Lake Tahoe;
                     the export is gzip-wrapped and the unpacker handles the wrapper)
+  gldb              the GLDB v2 tar.gz → one <id>_<lake>.tif per documented-bathymetry
+                    lake, cut from the global binary depth grid (convert_gldb)
   netcdf            gdal_translate to a GeoTIFF, per-file CRS preserved (NOAA estuaries)
   (absent)          a bare raster: hardlink to <url-filename>_<item-hash>.<ext> (staged_name)
 
@@ -66,6 +68,7 @@ from glob import glob
 import config
 import utils
 from convert_e00 import e00_to_tif
+from convert_gldb import gldb_to_tifs
 from source_datum import (coverage_report, dome_report, flatten_compound_crs, surface_path,
                           transform_file, write_sidecar)
 from source_normalize import normalize_file
@@ -136,6 +139,7 @@ _EXPECT_KIND = {
     "asc-mosaic": "zip",
     "tar.gz": "gzip",
     "e00": "gzip",
+    "gldb": "gzip",
     "7z": "7z",
     "netcdf": "netcdf",
 }
@@ -148,7 +152,7 @@ _GLOB_FORMATS = {"zip", "tar.gz", "7z"}
 def _parse_unpack(spec):
     """Parse a metadata `unpack` string `format[:glob][!N]` → (format, glob, expect).
     `expect` is the exact per-archive match count asserted by `!N` (else None). Archive
-    formats require a member glob; the glob-less formats (e00/netcdf/asc-mosaic) reject one."""
+    formats require a member glob; the glob-less formats (e00/netcdf/asc-mosaic/gldb) reject one."""
     fmt, _, rest = spec.partition(":")
     members_glob, expect = (rest or None), None
     if members_glob and "!" in members_glob:
@@ -282,6 +286,20 @@ def _stage_e00(raw, root, source, index, seen, origin):
             os.remove(inner)
 
 
+def _stage_gldb(raw, root, source, seen, origin):
+    """The GLDB v2 archive → one <id>_<lake>.tif per documented-bathymetry lake; the lake set
+    comes out of the archive, so each name is claimed as the converter reaches it. The converter
+    reads the tar.gz itself and fails closed on any change to its members, dimensions or counts;
+    a digest mismatch (truncated download or upstream republish) arrives as a ValueError and
+    self-heals as a corrupt raw."""
+    try:
+        paths = gldb_to_tifs(raw, root, source,
+                             claim=lambda base: _claim(seen, base, origin))
+    except (tarfile.TarError, ValueError) as e:
+        raise CorruptRaw(f"gldb: {e}") from e
+    return f"gldb → {len(paths)} lake tif(s)"
+
+
 def _stage_netcdf(raw, root, url, seen, origin):
     """Translate a netCDF to a GeoTIFF, preserving the file's embedded CRS (no -a_srs) —
     a mixed-CRS source keeps each file's zone. Named after the URL stem so the registration
@@ -399,6 +417,8 @@ def _unpack_one(unpack, raw, root, source, index, url, asc_dir, seen, origin):
         return _stage_targz(raw, root, index, seen, origin, members_glob, expect)
     if fmt == "e00":
         return _stage_e00(raw, root, source, index, seen, origin)
+    if fmt == "gldb":
+        return _stage_gldb(raw, root, source, seen, origin)
     return _stage_netcdf(raw, root, url, seen, origin)  # fmt == "netcdf"
 
 
@@ -593,6 +613,7 @@ def _check():
     assert _parse_unpack("zip:*.tif") == ("zip", "*.tif", None)
     assert _parse_unpack("tar.gz:*_lld.tif!1") == ("tar.gz", "*_lld.tif", 1)
     assert _parse_unpack("e00") == ("e00", None, None)
+    assert _parse_unpack("gldb") == ("gldb", None, None)
     try:
         _parse_unpack("rar:*.tif")
         assert False, "expected an unknown unpack format to exit"
@@ -601,7 +622,8 @@ def _check():
     # archive formats require a glob ("zip"/"zip:" would crash in _members later);
     # glob-less formats reject one.
     for bad, msg in (("zip", "needs a member glob"), ("zip:", "needs a member glob"),
-                     ("e00:*.tif", "takes no member glob"), ("netcdf:!1", "takes no member glob")):
+                     ("e00:*.tif", "takes no member glob"), ("netcdf:!1", "takes no member glob"),
+                     ("gldb:*.tif", "takes no member glob")):
         try:
             _parse_unpack(bad)
             assert False, f"expected {bad!r} to exit"

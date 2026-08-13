@@ -72,6 +72,7 @@ test-sources:
     uv run python source_fetch.py --check
     uv run python source_prep.py --check
     uv run python source_normalize.py --check
+    uv run python convert_gldb.py --check
     uv run python source_polygonize.py --check
     uv run python source_check.py --check
     uv run python source_datum.py --check
