@@ -937,15 +937,24 @@ def clamp_positive_ocean(cog_path, mask_tif, water_tif=None, erode_px=1):
                             col, row, min(block, ds.width - col), min(block, ds.height - row))
                         if pad:
                             # Read the erosion halo from the neighbouring blocks so the result is
-                            # block-size independent; off-raster reads fill LAND, the no-erosion
+                            # block-size independent. The halo is clipped to the raster and padded
+                            # in numpy rather than read boundless: a boundless read builds a
+                            # WarpedVRT per call, and this runs once per block per flagged source
+                            # (1024 blocks on a z15 tile). Off-raster pads LAND, the no-erosion
                             # value, and the aggregation buffer keeps that out of the interior.
-                            phal = rasterio.windows.Window(
-                                win.col_off - pad, win.row_off - pad,
-                                win.width + 2 * pad, win.height + 2 * pad)
-                            land = m.read(1, window=phal, boundless=True, fill_value=1) == 1
-                            land = ndimage.binary_erosion(
-                                land, _disk(erode_px), border_value=1)[pad:-pad, pad:-pad]
-                            ocean = ~land
+                            c0, r0 = win.col_off - pad, win.row_off - pad
+                            c1, r1 = c0 + win.width + 2 * pad, r0 + win.height + 2 * pad
+                            cc0, rr0 = max(c0, 0), max(r0, 0)
+                            cc1, rr1 = min(c1, ds.width), min(r1, ds.height)
+                            land = m.read(1, window=rasterio.windows.Window(
+                                cc0, rr0, cc1 - cc0, rr1 - rr0)) == 1
+                            land = np.pad(land, ((rr0 - r0, r1 - rr1), (cc0 - c0, c1 - cc1)),
+                                          constant_values=True)
+                            # Euclidean distance-to-water, thresholded — identical to eroding by a
+                            # disk of that radius, but O(pixels) instead of O(pixels x disk area).
+                            # The disk is 65x65 at the cap, which measured ~1 s per block.
+                            ocean = ndimage.distance_transform_edt(land)[
+                                pad:-pad, pad:-pad] <= erode_px
                         else:
                             ocean = m.read(1, window=win) == 0
                         if water is not None:
@@ -961,13 +970,6 @@ def clamp_positive_ocean(cog_path, mask_tif, water_tif=None, erode_px=1):
                 if water is not None:
                     water.close()
 
-
-def _disk(r):
-    """Euclidean disk of radius r as a binary structuring element — an isotropic erosion, so the
-    clamp reaches the same distance inland on a diagonal coast as on a north-south one."""
-    n = int(math.ceil(r))
-    y, x = np.ogrid[-n:n + 1, -n:n + 1]
-    return x * x + y * y <= r * r
 
 
 def _check():
@@ -1143,7 +1145,7 @@ def _check():
     # coastal cell the erosion exists to reach), ld* is land beyond its reach.
     from scipy import ndimage
     ERODE = 2
-    inner = ndimage.binary_erosion(lw == 1, _disk(ERODE), border_value=1)
+    inner = ndimage.distance_transform_edt(lw == 1) > ERODE  # same measure the clamp erodes by
     rmy, rmx = np.where((lw == 1) & ~inner)
     ldy, ldx = np.where(inner)
     assert len(iwy) > 1 and len(ocy) and len(ldy) and len(rmy), \
