@@ -77,8 +77,9 @@ _REFERENCE_ITEM = re.compile(r"^\d+\.\s")
 
 
 class ArchiveChanged(ValueError):
-    """The archive's bytes are not the pinned release — a truncated fetch or an upstream
-    republish. A ValueError so staging maps it onto its corrupt-raw self-heal."""
+    """The archive's bytes are truncated or otherwise unreadable. A ValueError so staging maps
+    it onto its corrupt-raw self-heal, which refetches. An upstream republish exits instead —
+    deleting readable bytes would destroy the only copy of what has to be re-verified."""
 
 
 def parse_inventory(text):
@@ -216,10 +217,18 @@ def read_archive(archive_path):
     with open(archive_path, "rb") as f:
         digest = hashlib.sha256(f.read()).hexdigest()
     if digest != ARCHIVE_SHA256:
-        raise ArchiveChanged(
-            f"archive sha256 {digest} is not the pinned {ARCHIVE_SHA256} — a truncated "
-            "download refetches; if upstream republished, re-verify the grid layout and the "
-            "asserted counts before repinning")
+        # Readable bytes are a republish, not a bad fetch: exit so the raw survives for the
+        # grid layout and counts to be re-verified against it before repinning. Only unreadable
+        # bytes take the refetch path, which deletes them.
+        try:
+            with tarfile.open(archive_path, "r|gz") as probe:
+                next(iter(probe))
+        except (tarfile.TarError, OSError, EOFError, StopIteration) as e:
+            raise ArchiveChanged(f"archive sha256 {digest} is not the pinned "
+                                 f"{ARCHIVE_SHA256} and the bytes do not read ({e})") from e
+        sys.exit(f"gldb: archive sha256 {digest} is not the pinned {ARCHIVE_SHA256}, but the "
+                 f"bytes are a readable archive — upstream republished. Re-verify the grid "
+                 f"layout and the asserted counts against {archive_path}, then repin.")
     depth, inventory, names = None, None, []
     with tarfile.open(archive_path, "r|gz") as tar:
         for member in tar:
@@ -364,6 +373,24 @@ Pskovskoe     Russia         |             58.065     27.905      |          |  
             assert list(src.read(1)[0]) == [4.0, 5.0], src.read(1)
             assert src.transform.c == -180.0 + 4 * CELL_DEG, src.transform
             assert src.transform.f == 90.0 - 5 * CELL_DEG, src.transform
+        # Both digest-mismatch paths: unreadable bytes refetch, a readable archive exits so the
+        # raw survives for repinning.
+        with open(f"{d}/truncated.tar.gz", "wb") as f:
+            f.write(b"\x1f\x8b\x08\x00 not a tar")
+        try:
+            read_archive(f"{d}/truncated.tar.gz")
+        except ArchiveChanged:
+            pass
+        else:
+            raise AssertionError("unreadable bytes must raise ArchiveChanged")
+        with tarfile.open(f"{d}/wrong.tar.gz", "w:gz") as tar:
+            tar.add(f"{d}/synthetic.tif", arcname=DEPTH_MEMBER)
+        try:
+            read_archive(f"{d}/wrong.tar.gz")
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("a readable archive off the pin must exit, not refetch")
         print("convert_gldb.py self-check ok (synthetic)")
 
         if not archive_path:
