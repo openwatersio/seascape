@@ -305,6 +305,7 @@ export function layers(
     unit = DEFAULT_UNIT,
     safety = DEFAULT_SAFETY,
     shading = DEFAULT_SHADING,
+    hillshade = true,
   }: {
     dem?: string;
     vector?: string;
@@ -312,6 +313,8 @@ export function layers(
     unit?: Unit;
     safety?: number;
     shading?: Shading;
+    /** Bathymetric hillshading over the water shading, on by default; false hides it. */
+    hillshade?: boolean;
   } = {},
 ): LayerSpecification[] {
   // `unit` picks every sounding/contour label and which isobath set shows;
@@ -339,17 +342,29 @@ export function layers(
       ? ["!=", ["get", "sys"], "ft"]
       : ["any", ["!", ["has", "sys"]], ["==", ["get", "sys"], "ft"]]
   ) as unknown as ExpressionSpecification;
+  // Depth number only, like paper charts (S-4 B-411.3) — the unit lives in the
+  // consumer's UI, and soundings are already unitless.
   const contourLabelText: ExpressionSpecification = [
-    "concat",
+    "to-string",
     [
-      "to-string",
-      [
-        "get",
-        unit === "ft" ? "depth_ft" : unit === "fm" ? "depth_fm" : "depth_abs_m",
-      ],
+      "get",
+      unit === "ft" ? "depth_ft" : unit === "fm" ? "depth_fm" : "depth_abs_m",
     ],
-    unit,
   ];
+
+  // The safety contour snaps UP the charted ladder to the next-deeper level, exactly
+  // as depthAreasColor recolours the bands, so the emphasized line always bounds the
+  // hazard tint. Contours carry integer depth props (depth_abs_m / depth_fm,
+  // contour_run.py), so the match is exact equality on the active system's prop.
+  const ladder = unit === "m" ? DEPARE_LADDER_M : DEPARE_LADDER_FT;
+  const safetyContour =
+    safety > 0
+      ? (ladder.find((l) => l >= safety - DRVAL_EPS) ?? ladder[ladder.length - 1])
+      : 0;
+  const isSafetyContour: ExpressionSpecification =
+    unit === "m"
+      ? ["==", ["get", "depth_abs_m"], safetyContour]
+      : ["==", ["get", "depth_fm"], Math.round(safetyContour / 1.8288)];
 
   // Shared label styling so soundings and contour labels read as one chart.
   const labelSize: ExpressionSpecification = [
@@ -443,7 +458,7 @@ export function layers(
       id: "depth-hillshade",
       type: "hillshade",
       source: dem,
-      layout: { visibility: "none" },
+      layout: { visibility: hillshade ? "visible" : "none" },
       paint: {
         "hillshade-exaggeration": 0.5,
         "hillshade-shadow-color": flavor.hillshadeShadow,
@@ -462,8 +477,14 @@ export function layers(
       // Full-strength linework at DEPCN weight — translucent hairlines read as
       // shading artefacts rather than isobaths.
       paint: {
-        "line-color": flavor.contour,
-        "line-width": 0.8,
+        // The safety contour is the one emphasized isobath — thicker, in the emphasis
+        // colour, like S-52's DEPSC over DEPCN (IMO MSC.232 requires the emphasis);
+        // every other contour stays uniform DEPCN weight (S-4 B-411.1 recommends
+        // against emphasizing fixed standard contours).
+        "line-color": safetyContour
+          ? ["case", isSafetyContour, flavor.soundingEmphasis, flavor.contour]
+          : flavor.contour,
+        "line-width": safetyContour ? ["case", isSafetyContour, 1.5, 0.8] : 0.8,
       },
     },
     {
@@ -575,6 +596,7 @@ export function style({
   unit = DEFAULT_UNIT,
   safety = DEFAULT_SAFETY,
   shading = DEFAULT_SHADING,
+  hillshade = true,
 }: {
   tilesBase: string;
   flavor?: Flavor;
@@ -583,6 +605,7 @@ export function style({
   unit?: Unit;
   safety?: number;
   shading?: Shading;
+  hillshade?: boolean;
 }): StyleSpecification {
   const osmSource: Record<string, SourceSpecification> = osm
     ? {
@@ -603,7 +626,7 @@ export function style({
     name: "Open Waters Seascape",
     glyphs,
     sources: { ...osmSource, ...sources({ tilesBase }) },
-    layers: [...osmBase, ...layers(flavor, { unit, safety, shading })],
+    layers: [...osmBase, ...layers(flavor, { unit, safety, shading, hillshade })],
   };
 }
 
@@ -636,11 +659,12 @@ export function applyState(
     unit,
     safety,
     shading = DEFAULT_SHADING,
-  }: { unit: Unit; safety: number; shading?: Shading },
+    hillshade = true,
+  }: { unit: Unit; safety: number; shading?: Shading; hillshade?: boolean },
   flavor: Flavor = day,
 ): void {
   const spec = Object.fromEntries(
-    layers(flavor, { unit, safety, shading }).map((l) => [l.id, l]),
+    layers(flavor, { unit, safety, shading, hillshade }).map((l) => [l.id, l]),
   ) as Record<string, { filter?: unknown; layout?: any; paint?: any }>;
   if (map.getLayer("depth-shading"))
     map.setPaintProperty(
@@ -656,8 +680,18 @@ export function applyState(
       spec["depth-areas"].paint["fill-color"],
     );
   }
-  if (map.getLayer("contour-lines"))
+  if (map.getLayer("contour-lines")) {
     map.setFilter("contour-lines", spec["contour-lines"].filter);
+    // safety moves the emphasized contour, so the paint is safety-dependent too
+    for (const p of ["line-color", "line-width", "line-opacity"])
+      map.setPaintProperty("contour-lines", p, spec["contour-lines"].paint[p]);
+  }
+  if (map.getLayer("depth-hillshade"))
+    map.setLayoutProperty(
+      "depth-hillshade",
+      "visibility",
+      spec["depth-hillshade"].layout.visibility,
+    );
   if (map.getLayer("contour-labels")) {
     map.setFilter("contour-labels", spec["contour-labels"].filter);
     map.setLayoutProperty(
