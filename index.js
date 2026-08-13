@@ -8,7 +8,8 @@ import { applyState, readDepth, style } from "@openwaters/seascape";
 //
 // VITE_TILES_BASE is the full bathymetry endpoint base — it includes the
 // /seascape route prefix in prod (e.g. https://tiles.openwaters.io/seascape);
-// the dev default points at the worker root. VITE_BBOX sets the initial view.
+// the dev default is same-origin (the Vite dev server runs the tile Worker
+// in-process via the Cloudflare plugin). VITE_BBOX sets the initial view.
 // ?tiles=<base> overrides it at runtime so this one viewer (deployed or local)
 // can inspect any build preview, e.g.
 // ?tiles=https://data.openwaters.io/bathymetry/build/<sha>.
@@ -25,7 +26,7 @@ const BBOX =
 const tilesBase = (
   new URLSearchParams(location.search).get("tiles") ||
   import.meta.env.VITE_TILES_BASE ||
-  "http://localhost:8787"
+  ""
 ).replace(/\/$/, "");
 const MAX_ZOOM = 13; // deepest zoom readDepth fetches (the Worker overzooms past it)
 

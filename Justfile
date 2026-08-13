@@ -40,23 +40,16 @@ preview bbox="-74.30,40.40,-73.75,40.80":
     uv run python -c "import bundle; bundle.stage_build()"
     ../worker/seed.sh
 
-# Run both dev servers in one terminal: tile Worker on :8787 + Vite viewer on :5173
-# (the viewer defaults to localhost:8787, so no VITE_TILES_BASE needed). Ctrl-C stops both.
-# Works in the container too (`./docker.sh dev`): there the servers bind 0.0.0.0 so the
-# published ports reach them; on the host they stay on localhost.
+# One dev server on :5173 — Vite serves the viewer and runs the tile Worker
+# in-process (Cloudflare Vite plugin), so tiles are same-origin and no
+# VITE_TILES_BASE is needed. Works in the container too (`./docker.sh dev`):
+# --host binds 0.0.0.0 so the published port reaches it.
 dev:
     #!/usr/bin/env bash
     set -euo pipefail
     cd "{{justfile_directory()}}"
     # -x check, not -d: in the container node_modules is a (possibly empty) named volume.
     [ -x node_modules/.bin/vite ] || npm ci
-    npm run dev -w worker -- --ip 0.0.0.0 &
-    worker=$!
-    # Kill only the worker we spawned — `kill 0` would TERM the whole process group,
-    # including the parent `just`. Ctrl-C is the intended stop, so exit 0 keeps just
-    # from reporting a failed recipe; the EXIT trap then reaps the worker.
-    trap 'kill "$worker" 2>/dev/null || true' EXIT
-    trap 'exit 0' INT TERM
     npm run dev -- --host
 
 # The whole test suite.

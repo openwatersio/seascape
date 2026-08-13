@@ -122,7 +122,7 @@ function pm(env: Env, file: string): PMTiles {
   // Dev (no RELEASE_PREFIX) and preview (a re-pushed build): don't reuse the isolate
   // cache. A local reseed / rebuild replaces the pmtiles under the same key, and a cached
   // instance's stale header/directory would then read the new bytes at old offsets
-  // (garbage / 500s) until wrangler restarts. A fresh instance re-reads them. Prod keys are
+  // (garbage / 500s) until the dev server restarts. A fresh instance re-reads them. Prod keys are
   // release-immutable, so the cache is safe there.
   if (!env.RELEASE_PREFIX || env.PREVIEW)
     return new PMTiles(new R2Source(env.TILES, key));
@@ -529,15 +529,10 @@ export default {
       rel = p.rel;
       mount = p.mount;
     }
-    // Absolute endpoint base echoed into TileJSON/style URLs. `wrangler dev`
-    // rewrites the request URL *and* Host header to the configured route host
-    // (tiles.openwaters.io), leaving no truthful origin in a local request — so
-    // LOCAL dev pins localhost at the port the dev script binds (worker/package.json);
-    // preview and prod are deployed on a real host, so they trust the request origin.
-    const tilesBase =
-      !env.RELEASE_PREFIX && !env.PREVIEW
-        ? `http://localhost:8787${mount}`
-        : `${url.origin}${mount}`;
+    // Absolute endpoint base echoed into TileJSON/style URLs. The request origin
+    // is truthful everywhere this runs: deployed hosts and the Vite plugin's dev
+    // server (unlike `wrangler dev`, which rewrites the URL to the route host).
+    const tilesBase = `${url.origin}${mount}`;
 
     if (rel === "/manifest.json") {
       return json(await manifest(renv));
