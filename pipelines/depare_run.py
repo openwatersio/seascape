@@ -107,7 +107,14 @@ def _may_dry(w):
     if "is_salt" in w.columns:
         may |= w["is_salt"].fillna(False).astype(bool)
     if "tidal" in w.columns:
-        may |= w["tidal"] == "yes"
+        tidal = w["tidal"] == "yes"
+        if "is_salt" in w.columns:
+            # An explicit salt=no outranks tidal=yes: the pair is self-contradictory, and OSM
+            # misapplies tidal=yes to inland lakes (105 worldwide, Ladoga/Ohrid/Chiemsee among
+            # them), where it paints drying across the lakebed. Missing salt still rescues, so
+            # the coastal lagoons that carry neither tag are untouched.
+            tidal &= w["is_salt"].fillna(True).astype(bool)
+        may |= tidal
     return may
 
 # Sliver filter: the vector edges (OSM water outline, effective-land cut) and the raster
@@ -1146,6 +1153,13 @@ def _check():
         "class=lagoon must rescue a kind=lake polygon (most lagoons carry no other signal)"
     assert dry.intersects(tidal_lake).any(), \
         "an OSM tidal=yes must rescue a kind=lake polygon"
+    # The three is_salt states against tidal=yes, asserted on the predicate rather than a fifth
+    # fixture box, which would narrow every polygon toward the legibility filters.
+    salt_probe = gpd.GeoDataFrame({"kind": ["lake"] * 3, "class": [None] * 3,
+                                   "is_salt": [False, None, True], "tidal": ["yes"] * 3},
+                                  geometry=[_box(0, 0, 1, 1)] * 3, crs="EPSG:3857")
+    assert list(_may_dry(salt_probe)) == [False, True, True], \
+        "salt=no must veto tidal=yes; unknown or salt water must still rescue"
     nodata_rows = rows[rows["drval1"].isna()]
     assert nodata_rows.covers(lake.intersection(cell_box(0, 20, 60, 40)).centroid).any(), \
         "the lake's [0, cap] shore ribbon stays part of its nodata polygon"
