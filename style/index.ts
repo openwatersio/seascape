@@ -47,8 +47,10 @@ export interface Flavor {
   contour: string;
   label: string;
   labelHalo: string;
+  soundingEmphasis: string;
   font: string[];
   hillshadeShadow: string;
+  hillshadeHighlight: string;
   coverage: string;
 }
 
@@ -86,11 +88,15 @@ export const day: Flavor = {
   // the hazard tint — unsurveyed water warrants the same caution as known-unsafe water
   // (ECDIS treats it as unsafe for the safety check; S-52 hatching is the eventual upgrade).
   nodata: "#1f86cb",
-  contour: "#4a7a9c",
-  label: "#036",
+  // Isobaths and their labels recede in chart grey (S-52 DEPCN/SNDG1 #768C97);
+  // only unsafe soundings jump, in soundingEmphasis (SNDG2).
+  contour: "#768c97",
+  label: "#768c97",
   labelHalo: "#fff",
+  soundingEmphasis: "#000",
   font: ["Noto Sans Regular"],
   hillshadeShadow: "#9adcfe",
+  hillshadeHighlight: "#ffffff",
   coverage: "#f58231",
 };
 
@@ -435,7 +441,7 @@ export function layers(
       paint: {
         "hillshade-exaggeration": 0.5,
         "hillshade-shadow-color": flavor.hillshadeShadow,
-        "hillshade-highlight-color": "#ffffff",
+        "hillshade-highlight-color": flavor.hillshadeHighlight,
         "hillshade-illumination-direction": 315,
       },
     },
@@ -447,10 +453,11 @@ export function layers(
       filter: contourLineFilter,
       // Presentation floor, not a data limit: below z6 isobaths read as clutter over depth shading.
       minzoom: 6,
+      // Full-strength linework at DEPCN weight — translucent hairlines read as
+      // shading artefacts rather than isobaths.
       paint: {
         "line-color": flavor.contour,
-        "line-width": 0.5,
-        "line-opacity": 0.6,
+        "line-width": 0.8,
       },
     },
     {
@@ -489,12 +496,12 @@ export function layers(
         "text-padding": 8,
       },
       paint: {
-        // Soundings at or shoaler than the safety depth print black — S-52
-        // shows unsafe-water soundings in black and lets the hazard tint carry
-        // the alarm; safety=0 → all normal.
+        // Soundings at or shoaler than the safety depth print in the emphasis
+        // colour (S-52's SNDG2 black-by-day) and the hazard tint carries the
+        // alarm; safety=0 → all normal.
         "text-color":
           safety > 0
-            ? ["case", ["<=", ["get", "depth_m"], safety], "#000", flavor.label]
+            ? ["case", ["<=", ["get", "depth_m"], safety], flavor.soundingEmphasis, flavor.label]
             : flavor.label,
         "text-halo-color": flavor.labelHalo,
         "text-halo-width": 1,
@@ -542,7 +549,7 @@ export function layers(
       },
       paint: {
         "text-color": coverageColor,
-        "text-halo-color": "#fff",
+        "text-halo-color": flavor.labelHalo,
         "text-halo-width": 1.2,
       },
     },
