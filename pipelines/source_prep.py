@@ -9,7 +9,7 @@ the per-source knobs that live in Justfile flags on the legacy chain:
   datum_offset_m  constant shift to the target datum (source_datum --offset)
   offset_surface  reference raster subtracted per pixel for a spatially-varying datum
                   separation (source_datum --offset-surface); names a raster in the datum
-                  store, e.g. "navd88_chart" (built by datum_grid.py)
+                  store, e.g. "navd88_chart" (config.DATUM_BUILDERS maps it to its composer)
   clamp_positive  drop cells above the water surface (source_datum --clamp-positive)
   unpack          how to turn each raw asset into staged raster(s); absent = a bare
                   raster (see below)
@@ -532,7 +532,7 @@ def prep(source, workers=DEFAULT_WORKERS):
     surface = surface_path(name) if name else None
     if surface and not os.path.isfile(surface):
         sys.exit(f"{source}: offset surface {surface} is not in the store — "
-                 "build it with datum_grid.py")
+                 f"build it with {config.datum_builder(name)}")
     transform = bool(negate or offset or clamp or surface)
     if transform:
         print(f"{source}: datum negate={negate} offset={offset} surface={name} "
@@ -812,13 +812,26 @@ def _check():
         with rasterio.open(f"store/source/{sid_s}/{staged_name(sid_s, su)}") as src:
             assert src.read(1)[0, 0] == -9.0, src.read(1)   # bed - (-1): shallower
             assert src.read(1)[0, 1] == -10.0, src.read(1)  # no coverage: passed through
-        # A declared surface that isn't in the store must name itself, not silently no-op.
+        # A declared surface that isn't in the store must name itself, not silently no-op —
+        # and point at the builder that composes THAT surface, since naming the wrong one
+        # sends you to the composer for another datum entirely.
         os.remove("store/datum/synth.tif")
         try:
             prep(sid_s)
             assert False, "expected a missing offset surface to exit"
         except SystemExit as e:
-            assert "offset surface" in str(e) and "datum_grid.py" in str(e), e
+            assert "offset surface" in str(e) and "none is registered" in str(e), e
+        registered = next(iter(config.DATUM_BUILDERS))
+        meta_path = f"sources/{sid_s}/metadata.json"
+        with open(meta_path) as f:
+            meta = json.load(f)
+        with open(meta_path, "w") as f:
+            json.dump({**meta, "offset_surface": registered}, f)
+        try:
+            prep(sid_s)
+            assert False, "expected a missing offset surface to exit"
+        except SystemExit as e:
+            assert config.DATUM_BUILDERS[registered] in str(e), e
 
         # Two archives whose members share a basename must hard-error, not silently overwrite.
         cid = "_prep_collide"

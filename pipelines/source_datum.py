@@ -47,6 +47,8 @@ from rasterio.warp import Resampling, reproject
 from rasterio.windows import Window
 from scipy.ndimage import find_objects, label
 
+import config
+
 DATUM_STORE = "store/datum"
 
 # A single file can be tens of gigapixels (CUDEM ships 8112x8112 tiles, and the reference
@@ -399,7 +401,7 @@ def main():
     surface = surface_path(a.offset_surface) if a.offset_surface else None
     if surface and not os.path.isfile(surface):
         sys.exit(f"{a.source}: offset surface {surface} is not in the store — "
-                 "build it with datum_grid.py")
+                 f"build it with {config.datum_builder(a.offset_surface)}")
     filepaths = sorted(glob(f"store/source/{a.source}/*.tif"))
     print(f"{a.source}: negate={a.negate} offset={a.offset} surface={a.offset_surface} "
           f"clamp_positive={a.clamp_positive} on {len(filepaths)} file(s)")

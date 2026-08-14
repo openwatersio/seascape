@@ -41,17 +41,17 @@ LOCAL_LISTED = [s for s in LISTED if s not in STREAMED]
 
 # offset_surface: <name> ⇒ that source's prep subtracts store/datum/<name>.tif per pixel —
 # the chart datum's height in the source's own vertical frame, for the tidal separations no
-# scalar datum_offset_m can express. Each surface names the module that composes it; a surface
-# with no builder is a hard error, because the alternative is one builder writing another's
-# filename and silently correcting a coast onto the wrong continent's datum.
-DATUM_BUILDERS = {"navd88_chart": "datum_grid.py",     # US waters, from NOAA's VDatum bundle
-                  "ign69_zh": "datum_grid_fr.py"}     # French waters, from Shom's BATHYELLI
+# scalar datum_offset_m can express. config.DATUM_BUILDERS names the module that composes each;
+# a surface with no builder is a hard error, because the alternative is one builder writing
+# another's filename and silently correcting a coast onto the wrong continent's datum.
+DATUM_BUILDERS = pipeline_config.DATUM_BUILDERS
 DATUM_SURFACES = sorted({name for name in
                          (pipeline_config.load_metadata(s).get("offset_surface")
                           for s in ALL_SOURCES) if name})
 _unbuildable = [n for n in DATUM_SURFACES if n not in DATUM_BUILDERS]
 if _unbuildable:
-    raise WorkflowError(f"offset_surface with no builder in DATUM_BUILDERS: {_unbuildable}")
+    raise WorkflowError(f"offset_surface with no builder in config.DATUM_BUILDERS: "
+                        f"{_unbuildable}")
 
 ONLY = config.get("source")
 if ONLY and ONLY not in PROCESSED + RAW:

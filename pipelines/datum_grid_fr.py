@@ -157,8 +157,16 @@ def fetch(url, path, headers=None):
     return path
 
 
-def harvest(dest):
-    """Fetch BATHYELLI + both geoid grids into ``dest``, returning (glhi paths, geoid paths)."""
+def harvest(dest=STORE):
+    """Fetch BATHYELLI + both geoid grids into ``dest``, returning (glhi paths,
+    [(geoid path, its region's legal-zero shift)]).
+
+    ``dest`` defaults beside the output, so the store's copy IS the cache: the inputs total
+    2.5 MB and a rebuild re-reads them instead of re-pulling them from Shom and the PROJ CDN.
+
+    Geoids come back paired with their shift rather than in a bare list, because pairing them
+    by POSITION downstream would mean a reordering here silently applies Corsica's shift to the
+    mainland — a 0.17 m error in the direction that charts deeper."""
     import py7zr
 
     os.makedirs(dest, exist_ok=True)
@@ -175,7 +183,7 @@ def harvest(dest):
     glhi = sorted(os.path.join(base, name)
                   for base, _dirs, names in os.walk(root)
                   for name in names if name.lower().endswith(".glhi"))
-    geoids = [fetch(url, os.path.join(dest, name)) for url, name, _bias in GEOIDS]
+    geoids = [(fetch(url, os.path.join(dest, name)), bias) for url, name, bias in GEOIDS]
     return glhi, geoids
 
 
@@ -250,8 +258,9 @@ def sample_geoid(path, lons, lats):
     return np.where(inside, out, np.nan)
 
 
-def compose(glhi_paths, geoid_paths, res=RES):
-    """The reference grid, its transform, and a per-input node count.
+def compose(glhi_paths, geoids, res=RES):
+    """The reference grid, its transform, and a per-input node count. ``geoids`` is
+    [(path, legal-zero shift)] in precedence order, LAST one winning where they overlap.
 
     The Atlantic and Mediterranean node sets are triangulated SEPARATELY and unioned: one
     triangulation over both would span the 0.5 deg of Languedoc coast between them with
@@ -271,7 +280,7 @@ def compose(glhi_paths, geoid_paths, res=RES):
     # RAC23 is a Corsican pixel, and must take Corsica's shift and no other.
     geoid = np.full(shape, np.nan)
     bias = np.full(shape, np.nan)
-    for path, shift in zip(geoid_paths, [b for _url, _name, b in GEOIDS]):
+    for path, shift in geoids:
         part = sample_geoid(path, lons, lats)
         # Later grid wins: RAC23 is Corsica's own datum region and must not be overwritten by
         # RAF20's bbox spilling across the Ligurian Sea.
@@ -283,14 +292,16 @@ def compose(glhi_paths, geoid_paths, res=RES):
     return np.where(valid, reference, NODATA).astype("float32"), transform, counts
 
 
-def build(work_root=None, out=OUT):
-    # Keyed to the output so a concurrent surface build cannot share — and race on — one
-    # scratch tree.
-    work = work_root or out + ".work"
+def build(cache=None, out=OUT):
+    # The fetched inputs persist in `cache` (the store, beside the output); only `work` — the
+    # uncompressed intermediate this run composes — is transient. Work is keyed to the output
+    # so a concurrent surface build cannot share, and race on, one scratch tree.
+    cache = cache or STORE
+    work = out + ".work"
     os.makedirs(work, exist_ok=True)
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
 
-    glhi, geoids = harvest(work)
+    glhi, geoids = harvest(cache)
     print(f"composing from {len(glhi)} node set(s) and {len(geoids)} geoid grid(s)")
     reference, transform, counts = compose(glhi, geoids)
     for name, n in sorted(counts.items()):
@@ -444,10 +455,58 @@ def _check():
     gap = (lons2 > 2.2) & (lons2 < 2.8)
     assert not np.isfinite(bridged[:, gap]).any(), "the distance bound let the hull bridge a gap"
 
-    # Geoid priority: the second grid wins where it has data, the first survives elsewhere.
-    a = np.where(np.isnan(np.array([np.nan, 2.0, np.nan])), np.array([1.0, 1.0, np.nan]),
-                 np.array([np.nan, 2.0, np.nan]))
-    assert a[0] == 1.0 and a[1] == 2.0 and np.isnan(a[2]), a
+    # Geoid precedence, through compose() itself: two overlapping grids standing in for RAF20
+    # and RAC23, each with its own shift. Where they overlap the LAST must win and must bring
+    # its OWN shift — a reversed precedence or a geoid paired with the other's shift is a
+    # silent metre-scale error over Corsica, and asserting it on a bare np.where would not
+    # notice either. The node field is a constant, so every expected value is exact.
+    with tempfile.TemporaryDirectory() as d:
+        cwd = os.getcwd()
+        try:
+            os.chdir(d)
+            zh_height, wide_n, narrow_n = 50.0, 12.0, 3.0
+            with open("a.glhi", "w") as f:  # a block of nodes over 1-2 E, 44-45 N
+                for lon in np.linspace(1.0, 2.0, 24):
+                    for lat in np.linspace(44.0, 45.0, 24):
+                        f.write(f"{lon} {lat} {zh_height} 0.1\n")
+            with open("b.glhi", "w") as f:  # a second set, far enough east to stay disjoint
+                for lon in np.linspace(5.0, 5.1, 4):
+                    for lat in np.linspace(44.0, 44.1, 4):
+                        f.write(f"{lon} {lat} {zh_height} 0.1\n")
+
+            def synth(name, value, west, south, east, north):
+                res = 0.05
+                width = int(round((east - west) / res))
+                height = int(round((north - south) / res))
+                with rasterio.open(name, "w", driver="GTiff", width=width, height=height,
+                                   count=1, dtype="float32", crs="EPSG:4326",
+                                   transform=Affine(res, 0.0, west, 0.0, -res, north)) as dst:
+                    dst.write(np.full((height, width), value, dtype="float32"), 1)
+
+            synth("wide.tif", wide_n, 0.5, 43.5, 2.5, 45.5)    # the whole node block
+            synth("narrow.tif", narrow_n, 1.5, 43.5, 2.5, 45.5)  # only its eastern half
+            wide_bias, narrow_bias = 0.1, 0.7
+            reference, transform, counts = compose(
+                ["a.glhi", "b.glhi"],
+                [("wide.tif", wide_bias), ("narrow.tif", narrow_bias)], res=0.05)
+            assert counts == {"a.glhi": 576, "b.glhi": 16}, counts
+
+            lon_axis = transform.c + (np.arange(reference.shape[1]) + 0.5) * transform.a
+            valid = reference != NODATA
+            west_half = valid & (lon_axis < 1.4)
+            east_half = valid & (lon_axis > 1.6)
+            assert west_half.any() and east_half.any(), (west_half.sum(), east_half.sum())
+            want_west = zh_height - wide_n - wide_bias
+            want_east = zh_height - narrow_n - narrow_bias
+            assert np.allclose(reference[west_half], want_west, atol=1e-4), \
+                (float(reference[west_half].min()), float(reference[west_half].max()), want_west)
+            assert np.allclose(reference[east_half], want_east, atol=1e-4), \
+                (float(reference[east_half].min()), float(reference[east_half].max()), want_east)
+            # …and the shift really is carried per region, not applied globally.
+            assert abs((want_west - want_east) - ((narrow_n + narrow_bias)
+                                                  - (wide_n + wide_bias))) < 1e-9
+        finally:
+            os.chdir(cwd)
 
     assert check_total_px(EXPECTED_TOTAL_PX) == EXPECTED_TOTAL_PX
     assert check_total_px(int(EXPECTED_TOTAL_PX * 1.01)) > 0
@@ -486,13 +545,24 @@ def valid_px(path):
                    for _, window in src.block_windows(1))
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--check", action="store_true", help="run the self-check and exit")
-    parser.add_argument("--work", help="scratch directory holding the fetched inputs")
+def main():
+    parser = argparse.ArgumentParser(
+        description="Compose the French chart-datum reference surface from Shom's BATHYELLI.")
+    parser.add_argument("--cache", help="directory holding the fetched inputs "
+                                        f"(default: {STORE}, beside the output)")
     parser.add_argument("--out", default=OUT)
     args = parser.parse_args()
-    if args.check:
+    # This module composes exactly one surface. The datum_surface rule templates --out from
+    # its {name} wildcard, so a mis-keyed DATUM_BUILDERS entry would silently give another
+    # datum's filename THIS surface's content — refuse any name this build doesn't produce.
+    if os.path.basename(args.out) != os.path.basename(OUT):
+        sys.exit(f"datum_grid_fr composes {os.path.basename(OUT)}, not "
+                 f"{os.path.basename(args.out)} — a new surface needs its own composer")
+    build(args.cache, args.out)
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] == ["--check"]:
         _check()
     else:
-        build(args.work, args.out)
+        main()
