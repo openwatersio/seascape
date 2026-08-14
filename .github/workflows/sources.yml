@@ -16,11 +16,11 @@ on:
         required: false
         default: ""
       force:
-        description: "Force re-registration from warm raw (re-run prep + catalog, NO refetch) + ignore the raw-collection shrink guard"
+        description: "Force re-registration (re-run prep + catalog, refetching raws on demand) + ignore the raw-collection shrink guard. Pair with a source id — unscoped it refetches every source."
         type: boolean
         default: false
       snakemake_args:
-        description: "Extra snakemake args, e.g. -R cover (aggregation-code changes) or -F (true cold rebuild incl. refetch)"
+        description: "Extra snakemake args, e.g. -R cover (aggregation-code changes) or -F (true cold rebuild)"
         required: false
         default: ""
 
@@ -260,9 +260,11 @@ jobs:
           # (28 = 32 GB - 4 reserved). Box-only — laptops keep cores:all as their cap.
           rc=0
           if [ "$INPUT_FORCE" = "true" ]; then
-            # Re-register from warm raw without refetching: prep_source and register are the two
-            # catalog.json producers (disjoint wildcard constraints: local vs raw sources).
-            # Cold rebuild: -F via snakemake_args.
+            # Re-register: prep_source and register are the two catalog.json producers (disjoint
+            # wildcard constraints: local vs raw sources). Raws are temp() — a forced prep
+            # refetches its source's archives, stages them, and discards them again — so an
+            # unscoped force re-pulls every upstream. Scope it with source= unless that is the
+            # intent. Cold rebuild: -F via snakemake_args.
             if [ -n "$INPUT_SOURCE" ]; then
               force_target=("store/source/$INPUT_SOURCE/catalog.json")
             else

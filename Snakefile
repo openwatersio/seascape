@@ -91,11 +91,18 @@ checkpoint enumerate:
 # an item can't re-key the others and a warm legacy raw/<index> self-migrates without refetch.
 # items.txt is `ancient` — it must exist (built by enumerate), but a re-enumeration must not
 # invalidate raws whose URL is unchanged.
+#
+# temp(): a raw is deleted as soon as prep_source has staged it. The durable artifacts are the
+# staged/normalized COGs and catalog.json — the raw archive is a means, and holding every
+# source's upstream bytes on the volume costs more than refetching the rare source that needs
+# re-staging (Litto3D alone is 191 GB of 7z for ~1 GB of grids). Snakemake does not re-fetch a
+# missing temp input whose downstream output is up to date, so a normal run stays a no-op; a
+# forced re-prep re-fetches on demand, then discards again.
 rule fetch_item:
     input:
         ancient("store/source/{source}/items.txt")
     output:
-        "store/source/{source}/raw/{hash}"
+        temp("store/source/{source}/raw/{hash}")
     wildcard_constraints:
         source=pat(LOCAL_PROCESSED), hash=r"[0-9a-f]{16}"
     retries: 2
