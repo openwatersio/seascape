@@ -1,6 +1,6 @@
 """Static soundings: shoalest-per-cell point depths off each aggregation tile's merged DEM.
 
-A second consumer of the same smoothed mosaic window contour_run.py reads. On a real chart,
+A second consumer of the same smoothed mosaic window that depare_run.py reads. On a real chart,
 point soundings are the primary depth cue.
 
 A client-side plugin (maplibre-contour's spot-soundings fork) point-samples one jittered

@@ -331,9 +331,14 @@ export function layers(
   // Contours: metre isobaths (sys != "ft", also legacy no-sys tiles) vs the
   // fathom-curve set (sys == "ft"), which labels as feet or fathoms. Both
   // systems label every curve — the standard isobath sets are sparse enough
-  // that GL collision thins the labels.
-  const contourLineFilter: ExpressionSpecification =
-    unit === "m" ? ["!=", ["get", "sys"], "ft"] : ["==", ["get", "sys"], "ft"];
+  // that GL collision thins the labels. The 0 m drying line is unit-independent
+  // and ships once with NO sys (like depare's drying/nodata), so both filters
+  // admit sys-less features.
+  const contourLineFilter = (
+    unit === "m"
+      ? ["!=", ["get", "sys"], "ft"]
+      : ["any", ["!", ["has", "sys"]], ["==", ["get", "sys"], "ft"]]
+  ) as unknown as ExpressionSpecification;
   const contourLabelText: ExpressionSpecification = [
     "concat",
     [
