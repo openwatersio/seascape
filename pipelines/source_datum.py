@@ -114,6 +114,30 @@ def flatten_compound_crs(filepath):
     return True
 
 
+def assign_declared_crs(filepath, crs):
+    """Stamp the source's declared CRS onto a staged raster carrying none — header only, pixels
+    untouched. Returns whether it stamped.
+
+    Normalize assigns `crs` at the END of prep, which is too late for ``--offset-surface``: the
+    reference is resampled onto the file's OWN grid, and that needs the grid's CRS. A format
+    that cannot carry one (ESRI ASCII, the asc-mosaic/asc-tile modes) would otherwise make
+    `crs` + `offset_surface` an unusable combination. Same assignment normalize would do
+    (`-a_srs`, never a warp), just early enough to be true when the datum step reads it."""
+    if not crs:
+        return False
+    with rasterio.open(filepath) as src:
+        if src.crs is not None:
+            return False
+    # Onto a fresh inode: a bare staged raster is a hardlink to its raw/ download, so an
+    # in-place header write would reach through into the verbatim bytes.
+    tmp = filepath + ".crs.tif"
+    shutil.copyfile(filepath, tmp)
+    with rasterio.open(tmp, "r+", IGNORE_COG_LAYOUT_BREAK="YES") as dst:
+        dst.crs = rasterio.crs.CRS.from_string(crs)
+    os.replace(tmp, filepath)
+    return True
+
+
 def reference_on(ref, transform, shape, crs):
     """The reference resampled bilinearly onto a window of the file's own grid, NaN outside
     its coverage. Bilinear is a local operation on the REFERENCE grid, which is far coarser

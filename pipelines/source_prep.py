@@ -26,6 +26,13 @@ micro-syntax is `format[:glob][!N]`:
                     py7zr, not GDAL /vsi7z (the CI image's GDAL lacks libarchive)
   asc-mosaic        a zip of ESRI ASCII .asc grids → mosaic to one store/source/<id>/
                     <id>.tif (swissBATHY / Bodensee)
+  asc-tile[:<glob>] a zip OR 7z of ESRI ASCII .asc grids → mosaic THIS asset's members to
+                    one tif, one per asset (uk_multibeam's per-OS-tile zips; Litto3D's
+                    per-prépaquet 7z). The container is sniffed, so one mode serves both.
+                    <glob> selects among the members — omit it to take every .asc, give it
+                    when an asset carries more than one grid of the SAME area at different
+                    resolutions (Litto3D ships MNT1m and MNT5m side by side, and mosaicking
+                    the two together would interleave 1 m and 5 m pixels)
   e00               gunzip → ARC/INFO .e00 export → convert to <id>.tif (Lake Tahoe;
                     the export is gzip-wrapped and the unpacker handles the wrapper)
   gldb              the GLDB v2 tar.gz → one <id>_<lake>.tif per documented-bathymetry
@@ -69,8 +76,8 @@ import config
 import utils
 from convert_e00 import e00_to_tif
 from convert_gldb import gldb_to_tifs
-from source_datum import (coverage_report, dome_report, flatten_compound_crs, surface_path,
-                          transform_file, write_sidecar)
+from source_datum import (assign_declared_crs, coverage_report, dome_report,
+                          flatten_compound_crs, surface_path, transform_file, write_sidecar)
 from source_normalize import normalize_file
 
 # Only trust a URL's trailing extension when it names a real data/archive format;
@@ -97,7 +104,7 @@ def ext_for(url):
 STEM_MAX = 100
 
 
-def staged_name(source, url):
+def staged_name(source, url, ext=None):
     """The staged basename for a bare raster: the URL's own filename beside the item hash that
     names its raw/ download (config.item_hash), so the staged file and raw/<hash> read as a pair.
 
@@ -107,10 +114,14 @@ def staged_name(source, url):
     filename apart — LINZ tiles the same national grid cell in adjacent surveys (23 such pairs
     in nz_coastal), and NCEI names a tile only within its region directory. A URL that names no
     data file (a weblink gateway, e.g. ddm's) has no filename to carry, so it takes the source id.
+
+    ``ext`` overrides the URL's extension for a mode that CONVERTS rather than extracts:
+    asc-tile mosaics an archive into a GeoTIFF, and inheriting the archive's own ".7z" would
+    leave a raster the rest of the lane — which globs ``*.tif`` — never sees.
     """
-    name, _, ext = _url_name(url).rpartition(".")
-    stem = re.sub(r"[^A-Za-z0-9._-]", "_", name).strip(".") if ext.lower() in DATA_EXTS else ""
-    return f"{(stem or source)[:STEM_MAX]}_{config.item_hash(url)}.{ext_for(url)}"
+    name, _, url_ext = _url_name(url).rpartition(".")
+    stem = re.sub(r"[^A-Za-z0-9._-]", "_", name).strip(".") if url_ext.lower() in DATA_EXTS else ""
+    return f"{(stem or source)[:STEM_MAX]}_{config.item_hash(url)}.{ext or ext_for(url)}"
 
 
 def _kind(head):
@@ -132,27 +143,33 @@ def _kind(head):
     return "other"
 
 
-# The magic byte kind each declared format's raw asset must present — sniffing kept only
-# to validate the declaration (e00/tar.gz arrive gzip-wrapped, asc-mosaic as a zip).
+# The magic byte kinds each declared format's raw asset may present — sniffing kept only to
+# validate the declaration (e00/tar.gz arrive gzip-wrapped, asc-mosaic as a zip). asc-tile is
+# the one mode that accepts either container: what it declares is the PAYLOAD (ESRI ASCII
+# grids to mosaic per asset), and whether an upstream ships them zipped or 7z-ed is packaging.
 _EXPECT_KIND = {
-    "zip": "zip",
-    "asc-mosaic": "zip",
-    "tar.gz": "gzip",
-    "e00": "gzip",
-    "gldb": "gzip",
-    "7z": "7z",
-    "netcdf": "netcdf",
+    "zip": frozenset({"zip"}),
+    "asc-mosaic": frozenset({"zip"}),
+    "asc-tile": frozenset({"zip", "7z"}),
+    "tar.gz": frozenset({"gzip"}),
+    "e00": frozenset({"gzip"}),
+    "gldb": frozenset({"gzip"}),
+    "7z": frozenset({"7z"}),
+    "netcdf": frozenset({"netcdf"}),
 }
 
 
-# Archive formats select members by glob; the rest transform the whole asset.
+# Archive formats select members by glob; the rest transform the whole asset. asc-tile sits
+# between: every .asc by default, narrowed by a glob when an asset carries more than one grid.
 _GLOB_FORMATS = {"zip", "tar.gz", "7z"}
+_OPTIONAL_GLOB_FORMATS = {"asc-tile"}
 
 
 def _parse_unpack(spec):
     """Parse a metadata `unpack` string `format[:glob][!N]` → (format, glob, expect).
     `expect` is the exact per-archive match count asserted by `!N` (else None). Archive
-    formats require a member glob; the glob-less formats (e00/netcdf/asc-mosaic/gldb) reject one."""
+    formats require a member glob, asc-tile accepts one, and the rest (e00/netcdf/asc-mosaic/
+    gldb) reject one."""
     fmt, _, rest = spec.partition(":")
     members_glob, expect = (rest or None), None
     if members_glob and "!" in members_glob:
@@ -163,7 +180,7 @@ def _parse_unpack(spec):
         sys.exit(f"unknown unpack format {fmt!r} (expected one of {sorted(_EXPECT_KIND)})")
     if fmt in _GLOB_FORMATS and not members_glob:
         sys.exit(f"unpack {spec!r}: {fmt} needs a member glob, e.g. {fmt!r}:*.tif")
-    if fmt not in _GLOB_FORMATS and (members_glob or expect is not None):
+    if fmt not in _GLOB_FORMATS | _OPTIONAL_GLOB_FORMATS and (members_glob or expect is not None):
         sys.exit(f"unpack {spec!r}: {fmt} takes no member glob or !N")
     return fmt, members_glob, expect
 
@@ -223,6 +240,65 @@ def _stage_asc(raw, asc_dir, seen, origin):
             with open(f"{asc_dir}/{base}", "wb") as f:
                 f.write(z.read(name))
     return f"asc-mosaic, {len(ascs)} tile(s) staged"
+
+
+def _asc_members(raw, kind, members_glob, expect, dest_dir, origin):
+    """Write this archive's selected ESRI ASCII members flat into ``dest_dir``, returning the
+    count. Container-agnostic: the caller has already sniffed zip vs 7z, and only the read
+    mechanics differ (py7zr has no random-access member read, so a 7z extracts to scratch and
+    the members are moved out).
+
+    Members are matched case-insensitively against the FULL member path, so a glob can select
+    on the directory an upstream sorts by — Litto3D's resolutions are `MNT1m/` vs `MNT5m/`
+    directories as much as they are `_MNT1M_` vs `_MNT5M_` filenames. Basenames are claimed
+    within this asset only: two prépaquets never share a dalle, but a national grid does
+    repeat tile ids across zips, and each asset mosaics on its own anyway."""
+    picks_glob = members_glob or "*.asc"
+    os.makedirs(dest_dir, exist_ok=True)
+    claimed = set()
+
+    def take(name, data):
+        member = os.path.basename(name)
+        _claim(claimed, member, origin)
+        with open(f"{dest_dir}/{member}", "wb") as f:
+            f.write(data)
+
+    if kind == "zip":
+        with zipfile.ZipFile(raw) as z:
+            picks = _members(z.namelist(), picks_glob, expect, origin)
+            for name in picks:
+                take(name, z.read(name))
+    else:
+        import py7zr
+        with py7zr.SevenZipFile(raw) as z:
+            picks = _members(z.getnames(), picks_glob, expect, origin)
+            tmp = f"{dest_dir}/_7z_extract"
+            shutil.rmtree(tmp, ignore_errors=True)
+            z.extract(path=tmp, targets=picks)
+        for name in picks:
+            with open(f"{tmp}/{name}", "rb") as f:
+                take(name, f.read())
+        shutil.rmtree(tmp, ignore_errors=True)
+    return len(picks)
+
+
+def _stage_asc_tile(raw, root, source, url, kind, members_glob, expect, seen, origin):
+    """A zip or 7z of ESRI ASCII grids → mosaic THIS asset's members into one GeoTIFF. A tiled
+    national product can't take the per-source asc-mosaic: its members span the whole country,
+    so one mosaic of them all would be a single country-sized raster with the gaps between
+    tiles filled in."""
+    base = staged_name(source, url, ext="tif")
+    _claim(seen, base, f"{origin} {url}")
+    # Per-asset scratch, not the shared asc/ dir: asc-tile mosaics each asset on its own, and
+    # a shared dir would let one asset's leftovers join the next asset's mosaic.
+    asc_dir = f"{root}/_asc_{config.item_hash(url)}"
+    shutil.rmtree(asc_dir, ignore_errors=True)
+    try:
+        n = _asc_members(raw, kind, members_glob, expect, asc_dir, origin)
+        _mosaic_asc(root, asc_dir, f"{root}/{base}", origin)
+    finally:
+        shutil.rmtree(asc_dir, ignore_errors=True)
+    return f"asc-tile ({kind}), {n} tile(s) -> {base}"
 
 
 def _stage_7z(raw, root, seen, origin, members_glob, expect):
@@ -320,19 +396,25 @@ def _stage_netcdf(raw, root, url, seen, origin):
     return f"netCDF → {stem}.tif"
 
 
-def _mosaic_asc(root, source, asc_dir):
+def _mosaic_asc(root, asc_dir, tif, label):
     """Mosaic the staged ESRI ASCII tiles into one GeoTIFF via a VRT (no -a_srs;
     source_normalize assigns the CRS from metadata), then drop the tiles."""
+    import rasterio
     ascs = sorted(glob(f"{asc_dir}/*.asc"))
     listfile = f"{root}/tiles.txt"
     with open(listfile, "w") as f:
         f.write("\n".join(ascs) + "\n")
-    vrt = f"{root}/{source}.vrt"
-    tif = f"{root}/{source}.tif"
-    print(f"{source}: mosaicking {len(ascs)} asc tile(s) -> {tif}")
+    vrt = f"{os.path.splitext(tif)[0]}.vrt"
+    print(f"{label}: mosaicking {len(ascs)} asc tile(s) -> {tif}")
     utils.run_command(f"gdalbuildvrt -overwrite -input_file_list {listfile} {vrt}", silent=False)
+    # Assign -9999 ONLY when the grids declare no NODATA_value of their own. -a_nodata relabels
+    # without touching pixels, so forcing it over a grid that says -99999 (Litto3D) leaves every
+    # void as a -99999 m reading that the datum step then "corrects" into a plausible depth.
+    with rasterio.open(vrt) as src:
+        declared = src.nodata
+    nodata_arg = "" if declared is not None else "-a_nodata -9999 "
     utils.run_command(
-        f"gdal_translate -q -of GTiff -a_nodata -9999 -co TILED=YES -co COMPRESS=DEFLATE "
+        f"gdal_translate -q -of GTiff {nodata_arg}-co TILED=YES -co COMPRESS=DEFLATE "
         f"-co NUM_THREADS=ALL_CPUS {vrt} {tif}", silent=False)
     os.remove(vrt)
     os.remove(listfile)
@@ -365,12 +447,15 @@ def _raw_hashes(source, root, items):
 
 def _clear_stale(root):
     """Remove every derived/intermediate artifact a prior prep may have left: staged tifs,
-    netCDF translations, gzip spool files, VRT/mosaic scratch, and the asc/ tile dir (stale
+    netCDF translations, gzip spool files, VRT/mosaic scratch, and the asc tile dirs (stale
     .asc tiles would otherwise join the next mosaic; a stale .nc breaks the netCDF hardlink)."""
     for stale in (glob(f"{root}/*.tif") + glob(f"{root}/*.tiff") + glob(f"{root}/*.nc")
                   + glob(f"{root}/_gz_*") + glob(f"{root}/*.vrt") + glob(f"{root}/tiles.txt")):
         os.remove(stale)
-    shutil.rmtree(f"{root}/asc", ignore_errors=True)
+    # asc/ is asc-mosaic's shared dir; _asc_<hash>/ is asc-tile's per-asset scratch, left
+    # behind only by a crash mid-mosaic.
+    for stale_dir in [f"{root}/asc"] + glob(f"{root}/_asc_*"):
+        shutil.rmtree(stale_dir, ignore_errors=True)
     shutil.rmtree(f"{root}/_7z_extract", ignore_errors=True)
     for scratch in glob(f"{root}/seascape-shoal-*"):  # a crashed normalize's pyramid levels
         shutil.rmtree(scratch, ignore_errors=True)
@@ -405,12 +490,15 @@ def _unpack_one(unpack, raw, root, source, index, url, asc_dir, seen, origin):
     fmt, members_glob, expect = unpack
     with open(raw, "rb") as f:
         kind = _kind(f.read(512))
-    if kind != _EXPECT_KIND[fmt]:
-        raise CorruptRaw(f"declared unpack {fmt!r} expects {_EXPECT_KIND[fmt]} bytes, got {kind}")
+    if kind not in _EXPECT_KIND[fmt]:
+        raise CorruptRaw(f"declared unpack {fmt!r} expects "
+                         f"{'/'.join(sorted(_EXPECT_KIND[fmt]))} bytes, got {kind}")
     if fmt == "zip":
         return _stage_zip(raw, root, seen, origin, members_glob, expect)
     if fmt == "asc-mosaic":
         return _stage_asc(raw, asc_dir, seen, origin)
+    if fmt == "asc-tile":
+        return _stage_asc_tile(raw, root, source, url, kind, members_glob, expect, seen, origin)
     if fmt == "7z":
         return _stage_7z(raw, root, seen, origin, members_glob, expect)
     if fmt == "tar.gz":
@@ -447,8 +535,8 @@ def stage(source):
     if corrupt:
         sys.exit(f"{source}: deleted {len(corrupt)} corrupt raw asset(s) {corrupt} — "
                  "rerun to refetch them")
-    if os.path.isdir(asc_dir):
-        _mosaic_asc(root, source, asc_dir)
+    if os.path.isdir(asc_dir):  # asc-mosaic only — asc-tile mosaics per asset and cleans up
+        _mosaic_asc(root, asc_dir, f"{root}/{source}.tif", source)
 
 
 def _check_raster(path):
@@ -472,6 +560,9 @@ def prep_file(tif, transform, negate, offset, clamp, surface, crs, nodata):
     corrected = valid = 0
     domes = None  # only the value transform streams the pixels; without it nothing is scored
     if transform:
+        # Before the transform, not after: an offset surface is resampled onto this file's own
+        # grid, which normalize would not have declared yet.
+        assign_declared_crs(tif, crs)
         corrected, valid, domes = transform_file(tif, negate, offset, clamp, surface)
     # After the transform, which already reduces the CRS on the files it rewrites; this catches
     # the rest, so no staged raster reaches a warp carrying a vertical CRS.
@@ -682,11 +773,12 @@ def _check():
             "in-place steps must never write through into raw/"
         with open(f"store/source/{sid}/datum.json") as f:
             sidecar = json.load(f)
-        # dome_candidates is None here, not 0: these staged tifs carry no CRS of their own (the
-        # metadata one is assigned at normalize), so the detector has no metres to size itself by.
+        # dome_candidates is 0, not None: the staged tifs carry no CRS of their own, but the
+        # metadata one is stamped on before the transform, so the detector can size itself in
+        # metres and actually runs.
         assert sidecar == {"negate": True, "offset_m": -1.0, "clamp_positive": False,
                            "offset_surface": None, "corrected_fraction": None,
-                           "dome_candidates": None}, sidecar
+                           "dome_candidates": 0}, sidecar
         for name, want in (("a.tif", -6.0), ("b.tif", -11.0)):  # -(v) - 1
             with rasterio.open(f"store/source/{sid}/{name}") as src:
                 assert src.crs.to_epsg() == 28992, (name, src.crs)
@@ -1073,7 +1165,79 @@ def _check():
             assert os.path.isfile(f"store/source/{aid}/{aid}.tif"), "asc zip must mosaic to <id>.tif"
             with rasterio.open(f"store/source/{aid}/{aid}.tif") as src:
                 assert src.shape == (2, 2), src.shape
-            print("source_prep.py self-check ok (incl. asc mosaic)")
+
+            def asc_grid(x_off, value, nodata=-9999):
+                head = (f"ncols 2\nnrows 2\nxllcorner {x_off}\nyllcorner 0\ncellsize 1\n"
+                        + (f"NODATA_value {nodata}\n" if nodata is not None else ""))
+                return head + f"{value} {value}\n{value} {value}\n"
+
+            # asc-tile mosaics each asset on its own, so two disjoint archives stay two
+            # rasters rather than one bounding-box-sized mosaic spanning the gap between them.
+            tid = "_prep_asc_tile"
+            tu = [f"https://x/tiles/0.5/T{i}" for i in range(2)]
+            seed(tid, tu, {"name": "ASC tile", "unpack": "asc-tile", "crs": "EPSG:27700"})
+            for i, u in enumerate(tu):
+                zb = io.BytesIO()
+                with zipfile.ZipFile(zb, "w") as z:
+                    for j in range(2):  # two members per asset, side by side
+                        z.writestr(f"t{i}{j}mb.asc", asc_grid(i * 1000 + j * 2, -1))
+                with open(raw_of(tid, u), "wb") as f:
+                    f.write(zb.getvalue())
+            stage(tid)
+            staged = sorted(glob(f"store/source/{tid}/*.tif"))
+            assert [os.path.basename(p) for p in staged] == sorted(
+                staged_name(tid, u) for u in tu), staged
+            for p in staged:
+                with rasterio.open(p) as src:
+                    assert src.shape == (2, 4), src.shape  # its own two members, not the gap
+                    assert src.read(1).max() < 0, "seafloor stays negative"
+                    # grids declaring no NODATA_value fall back to -9999
+                    assert src.nodata == -9999, (p, src.nodata)
+            assert not glob(f"store/source/{tid}/_asc_*"), "asc-tile must consume its scratch"
+
+            # A grid that declares no NODATA_value at all still gets the -9999 fallback.
+            nid = "_prep_asc_no_nodata"
+            nu = "https://x/tiles/0.5/N0"
+            seed(nid, [nu], {"name": "ASC no nodata", "unpack": "asc-tile",
+                             "crs": "EPSG:27700"})
+            zb = io.BytesIO()
+            with zipfile.ZipFile(zb, "w") as z:
+                z.writestr("n0mb.asc", asc_grid(0, -4, nodata=None))
+            with open(raw_of(nid, nu), "wb") as f:
+                f.write(zb.getvalue())
+            stage(nid)
+            with rasterio.open(f"store/source/{nid}/{staged_name(nid, nu, ext='tif')}") as src:
+                assert src.nodata == -9999, src.nodata
+
+            # The SAME mode over a 7z, narrowed by a glob: the container is sniffed, and the
+            # glob keeps a second resolution of the same ground out of the mosaic (Litto3D
+            # ships MNT1m beside MNT5m). Only the 5 m member may reach the raster.
+            sid_7z = "_prep_asc_tile_7z"
+            u7 = "https://x/prepaquet/0225_6770.7z"
+            seed(sid_7z, [u7], {"name": "ASC tile 7z", "unpack": "asc-tile:*_MNT5M_*.asc",
+                                "crs": "EPSG:2154"})
+            import py7zr
+            with py7zr.SevenZipFile(raw_of(sid_7z, u7), "w") as z:
+                for j in range(2):
+                    z.writestr(asc_grid(j * 2, -7, nodata=-99999),
+                               f"d{j}/MNT5m/L3D_{j}_MNT5M_LAMB93.asc")
+                    z.writestr(asc_grid(j * 2, -1, nodata=-99999),
+                               f"d{j}/MNT1m/L3D_{j}_MNT1M_LAMB93.asc")
+                z.writestr("read me", "d0/DC_LITTO3D.txt")
+            stage(sid_7z)
+            # …and it is named for what it IS (a tif), not for the .7z it came out of —
+            # otherwise prep()'s *.tif glob registers nothing at all.
+            staged7 = glob(f"store/source/{sid_7z}/*.tif")
+            assert staged7 == [f"store/source/{sid_7z}/{staged_name(sid_7z, u7, ext='tif')}"], \
+                staged7
+            assert staged7[0].endswith(".tif") and "0225_6770" in staged7[0], staged7
+            with rasterio.open(staged7[0]) as src:
+                assert src.shape == (2, 4), src.shape  # the two 5 m members only
+                assert (src.read(1) == -7).all(), "the 1 m members must not join the mosaic"
+                # the grids' OWN nodata survives — relabelling it would turn every void into
+                # a plausible depth once the datum step shifts it
+                assert src.nodata == -99999, src.nodata
+            print("source_prep.py self-check ok (incl. asc mosaic + asc tile over zip/7z)")
         else:
             print("source_prep.py self-check ok (asc mosaic skipped — no GDAL CLI)")
     finally:

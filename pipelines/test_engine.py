@@ -410,9 +410,12 @@ def check_raw_discard():
 
     Runs the real fetch → prep → catalog chain against a GeoTIFF served from a throwaway
     localhost HTTP server (requests has no file:// transport, and the point is to exercise
-    source_fetch as it actually runs). Three properties, each a separate way to get this wrong:
-    the raw is gone after prep, a clean rerun does NOT re-download it, and a forced re-prep
-    schedules the fetch again rather than failing on the absent input.
+    source_fetch as it actually runs). Four properties, each a separate way to get this wrong:
+    the raw is gone after prep, a clean rerun does NOT re-download it, a forced re-prep
+    schedules the fetch again rather than failing on the absent input, and — the one that
+    makes a retry cheap — a FAILED prep leaves its raw on disk, so the retry stages the bytes
+    it already has. The server counts its own requests, so "did not refetch" is asserted
+    against the upstream rather than inferred from the DAG.
     """
     import functools
     import http.server
@@ -427,7 +430,17 @@ def check_raw_discard():
                        transform=from_origin(0.0, 0.0, res, res)) as d:
         d.write(np.full((px, px), -30.0, dtype="float32"), 1)
 
-    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=served)
+    hits = []
+
+    class Counting(http.server.SimpleHTTPRequestHandler):
+        def do_GET(self):
+            hits.append(self.path)
+            super().do_GET()
+
+        def log_message(self, *a):
+            pass
+
+    handler = functools.partial(Counting, directory=served)
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     try:
@@ -451,7 +464,43 @@ def check_raw_discard():
         forced = _job_counts(snake(tmp, "-c", "1", "-n", "-R", "prep_source", catalog).stdout)
         assert forced.get("fetch_item") == 1, \
             f"a forced re-prep must refetch the discarded raw, got {forced}"
-        print("raw discard ok — staged then dropped, no refetch until a force needs it")
+
+        # A prep that FAILS must keep its raw: temp() collects an input only once every
+        # consuming job succeeded, which is what makes a retry a re-stage and not a re-download.
+        # The induced failure is a real one from source_prep's own repertoire — clamp_positive
+        # over a file that declares no nodata.
+        fid = "discard_fail"
+        os.makedirs(f"{tmp}/sources/{fid}")
+        with rasterio.open(os.path.join(served, "bad.tif"), "w", driver="GTiff", height=px,
+                           width=px, count=1, dtype="float32", crs="EPSG:4326",
+                           transform=from_origin(0.0, 0.0, res, res)) as d:
+            d.write(np.full((px, px), -30.0, dtype="float32"), 1)
+        meta = f"{tmp}/sources/{fid}/metadata.json"
+        with open(meta, "w") as f:
+            json.dump({"name": fid, "max_zoom": 10, "clamp_positive": True}, f)
+        with open(f"{tmp}/sources/{fid}/file_list.txt", "w") as f:
+            f.write(f"http://127.0.0.1:{httpd.server_address[1]}/bad.tif\n")
+
+        fail_catalog = f"store/source/{fid}/catalog.json"
+        proc = snake(tmp, "-c", "1", fail_catalog, check=False)
+        assert proc.returncode != 0, "the induced prep failure must fail the run"
+        assert not os.path.isfile(f"{tmp}/{fail_catalog}"), "a failed prep must not register"
+        kept = glob(f"{tmp}/store/source/{fid}/raw/*")
+        assert len(kept) == 1, f"a failed prep must keep its raw for the retry, found {kept}"
+        downloads = [h for h in hits if h.endswith("/bad.tif")]
+        assert len(downloads) == 1, f"expected exactly one download, got {downloads}"
+
+        # The retry: same raw, repaired recipe. It must stage from the bytes on disk and never
+        # touch the server again.
+        with open(meta, "w") as f:
+            json.dump({"name": fid, "max_zoom": 10, "nodata": -9999}, f)
+        snake(tmp, "-c", "1", fail_catalog)
+        assert os.path.isfile(f"{tmp}/{fail_catalog}"), "the retry must register"
+        assert [h for h in hits if h.endswith("/bad.tif")] == downloads, \
+            f"the retry must not re-download: {hits}"
+        assert not glob(f"{tmp}/store/source/{fid}/raw/*"), "the retry must discard the raw"
+        print("raw discard ok — staged then dropped, kept across a failed prep, "
+              "no refetch until a force needs it")
     finally:
         httpd.shutdown()
         shutil.rmtree(tmp, ignore_errors=True)
