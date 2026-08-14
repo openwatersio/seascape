@@ -199,12 +199,14 @@ def tile(stem):
                              "depth_ft": int(round(lvl / 0.3048)),
                              "depth_fm": int(round(lvl / 1.8288))})
     if rows:
-        tmp = tempfile.mkdtemp(prefix=f"contour-{stem}-")  # local scratch; publish crosses stores
-        final = f"{tmp}/contour-final.fgb"
-        gpd.GeoDataFrame(rows, crs="EPSG:3857").to_crs("EPSG:4326").to_file(
-            final, driver="FlatGeobuf")
-        utils.publish(final, out)  # scratch and store are separate filesystems
-        shutil.rmtree(tmp)
+        tmp = tempfile.mkdtemp(prefix=f"contour-{stem}-")  # local scratch
+        try:
+            final = f"{tmp}/contour-final.fgb"
+            gpd.GeoDataFrame(rows, crs="EPSG:3857").to_crs("EPSG:4326").to_file(
+                final, driver="FlatGeobuf")
+            utils.publish(final, out)  # scratch and store are separate filesystems
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
         print(f"contour tile {stem}: {len(rows)} features")
     else:
         open(out, "w").close()
