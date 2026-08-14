@@ -415,9 +415,13 @@ def translate(in_filepath, out_filepath):
     # inherits the profile into the merged DEM, so compressing here propagates downstream.
     # IF_SAFER, not IF_NEEDED: with compression IF_NEEDED never fires, and z15 grids
     # whose ZSTD output still crosses 4 GB die mid-write in TIFFAppendToStrip.
+    # NUM_THREADS=8, not ALL_CPUS: this child's memory scales with visible cores when the
+    # input is a warped VRT (one isolated cz15 tile: 5.5 GB on 8 cores, 22.4 GB on 48 —
+    # a live sample caught this translate at 10.8 GB), while compression wall-time barely
+    # moves. Many merges run concurrently anyway; the width belongs to the scheduler.
     _run("gdal_translate -of COG -co BIGTIFF=IF_SAFER -co ADD_ALPHA=YES "
          "-co OVERVIEWS=NONE -co SPARSE_OK=YES -co BLOCKSIZE=512 "
-         f"-co COMPRESS=ZSTD -co NUM_THREADS=ALL_CPUS {in_filepath} {out_filepath}",
+         f"-co COMPRESS=ZSTD -co NUM_THREADS=8 {in_filepath} {out_filepath}",
          f"gdal_translate {in_filepath}")
 
 
