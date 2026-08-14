@@ -16,13 +16,15 @@ SOURCES_DIR = os.environ.get("SOURCES_DIR", "../sources")
 
 # Standard INT isobaths (IHO S-4 B-411), metres, most-negative first. The shallow
 # ladder (2/5/10/20/30) is also the S-52 safety-contour value set; fine depth detail
-# between curves is the soundings layer's job, not extra isobaths. Env-tunable like the
-# other contour knobs; the resolved list enters the contour/depare tile keys. The style
-# hand-mirrors the DEFAULT (style/index.ts DEPARE_LADDER_M/FT), so contour_run/depare_run
-# warn when an override diverges from CONTOUR_LEVELS_DEFAULT.
+# between curves is the soundings layer's job, not extra isobaths. 0 is the drying line, the
+# chart-datum shoreline (the encoder holds land at >= 0, water below); it is the same curve in
+# every unit, so contour_run ships it once with no `sys` rather than in both ladders.
+# Env-tunable like the other contour knobs; the resolved list enters the contour/depare tile
+# keys. The style hand-mirrors the DEFAULT (style/index.ts DEPARE_LADDER_M/FT), so
+# contour_run/depare_run warn when an override diverges from CONTOUR_LEVELS_DEFAULT.
 _CONTOUR_LEVELS_DEFAULT = (
     "-10000 -8000 -6000 -5000 -4000 -3000 -2000 -1000 -500 -300 -200 "
-    "-100 -50 -30 -20 -10 -5 -2"
+    "-100 -50 -30 -20 -10 -5 -2 0"
 )
 CONTOUR_LEVELS_DEFAULT = [int(x) for x in _CONTOUR_LEVELS_DEFAULT.split()]
 CONTOUR_LEVELS = [int(x) for x in os.environ.get("CONTOUR_LEVELS", _CONTOUR_LEVELS_DEFAULT).split()]
@@ -52,13 +54,13 @@ FATHOM_CURVES = [1, 2, 3, 5, 10, 20, 30, 50, 100, 200, 300, 500, 1000, 2000, 300
 # Ascending (deepest first, like CONTOUR_LEVELS) — gdal_contour -fl needs strictly increasing.
 CONTOUR_LEVELS_FT = sorted(round(-fm * 1.8288, 4) for fm in FATHOM_CURVES)
 
-# Depth-area (ENC DEPARE) partition levels: every charted isobath is a band edge, plus 0 to
-# close the shoalest band at the shoreline (the encoder holds land at >= 0, water below).
-# gdal_contour -p buckets the DEM between successive levels; the style tints buckets off
-# drval1 and snaps the safety contour to the next-deeper level. Mirrored in style/index.ts
-# (DEPARE_LADDER_M / DEPARE_LADDER_FT) — keep them in sync.
-DEPARE_LEVELS = CONTOUR_LEVELS + [0]
-DEPARE_LEVELS_FT = CONTOUR_LEVELS_FT + [0]
+# Depth-area (ENC DEPARE) partition levels: every charted isobath is a band edge, and 0 closes
+# the shoalest band at the shoreline. gdal_contour -p buckets the DEM between successive levels;
+# the style tints buckets off drval1 and snaps the safety contour to the next-deeper level.
+# Mirrored in style/index.ts (DEPARE_LADDER_M / DEPARE_LADDER_FT) — keep them in sync.
+# Deduped: 0 is already a metre isobath, and an env-overridden ladder without it still gets the edge.
+DEPARE_LEVELS = sorted({*CONTOUR_LEVELS, 0})
+DEPARE_LEVELS_FT = sorted({*CONTOUR_LEVELS_FT, 0})
 
 
 def sources():

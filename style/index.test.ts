@@ -140,6 +140,23 @@ test("contour lines floor at z6 — depth shading carries lower zooms", () => {
   expect((lines as { minzoom?: number }).minzoom).toBe(6);
 });
 
+test("the 0 m drying line is unit-less — every isobath filter admits it", () => {
+  // The chart-datum shoreline is the same curve in metres, feet and fathoms, so the pipeline
+  // ships it once with no `sys` (like depare's drying/nodata) instead of once per ladder.
+  const filterOf = (unit: "m" | "ft" | "fm", id: string) =>
+    (layers(day, { unit }).find((l) => l.id === id) as { filter?: unknown })
+      .filter;
+  for (const id of ["contour-lines", "contour-labels"]) {
+    expect(filterOf("m", id)).toEqual(["!=", ["get", "sys"], "ft"]); // missing sys reads null
+    for (const unit of ["ft", "fm"] as const)
+      expect(filterOf(unit, id)).toEqual([
+        "any",
+        ["!", ["has", "sys"]],
+        ["==", ["get", "sys"], "ft"],
+      ]);
+  }
+});
+
 test("layer ids are stable — consumers key toggles/queries off them", () => {
   expect(layers().map((l) => l.id)).toEqual([
     "depth-shading",
@@ -267,10 +284,14 @@ test("applyState re-derives every unit/safety-dependent property", () => {
   );
   expect(ramp).toContain(-30 * 1.8288);
   expect(ramp).toContain(day.hazard);
-  // Isobath filters flip to the fathom-curve set — the contour lines and labels.
+  // Isobath filters flip to the fathom-curve set plus the unit-less 0 m drying line — the
+  // contour lines and labels.
   for (const id of ["contour-lines", "contour-labels"])
-    expect(calls.find((c) => c.fn === "filter" && c.layer === id)!.value)
-      .toEqual(["==", ["get", "sys"], "ft"]);
+    expect(calls.find((c) => c.fn === "filter" && c.layer === id)!.value).toEqual([
+      "any",
+      ["!", ["has", "sys"]],
+      ["==", ["get", "sys"], "ft"],
+    ]);
   // The depare fill adds the ft band ladder alongside the unit-less drying/nodata features.
   expect(
     calls.find((c) => c.fn === "filter" && c.layer === "depth-areas")!.value,

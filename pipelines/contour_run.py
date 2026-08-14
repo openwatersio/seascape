@@ -139,6 +139,9 @@ def _refine_stream(sources, out_fgb, tol, clip):
         for off in range(0, total, STREAM_BATCH):
             g = gpd.read_file(fgb, rows=slice(off, min(off + STREAM_BATCH, total)))
             g["sys"] = sys_tag
+            # The 0 m drying line is the same curve in every unit — it ships once with NO sys,
+            # like depare's drying/nodata, and both ladders' style filters admit it.
+            g.loc[g["depth_m"] == 0, "sys"] = None
             g["depth_abs_m"] = (-g["depth_m"]).round().astype(int)
             g["depth_ft"] = (-g["depth_m"] / 0.3048).round().astype(int)
             g["depth_fm"] = (-g["depth_m"] / 1.8288).round().astype(int)
@@ -256,11 +259,12 @@ def contour_minzoom(sys_tag, depth_m):
     """Per-curve tippecanoe.minzoom: the first CONTOUR_TIERS band that shows the curve (native+ if
     none). The leaf-safe replacement for the old -j $zoom PER_ZOOM_FILTER — a variable-depth leaf
     freezes at its own zoom, so zoom gating must ride each feature, not the $zoom expression. Metre
-    isobaths match a tier's hand-picked levels; feet/fathom curves mirror by depth (shown once at
-    least as deep as the shallowest metre curve the band shows)."""
+    isobaths — and the sys-less 0 m drying line, which is in no tier, so it shows at native+ with
+    the other shoal curves — match a tier's hand-picked levels; feet/fathom curves mirror by depth
+    (shown once at least as deep as the shallowest metre curve the band shows)."""
     lo = 0
     for hi, depths in CONTOUR_TIERS:
-        if sys_tag == "m":
+        if sys_tag != "ft":
             shown = round(depth_m) in depths
         else:  # ft: at least as deep as the shallowest metre curve shown in this band
             shown = depth_m <= -min(-d for d in depths)
@@ -674,7 +678,7 @@ def _build_seqs_and_run(stems, minz, maxz, id_base, variable_depth, out, max_min
     detail = LEAF_DETAIL if variable_depth else VECTOR_SHALLOW_DETAIL
     try:
         nid, cids = _fgb_to_seq(cfgbs, ("depth_m", "depth_abs_m", "sys", "depth_ft", "depth_fm"),
-                                lambda p: contour_minzoom(p["sys"], float(p["depth_m"])), cseq,
+                                lambda p: contour_minzoom(p.get("sys"), float(p["depth_m"])), cseq,
                                 "contour", lambda p: f"sys={p.get('sys')} depth_m={p.get('depth_m')}",
                                 nid, maxz, max_minzoom, min_minzoom, detail)
         nid, sids = _soundings_to_seq(sgjs, sseq, nid, max_minzoom, min_minzoom)
@@ -1072,7 +1076,7 @@ def _vector_selfcheck(vec, maxz, expected=None, per_zoom=6):
             for feat in L.get("contours", []):
                 p = feat["properties"]
                 d, s = p.get("depth_m"), p.get("sys")
-                if d is not None and s and contour_minzoom(s, float(d)) > z:
+                if d is not None and contour_minzoom(s, float(d)) > z:
                     problems.append(f"z{z} {x}/{y}: contour depth_m={d} sys={s} below minzoom "
                                     f"{contour_minzoom(s, float(d))}")
                     break
@@ -1152,6 +1156,8 @@ def _check():
     assert contour_minzoom("m", -50) == 7 and contour_minzoom("m", -10) == 9
     assert contour_minzoom("ft", -0.5) == ceilings[-1]          # shallower than any band's floor
     assert contour_minzoom("ft", -4000) == 0                     # deeper than the first band's floor
+    assert contour_minzoom(None, 0) == ceilings[-1]              # the sys-less drying line: native+
+    assert 0 in config.CONTOUR_LEVELS, "the 0 m drying line must be a contoured level"
     # every tier level must exist in the generated contour set (else it gates nothing)
     assert all(d in config.CONTOUR_LEVELS for _, depths in CONTOUR_TIERS for d in depths)
     print("contour_run ring-drop + minzoom self-check ok")
