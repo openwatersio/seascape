@@ -1,22 +1,31 @@
-"""Contours as a fork off each aggregation tile's merged DEM.
+"""Contour lines derived from the depare depth-area partition.
 
-Reads a window of the persisted mosaic (smoothed at read by smooth.py), so contours
-come from one continuous surface. GDAL runs as a subprocess; geopandas/shapely do the
-Chaikin smoothing.
+Isobaths are the shared edges of store/depare/<stem>.fgb's band polygons: a segment
+two bands of one ladder share is a contour at every ladder level between the shallow
+band's drval2 and the deep band's drval1 (a pinched-out band puts two coincident
+levels on one edge), while a segment with a single owner is an outer edge — land,
+nodata water, the tile clip line — and is no contour. Deriving the lines from the
+bands instead of contouring the DEM again is what makes crossing isobaths impossible
+and keeps the drawn line and the band edge the same polyline: per-line smoothing
+(Chaikin, Douglas-Peucker) generalizes each line independently, so adjacent levels
+closer than the tolerance could cross (issue #139). The bands' coverage
+simplification already generalized every shared chain once, identically for both
+owners (depare_run.simplify_coverage), so extraction is exact segment matching over
+identical float coordinates — no overlay, no tolerance.
 
-Each aggregation tile contours its full-res merged DEM, so every source shows at
-all zooms (coarse GEBCO is overzoomed by the renderer above its native z9; CUDEM
-adds detail where present). Within a tile the merge is feathered, so the
-CUDEM->GEBCO footprint transition is continuous; the residual coarse/fine
-difference at the tile edge is fundamental (you can't draw GEBCO at CUDEM's
-resolution) and is softened by the smoothing.
+Per tile: read the band rows per ladder (sys m/ft; the metre pass adds the sys-less
+drying rows, whose seaward edge is the 0 m drying line, shipped once with no sys;
+nodata rows never take part) -> match segments -> assemble per-level lines -> drop
+abyssal micro-rings -> enrich (depth_abs_m/ft/fm) -> EPSG:4326 FGB. Rows arrive
+clipped to the unbuffered tile bbox and on the depare seam contract, so the lines
+abut across stems exactly like the bands do.
 
-Per tile: gdal_contour (3857) -> Chaikin smooth + enrich (depth_abs_m)
--> clip to the unbuffered tile bbox -> reproject to EPSG:4326.
-
-(A disjoint base/regional zoom-band split was tried to make lines join at z9, but
-it hid GEBCO above z9 — not worth losing GEBCO at high zoom. Smoothing is the
-real seam mitigation.)
+One bounded residual: the m and ft ladders are two coverages of the same water, so
+the m-derived 0 m line can touch the ft curves where the two simplifications part
+company — sub-pixel by the band tolerance (measured 0–36 contact points per marsh
+stem, displacement under the ~1 px coverage divergence), against tens-of-metres
+crossings within a ladder before derivation. Within a displayed ladder, crossings
+are impossible.
 """
 
 import collections
@@ -33,21 +42,7 @@ import mercantile
 
 import aggregation_covering
 import config
-import landmask
 import utils
-from aggregation_reproject import get_resolution
-
-CHAIKIN_ITERATIONS = 5
-# Skip Chaikin in the navigable band: corner-cutting bows a contour toward the deep
-# side at shallow-convex bends, which shrinks a shoal (unsafe). Shallow lines keep
-# their raw gdal_contour geometry (sub-pixel simplify only); deeper contours smooth
-# for looks. Mirrors smooth.DEPTH_FULL / the ECDIS safety-contour depth.
-NAV_SMOOTH_MAX_M = int(os.environ.get("CONTOUR_NAV_SMOOTH_MAX", "30"))
-
-
-def _chaikin_iters(depth_abs_m):
-    return 0 if depth_abs_m <= NAV_SMOOTH_MAX_M else CHAIKIN_ITERATIONS
-
 
 # Drop spurious tiny closed contours (abyssal stipple — micro-loops around bumps
 # near a deep contour value) at deep levels only. Shallow rings are navigable
@@ -71,46 +66,11 @@ def _run(cmd, what):
         raise Exception(f"{what} failed (exit {p.returncode}):\n{p.stdout}\n{p.stderr}")
 
 
-def feature_count(fgb):
-    out = subprocess.run(["ogrinfo", "-so", "-al", fgb], capture_output=True, text=True).stdout
-    for line in out.splitlines():
-        if "Feature Count" in line:
-            return int(line.split(":")[1].strip())
-    return 0
-
-
-# ── Chaikin smoothing (ported from scripts/smooth-contours, via shapely) ─────
-
-def _chaikin(coords, iterations):
-    import numpy as np
-    pts = np.asarray(coords, float)
-    for _ in range(iterations):
-        if len(pts) < 3:
-            break
-        q = 0.75 * pts[:-1] + 0.25 * pts[1:]
-        r = 0.25 * pts[:-1] + 0.75 * pts[1:]
-        out = np.empty((2 * len(q), 2))
-        out[0::2], out[1::2] = q, r
-        out[0], out[-1] = pts[0], pts[-1]  # preserve endpoints (lines must not drift)
-        pts = out
-    return pts
-
-
-def _smooth_geom(geom, tol, iterations):
-    from shapely.geometry import LineString, MultiLineString
-    if geom.geom_type == "LineString":
-        g = geom.simplify(tol) if tol > 0 else geom
-        coords = list(g.coords)
-        return LineString(_chaikin(coords, iterations)) if len(coords) >= 3 else geom
-    if geom.geom_type == "MultiLineString":
-        return MultiLineString([_smooth_geom(p, tol, iterations) for p in geom.geoms])
-    return geom
-
+# ── isobath derivation (shared band edges) ───────────────────────────────────
 
 def _lines(geom):
-    """Every non-empty LineString inside a geometry, recursing into Multi/GeometryCollection and
-    dropping the point/polygon slivers a clip or make_valid can leave (the line analog of
-    depare_run._polys) — so the output layer stays uniformly line (FlatGeobuf rejects a mixed layer)."""
+    """Every non-empty LineString inside a geometry, recursing into Multi/GeometryCollection —
+    so the output layer stays uniformly line (FlatGeobuf rejects a mixed layer)."""
     t = geom.geom_type
     if t == "LineString":
         return [] if geom.is_empty else [geom]
@@ -119,56 +79,71 @@ def _lines(geom):
     return []
 
 
-STREAM_BATCH = 100_000  # features per refine batch; a z15 window's set doesn't fit in RAM
+def _ring_segments(geoms):
+    """Canonical segment array (n, 4: x_lo, y_lo, x_hi, y_hi — endpoints in lexicographic order,
+    zero-length dropped) over every ring of `geoms`. Segment identity is what edge sharing means:
+    coverage simplification keeps a shared chain vertex-identical in both owners, so two bands'
+    copies of an edge yield bit-equal rows."""
+    import numpy as np
+    import shapely
+    rings = shapely.get_rings(shapely.get_parts(np.asarray(geoms, dtype=object)))
+    if not len(rings):
+        return np.empty((0, 4))
+    coords = shapely.get_coordinates(rings)
+    counts = shapely.get_num_coordinates(rings)
+    keep = np.ones(len(coords) - 1, dtype=bool)
+    keep[np.cumsum(counts)[:-1] - 1] = False  # no segment across a ring boundary
+    a, b = coords[:-1][keep], coords[1:][keep]
+    swap = (a[:, 0] > b[:, 0]) | ((a[:, 0] == b[:, 0]) & (a[:, 1] > b[:, 1]))
+    lo = np.where(swap[:, None], b, a)
+    hi = np.where(swap[:, None], a, b)
+    seg = np.hstack([lo, hi])
+    return seg[np.any(lo != hi, axis=1)]
 
 
-def _refine_stream(sources, out_fgb, tol, clip):
-    """Enrich, Chaikin-smooth, deep ring-drop, and bbox-clip the raw contour sets, one feature
-    batch at a time, appending to a GeoJSONSeq (4326) that a final ogr2ogr converts to the
-    multi-promoted FGB. Clip in shapely, keeping only line pieces — ogr2ogr -clipsrc emits a
-    GeometryCollection here that the FlatGeobuf write rejects (the GDAL GeometryCollection trap,
-    same as depare's shapely clip). Returns the written feature count."""
-    import geopandas as gpd
-    from shapely import make_valid
-    from shapely.geometry import MultiLineString
+def _level_lines(gdf, levels):
+    """{level: line geometry} for one ladder's band rows (any projected CRS; `levels` positive-down
+    like drval1/drval2). A segment owned by exactly two bands is a contour at every ladder level L
+    with shallow.drval2 <= L <= deep.drval1: the adjacent case is drval2 == L == drval1, and a
+    pinched-out band (depth jumps past a level inside one pixel) puts the skipped level on the same
+    edge, coincident — exactly where gdal_contour would draw both lines. Single-owner segments are
+    outer edges (land, nodata, the tile clip line), never contours; two pieces of the SAME band
+    select no level (drval1 < drval2 empties the range)."""
+    import numpy as np
+    import shapely
 
-    seq = out_fgb + ".geojsons"
-    written = 0
-    for fgb, sys_tag in sources:
-        total = feature_count(fgb)
-        for off in range(0, total, STREAM_BATCH):
-            g = gpd.read_file(fgb, rows=slice(off, min(off + STREAM_BATCH, total)))
-            g["sys"] = sys_tag
-            # The 0 m drying line is the same curve in every unit — it ships once with NO sys,
-            # like depare's drying/nodata, and both ladders' style filters admit it.
-            g.loc[g["depth_m"] == 0, "sys"] = None
-            g["depth_abs_m"] = (-g["depth_m"]).round().astype(int)
-            g["depth_ft"] = (-g["depth_m"] / 0.3048).round().astype(int)
-            g["depth_fm"] = (-g["depth_m"] / 1.8288).round().astype(int)
-            g["geometry"] = [_smooth_geom(geom, tol, _chaikin_iters(d))
-                             for geom, d in zip(g.geometry, g["depth_abs_m"])]
-            deep = g["depth_abs_m"] >= DEEP_CUTOFF_M
-            if deep.any():
-                g.loc[deep, "geometry"] = [_drop_small_rings(geom, MIN_RING_AREA_M2)
-                                           for geom in g.loc[deep, "geometry"]]
-            g = g[g.geometry.notna() & ~g.geometry.is_empty]
-            if len(g):
-                g["geometry"] = [MultiLineString(parts) if parts else None
-                                 for parts in (_lines(make_valid(geom).intersection(clip))
-                                               for geom in g.geometry)]
-                g = g[g.geometry.notna() & ~g.geometry.is_empty]
-            if len(g) == 0:
-                continue
-            g.to_crs(4326).to_file(seq, driver="GeoJSONSeq", mode="a" if written else "w")
-            written += len(g)
-    if written:
-        # Same 200 MB per-feature GeoJSON ceiling as the depare sink (see _RowSink.finish):
-        # a dense stem's isobath can exceed it.
-        _run(f"ogr2ogr --config OGR_GEOJSON_MAX_OBJ_SIZE 0 "
-             f"-f FlatGeobuf -overwrite -nlt PROMOTE_TO_MULTI {out_fgb} {seq}",
-             "ogr2ogr contours")
-        os.remove(seq)
-    return written
+    keys = sorted({(d1, d2) for d1, d2 in zip(gdf["drval1"], gdf["drval2"])})
+    segs, owner = [], []
+    for i, (d1, d2) in enumerate(keys):
+        s = _ring_segments(gdf.geometry.values[
+            (gdf["drval1"].values == d1) & (gdf["drval2"].values == d2)])
+        segs.append(s)
+        owner.append(np.full(len(s), i))
+    seg = np.concatenate(segs)
+    own = np.concatenate(owner)
+    if not len(seg):
+        return {}
+    order = np.lexsort((seg[:, 3], seg[:, 2], seg[:, 1], seg[:, 0]))
+    seg, own = seg[order], own[order]
+    gid = np.concatenate([[0], np.cumsum(np.any(seg[1:] != seg[:-1], axis=1))])
+    counts = np.bincount(gid)
+    starts = np.concatenate([[0], np.cumsum(counts)[:-1]])
+    pair = starts[counts == 2]  # >2 owners is degenerate (a spike), never a band edge
+    if not len(pair):
+        return {}
+    d1 = np.array([k[0] for k in keys])
+    d2 = np.array([k[1] for k in keys])
+    o1, o2 = own[pair], own[pair + 1]
+    shallow_first = d1[o1] <= d1[o2]
+    sh_d2 = np.where(shallow_first, d2[o1], d2[o2])
+    dp_d1 = np.where(shallow_first, d1[o2], d1[o1])
+    out = {}
+    for lvl in levels:
+        sel = pair[(sh_d2 <= lvl) & (lvl <= dp_d1)]
+        if len(sel):
+            pts = seg[sel].reshape(-1, 2, 2)
+            out[lvl] = shapely.line_merge(shapely.multilinestrings(shapely.linestrings(pts)))
+    return out
 
 
 def _drop_small_rings(geom, min_area):
@@ -184,57 +159,58 @@ def _drop_small_rings(geom, min_area):
 
 
 def tile(stem):
-    """The per-stem Snakemake job: contour one stem from a BUFFERED mosaic window, smoothed at read
-    with the one shared f(depth, zoom), output at store/contour/<stem>.fgb. A featureless tile
-    writes a 0-byte sentinel so the engine sees a complete output; bundling filters empties by
-    size."""
-    z, x, y, child_z = (int(a) for a in stem.split("-"))
+    """The per-stem Snakemake job: derive one stem's isobaths from store/depare/<stem>.fgb,
+    output at store/contour/<stem>.fgb (4326, one MultiLineString per sys × level). A featureless
+    tile writes a 0-byte sentinel so the engine sees a complete output; bundling filters empties
+    by size."""
+    import geopandas as gpd
+    from shapely.geometry import MultiLineString
+
+    src = f"store/depare/{stem}.fgb"
     out = f"store/contour/{stem}.fgb"
-    tmp = tempfile.mkdtemp(prefix=f"contour-{stem}-")  # local scratch; publish crosses to the store
-    # Private copy of the shared smoothed window: the clamp mutates in place, and the
-    # smoothing already smeared sea negatives back across islands — without the re-cut,
-    # isobaths land on shore.
-    dem = f"{tmp}/dem.tiff"
-    shutil.copyfile(f"store/window/{stem}.tif", dem)
-    landmask.clamp_dem_to_land(dem)
-    final = _contour_dem(dem, mercantile.Tile(x=x, y=y, z=z), child_z, tmp, stem)
     os.makedirs(os.path.dirname(out), exist_ok=True)
-    if final:
-        utils.publish(final, out)  # scratch and store are separate filesystems
-        print(f"contour tile {stem}: {feature_count(out)} features")
+    rows = []
+    if os.path.getsize(src) > 0:
+        for sys_tag, cfg_levels in (("m", config.CONTOUR_LEVELS), ("ft", config.CONTOUR_LEVELS_FT)):
+            # The metre pass also reads the drying rows (sys-less, drval1 < 0): their seaward
+            # edge against the shoalest band is the 0 m drying line, which ships once with NO
+            # sys — where no drying polygon survives its gates, no 0 m line ships either, so
+            # line and green fill stay consistent. Nodata rows (drval1 NULL) never take part.
+            where = f"sys = '{sys_tag}'" + (" OR drval1 < 0" if sys_tag == "m" else "")
+            g = gpd.read_file(src, where=where)
+            if not len(g):
+                continue
+            # Depth-band areas (the m² ring-drop threshold) want a projected CRS; 3857 is also
+            # where the depare geometry was built, so the reprojection is an exact round trip
+            # of deterministic transforms — shared chains stay bit-identical.
+            g = g.to_crs("EPSG:3857")
+            for lvl, geom in sorted(_level_lines(g, [0.0 - l for l in cfg_levels]).items()):
+                if lvl >= DEEP_CUTOFF_M:
+                    geom = _drop_small_rings(geom, MIN_RING_AREA_M2)
+                    if geom is None:
+                        continue
+                parts = _lines(geom)
+                if not parts:
+                    continue
+                rows.append({"geometry": MultiLineString(parts), "depth_m": 0.0 - lvl,
+                             # the 0 m drying line is the same curve in every unit: no sys
+                             "sys": None if lvl == 0 else sys_tag,
+                             "depth_abs_m": int(round(lvl)),
+                             "depth_ft": int(round(lvl / 0.3048)),
+                             "depth_fm": int(round(lvl / 1.8288))})
+    if rows:
+        tmp = tempfile.mkdtemp(prefix=f"contour-{stem}-")  # local scratch
+        try:
+            final = f"{tmp}/contour-final.fgb"
+            gpd.GeoDataFrame(rows, crs="EPSG:3857").to_crs("EPSG:4326").to_file(
+                final, driver="FlatGeobuf")
+            utils.publish(final, out)  # scratch and store are separate filesystems
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        print(f"contour tile {stem}: {len(rows)} features")
     else:
         open(out, "w").close()
         print(f"contour tile {stem}: empty")
-    shutil.rmtree(tmp)
-
-
-def _contour_dem(dem, tile_obj, child_z, tmp, label):
-    """gdal_contour -> smooth/enrich -> clip -> reproject, off any DEM covering the tile's
-    buffered extent. Returns the final FGB path inside ``tmp``, or None when featureless."""
-    levels = " ".join(str(l) for l in config.CONTOUR_LEVELS)
-    raw = f"{tmp}/contour-raw.fgb"
-    _run(f"gdal_contour -q -fl {levels} -a depth_m -f FlatGeobuf {dem} {raw}", "gdal_contour m")
-    sources = [(raw, "m")]
-
-    # A second set at the fathom curves for feet/fathom charts (same DEM, tagged sys=ft).
-    levels_ft = " ".join(str(l) for l in config.CONTOUR_LEVELS_FT)
-    raw_ft = f"{tmp}/contour-raw-ft.fgb"
-    _run(f"gdal_contour -q -fl {levels_ft} -a depth_m -f FlatGeobuf {dem} {raw_ft}", "gdal_contour ft")
-    if feature_count(raw_ft) > 0:
-        sources.append((raw_ft, "ft"))
-
-    if sum(feature_count(f) for f, _ in sources) == 0:
-        print(f"contour: no ocean features for {label}")
-        return None
-
-    from shapely.geometry import box
-    b = mercantile.xy_bounds(tile_obj)  # unbuffered, tile-aligned (EPSG:3857)
-    final = f"{tmp}/contour-final.fgb"
-    if _refine_stream(sources, final, get_resolution(child_z),
-                      box(b.left, b.bottom, b.right, b.top)) == 0:
-        print(f"contour: no features in tile bbox for {label}")
-        return None
-    return final
 
 
 # ── bundle ───────────────────────────────────────────────────────────────────
@@ -663,7 +639,8 @@ def _build_seqs_and_run(stems, minz, maxz, id_base, variable_depth, out, max_min
     above-leaf-pixel features. An all-empty input writes a 0-byte `out` and returns empty maps.
     require_stable_complete gates the caller; here 0-byte per-tile files are legitimately empty."""
     depare_on = not os.environ.get("SKIP_DEPARE")
-    cfiles = [f"store/contour/{s}.fgb" for s in stems]
+    # Contours derive from depare, so both layers ride (or skip) together.
+    cfiles = [f"store/contour/{s}.fgb" for s in stems] if depare_on else []
     sfiles = [f"store/soundings/{s}.geojsons" for s in stems]
     dfiles = [f"store/depare/{s}.fgb" for s in stems] if depare_on else []
     cfgbs = [f for f in cfiles if os.path.getsize(f) > 0]
@@ -1119,9 +1096,32 @@ def _vector_selfcheck(vec, maxz, expected=None, per_zoom=6):
 
 
 def _check():
-    """Deep micro-loops dropped; big deep ring and open lines kept."""
+    """Isobath derivation from synthetic bands; deep micro-loops dropped; big deep ring and open
+    lines kept."""
+    import geopandas as gpd
     import numpy as np
-    from shapely.geometry import LineString
+    from shapely.geometry import LineString, box as sbox
+
+    # The 5 m line is the shared inner-square edge, whole and merged; the outer boundary has one
+    # owner and yields nothing. A pinched-out band puts both skipped levels on one edge,
+    # coincident — never crossing. Two pieces of one band share no contour.
+    inner = sbox(2, 2, 8, 8)
+    g = gpd.GeoDataFrame({"drval1": [2.0, 5.0], "drval2": [5.0, 10.0]},
+                         geometry=[sbox(0, 0, 10, 10).difference(inner), inner])
+    lv = _level_lines(g, [2.0, 5.0, 10.0])
+    assert list(lv) == [5.0] and lv[5.0].length == inner.exterior.length, lv
+    left, right = sbox(0, 0, 1, 1), sbox(1, 0, 2, 1)
+    g = gpd.GeoDataFrame({"drval1": [2.0, 10.0], "drval2": [5.0, 20.0]},
+                         geometry=[left, right])
+    lv = _level_lines(g, [2.0, 5.0, 10.0, 20.0])
+    assert sorted(lv) == [5.0, 10.0] and lv[5.0].equals(lv[10.0]), lv
+    g = gpd.GeoDataFrame({"drval1": [2.0, 2.0], "drval2": [5.0, 5.0]},
+                         geometry=[left, right])
+    assert _level_lines(g, [2.0, 5.0]) == {}
+    # the drying bucket (negative drval1) beside the shoalest band yields the 0 m drying line
+    g = gpd.GeoDataFrame({"drval1": [-30.0, 0.0], "drval2": [0.0, 2.0]},
+                         geometry=[left, right])
+    assert list(_level_lines(g, [0.0, 2.0])) == [0.0]
     def ring(r, n=48):
         t = np.linspace(0, 2 * np.pi, n, endpoint=False)
         pts = [(r * np.cos(a), r * np.sin(a)) for a in t]
@@ -1144,9 +1144,6 @@ def _check():
     order = sorted(vector_covering_cells([a_stem, b_stem]))
     bases = [0] + [(i + 1) * ID_STRIDE for i in range(len(order))]
     assert all(b2 - b1 >= ID_STRIDE for b1, b2 in zip(bases, bases[1:])), bases
-    # navigable-band contours skip Chaikin (never bow a shoal deeper); deeper ones smooth
-    assert _chaikin_iters(10) == 0 and _chaikin_iters(NAV_SMOOTH_MAX_M) == 0
-    assert _chaikin_iters(NAV_SMOOTH_MAX_M + 1) == CHAIKIN_ITERATIONS
     # per-feature minzoom reproduces the CONTOUR_TIERS thinning (the leaf-safe replacement for -j).
     # A shallow metre curve only shows at native+ (last ceiling); a deep one from the first tier
     # shows at z0; a fathom curve is gated by depth like the deep metre ones.
@@ -1160,7 +1157,7 @@ def _check():
     assert 0 in config.CONTOUR_LEVELS, "the 0 m drying line must be a contoured level"
     # every tier level must exist in the generated contour set (else it gates nothing)
     assert all(d in config.CONTOUR_LEVELS for _, depths in CONTOUR_TIERS for d in depths)
-    print("contour_run ring-drop + minzoom self-check ok")
+    print("contour_run derivation + ring-drop + minzoom self-check ok")
 
 
 if __name__ == "__main__":

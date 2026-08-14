@@ -35,7 +35,8 @@ RASTER_MASK = [] if landmask.raster_path().startswith("/vsi") else [landmask.ras
 
 # depare rides only when SKIP_DEPARE is unset — an env gate, known at parse, so it decides which
 # depare rules even EXIST (an empty input list would break the bundle rules). The stem set behind
-# it is still checkpoint-derived (depare_stems()).
+# it is still checkpoint-derived (depare_stems()). Contour lines derive from the depare
+# partition, so SKIP_DEPARE skips the isobaths too.
 DEPARE = not os.environ.get("SKIP_DEPARE")
 
 
@@ -389,16 +390,17 @@ rule fork_window:
         "{PY}/smooth.py prepare-window {wildcards.stem} {output} 2> {log}"
 
 
+# Isobaths derive from the depare partition (shared band edges — see contour_run), so the rule
+# consumes the depare FGB, not the DEM window, and rides only when DEPARE is on.
 rule contour_tile:
     input:
-        window="store/window/{stem}.tif",
-        masks=MASKS,
+        depare="store/depare/{stem}.fgb",
     output:
         "store/contour/{stem}.fgb"
     params:
-        version=2, # increment to force a rebuild
+        version=3, # increment to force a rebuild
         levels=json.dumps({"m": pipeline_config.CONTOUR_LEVELS, "ft": pipeline_config.CONTOUR_LEVELS_FT}),
-        nav=contour_run.NAV_SMOOTH_MAX_M, deep=contour_run.DEEP_CUTOFF_M,
+        deep=contour_run.DEEP_CUTOFF_M,
         ring=contour_run.MIN_RING_AREA_M2,
     priority: vector_tile_priority  # vector band: drain before terrain so the bundle overlaps it
     retries: 2
@@ -507,7 +509,7 @@ rule terrain_render:
 # set is checkpoint-derived, so the input is a function (not a parse-time expand()).
 rule contours:
     input:
-        lambda wc: expand("store/contour/{stem}.fgb", stem=covering_stems())
+        lambda wc: expand("store/contour/{stem}.fgb", stem=depare_stems())
 
 
 rule soundings:
@@ -528,7 +530,7 @@ rule terrain:
 def tile_inputs(wc):
     """Everything cartographic per stem — the union the `tiles` target gates on (DEPARE rides
     only when enabled)."""
-    return (expand("store/contour/{stem}.fgb", stem=covering_stems())
+    return (expand("store/contour/{stem}.fgb", stem=depare_stems())
             + expand("store/soundings/{stem}.geojsons", stem=covering_stems())
             + expand("store/depare/{stem}.fgb", stem=depare_stems())
             + expand("store/pmtiles/{stem}.pmtiles", stem=render_stems()))
@@ -558,7 +560,7 @@ rule tiles:
 # (DEPARE). Always rebuilds — Snakemake owns freshness.
 rule vector_shallow:
     input:
-        contours=lambda wc: expand("store/contour/{stem}.fgb", stem=covering_stems()),
+        contours=lambda wc: expand("store/contour/{stem}.fgb", stem=depare_stems()),
         soundings=lambda wc: expand("store/soundings/{stem}.geojsons", stem=covering_stems()),
         depare=lambda wc: expand("store/depare/{stem}.fgb", stem=depare_stems()),
     output:
@@ -578,7 +580,8 @@ rule vector_shallow:
 
 rule vector_cell:
     input:
-        contours=lambda wc: expand("store/contour/{stem}.fgb", stem=vector_cells().get(wc.cell, [])),
+        contours=lambda wc: expand("store/contour/{stem}.fgb",
+                                   stem=(vector_cells().get(wc.cell, []) if DEPARE else [])),
         soundings=lambda wc: expand("store/soundings/{stem}.geojsons", stem=vector_cells().get(wc.cell, [])),
         depare=lambda wc: expand("store/depare/{stem}.fgb",
                                  stem=(vector_cells().get(wc.cell, []) if DEPARE else [])),
