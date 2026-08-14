@@ -33,15 +33,13 @@ semantics (drval1 < 0 / no drval1), not by sys, and showing them in both m and f
 needs no duplication. Halves their feature bytes vs a per-sys copy for identical pixels.
 Drying rides the metre pass only (the cap is a metre level) and is emitted once.
 
-gdal_contour -p buckets the same merged, smoothed DEM the contour lines trace, with the
-same contour generator — band edges and contour lines coincide by construction. No Chaikin
-and no per-feature shapely simplify: adjacent partitions share edges, and per-feature
-smoothing treats the shared chain differently in each polygon, opening see-through cracks
-between bands. Generalization is COVERAGE simplification instead (simplify_coverage), which
-simplifies each shared edge once, for both its owners, at the S-58 vertex floor. It selects a
-subset of the contour's own vertices, so the drawn line and the band edge stay pinned to the
-same points and part company by at most the tolerance — 1.1 m measured at cz15, against the
-1 MVT pixel tippecanoe already spends on every zoom below the leaf.
+gdal_contour -p buckets the merged, smoothed DEM; the contour LINES are then derived from
+these bands' shared edges (contour_run), so band edge and drawn isobath are the same
+polyline and can never cross. No Chaikin and no per-feature shapely simplify: adjacent
+partitions share edges, and per-feature smoothing treats the shared chain differently in
+each polygon, opening see-through cracks between bands. Generalization is COVERAGE
+simplification instead (simplify_coverage), which simplifies each shared edge once, for
+both its owners, at the S-58 vertex floor.
 
 Per tile: bands (gdal_contour -p at DEPARE_LEVELS / DEPARE_LEVELS_FT, drop land, drval/sys)
 + drying (the metre ladder's [0, DRYING_CAP] bucket ∩ effective water, drval1 < 0) + nodata

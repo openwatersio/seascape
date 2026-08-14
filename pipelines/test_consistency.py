@@ -43,10 +43,10 @@ What is asserted, and the bound each rests on:
   6. THE ISOBATH SEPARATES THE RASTER. The closed -5 m contour around the shoal encloses the
      shoal and excludes the basin, and the served raster is at-or-shallower than -5 m inside it
      and at-or-deeper outside — with a 2 px geometric margin (gdal_contour's sub-pixel
-     interpolation plus the 1 px simplify) and one quantization step of value slack.
+     interpolation plus the ~1 px coverage simplify) and one quantization step of value slack.
   7. LINE ON EDGE. The -5 m isobath and the 5 m depth-area edge are the same geometry to
-     CONTOUR_BAND_TOL_PX pixels — the line simplify (1 px) plus the coverage simplify
-     (DEPARE_SIMPLIFY_MM/MM_PER_PX = 1.07 px).
+     CONTOUR_BAND_TOL_PX — the line IS the band edge (derived from it, contour_run), so the
+     budget is only the 4326→3857 round trip of the write grid.
 
 6 and 7 are native-zoom only: the vectors are cut once at child_z and carry their own per-feature
 minzoom, so at the coarse zoom there is no re-derived line to compare and 4 is the whole claim.
@@ -119,8 +119,8 @@ CHANNEL_LINE_COL = 498.0          # the channel's centreline
 NOTCH_COLS = slice(496, 500)      # the OSM water gap in the land bar, one pixel clear of the cut
 
 CONTOUR_LEVEL = -5.0              # the closed isobath ringing the shoal
-GEOMETRY_TOL_PX = 2.0             # gdal_contour interpolates within a pixel; the refine simplifies 1 px
-CONTOUR_BAND_TOL_PX = 3.0         # + the coverage simplify (DEPARE_SIMPLIFY_MM / MM_PER_PX = 1.07 px)
+GEOMETRY_TOL_PX = 2.0             # gdal_contour interpolates within a pixel; the coverage simplify ~1 px
+CONTOUR_BAND_TOL_PX = 0.01        # the line IS the band edge; slack is the write grid round trip
 
 SWEEP_STRIDE_PX = 4               # native pixels between whole-raster samples
 
@@ -564,8 +564,8 @@ def main():
         terrain.render(stem)
         terrain.render(coarse)
         smooth.prepare_window(stem, f"store/window/{stem}.tif")
-        contour_run.tile(stem)
         depare_run.tile(stem)
+        contour_run.tile(stem)  # derives from the depare FGB, so depare must run first
 
         native = _served(f"store/pmtiles/{stem}.pmtiles")
         coarse_tiles = _served(f"store/pmtiles/{coarse}.pmtiles")

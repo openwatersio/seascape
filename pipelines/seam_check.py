@@ -1,7 +1,8 @@
 """Seam gate: verify contour and depth-area continuity across mosaic tile edges.
 
 The stage-3 forks each window one continuous mosaic through a BUFFERED read and restrict output to
-the unbuffered tile (see contour_run.tile / depare_run.tile). The promise of that buffer-input /
+the unbuffered tile (depare_run.tile; contour lines inherit the contract through the depare FGB
+they derive from). The promise of that buffer-input /
 restrict-output design is that adjacent tiles' lines and polygons meet EXACTLY at the shared tile
 boundary — no gap, no doubled line, no kink. This module checks that promise on a built store, so a
 regression in the windowing (wrong buffer, wrong clip, resolution slip at a hi-res/GEBCO boundary)
@@ -403,8 +404,8 @@ def auto():
         ok = _run_pair("contours", a, b)
         results.append((ok, "contours", a, b))
         failures += 0 if ok else 1
-        # depare only where both tiles have a depare output (a tile may be contour-only under
-        # SKIP_DEPARE) — a missing depare file is noted, not a failure.
+        # depare only where both tiles have a depare output (a partially built store) — a
+        # missing depare file is noted, not a failure.
         if os.path.exists(f"store/depare/{a}.fgb") and os.path.exists(f"store/depare/{b}.fgb"):
             ok = _run_pair("depare", a, b)
             results.append((ok, "depare", a, b))
