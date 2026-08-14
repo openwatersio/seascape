@@ -18,7 +18,7 @@ import urllib.request
 
 FEED = ("https://nedlasting.geonorge.no/geonorge/ATOM-feeds/"
         "SjoTerrengmodellerDTM50_AtomFeedTIFF.xml")
-LINK_RE = re.compile(r'<link\s+rel="alternate"\s+href="([^"]+\.zip)"')
+LINK_RE = re.compile(r'<link\b[^>]*href="([^"]+\.zip)"')
 
 
 def cell_urls(xml):
