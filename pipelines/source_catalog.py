@@ -140,7 +140,7 @@ def _crs_epsg(source, mixed_crs):
 
 def _datum(source):
     """The datum facts downstream reads: (negate, offset_m, clamp_positive, offset_surface,
-    corrected_fraction, dome_candidates).
+    corrected_fraction, dome_candidates, valid_range).
 
     ``negate`` is the one field with a machine consumer — aggregation_reproject flips band 1
     when it's true — so it must mean "negate at aggregation", which only a raw/streamed
@@ -163,9 +163,9 @@ def _datum(source):
         domes = d.get("dome_candidates")
         return (False, float(d.get("offset_m", 0.0)), bool(d.get("clamp_positive", False)),
                 d.get("offset_surface"), None if corrected is None else float(corrected),
-                None if domes is None else int(domes))
+                None if domes is None else int(domes), d.get("valid_range"))
     meta = config.load_metadata(source)
-    return bool(meta.get("negate", False)), 0.0, False, None, None, None
+    return bool(meta.get("negate", False)), 0.0, False, None, None, None, None
 
 
 def build_item(source, rows, recipe_hash=None):
@@ -174,7 +174,8 @@ def build_item(source, rows, recipe_hash=None):
     violated — a source can't register without a complete item."""
     meta = config.load_metadata(source)  # raises FileNotFoundError if absent
     bbox, file_count = _bbox_and_count(rows)
-    negate, offset_m, clamp_positive, offset_surface, datum_corrected, domes = _datum(source)
+    (negate, offset_m, clamp_positive, offset_surface, datum_corrected, domes,
+     valid_range) = _datum(source)
     producer = meta.get("producer")
     website = meta.get("website")
     return {
@@ -210,6 +211,7 @@ def build_item(source, rows, recipe_hash=None):
             "seascape:dome_candidates": domes,
             "seascape:negate": negate,  # negate at aggregation — false once baked at prep
             "seascape:clamp_positive": clamp_positive,
+            "seascape:valid_range": valid_range,  # the band prep voided outside, if declared
             "seascape:file_count": file_count,
             # The per-file registration (the retired bounds.csv absorbed): compact arrays in
             # the documented [filename, left, bottom, right, top, width, height] 3857 order.
