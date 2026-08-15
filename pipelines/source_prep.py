@@ -427,14 +427,68 @@ def _stage_netcdf(raw, root, url, seen, origin):
     return f"netCDF → {stem}.tif"
 
 
+# No real depth is 99 km. A grid declaring NODATA_value -9999 can still carry earlier vintages'
+# void markers as ordinary pixels (EA multibeam holds -99999, -999999 and -1e7 among its 0.5 m
+# soundings), and at that resolution a single one wins every merge it touches. Everything above
+# this floor is left alone — the declared value stays authoritative, and the positive outliers
+# the same sweep found are not provably markers.
+SENTINEL_FLOOR = -99999.0
+
+
+def _float32_inputs(ascs, label):
+    """The mosaic's inputs, with any non-Float32 grid promoted through a Float32 VRT.
+
+    gdalbuildvrt REFUSES to mix band types: it keeps the first file's type, SKIPS every input
+    that disagrees, and still exits 0 with only a warning. AAIGrid infers Int32 for a grid whose
+    every value is a bare integer — which is what an all-void EA member looks like — so one of
+    those sorting first pinned the VRT to Int32 and silently dropped the real Float32 soundings
+    beside it (3 of 5 members, 355,796 valid pixels, on TQ9015 alone). Promoting is a header
+    rewrite, no pixels copied."""
+    import rasterio
+    out, promoted = [], 0
+    for asc in ascs:
+        with rasterio.open(asc) as src:
+            if src.dtypes[0] == "float32":
+                out.append(asc)
+                continue
+        vrt = asc + ".f32.vrt"
+        utils.run_command(f"gdal_translate -q -of VRT -ot Float32 {asc} {vrt}", silent=True)
+        out.append(vrt)
+        promoted += 1
+    if promoted:
+        print(f"{label}: promoted {promoted}/{len(ascs)} asc tile(s) to Float32 "
+              "(gdalbuildvrt would have skipped them)")
+    return out
+
+
+def _mask_sentinels(tif, label):
+    """Void every pixel at or below SENTINEL_FLOOR, in place. Returns how many were masked."""
+    import rasterio
+    masked = 0
+    with rasterio.open(tif, "r+") as ds:
+        nodata = ds.nodata if ds.nodata is not None else -9999.0
+        for _, window in ds.block_windows(1):
+            block = ds.read(1, window=window)
+            hit = (block <= SENTINEL_FLOOR) & (block != nodata)
+            if hit.any():
+                block[hit] = nodata
+                ds.write(block, 1, window=window)
+                masked += int(hit.sum())
+    if masked:
+        print(f"{label}: voided {masked} pixel(s) at or below {SENTINEL_FLOOR:g} "
+              "(stray void markers, not soundings)")
+    return masked
+
+
 def _mosaic_asc(root, asc_dir, tif, label):
     """Mosaic the staged ESRI ASCII tiles into one GeoTIFF via a VRT (no -a_srs;
     source_normalize assigns the CRS from metadata), then drop the tiles."""
     import rasterio
     ascs = sorted(glob(f"{asc_dir}/*.asc"))
+    inputs = _float32_inputs(ascs, label)
     listfile = f"{root}/tiles.txt"
     with open(listfile, "w") as f:
-        f.write("\n".join(ascs) + "\n")
+        f.write("\n".join(inputs) + "\n")
     vrt = f"{os.path.splitext(tif)[0]}.vrt"
     print(f"{label}: mosaicking {len(ascs)} asc tile(s) -> {tif}")
     utils.run_command(f"gdalbuildvrt -overwrite -input_file_list {listfile} {vrt}", silent=False)
@@ -444,9 +498,11 @@ def _mosaic_asc(root, asc_dir, tif, label):
     with rasterio.open(vrt) as src:
         declared = src.nodata
     nodata_arg = "" if declared is not None else "-a_nodata -9999 "
+    # -ot Float32: depth is a float measurement, and an all-integer grid must not stage as one.
     utils.run_command(
-        f"gdal_translate -q -of GTiff {nodata_arg}-co TILED=YES -co COMPRESS=DEFLATE "
-        f"-co NUM_THREADS=ALL_CPUS {vrt} {tif}", silent=False)
+        f"gdal_translate -q -of GTiff -ot Float32 {nodata_arg}-co TILED=YES "
+        f"-co COMPRESS=DEFLATE -co NUM_THREADS=ALL_CPUS {vrt} {tif}", silent=False)
+    _mask_sentinels(tif, label)
     os.remove(vrt)
     os.remove(listfile)
     shutil.rmtree(asc_dir, ignore_errors=True)
@@ -583,7 +639,12 @@ def _check_raster(path):
 
 
 class CorruptStaged(Exception):
-    """A staged raster whose header parses but whose PIXELS are unreadable."""
+    """A staged raster whose header parses but whose PIXELS are unreadable. Carries the paths
+    already quarantined, so a pass over many files can report them as one list."""
+
+    def __init__(self, message, removed=()):
+        super().__init__(message)
+        self.removed = list(removed)
 
 
 def _raw_index(root, source):
@@ -651,8 +712,7 @@ def prep_file(tif, transform, negate, offset, clamp, surface, crs, nodata, raw_i
         # ONLY this: bad bytes, never a bad recipe. A value error, a missing nodata or an
         # unbuildable COG are all reasons to stop and fix the source, not to delete a download.
         removed = _quarantine(tif, raw_index)
-        raise CorruptStaged(f"unreadable pixels ({e}) — removed "
-                            f"{', '.join(removed) or 'nothing'}; the next run refetches") from e
+        raise CorruptStaged(f"{os.path.basename(tif)}: unreadable pixels ({e})", removed) from e
     return os.path.basename(tif), corrected, valid, flattened, domes
 
 
@@ -674,24 +734,48 @@ PROGRESS_EVERY = 25  # a listed source is ~1,000 files and hours long; log that 
 def _fan_out(source, tifs, workers, job):
     """Run `job(tif)` over every staged tif, `workers` at a time, and return the results in
     `tifs` order — the aggregates (coverage report, sidecar) must not depend on who finished
-    first. The first failure names its file and stops the source: a partially prepped source
-    that registered anyway would ship a datum-uncorrected tile as if it were corrected."""
+    first.
+
+    Two failure kinds, deliberately unalike. Any ordinary failure stops the source at the FIRST
+    one, by name: it means the recipe is wrong, every remaining file would fail the same way,
+    and a partially prepped source that registered anyway would ship a datum-uncorrected tile as
+    if it were corrected. A CorruptStaged does NOT stop the pass — its bytes are already
+    quarantined, and a volume can hold several truncated downloads (cudem had at least two), so
+    stopping at the first would cost one dispatch per bad file. Collect them all, then fail once
+    with the whole list."""
+    results, corrupt, done_n = {}, [], 0
+
+    def record(tif, call):
+        """Run one file, keeping a quarantined one out of the results without stopping."""
+        try:
+            results[tif] = call()
+        except CorruptStaged as e:
+            corrupt.append(e)
+
     if workers == 1:
-        return [job(tif) for tif in tifs]
-    results, done_n = {}, 0
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(job, tif): tif for tif in tifs}
-        for future in as_completed(futures):
-            tif = futures[future]
-            try:
-                results[tif] = future.result()
-            except BaseException as e:
-                for pending in futures:
-                    pending.cancel()
-                raise RuntimeError(f"{source}: {os.path.basename(tif)}: {e}") from e
-            done_n += 1
-            if len(tifs) >= PROGRESS_EVERY * 2 and done_n % PROGRESS_EVERY == 0:
-                print(f"{source}: prepped {done_n}/{len(tifs)} file(s)", flush=True)
+        for tif in tifs:
+            record(tif, lambda t=tif: job(t))
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(job, tif): tif for tif in tifs}
+            for future in as_completed(futures):
+                tif = futures[future]
+                try:
+                    record(tif, future.result)
+                except BaseException as e:
+                    for pending in futures:
+                        pending.cancel()
+                    raise RuntimeError(f"{source}: {os.path.basename(tif)}: {e}") from e
+                done_n += 1
+                if len(tifs) >= PROGRESS_EVERY * 2 and done_n % PROGRESS_EVERY == 0:
+                    print(f"{source}: prepped {done_n}/{len(tifs)} file(s)", flush=True)
+    if corrupt:
+        removed = [path for e in corrupt for path in e.removed]
+        raise CorruptStaged(
+            f"quarantined {len(corrupt)} unreadable file(s) — "
+            + "; ".join(str(e) for e in corrupt)
+            + f". Removed {len(removed)} path(s): {', '.join(removed)} — "
+            "the next run refetches them", removed)
     return [results[tif] for tif in tifs]
 
 
@@ -1252,9 +1336,13 @@ def _check():
         # its raw, not merely failed: staging validates by header-open, so these bytes get past
         # it every run, and _clear_stale re-links the staged copy from the same bad raw — the
         # source would fail identically forever. Removing the raw makes fetch_item reschedule.
+        # ONE pass heals EVERY corrupt file: a volume can hold several truncated downloads
+        # (cudem had at least two), and stopping at the first costs one dispatch per bad file.
         qid = "_prep_quarantine"
-        qu = "https://x/truncated.tif"
-        seed(qid, [qu], {"name": "Quarantine", "negate": True})  # negate: forces a pixel read
+        bad_urls = [f"https://x/truncated{i}.tif" for i in range(2)]
+        ok_urls = [f"https://x/whole{i}.tif" for i in range(2)]
+        qus = bad_urls + ok_urls
+        seed(qid, qus, {"name": "Quarantine", "negate": True})  # negate: forces a pixel read
         good = io.BytesIO()
         with rasterio.open(good, "w", driver="GTiff", height=256, width=256, count=1,
                            dtype="float32", nodata=-9999.0, crs="EPSG:4326",
@@ -1262,24 +1350,34 @@ def _check():
                            tiled=True, blockxsize=128, blockysize=128, compress="deflate") as dst:
             dst.write(np.full((256, 256), -5.0, dtype="float32"), 1)
         whole = good.getvalue()
-        staged_q = f"store/source/{qid}/{staged_name(qid, qu)}"
+        staged_of = {u: f"store/source/{qid}/{staged_name(qid, u)}" for u in qus}
         # Both fan-out paths: serial raises CorruptStaged bare, the pool re-raises it wrapped,
         # and only one of those was reaching the clean exit.
         for workers in (1, 4):
-            with open(raw_of(qid, qu), "wb") as f:
-                f.write(whole[:len(whole) // 2])  # header + directory survive, tile data does not
+            for u in bad_urls:  # header + directory survive, tile data does not
+                with open(raw_of(qid, u), "wb") as f:
+                    f.write(whole[:len(whole) // 2])
+            for u in ok_urls:
+                with open(raw_of(qid, u), "wb") as f:
+                    f.write(whole)
             try:
                 prep(qid, workers)
-                assert False, f"expected a truncated staged raster to exit (workers={workers})"
+                assert False, f"expected truncated staged rasters to exit (workers={workers})"
             except SystemExit as e:
-                assert "unreadable pixels" in str(e) and "refetches" in str(e), (workers, e)
-                assert staged_q in str(e) and raw_of(qid, qu) in str(e), (workers, e)
-            assert not os.path.exists(staged_q), (workers, "the staged copy must be quarantined")
-            assert not os.path.exists(raw_of(qid, qu)), (workers, "the raw behind it must go too")
-        # …and with the raw gone, the next prep asks for a refetch rather than repeating itself.
+                assert "quarantined 2 unreadable file(s)" in str(e), (workers, e)
+                assert "refetches" in str(e), (workers, e)
+                for u in bad_urls:  # every bad file named, not just the first to fail
+                    assert staged_of[u] in str(e) and raw_of(qid, u) in str(e), (workers, u, e)
+            for u in bad_urls:
+                assert not os.path.exists(staged_of[u]), (workers, u, "staged must be gone")
+                assert not os.path.exists(raw_of(qid, u)), (workers, u, "raw must be gone")
+            for u in ok_urls:  # the readable files still prepped, and keep their raws
+                assert os.path.exists(staged_of[u]), (workers, u, "good file must survive")
+                assert os.path.exists(raw_of(qid, u)), (workers, u, "good raw must survive")
+        # …and with the bad raws gone, the next prep asks for a refetch rather than repeating.
         try:
             prep(qid)
-            assert False, "expected the missing raw to exit"
+            assert False, "expected the missing raws to exit"
         except SystemExit as e:
             assert "missing" in str(e) and "fetch" in str(e), e
 
@@ -1406,6 +1504,57 @@ def _check():
             except SystemExit as e:
                 assert "more than once with different bytes" in str(e), e
                 assert "tg5702mb.asc" in str(e), e
+
+            # A grid declaring NODATA_value -9999 can still carry an older vintage's void
+            # marker as an ordinary pixel. At 0.5 m one of those wins every merge it touches,
+            # so anything at or below the sentinel floor is voided whatever the header says —
+            # while a merely deep value, and the unprovable positive outliers, are left alone.
+            sentid = "_prep_asc_sentinel"
+            sentu = "https://x/tiles/0.5/SS01"
+            seed(sentid, [sentu], {"name": "ASC sentinel", "unpack": "asc-tile",
+                                   "crs": "EPSG:27700"})
+            zb = io.BytesIO()
+            with zipfile.ZipFile(zb, "w") as z:
+                z.writestr("ss0102mb.asc",
+                           "ncols 2\nnrows 2\nxllcorner 0\nyllcorner 0\ncellsize 1\n"
+                           "NODATA_value -9999\n-999999 -5.5\n-99999 99\n")
+            with open(raw_of(sentid, sentu), "wb") as f:
+                f.write(zb.getvalue())
+            stage(sentid)
+            with rasterio.open(
+                    f"store/source/{sentid}/{staged_name(sentid, sentu, ext='tif')}") as src:
+                band = src.read(1)
+                assert band[0][0] == src.nodata, ("-999999 must be void", band)
+                assert band[1][0] == src.nodata, ("-99999 must be void", band)
+                assert band[0][1] == np.float32(-5.5), ("a real sounding survives", band)
+                assert band[1][1] == 99, ("a positive outlier is not provably a marker", band)
+
+            # AAIGrid reads a grid whose every value is a bare integer as Int32, and
+            # gdalbuildvrt SKIPS inputs whose type disagrees with the first file's — warning
+            # only, exit 0. An all-void integer member sorting first therefore used to drop
+            # every real Float32 grid beside it. Both must survive, as float32.
+            mixid = "_prep_asc_mixed_dtype"
+            mixu = "https://x/tiles/0.5/MX01"
+            seed(mixid, [mixu], {"name": "ASC mixed", "unpack": "asc-tile",
+                                 "crs": "EPSG:27700"})
+            zb = io.BytesIO()
+            with zipfile.ZipFile(zb, "w") as z:
+                z.writestr("mx0101mb.asc",  # sorts FIRST, all void, no decimal point anywhere
+                           "ncols 2\nnrows 2\nxllcorner 0\nyllcorner 0\ncellsize 1\n"
+                           "NODATA_value -9999\n-9999 -9999\n-9999 -9999\n")
+                z.writestr("mx0102mb.asc",  # the real soundings, float
+                           "ncols 2\nnrows 2\nxllcorner 2\nyllcorner 0\ncellsize 1\n"
+                           "NODATA_value -9999\n-3.25 -3.5\n-3.75 -4.0\n")
+            with open(raw_of(mixid, mixu), "wb") as f:
+                f.write(zb.getvalue())
+            stage(mixid)
+            with rasterio.open(
+                    f"store/source/{mixid}/{staged_name(mixid, mixu, ext='tif')}") as src:
+                assert src.dtypes[0] == "float32", src.dtypes
+                assert src.shape == (2, 4), (src.shape, "the float member must not be skipped")
+                got = src.read(1, masked=True)
+                assert got.count() == 4, (got.count(), "all four soundings survive")
+                assert float(got.min()) == -4.0 and float(got.max()) == -3.25, got
 
             # A grid that declares no NODATA_value at all still gets the -9999 fallback.
             nid = "_prep_asc_no_nodata"
