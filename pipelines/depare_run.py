@@ -533,9 +533,17 @@ class _RowSink:
     COORD_DECIMALS = 9
     # A repair may GROW a row's area (an invalid ring's shoelace cancels against itself) but must
     # never shrink it: a band or drying part that loses area on write leaves a hole in the chart,
-    # which is the unsafe direction, so the tile fails instead. Sized for float noise on a sum of
-    # degree squares, not for any real geometry.
-    REPAIR_MAX_AREA_LOSS = 1e-9
+    # which is the unsafe direction, so the tile fails instead. Compared PER ROW — across a batch,
+    # one row's growth pays for another's loss.
+    #
+    # ABSOLUTE (deg^2), not relative, because the repair's error is float64 noise on the
+    # COORDINATES and so does not scale with the row's area: measured worst case 3.5e-15 deg^2
+    # across 164 folded rows spanning 12 orders of area (Brittany + Gulf-marsh macrotiles). A
+    # relative gate is therefore both too tight on a sub-metre sliver and far too slack on a
+    # 232 km2 one. This floor is ~300x the observed noise and ~1e4x below the smallest part
+    # SLIVER_MIN_PX can admit (4 px ~ 91 m2 ~ 1.1e-8 deg^2), i.e. ~0.008 m2 of sensitivity on a
+    # row of any size.
+    REPAIR_MAX_AREA_LOSS_DEG2 = 1e-12
 
     def __init__(self, seq):
         self.seq = seq
@@ -552,6 +560,7 @@ class _RowSink:
             return
         import geopandas as gpd
         import numpy as np
+        import pandas as pd
         import shapely
         gdf = gpd.GeoDataFrame(self.pending, crs="EPSG:3857").to_crs("EPSG:4326")
         # Round to the write grid HERE, not in the driver, so what gets validated below is what
@@ -572,7 +581,7 @@ class _RowSink:
         ok = shapely.is_valid(geoms)
         if not ok.all():
             folded = np.flatnonzero(~ok)
-            before = float(shapely.area(geoms[folded]).sum())
+            before = shapely.area(geoms[folded])
             # method="structure", not the linework default: linework can return a
             # GeometryCollection whose polygonal member is itself a MultiPolygon, which ONE explode
             # leaves nested for the Polygon filter below to delete — silently, and in full.
@@ -586,12 +595,19 @@ class _RowSink:
             # keep_collapsed=False leaves a wholly collapsed ring as POLYGON EMPTY, which the
             # driver would write as a null geometry.
             gdf = gdf[(gdf.geom_type == "Polygon") & ~gdf.is_empty]
-            kept = gdf.index.isin(repaired)
-            after = float(shapely.area(gdf.geometry.to_numpy()[kept]).sum())
-            if after < before * (1 - self.REPAIR_MAX_AREA_LOSS):
+            # Each repaired row against ITS OWN pre-repair area: summed over the batch, a row whose
+            # shoelace cancelled and now measures its true area would pay for a row that lost its
+            # parts. Only the repaired rows are re-measured, so the bookkeeping stays off the
+            # thousands of rows the write leaves alone.
+            sub = gdf[gdf.index.isin(repaired)]
+            after = (pd.Series(shapely.area(sub.geometry.to_numpy()), index=sub.index)
+                     .groupby(level=0).sum().reindex(repaired, fill_value=0.0).to_numpy())
+            lost = np.flatnonzero(before - after > self.REPAIR_MAX_AREA_LOSS_DEG2)
+            if len(lost):
+                i = lost[0]
                 raise AssertionError(
-                    f"repairing {len(folded)} folded row(s) lost polygonal area: {before!r} -> "
-                    f"{after!r} deg^2")
+                    f"repairing row {repaired[i]} of {len(folded)} folded row(s) lost polygonal "
+                    f"area: {before[i]!r} -> {after[i]!r} deg^2")
             print(f"depare: repaired {len(folded)} row(s) the 4326 write folded", flush=True)
         gdf.to_file(self.seq, driver="GeoJSONSeq", mode="a" if self.count else "w",
                     COORDINATE_PRECISION=self.COORD_DECIMALS)
@@ -1032,10 +1048,45 @@ def _check():
             f"{_name}: the layer must stay uniformly non-empty polygon"
         assert abs(_got.area.sum() - _want) <= 1e-5 * _want, \
             f"{_name}: the sink wrote {_got.area.sum():.2f} m2 of a {_want:.2f} m2 batch"
-    # The guard on that loss trips on a dropped part and not on float noise.
-    _tol = _RowSink.REPAIR_MAX_AREA_LOSS
-    assert 0.0 < 1.0 * (1 - _tol) and not (1.0 - 1e-15) < 1.0 * (1 - _tol), \
-        "the repair area guard must reject a dropped part and tolerate float noise"
+    # The guard on that loss trips on a dropped part and not on the repair's own float noise, whose
+    # measured worst case over 164 real folded rows is 3.5e-15 deg^2 — and it stays that sensitive
+    # on a huge row, which is the point of an absolute floor.
+    _tol = _RowSink.REPAIR_MAX_AREA_LOSS_DEG2
+    assert 1.0 - 0.0 > _tol and 1.6e-2 - (1.6e-2 - 1.1e-8) > _tol, \
+        "the repair area guard must reject a dropped part, at any row size"
+    assert not 3.5e-15 > _tol, "the repair area guard must tolerate the repair's own float noise"
+    # And it is PER ROW. A pinch's shoelace cancels to 0 and repairs to its two real lobes, so it
+    # reads as growth; pair it with a folded row small enough that the growth covers the loss and
+    # the batch TOTAL never drops. Force that pairing — a lossy repair on the second folded row —
+    # and require the write to fail naming the row that lost, which only a per-row test can do.
+    _small = side / 4
+    _losing = Polygon([(x0, y0), (x0 + _small, y0), (x0 + _small, y0 + _small),
+                       (x0 + _small / 2 + eps, y0 + _small),
+                       (x0 + _small / 2, y0 + _small * 1.25),
+                       (x0 + _small / 2 - eps, y0 + _small), (x0, y0 + _small)])
+    assert _losing.area < fixtures["pinched"][1], \
+        "the losing row must be small enough that the pinch's growth hides it in the batch total"
+    _real_make_valid = shapely.make_valid
+    _seen = []
+
+    def _lose_the_second(geom, **kw):
+        _seen.append(geom)
+        return Polygon() if len(_seen) == 2 else _real_make_valid(geom, **kw)
+
+    shapely.make_valid = _lose_the_second
+    _raised = ""
+    try:
+        _d = tempfile.mkdtemp()
+        _sink = _RowSink(f"{_d}/rows.geojsons")
+        _sink.write([{"geometry": g, "drval1": -config.DRYING_CAP, "drval2": 0.0,
+                      "sys": None, "kind": None, "rank": DRYING_RANK}
+                     for g in (fixtures["pinched"][0], _losing)])
+    except AssertionError as e:
+        _raised = str(e)
+    finally:
+        shapely.make_valid = _real_make_valid
+    assert "lost polygonal area" in _raised and "row 1" in _raised, \
+        f"a repair that drops one row's parts must fail the write by row, got {_raised!r}"
 
     # ContourTimeout mapping: a bounded command that exceeds its budget must surface as
     # ContourTimeout (the tile's retry trigger), not a generic failure.
