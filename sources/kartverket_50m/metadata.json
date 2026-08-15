@@ -1,0 +1,8 @@
+{
+    "name": "Dybdedata terrengmodeller 50 m (Norway, Svalbard, Barents Sea)",
+    "producer": "Kartverket / MAREANO",
+    "website": "https://kartkatalog.geonorge.no/metadata/dybdedata-terrengmodeller-50-meters-grid/67a3a191-49cc-45bc-baf0-eaaf7c513549",
+    "license": "CC-BY 4.0",
+    "unpack": "zip:*.tif!1",
+    "datum": "sjøkartnull (LAT) inshore, middelvann (MSL) offshore; elevation, seafloor negative (like GEBCO) — no transform"
+}
