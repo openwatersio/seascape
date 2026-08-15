@@ -1,4 +1,5 @@
 {
+    "version": 2,
     "name": "Multibeam Bathymetry (England nearshore, 0.5 m)",
     "producer": "Environment Agency",
     "website": "https://www.data.gov.uk/dataset/52b3a813-69c6-4b6f-8684-fd0bdc4aa71b/multibeam-bathymetry",
