@@ -11,6 +11,9 @@ the per-source knobs that live in Justfile flags on the legacy chain:
                   separation (source_datum --offset-surface); names a raster in the datum
                   store, e.g. "navd88_chart" (config.DATUM_BUILDERS maps it to its composer)
   clamp_positive  drop cells above the water surface (source_datum --clamp-positive)
+  valid_range     [min, max] in the source's FINAL frame — values outside it are voided
+                  (source_datum --valid-range); the only defence against an upstream that
+                  ships impossible depths as ordinary data rather than as its nodata
   unpack          how to turn each raw asset into staged raster(s); absent = a bare
                   raster (see below)
 
@@ -491,6 +494,10 @@ def _mosaic_asc(root, asc_dir, tif, label):
         f.write("\n".join(inputs) + "\n")
     vrt = f"{os.path.splitext(tif)[0]}.vrt"
     print(f"{label}: mosaicking {len(ascs)} asc tile(s) -> {tif}")
+    # No -srcnodata: gdalbuildvrt already reads each member's OWN NODATA_value and masks it,
+    # while -srcnodata forces one value across every member — a member declaring -32768 then
+    # enters with its voids as ordinary -32768 readings. Measured both ways on members that
+    # disagree: the default masks all voids, -srcnodata leaks them in.
     utils.run_command(f"gdalbuildvrt -overwrite -input_file_list {listfile} {vrt}", silent=False)
     # Assign -9999 ONLY when the grids declare no NODATA_value of their own. -a_nodata relabels
     # without touching pixels, so forcing it over a grid that says -99999 (Litto3D) leaves every
@@ -597,7 +604,19 @@ def _unpack_one(unpack, raw, root, source, index, url, asc_dir, seen, origin):
     return _stage_netcdf(raw, root, url, seen, origin)  # fmt == "netcdf"
 
 
+def _staged_now(root):
+    """The staged rasters currently in the source dir, as basenames."""
+    return {os.path.basename(p) for p in glob(f"{root}/*.tif") + glob(f"{root}/*.tiff")}
+
+
 def stage(source):
+    """Materialize every raw, returning {staged basename: the raw path it came from}.
+
+    The map is built by diffing the directory around each unpack rather than by threading a
+    return value through every stager: an ARCHIVE member's staged name is invented by the
+    upstream, derivable from neither the item URL nor an inode (only a bare raster is a hardlink
+    to its raw). Without it a corrupt extracted member could be quarantined while its archive
+    survived, re-extracting the same bad bytes every run under a message promising a refetch."""
     root = f"store/source/{source}"
     spec = config.load_metadata(source).get("unpack")
     unpack = _parse_unpack(spec) if spec else None
@@ -606,11 +625,13 @@ def stage(source):
     asc_dir = f"{root}/asc"
     seen = set()  # staged basenames — collisions across raws/archives hard-error
     corrupt = []
+    produced = {}
     # `pos` (enumeration position) names archive scratch + the error origin only; staged
     # basenames derive from the item URL, and the raw itself lives at raw/<hash>.
     for pos, (h, url) in enumerate(hashes):
         raw = f"{root}/raw/{h}"
         origin = f"{source}[{pos}]"
+        before = _staged_now(root)
         try:
             note = _unpack_one(unpack, raw, root, source, pos, url, asc_dir, seen, origin)
         except _CORRUPT as e:
@@ -618,12 +639,18 @@ def stage(source):
             os.remove(raw)
             corrupt.append(h)
             continue
+        for name in _staged_now(root) - before:
+            produced[name] = raw
         print(f"{origin}: {note}")
     if corrupt:
         sys.exit(f"{source}: deleted {len(corrupt)} corrupt raw asset(s) {corrupt} — "
                  "rerun to refetch them")
     if os.path.isdir(asc_dir):  # asc-mosaic only — asc-tile mosaics per asset and cleans up
+        # Every raw fed this one mosaic, so no single raw owns it: quarantining it would have
+        # to delete the whole source's downloads, which is a decision for an operator.
         _mosaic_asc(root, asc_dir, f"{root}/{source}.tif", source)
+        produced.pop(f"{source}.tif", None)
+    return produced
 
 
 def _check_raster(path):
@@ -647,12 +674,14 @@ class CorruptStaged(Exception):
         self.removed = list(removed)
 
 
-def _raw_index(root, source):
+def _raw_index(root, source, staged_map=None):
     """(by-inode, by-name) lookups from a staged file back to the raw it came from.
 
     By inode is exact and needs no naming convention: a bare raster IS its raw, one hardlink to
-    one set of bytes. By name covers the modes that CONVERT, whose staged file is a fresh
-    inode — both names staging can give it, since asc-tile forces the .tif extension."""
+    one set of bytes. By name covers the modes that CONVERT, whose staged file is a fresh inode —
+    both names staging can give it, since asc-tile forces the .tif extension. ``staged_map``
+    (what stage() actually produced) covers the rest: an archive member's staged name comes from
+    the upstream and is derivable from neither, so it has to be observed, not computed."""
     by_inode, by_name = {}, {}
     for url in config.items(source):
         raw = f"{root}/raw/{config.item_hash(url)}"
@@ -662,6 +691,7 @@ def _raw_index(root, source):
         by_inode[(st.st_dev, st.st_ino)] = raw
         for name in (staged_name(source, url), staged_name(source, url, ext="tif")):
             by_name[name] = raw
+    by_name.update(staged_map or {})  # observed beats derived
     return by_inode, by_name
 
 
@@ -689,7 +719,8 @@ def _quarantine(tif, raw_index):
     return removed
 
 
-def prep_file(tif, transform, negate, offset, clamp, surface, crs, nodata, raw_index):
+def prep_file(tif, transform, negate, offset, clamp, surface, crs, nodata, valid_range,
+              raw_index):
     """One staged raster end to end: datum transform → compound-CRS flatten → normalize to a COG.
     The unit the pool fans out over, so it touches no file but its own — every step writes a
     sibling temp and os.replaces it, and rasterio's GDAL config Env is thread-local.
@@ -703,7 +734,8 @@ def prep_file(tif, transform, negate, offset, clamp, surface, crs, nodata, raw_i
             # Before the transform, not after: an offset surface is resampled onto this file's
             # own grid, which normalize would not have declared yet.
             assign_declared_crs(tif, crs)
-            corrected, valid, domes = transform_file(tif, negate, offset, clamp, surface)
+            corrected, valid, domes = transform_file(tif, negate, offset, clamp, surface,
+                                                     valid_range)
         # After the transform, which already reduces the CRS on the files it rewrites; this
         # catches the rest, so no staged raster reaches a warp carrying a vertical CRS.
         flattened = flatten_compound_crs(tif)
@@ -781,29 +813,34 @@ def _fan_out(source, tifs, workers, job):
 
 def prep(source, workers=DEFAULT_WORKERS):
     meta = config.load_metadata(source)
-    stage(source)
+    staged_map = stage(source)
     tifs = sorted(glob(f"store/source/{source}/*.tif"))  # staging canonicalizes .tiff -> .tif (ext_for)
 
     negate = bool(meta.get("negate", False))
     offset = float(meta.get("datum_offset_m", 0.0))
     clamp = bool(meta.get("clamp_positive", False))
     name = meta.get("offset_surface")
-    write_sidecar(source, negate, offset, clamp, name)  # even for a no-op: the catalog's invariant
+    band = meta.get("valid_range")
+    if band is not None and (len(band) != 2 or band[0] >= band[1]):
+        sys.exit(f"{source}: valid_range must be [min, max] with min < max, got {band}")
+    write_sidecar(source, negate, offset, clamp, name,  # even for a no-op: the catalog's invariant
+                  valid_range=band)
     surface = surface_path(name) if name else None
     if surface and not os.path.isfile(surface):
         sys.exit(f"{source}: offset surface {surface} is not in the store — "
                  f"build it with {config.datum_builder(name)}")
-    transform = bool(negate or offset or clamp or surface)
+    transform = bool(negate or offset or clamp or surface or band)
     if transform:
         print(f"{source}: datum negate={negate} offset={offset} surface={name} "
-              f"clamp_positive={clamp}")
+              f"clamp_positive={clamp} valid_range={band}")
     crs, nodata = meta.get("crs"), meta.get("nodata")
     print(f"{source}: prep {len(tifs)} file(s) on {workers} worker(s) "
           f"(crs={crs} nodata={nodata})", flush=True)
 
     job = functools.partial(prep_file, transform=transform, negate=negate, offset=offset,
                             clamp=clamp, surface=surface, crs=crs, nodata=nodata,
-                            raw_index=_raw_index(f"store/source/{source}", source))
+                            valid_range=band,
+                            raw_index=_raw_index(f"store/source/{source}", source, staged_map))
     try:
         per_file = _fan_out(source, tifs, workers, job)
     # A quarantined raw is an operational fact, not a stack trace: the source is red until the
@@ -821,7 +858,8 @@ def prep(source, workers=DEFAULT_WORKERS):
         # dome-candidate count, are only known once every file is transformed.
         write_sidecar(source, negate, offset, clamp, name,
                       coverage_report(source, [r[:3] for r in per_file]) if surface else None,
-                      dome_report(source, [(r[0], r[4]) for r in per_file]))
+                      dome_report(source, [(r[0], r[4]) for r in per_file]),
+                      valid_range=band)
     flattened = sum(r[3] for r in per_file)
     if flattened:
         print(f"{source}: dropped the vertical CRS from {flattened}/{len(tifs)} file(s)")
@@ -958,8 +996,8 @@ def _check():
         # metadata one is stamped on before the transform, so the detector can size itself in
         # metres and actually runs.
         assert sidecar == {"negate": True, "offset_m": -1.0, "clamp_positive": False,
-                           "offset_surface": None, "corrected_fraction": None,
-                           "dome_candidates": 0}, sidecar
+                           "offset_surface": None, "valid_range": None,
+                           "corrected_fraction": None, "dome_candidates": 0}, sidecar
         for name, want in (("a.tif", -6.0), ("b.tif", -11.0)):  # -(v) - 1
             with rasterio.open(f"store/source/{sid}/{name}") as src:
                 assert src.crs.to_epsg() == 28992, (name, src.crs)
@@ -1374,6 +1412,29 @@ def _check():
             for u in ok_urls:  # the readable files still prepped, and keep their raws
                 assert os.path.exists(staged_of[u]), (workers, u, "good file must survive")
                 assert os.path.exists(raw_of(qid, u)), (workers, u, "good raw must survive")
+        # An EXTRACTED member's staged name is the upstream's invention — no inode shared with
+        # the raw, no URL to derive it from — so the quarantine has to learn it from staging.
+        # Without that it deleted the tif and left the archive, which re-extracted the same bad
+        # bytes every run while the message promised a refetch.
+        zqid = "_prep_quarantine_zip"
+        zqu = "https://x/pack.zip"
+        seed(zqid, [zqu], {"name": "Quarantine zip", "unpack": "zip:*.tif", "negate": True})
+        zb = io.BytesIO()
+        with zipfile.ZipFile(zb, "w") as z:
+            z.writestr("inner/member.tif", whole[:len(whole) // 2])  # header ok, pixels cut
+        with open(raw_of(zqid, zqu), "wb") as f:
+            f.write(zb.getvalue())
+        staged_member = f"store/source/{zqid}/member.tif"
+        try:
+            prep(zqid, 1)
+            assert False, "expected a truncated extracted member to exit"
+        except SystemExit as e:
+            assert "quarantined 1 unreadable file(s)" in str(e), e
+            assert staged_member in str(e) and raw_of(zqid, zqu) in str(e), e
+        assert not os.path.exists(staged_member), "the staged member must go"
+        assert not os.path.exists(raw_of(zqid, zqu)), \
+            "the ARCHIVE behind it must go too, else it re-extracts forever"
+
         # …and with the bad raws gone, the next prep asks for a refetch rather than repeating.
         try:
             prep(qid)
@@ -1555,6 +1616,35 @@ def _check():
                 got = src.read(1, masked=True)
                 assert got.count() == 4, (got.count(), "all four soundings survive")
                 assert float(got.min()) == -4.0 and float(got.max()) == -3.25, got
+
+            # Voids must never enter the pixel values, and the mosaic must not let a later
+            # member's holes overpaint an earlier one's soundings — the shape EA ships when it
+            # packages one cell from two survey dates. This is the invariant the whole
+            # near-nodata question turns on, so it is pinned rather than assumed.
+            ovid = "_prep_asc_overlap"
+            ovu = "https://x/tiles/0.5/OV01"
+            seed(ovid, [ovu], {"name": "ASC overlap", "unpack": "asc-tile",
+                               "crs": "EPSG:27700"})
+            zb = io.BytesIO()
+            with zipfile.ZipFile(zb, "w") as z:
+                z.writestr("ov0101_20140101mb.asc",  # sorts first: real soundings
+                           "ncols 2\nnrows 2\nxllcorner 0\nyllcorner 0\ncellsize 1\n"
+                           "NODATA_value -9999\n-5.5 -6.5\n-7.5 -8.5\n")
+                z.writestr("ov0101_20140202mb.asc",  # sorts last, same ground, all void
+                           "ncols 2\nnrows 2\nxllcorner 0\nyllcorner 0\ncellsize 1\n"
+                           "NODATA_value -9999\n-9999 -9999\n-9999 -9999\n")
+            with open(raw_of(ovid, ovu), "wb") as f:
+                f.write(zb.getvalue())
+            stage(ovid)
+            with rasterio.open(
+                    f"store/source/{ovid}/{staged_name(ovid, ovu, ext='tif')}") as src:
+                got = src.read(1, masked=True)
+                assert got.count() == 4, (got.count(), "a later member's voids must not "
+                                          "overpaint an earlier member's soundings")
+                assert float(got.min()) == -8.5 and float(got.max()) == -5.5, got
+                # nothing may sit in the empty gap between the void marker and the real data
+                between = got[(got > src.nodata) & (got < -100)]
+                assert between.count() == 0, ("nodata blended into a neighbour", between)
 
             # A grid that declares no NODATA_value at all still gets the -9999 fallback.
             nid = "_prep_asc_no_nodata"
