@@ -241,7 +241,8 @@ def _scan_stripe(lead, held, trail, row_m, col_m):
                            row_m, col_m, core=(start, start + held[0].shape[0]))
 
 
-def transform_file(filepath, negate, offset, clamp_positive=False, surface=None):
+def transform_file(filepath, negate, offset, clamp_positive=False, surface=None,
+                   valid_range=None):
     """Rewrite one file with the value transform applied. Returns (pixels the reference
     actually corrected — 0 when no ``surface`` is given, valid pixels in the file,
     interpolation-dome candidates): the first pair's ratio is this file's datum coverage, the
@@ -250,7 +251,14 @@ def transform_file(filepath, negate, offset, clamp_positive=False, surface=None)
 
     The dome scan rides this pass rather than adding one of its own, so it needs the
     neighbourhood a stripe cuts through: each stripe is scored one iteration late, between the
-    tail of the stripe before it and the head of the one after."""
+    tail of the stripe before it and the head of the one after.
+
+    ``valid_range`` (min, max) voids everything outside the depths the source can physically
+    contain. It is the only defence against an upstream shipping impossible values as ORDINARY
+    data rather than as its declared nodata: EA multibeam carries -999, -9910, +99, +999 among
+    0.5 m soundings that really span -101..+3.2, and at that resolution one of them wins every
+    merge it touches. No global sentinel list can catch those safely — -999 m is a real depth
+    somewhere — so the band is declared per source, by whoever knows the survey."""
     ref = rasterio.open(surface) if surface else None
     if ref is not None and ref.nodata is not None and np.float32(ref.nodata) != ref.nodata:
         # reference_on honors src_nodata only when the sentinel round-trips float32 exactly
@@ -259,7 +267,7 @@ def transform_file(filepath, negate, offset, clamp_positive=False, surface=None)
         # height, so refuse it here rather than chart the coverage edge wrong.
         raise ValueError(f"{surface}: nodata {ref.nodata} is not float32-exact — "
                          "reference_on would interpolate it into the correction")
-    corrected = valid = 0
+    corrected = valid = ranged = 0
     try:
         with rasterio.open(filepath) as src:
             profile = src.profile
@@ -270,6 +278,8 @@ def transform_file(filepath, negate, offset, clamp_positive=False, surface=None)
             nodata = profile.get("nodata")
             if clamp_positive and nodata is None:
                 raise ValueError(f"{filepath}: --clamp-positive needs a nodata value set")
+            if valid_range is not None and nodata is None:
+                raise ValueError(f"{filepath}: valid_range needs a nodata value set")
             centre = (src.bounds.bottom + src.bounds.top) / 2
             metres = pixel_metres(crs, src.transform, centre)
             domes = 0 if metres else None
@@ -305,12 +315,23 @@ def transform_file(filepath, negate, offset, clamp_positive=False, surface=None)
                         drop = mask & (data > 0)
                         data[drop] = np.float32(nodata)
                         mask &= ~drop
+                    if valid_range is not None:
+                        # Last, so the band is read in the source's FINAL frame — the same
+                        # metres a chart would show, not the raw values it arrived with.
+                        low, high = valid_range
+                        out = mask & ((data < np.float32(low)) | (data > np.float32(high)))
+                        data[out] = np.float32(nodata)
+                        mask &= ~out
+                        ranged += int(out.sum())
                     dst.write(data, 1, window=window)
                     if metres:
                         domes += _scan_stripe(lead, held, (data, mask), *metres)
                         lead, held = held, (data, mask)
                 if metres:
                     domes += _scan_stripe(lead, held, None, *metres)
+        if ranged:
+            print(f"{os.path.basename(filepath)}: voided {ranged} px outside "
+                  f"valid_range {list(valid_range)}")
         os.replace(tmp, filepath)
     finally:
         if ref is not None:
@@ -378,7 +399,7 @@ def dome_report(source, per_file):
 
 
 def write_sidecar(source, negate, offset, clamp_positive, surface=None, corrected=None,
-                  domes=None):
+                  domes=None, valid_range=None):
     """Record the applied transform in store/source/<id>/datum.json — the machine-readable
     provenance source_catalog folds into the catalog item (vertical-datum offset was invisible
     downstream when it lived only in this CLI arg). Written whenever the step runs, so a source
@@ -396,6 +417,7 @@ def write_sidecar(source, negate, offset, clamp_positive, surface=None, correcte
         json.dump({"negate": bool(negate), "offset_m": float(offset),
                    "clamp_positive": bool(clamp_positive),
                    "offset_surface": name,
+                   "valid_range": None if valid_range is None else [float(v) for v in valid_range],
                    "corrected_fraction": None if corrected is None else round(corrected, 4),
                    "dome_candidates": None if domes is None else int(domes)},
                   f, indent=2)
@@ -413,13 +435,18 @@ def main():
     p.add_argument("--clamp-positive", action="store_true",
                    help="after the offset, drop cells > 0 (above the water surface) to nodata — "
                         "removes a lake DEM's land fringe / a topobathy playa")
+    p.add_argument("--valid-range", nargs=2, type=float, metavar=("MIN", "MAX"),
+                   help="void everything outside [MIN, MAX] in the source's final frame — for "
+                        "an upstream shipping impossible depths as ordinary data")
     a = p.parse_args()
 
     # Record what this invocation applies even when it's a no-op, so the sidecar exists for
     # every source whose recipe runs source_datum (source_catalog's invariant).
-    write_sidecar(a.source, a.negate, a.offset, a.clamp_positive, a.offset_surface)
+    write_sidecar(a.source, a.negate, a.offset, a.clamp_positive, a.offset_surface,
+                  valid_range=a.valid_range)
 
-    if not a.negate and a.offset == 0 and not a.clamp_positive and not a.offset_surface:
+    if (not a.negate and a.offset == 0 and not a.clamp_positive and not a.offset_surface
+            and not a.valid_range):
         print(f"{a.source}: no datum transform (negate=False, offset=0)")
         return
     surface = surface_path(a.offset_surface) if a.offset_surface else None
@@ -433,7 +460,7 @@ def main():
     for filepath in filepaths:
         per_file.append((os.path.basename(filepath),
                          *transform_file(filepath, a.negate, a.offset, a.clamp_positive,
-                                         surface)))
+                                         surface, a.valid_range)))
     write_sidecar(a.source, a.negate, a.offset, a.clamp_positive, a.offset_surface,
                   coverage_report(a.source, [r[:3] for r in per_file]) if surface else None,
                   dome_report(a.source, [(r[0], r[3]) for r in per_file]))
@@ -483,6 +510,38 @@ def _check():
         o2 = src.read(1)
     assert o2[0, 0] == -50.0 and o2[0, 1] == -10.0, o2  # bed kept
     assert o2[1, 0] == nodata and o2[1, 1] == nodata, o2  # +5 land clamped; nodata untouched
+
+    # valid_range: the upstream ladder (-999/-9910/+99/+999) voids, real soundings survive, and
+    # BOTH bounds are inclusive — a value exactly on the bound is inside the band, not outside.
+    path3 = os.path.join(d, "t3.tif")
+    arr3 = np.array([[-9910.0, -999.0, -101.0, -0.5],
+                     [999.0, 99.0, 3.2, nodata],
+                     [-200.0, 10.0, -200.001, 10.001]], dtype="float32")
+    with rasterio.open(path3, "w", driver="GTiff", height=3, width=4, count=1,
+                       dtype="float32", nodata=nodata, crs="EPSG:4326",
+                       transform=from_origin(0, 3, 1, 1)) as dst:
+        dst.write(arr3, 1)
+    transform_file(path3, negate=False, offset=0.0, valid_range=(-200.0, 10.0))
+    with rasterio.open(path3) as src:
+        o3 = src.read(1)
+    assert o3[0, 0] == nodata and o3[0, 1] == nodata, o3      # -9910, -999 voided
+    assert o3[0, 2] == -101.0 and o3[0, 3] == -0.5, o3        # the real distribution survives
+    assert o3[1, 0] == nodata and o3[1, 1] == nodata, o3      # +999, +99 voided
+    assert o3[1, 2] == np.float32(3.2) and o3[1, 3] == nodata, o3
+    assert o3[2, 0] == -200.0 and o3[2, 1] == 10.0, o3        # both bounds inclusive
+    assert o3[2, 2] == nodata and o3[2, 3] == nodata, o3      # just outside either bound voids
+
+    # The band is read in the source's FINAL frame, so it composes with the other knobs rather
+    # than racing them: negated depth lands inside a band expressed as elevation.
+    path4 = os.path.join(d, "t4.tif")
+    with rasterio.open(path4, "w", driver="GTiff", height=1, width=2, count=1,
+                       dtype="float32", nodata=nodata, crs="EPSG:4326",
+                       transform=from_origin(0, 1, 1, 1)) as dst:
+        dst.write(np.array([[50.0, 9999.0]], dtype="float32"), 1)  # positive-down depths
+    transform_file(path4, negate=True, offset=0.0, valid_range=(-200.0, 10.0))
+    with rasterio.open(path4) as src:
+        o4 = src.read(1)
+    assert o4[0, 0] == -50.0 and o4[0, 1] == nodata, o4
 
     # A bare name resolves in the datum store; a path is taken as given.
     assert surface_path("navd88_chart") == f"{DATUM_STORE}/navd88_chart.tif"

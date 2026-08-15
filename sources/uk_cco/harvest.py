@@ -13,6 +13,9 @@ HTTPS. Re-run when CCO publishes new surveys:
   python harvest.py <work_dir> --file-list   # rewrite file_list.txt from the manifest
   python harvest.py <work_dir> --repack      # rebuild the mirror from the retained order zips
                                              # (a change to what repack keeps, no re-download)
+  python harvest.py <work_dir> --recover     # promote the fallback surveys of squares whose
+                                             # newest survey turned out unlicensed, fetch only
+                                             # what no order zip holds, then rebuild
 
 CCO's catalog holds two separately licensed bodies of survey, so one harvest feeds two sources.
 `--doris` selects the DORIS grids — Crown Copyright, no <licence> element, reuse granted in the
@@ -47,6 +50,7 @@ Stdlib only, no pipeline coupling.
 """
 
 import collections
+import hashlib
 import html
 import http.client
 import http.cookiejar
@@ -61,6 +65,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from glob import glob
 
 BASE = "https://coastalmonitoring.org/cco/"
 TEST = BASE + "test.php"
@@ -235,19 +240,28 @@ def parse_rows(page):
     return rows
 
 
-def select(rows):
+def select(rows, refused=()):
     """One grid per OS 1 km square: the newest survey, and among same-date variants the
     largest. CCO registers many a filename under several survey records, and re-surveys
-    squares over the years; either would stack overlapping rasters inside one mosaic."""
+    squares over the years; either would stack overlapping rasters inside one mosaic.
+
+    `refused` names grids a previous pass's licence vetting rejected, and it is what keeps
+    "newest" from meaning "newest, licensed or not". Redistributability is a property of the
+    FGDC record INSIDE the download, so it cannot be known when the order is planned: picking
+    the newest survey blind and vetting afterwards silently drops a square whose latest survey
+    is unlicensed but whose earlier one is fine. Feeding the refusals back turns selection into
+    "the newest survey this square has that we may actually redistribute" — and a square whose
+    every survey has been refused drops out rather than being fetched again to be dropped again."""
     unique = {}
     for r in sorted(rows, key=lambda r: int(r["meta"])):
         unique.setdefault(r["name"].upper(), r)
-    best = {}
+    ranked = collections.defaultdict(list)
     for r in unique.values():
-        rank = (r["survey"], r["size"], -int(r["meta"]))
-        if r["sq"] not in best or rank > best[r["sq"]][0]:
-            best[r["sq"]] = (rank, r)
-    return sorted((v[1] for v in best.values()), key=lambda r: r["name"].upper())
+        if r["name"].upper() not in refused:
+            ranked[r["sq"]].append(r)
+    best = [max(rs, key=lambda r: (r["survey"], r["size"], -int(r["meta"])))
+            for rs in ranked.values()]
+    return sorted(best, key=lambda r: r["name"].upper())
 
 
 def tile5k(sq):
@@ -480,6 +494,79 @@ def repack(order_zip, groups, tiles, mirror_dir, manifest, dropped, edition=OGL_
     return written, sorted(set(want) - seen)
 
 
+def grid_index(work):
+    """{GRID NAME: (order zip, member, metadata member)} across every retained order zip.
+
+    Repacking per order assumes an asset's grids all arrived in the same download, which holds
+    for a fresh harvest — plan() never splits a 5 km square. It stops holding the moment a
+    delta fetch adds a fallback survey to a square whose other grids came down weeks earlier,
+    so a rebuild indexes the zips instead of trusting that correspondence."""
+    index = {}
+    for path in sorted(glob(f"{work}/orders/*.zip")):
+        with zipfile.ZipFile(path) as z:
+            names = z.namelist()
+            meta = {os.path.basename(n).upper(): n for n in names
+                    if "/metadata/" in n.lower() and n.lower().endswith(".xml")}
+            for n in names:
+                base = os.path.basename(n).upper()
+                if base.endswith(".ASC"):
+                    index.setdefault(base, (path, n, meta.get(base + ".XML")))
+    return index
+
+
+def rebuild(work, groups, edition, manifest, dropped):
+    """Repack every asset from the retained order zips, wherever each grid happens to live."""
+    index = grid_index(work)
+    mirror_dir = f"{work}/{edition.mirror}"
+    shutil.rmtree(mirror_dir, ignore_errors=True)
+    os.makedirs(mirror_dir, exist_ok=True)
+    written, missing, handles = [], [], {}
+    try:
+        for tile in sorted(groups):
+            assets = collections.defaultdict(list)
+            for r in sorted(groups[tile], key=lambda r: r["name"].upper()):
+                hit = index.get(r["name"].upper())
+                if hit is None:
+                    missing.append(r["name"])
+                    continue
+                path, member, xml_member = hit
+                if path not in handles:
+                    handles[path] = zipfile.ZipFile(path)
+                z = handles[path]
+                xml = z.read(xml_member).decode("utf-8", "replace") if xml_member else ""
+                with z.open(member) as f:
+                    cs = cellsize(f.read(HEADER_BYTES))
+                e = {"tile": tile, "name": os.path.basename(member), "itemnum": r["item"],
+                     "metadata_id": r["meta"], "size": r["size"], "survey": r["survey"],
+                     "cellsize": cs, "_zip": path, "_member": member, "_xml": xml_member,
+                     **licensing(xml)}
+                granted = edition.keep(e)
+                if granted is None:
+                    dropped.append({**public(e), "reason": edition.refusal})
+                elif cs is None:
+                    dropped.append({**public(e), "reason": "no cellsize in the AAIGrid header"})
+                else:
+                    e.update(granted)
+                    assets[res_class(cs)].append(e)
+            for res, keep in sorted(assets.items()):
+                asset = f"{tile}_{res:g}m"
+                tmp = f"{mirror_dir}/{asset}.zip.part"
+                with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as w:
+                    for e in keep:
+                        z = handles[e["_zip"]]
+                        w.writestr(e["name"], z.read(e["_member"]))
+                        if e["_xml"]:
+                            w.writestr("metadata/" + os.path.basename(e["_xml"]),
+                                       z.read(e["_xml"]))
+                        manifest.append({**public(e), "asset": asset, "resolution": res})
+                os.replace(tmp, f"{mirror_dir}/{asset}.zip")
+                written.append(asset)
+    finally:
+        for z in handles.values():
+            z.close()
+    return sorted(written), sorted(missing)
+
+
 def public(entry):
     """A manifest row — the entry without the archive-member bookkeeping."""
     return {k: v for k, v in entry.items() if not k.startswith("_")}
@@ -538,6 +625,98 @@ def write_file_list(assets, path, edition=OGL_EDITION):
         f.writelines(
             f"https://data.openwaters.io/bathymetry/mirror/{edition.source}/{a}.zip\n"
             for a in assets)
+
+
+def refused_names(work):
+    """Every grid that has been vetted and that no edition ships.
+
+    Not the intersection of the editions' refusals: an edition only ever vets what its own
+    selection asked for, so a grid missing from one edition's dropped list may simply never
+    have been offered to it, and reading that silence as approval empties the set. What a grid
+    is worth is settled by whether it reached A mirror, so refusal is `vetted minus shipped`."""
+    shipped, vetted = set(), set()
+    for e in (OGL_EDITION, DORIS_EDITION):
+        shipped |= {m["name"].upper() for m in load(f"{work}/{e.manifest}", [])}
+        vetted |= {d["name"].upper() for d in load(f"{work}/dropped_{e.source}.json", [])}
+    return vetted - shipped
+
+
+def recover(work, edition=OGL_EDITION):
+    """Fetch the fallback surveys the first pass never tried, then rebuild every asset.
+
+    A square whose newest survey turned out unlicensed shipped nothing, even where an older
+    licensed survey of the same ground exists. Re-selecting against the refusals promotes those
+    older surveys; only the ones no order zip already holds have to be fetched."""
+    rows = load(f"{work}/catalog.json", None)
+    if rows is None:
+        sys.exit(f"no catalog in {work} — run the harvest first")
+    refused = refused_names(work)
+    kept = select(rows, refused)
+    have = set(grid_index(work))
+    delta = [r for r in kept if r["name"].upper() not in have]
+    print(f"{len(refused)} refused grid(s); re-selected {len(kept)} square(s), "
+          f"{len(delta)} not yet downloaded ({sum(r['size'] for r in delta) / 1e9:.2f} GB)")
+    state = load(f"{work}/state.json", {"token": None, "orders": {}})
+    for batch in batches(delta, ORDER_BYTES):
+        # Name a recovery order after WHAT IT HOLDS, not its position in this run. Recovery is
+        # iterative — each pass promotes the fallbacks the last one's vetting refused — and a
+        # per-run counter would restart at 0 and mistake the previous pass's zip for this one's,
+        # skipping the fetch and rebuilding a mirror that silently lacks the grids.
+        key = hashlib.sha256(",".join(sorted(r["item"] for r in batch)).encode()).hexdigest()[:12]
+        st = state["orders"].setdefault(f"recover-{key}", {})
+        zip_path = f"{work}/orders/order_r{key}.zip"
+        if os.path.exists(zip_path):
+            continue
+        print(f"recovery order {key}: {len(batch)} grid(s), "
+              f"{sum(r['size'] for r in batch) / 1e9:.2f} GB declared")
+        if not st.get("token"):
+            s = Session()
+            st["before"] = (sorted(o for o, _ in orders_pending(s.get(state["token"])) if o)
+                            if state.get("token") else [])
+            st["token"] = state["token"] = place(s, batch)
+            save(f"{work}/state.json", state)
+            print(f"  requested → {st['token']}")
+        n_bytes = collect(st["token"], zip_path, st.get("before", []))
+        st["zip_bytes"] = n_bytes
+        save(f"{work}/state.json", state)
+        print(f"  downloaded {n_bytes / 1e6:.0f} MB")
+    groups, _ = plan(kept)
+    manifest, dropped = [], []
+    written, missing = rebuild(work, groups, edition, manifest, dropped)
+    save(f"{work}/{edition.manifest}", manifest)
+    save(f"{work}/dropped_{edition.source}.json", dropped)
+    if missing:
+        print(f"  WARNING: {len(missing)} selected grid(s) in no order zip")
+    report(edition, written, manifest, dropped, f"{work}/{edition.mirror}")
+    return written
+
+
+def batches(items, limit):
+    """Split items into order-sized runs of declared bytes."""
+    cur, curb = [], 0
+    for r in items:
+        if cur and curb + r["size"] > limit:
+            yield cur
+            cur, curb = [], 0
+        cur.append(r)
+        curb += r["size"]
+    if cur:
+        yield cur
+
+
+def report(edition, assets, manifest, dropped, mirror_dir):
+    print(f"{edition.source}: {len(assets)} asset(s), {len(manifest)} grid(s) in {mirror_dir}")
+    for text, n in collections.Counter(
+            e.get("licence") or "(none declared)" for e in manifest).most_common():
+        print(f"  licence {n:6d}  {text[:110]}")
+    for text, n in collections.Counter(e["reason"] for e in dropped).most_common():
+        print(f"  dropped {n:6d}  {text}")
+    for res, n in sorted(collections.Counter(e["resolution"] for e in manifest).items()):
+        print(f"  {res:g} m {n:6d} grid(s)")
+    mixed = collections.defaultdict(set)
+    for e in manifest:
+        mixed[e["tile"]].add(e["resolution"])
+    print(f"  {sum(1 for r in mixed.values() if len(r) > 1)} square(s) carry >1 resolution")
 
 
 def harvest(work, redo_repack=False, edition=OGL_EDITION):
@@ -606,23 +785,13 @@ def harvest(work, redo_repack=False, edition=OGL_EDITION):
         # The order zip stays: it is the only copy of the raw download, and a change to what
         # repack keeps would otherwise mean re-requesting every order from the server.
     assets = sorted(done_assets)
-    print(f"{edition.source}: {len(assets)} asset(s), {len(manifest)} grid(s) in {mirror_dir}")
-    for text, n in collections.Counter(
-            e.get("licence") or "(none declared)" for e in manifest).most_common():
-        print(f"  licence {n:6d}  {text[:110]}")
-    for text, n in collections.Counter(e["reason"] for e in dropped).most_common():
-        print(f"  dropped {n:6d}  {text}")
-    for res, n in sorted(collections.Counter(e["resolution"] for e in manifest).items()):
-        print(f"  {res:g} m {n:6d} grid(s)")
-    mixed = collections.defaultdict(set)
-    for e in manifest:
-        mixed[e["tile"]].add(e["resolution"])
-    multi = {t: sorted(r) for t, r in mixed.items() if len(r) > 1}
-    print(f"  {len(multi)} square(s) carry more than one resolution")
+    report(edition, assets, manifest, dropped, mirror_dir)
     return assets
 
 
 def _check():
+    import tempfile
+
     rows = [
         # the same filename registered under three survey records, plus older surveys and a
         # same-date variant grid of the same square
@@ -639,6 +808,26 @@ def _check():
     ]
     k = select(rows)
     assert [r["item"] for r in k] == ["5-4", "2-4"], k  # newest wins; ties go to the larger grid
+    # Licence is only knowable after the download, so a refused grid must let its square fall
+    # back to an older survey rather than the square shipping nothing.
+    fell_back = select(rows, refused={"TG5016_20250912MB.ASC"})
+    assert [r["item"] for r in fell_back] == ["5-4", "3-4"], fell_back
+    assert next(r for r in fell_back if r["sq"] == "TG5016")["survey"] == "20200101"
+    # a refusal must catch every registration of that filename, not just the one that was vetted
+    assert all(r["sq"] != "TG5016" for r in select(
+        rows, refused={"TG5016_20250912MB.ASC", "TG5016_20200101MB.ASC"})), "square must drop out"
+    # and refusing one square leaves the others exactly as they were
+    assert [r["item"] for r in select(rows, refused={"SM8941_20200920MB.ASC"})] == ["4-4", "2-4"]
+
+    # refused_names: a grid one edition dropped but the OTHER ships is not refused, while a
+    # grid an edition never selected must not read as approved just because it is absent there
+    with tempfile.TemporaryDirectory() as tmp:
+        save(f"{tmp}/{OGL_EDITION.manifest}", [{"name": "a.asc"}])
+        save(f"{tmp}/{DORIS_EDITION.manifest}", [{"name": "b.asc"}])
+        save(f"{tmp}/dropped_{OGL_EDITION.source}.json",
+             [{"name": "b.asc"}, {"name": "c.asc"}])   # b is DORIS's, c is nobody's
+        save(f"{tmp}/dropped_{DORIS_EDITION.source}.json", [{"name": "a.asc"}])
+        assert refused_names(tmp) == {"C.ASC"}, refused_names(tmp)
     assert tile5k("SZ0479") == "SZ0075" and tile5k("TF4590") == "TF4590"
     assert tile5k("NZ5934") == "NZ5530"
 
@@ -735,8 +924,6 @@ def _check():
 
     # repack against a synthetic order zip: a square surveyed at both 1 m and 2 m splits into
     # one asset per resolution, and a grid with no OGL grant never reaches the mirror
-    import tempfile
-
     def grid(res):
         return (f"ncols 4\nnrows 4\nxllcenter 0\nyllcenter 0\ncellsize {res}\n"
                 "nodata_value -9999\n" + "-1 -2 -3 -4\n" * 4).encode()
@@ -810,6 +997,32 @@ def _check():
         man, drop = [], []
         repack(order, {"SY6080": rs}, ["SY6080"], f"{tmp}/m2", man, drop, OGL_EDITION)
         assert [e["name"] for e in man] == ["SY6081_20090101mb.asc"], man
+
+    # rebuild() draws a square's grids from WHICHEVER order zip holds them — the case a delta
+    # fetch creates, where a promoted fallback survey arrives long after its neighbours.
+    with tempfile.TemporaryDirectory() as tmp:
+        os.makedirs(f"{tmp}/orders")
+        for i, n in enumerate(("TQ1000_20200101mb.asc", "TQ1001_20150101mb.asc")):
+            with zipfile.ZipFile(f"{tmp}/orders/order_{i:03d}.zip", "w") as w:
+                w.writestr(f"d/data/hydrographic/{n}", grid(1.0))
+                w.writestr(f"d/metadata/hydrographic/{n}.xml", fgdc(ogl))
+        idx = grid_index(tmp)
+        assert set(idx) == {"TQ1000_20200101MB.ASC", "TQ1001_20150101MB.ASC"}, idx
+        assert idx["TQ1000_20200101MB.ASC"][0] != idx["TQ1001_20150101MB.ASC"][0]
+        rs = [{"name": n, "item": "1-4", "meta": "1", "size": 1, "survey": n[7:15],
+               "sq": n[:6]} for n in ("TQ1000_20200101mb.asc", "TQ1001_20150101mb.asc")]
+        man, drop = [], []
+        written, missing = rebuild(tmp, {"TQ1000": rs}, OGL_EDITION, man, drop)
+        assert written == ["TQ1000_1m"] and missing == [], (written, missing)
+        assert sorted(e["name"] for e in man) == sorted(r["name"] for r in rs), man
+        with zipfile.ZipFile(f"{tmp}/mirror/TQ1000_1m.zip") as z:
+            assert len([n for n in z.namelist() if n.endswith(".asc")]) == 2, z.namelist()
+        # a selected grid no zip holds is reported, not silently skipped
+        man, drop = [], []
+        gone = rs + [{"name": "TQ1002_20200101mb.asc", "item": "9-4", "meta": "9", "size": 1,
+                      "survey": "20200101", "sq": "TQ1002"}]
+        _, missing = rebuild(tmp, {"TQ1000": gone}, OGL_EDITION, man, drop)
+        assert missing == ["TQ1002_20200101mb.asc"], missing
     print("harvest.py self-check ok")
 
 
@@ -818,8 +1031,8 @@ def main():
     if args[:1] == ["--check"]:
         return _check()
     if not args:
-        sys.exit(__doc__.strip().splitlines()[0]
-                 + "\n\nusage: harvest.py <work_dir> [--doris] [--file-list | --repack]")
+        sys.exit(__doc__.strip().splitlines()[0] + "\n\nusage: harvest.py <work_dir> "
+                 "[--doris] [--file-list | --repack | --recover]")
     work = args[0]
     edition = DORIS_EDITION if "--doris" in args else OGL_EDITION
     if "--file-list" in args:
@@ -827,6 +1040,8 @@ def main():
         if not manifest:
             sys.exit(f"no {edition.manifest} in {work} — run the harvest first")
         assets = sorted({e["asset"] for e in manifest})
+    elif "--recover" in args:
+        assets = recover(work, edition)
     else:
         assets = harvest(work, redo_repack="--repack" in args, edition=edition)
     # Each edition writes into its own source directory; they are siblings under sources/.
