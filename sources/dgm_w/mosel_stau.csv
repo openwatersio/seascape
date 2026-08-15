@@ -1,0 +1,25 @@
+# Mosel impounded-pool low-water datum: normal retention level (Stauziel / Oberwasser-Stauziel) per
+# barrage, in NHN. The canalised German Mosel (Koblenz km 1.9 → Palzem km 229.9) is a staircase of
+# twelve pools; each barrage holds the reach UPSTREAM of it at a fixed Stauziel. build_reference.py
+# (build_impounded) assigns each channel pixel the retention level of the barrage bounding its pool
+# downstream, by arc-length along mosel_centerline.wkt (Mosel-km runs the other way, low km = the
+# downstream Koblenz end — build_impounded infers direction from the falling levels).
+#
+# stauziel + km: German Wikipedia "Liste der Moselstaustufen" (Stauziel = Oberwasser above NN ≈ NHN),
+#   corroborated by the individual "Staustufe <name>" infoboxes. https://de.wikipedia.org/wiki/Liste_der_Moselstaustufen
+# lat,lon: the barrage/weir (WGS84). Cross-checked against PEGELONLINE ZS_I (mosel_zs.csv):
+#   Cochem km51.6 sits in Müden's pool (79.03 vs 79.00), Trier UP km195.3 in Detzem's (123.01 vs 123.00).
+# Not for navigation.
+barrage,km,lat,lon,stauziel_nhn_m
+Koblenz,1.90,50.36667,7.58250,65.05
+Lehmen,20.76,50.27472,7.46028,72.50
+Mueden,37.11,50.18472,7.33306,79.00
+Fankel,59.38,50.12417,7.22722,86.00
+St.Aldegund,78.37,50.08722,7.13611,93.00
+Enkirch,103.01,49.97667,7.12806,100.50
+Zeltingen,123.84,49.95083,7.02306,106.50
+Wintrich,141.48,49.87967,6.94806,114.00
+Detzem,166.18,49.81151,6.84531,123.00
+Trier,195.76,49.72812,6.62322,130.25
+Grevenmacher,212.83,49.67237,6.43830,136.50
+Palzem,229.86,49.56763,6.36527,140.50

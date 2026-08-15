@@ -1,27 +1,40 @@
-"""Build the SKN (chart datum) reference surface for the DGM-W tidal reaches.
+"""Build the low-water (chart datum) reference surface for the DGM-W waterways.
 
 Bespoke to this source, so it lives here rather than in pipelines/. The Snakefile's
 ``datum_surface_dgm_w`` rule runs it to compose ``store/datum/dgm_w_lowwater.tif`` — the height
 of the local low-water datum in NHN, which the prep subtracts from the NHN riverbed
 (``source_datum --offset-surface``) to get depth below low water.
 
-Tidal — Seekartennull (SKN ~= LAT): the BSH "SKN-Fläche Nordsee 2026" grid (CC-BY 4.0), fetched
-here, covers the sea/Watten/outer estuaries but stops at ~9.5 deg E; east of it the inner tidal
-Elbe (Hamburg reach to the Geesthacht weir) is filled from the per-gauge SKN values in
-``tideelbe_skn.csv`` via ``fill_corridor``: interpolate the per-gauge SKN along the gauge
-polyline and paint it into a corridor around the river (beyond the corridor stays nodata, so
-source_datum leaves those bed cells un-referenced and drops them). Interpolation is on arc-length
-along the gauge line, not river-km; for a monotonic profile between the same gauge anchors the
-two agree to a few cm — negligible against a datum that drifts ~0.02 m/km.
+Reaches by low-water regime, each built as its own GeoTIFF and merged onto the finest grid for
+the single raster the datum store expects:
 
-Refresh: re-download the BSH grid edition when BSH republishes; update tideelbe_skn.csv
-alongside it. Not for navigation.
+  1. **Tidal — Seekartennull (SKN ~= LAT)**, ``build_tidal`` → ``skn_reference.tif``. The BSH
+     "SKN-Fläche Nordsee 2026" grid (CC-BY 4.0), fetched here, covers the sea/Watten/outer estuaries
+     but stops at ~9.5 deg E; east of it the inner tidal Elbe is filled from the per-gauge SKN values
+     in ``tideelbe_skn.csv``, interpolated along the gauge line.
+
+  2. **Free-flowing — a low-water ramp**, ``build_freeflowing`` → ``ramp_<river>.tif``. Un-impounded
+     rivers slope continuously, so low water is interpolated along the gauges: GlW for the Rhein, MNW
+     (an open proxy for the un-published GlW) for the Elbe, Grenzoder and Ober-/Mittelweser.
+
+  3. **Impounded — a Stauziel step**, ``build_main`` / ``build_rhein_upper`` / ``build_impounded`` →
+     ``zs_<river>.tif``. Canalised rivers are a staircase of pools, each flat at its barrage's
+     retention level; a pixel takes the level of the barrage bounding its pool downstream (Main via
+     weir lines, upper Rhein via latitude, Mosel/Saar/Lahn via arc-length along the centerline).
+
+All fills share ``fill_corridor``: paint a value into a corridor around the river (beyond it stays
+nodata, so source_datum leaves those bed cells un-referenced and drops them). Gauge datums come from
+``harvest_gauges.py`` (PEGELONLINE); river geometry from ``build_geometry.py`` (Overture Maps).
+
+Refresh: re-download the BSH grid edition and re-run harvest_gauges.py / build_geometry.py when
+BSH/GDWS/WSV/Overture republish; update tideelbe_skn.csv alongside the BSH grid. Not for navigation.
 """
 
 import argparse
 import csv
 import os
 import shutil
+import subprocess
 import zipfile
 
 import numpy as np
@@ -34,9 +47,25 @@ BSH_ZIP = "https://gdi.bsh.de/de/data/Chart-datum-for-the-German-Bight-2026.zip"
 BSH_MEMBER = "SKN-Flaeche_Nordsee_2026_NHN.tif"
 HERE = os.path.dirname(__file__)
 ELBE_CSV = os.path.join(HERE, "tideelbe_skn.csv")
+MAIN_ZS_CSV = os.path.join(HERE, "main_zs.csv")
+MAIN_STAU_CSV = os.path.join(HERE, "main_stau.csv")
+MAIN_CENTERLINE_WKT = os.path.join(HERE, "main_centerline.wkt")
+RHEIN_STAU_CSV = os.path.join(HERE, "rhein_stau.csv")
+RHEIN_CENTERLINE_WKT = os.path.join(HERE, "rhein_centerline.wkt")
 
 CORRIDOR_DEG = 0.06   # ~6 km: only fill cells this close to the gauge line (keeps it to the river)
+MAIN_CORRIDOR = 0.015  # ~1.5 km: the Main is a narrow river — hug it (the estuary width isn't needed)
+RHEIN_UP_CORRIDOR = 0.02  # ~2 km: the upper Rhein channel/braids are wider than the Main
 EAST_MARGIN = 0.25    # extend the SKN canvas this far east of the most-upstream inner-Elbe gauge
+REACH_RES = 0.001     # ~110 m: a smooth ramp / flat pools resample cleanly onto 2 m tiles
+REACH_NODATA = -9999.0
+
+# Regime boundaries. The reach merge is last-wins where corridors overlap, and the free-flowing
+# ramps are painted after the tidal/Stauziel surfaces, so each ramp must stop at its boundary or
+# it overrides the neighbouring regime (a clamped-endpoint GlW over the Iffezheim pools misses by
+# 20 m+; MNW over tidal SKN reads metres too deep).
+IFFEZHEIM_LAT = 48.8312    # Iffezheim barrage (rhein_stau.csv): ramp north of it, Stauziel south
+GEESTHACHT_LON = 10.334765  # Geesthacht weir (tideelbe_skn.csv anchor): ramp east of it, SKN west
 
 
 def read_gauges(path, value_col):
@@ -46,6 +75,19 @@ def read_gauges(path, value_col):
         for r in csv.DictReader(line for line in f if not line.lstrip().startswith("#")):
             rows.append((float(r["lon"]), float(r["lat"]), float(r[value_col]), float(r["km"])))
     return sorted(rows, key=lambda g: -g[3])
+
+
+def read_barrages(path):
+    """[{km, stau, weir}] sorted by km, from main_stau.csv. weir is ((lon1,lat1),(lon2,lat2)) —
+    the channel-crossing weir line used as the pool divider — or None where OSM has no weir way."""
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        for r in csv.DictReader(line for line in f if not line.lstrip().startswith("#")):
+            weir = None
+            if r.get("lon1", "").strip():
+                weir = ((float(r["lon1"]), float(r["lat1"])), (float(r["lon2"]), float(r["lat2"])))
+            rows.append({"km": float(r["km"]), "stau": float(r["stauziel_nhn_m"]), "weir": weir})
+    return sorted(rows, key=lambda b: b["km"])
 
 
 def _spine(gauges):
@@ -75,21 +117,26 @@ def fill_corridor(out, nodata, west, north, xres, yres, line, value_at, corridor
         near = shapely.distance(pts, line) < corridor_deg
         if not near.any():
             continue
-        proj = shapely.line_locate_point(line, pts[near])
+        # arc-length along the spine (only the ramp reaches need it; a MultiLineString corridor
+        # geometry — the Main's real centerline — has no single arc-length, and value_at ignores it)
+        proj = shapely.line_locate_point(line, pts[near]) if line.geom_type == "LineString" \
+            else np.zeros(int(near.sum()))
         out[row, need[near]] = value_at(proj, plon[near], np.full(int(near.sum()), lats[row])).astype("float32")
 
 
-def build_tidal(ref_path):
-    """SKN surface: BSH grid (west) + inner-Elbe gauge corridor (east) -> ref_path."""
+def build_tidal(out_dir):
+    """SKN surface: BSH grid (west) + inner-Elbe gauge corridor (east) -> skn_reference.tif."""
+    ref_path = f"{out_dir}/skn_reference.tif"
+
     # BSH SKN grid — stream the zip to disk and copy the NHN member out, so memory stays
     # bounded regardless of the grid edition's size (no cached upstream archive)
-    zip_path = f"{ref_path}.bsh.zip"
+    zip_path = f"{out_dir}/_skn_bsh.zip"
     with requests.get(BSH_ZIP, stream=True, timeout=120) as r:
         r.raise_for_status()
         with open(zip_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=1 << 20):
                 f.write(chunk)
-    bsh_path = f"{ref_path}.bsh.tif"
+    bsh_path = f"{out_dir}/_skn_bsh.tif"
     with zipfile.ZipFile(zip_path) as z:
         with z.open(BSH_MEMBER) as m, open(bsh_path, "wb") as f:
             shutil.copyfileobj(m, f)
@@ -127,12 +174,266 @@ def build_tidal(ref_path):
     return ref_path
 
 
+def _corridor_reach(spine_pts, value_at_factory, ref_path, label, corridor_deg=CORRIDOR_DEG):
+    """Fill a corridor reference raster sized to the spine bbox. value_at_factory(line, gdist)
+    returns the value_at(arc_length, lon, lat) function; corridor_deg hugs narrow rivers tighter."""
+    lons_g = [p[0] for p in spine_pts]
+    lats_g = [p[1] for p in spine_pts]
+    west = min(lons_g) - corridor_deg - REACH_RES
+    north = max(lats_g) + corridor_deg + REACH_RES
+    width = int(np.ceil((max(lons_g) + corridor_deg - west) / REACH_RES))
+    height = int(np.ceil((north - (min(lats_g) - corridor_deg)) / REACH_RES))
+
+    out = np.full((height, width), REACH_NODATA, dtype="float32")
+    line, gdist = _spine(spine_pts)
+    fill_corridor(out, REACH_NODATA, west, north, REACH_RES, -REACH_RES, line,
+                  value_at_factory(line, gdist), corridor_deg)
+
+    prof = dict(driver="GTiff", dtype="float32", count=1, width=width, height=height,
+                crs="EPSG:4326", nodata=REACH_NODATA,
+                transform=rasterio.transform.from_origin(west, north, REACH_RES, REACH_RES),
+                compress="deflate", tiled=True, blockxsize=512, blockysize=512)
+    with rasterio.open(ref_path, "w", **prof) as dst:
+        dst.write(out, 1)
+    valid = out[out != REACH_NODATA]
+    print(f"wrote {ref_path}: {width}x{height}, {label} "
+          f"{valid.min():.2f}..{valid.max():.2f} m over {valid.size:,} cells ({len(spine_pts)} spine pts)")
+    return ref_path
+
+
+def build_freeflowing(out_dir, name, gauge_csv, river_wkt, corridor, label,
+                      lat_range=None, lon_min=None):
+    """Ramp surface for a free-flowing river: a low-water datum interpolated along the gauges and
+    filled over the OSM river corridor.
+
+    The corridor is the river union (``river_wkt``), NOT the gauge polyline: gauges are ~30 km apart,
+    so a corridor around their chord misses the wide outer channel at the big meanders (the Rhein's
+    Düsseldorf/Kaiserswerth bends) and the river there falls outside the mask. The value is still the
+    gauge ramp — each pixel projected onto the gauge line, the datum linearly interpolated by
+    arc-length (low water drifts ~0.02 m/km, so the coarse chord is fine for the *value*; only the
+    fill needed the river). Used for both the Rhein (GlW) and the Elbe (MNW proxy for the un-published
+    GlW), the un-impounded reaches (Rhein, Elbe, Oder)."""
+    gauges = read_gauges(gauge_csv, "datum_nhn_m")
+    gline, gdist = _spine(gauges)
+    gval = np.array([g[2] for g in gauges])
+
+    def value_at(proj, plon, plat):  # interp the datum at each pixel's projection onto the gauge line
+        s = np.asarray(shapely.line_locate_point(gline, points(np.column_stack([plon, plat]))))
+        return np.interp(s, gdist, gval)
+
+    river = shapely.from_wkt(open(river_wkt, encoding="utf-8").read())
+    return _paint_corridor(river, value_at, corridor, f"{out_dir}/ramp_{name}.tif",
+                           label, f"{len(gauges)} gauges", lat_range=lat_range, lon_min=lon_min)
+
+
+def build_main(out_dir):
+    """Stauziel surface: impounded Main as pool steps divided at the actual weirs -> zs_main.tif.
+
+    Pool levels come from the complete per-barrage Stauziel table (main_stau.csv), since the DEM
+    reach has more pools than PEGELONLINE gauges; the gauges (main_zs.csv) are only a cross-check.
+    Each barrage's OSM weir line is the exact pool divider — a pixel takes the Stauziel of the
+    barrage whose weir is immediately downstream of it (the count of weir lines it lies upstream of).
+    The corridor follows the real OSM Main centerline (main_centerline.wkt) so it hugs every meander
+    rather than a coarse gauge chord that the river escapes at bends."""
+    gauges = read_gauges(MAIN_ZS_CSV, "datum_nhn_m")
+    barrages = read_barrages(MAIN_STAU_CSV)
+    bkm = np.array([b["km"] for b in barrages])
+    ball = np.array([b["stau"] for b in barrages])
+
+    def stau_at_km(km):  # cross-check helper: pool level by km
+        return ball[np.clip(np.searchsorted(bkm, km, side="right") - 1, 0, len(bkm) - 1)]
+
+    for lon, lat, zs_i, km in gauges:  # each gauge's ZS_I must match its pool's Stauziel
+        assert abs(zs_i - stau_at_km(km)) < 0.15, \
+            f"main gauge km{km} ZS_I {zs_i} != pool Stauziel {stau_at_km(km):.2f} — stale table?"
+
+    center = shapely.from_wkt(open(MAIN_CENTERLINE_WKT, encoding="utf-8").read())
+
+    # one divider per barrage weir in the DEM reach; the upstream side is the one toward the next
+    # barrage upstream (its weir midpoint), so no river-km projection or spine is needed.
+    div = [b for b in barrages if b["weir"] and b["km"] <= 105]
+    mids = [np.array([(b["weir"][0][0] + b["weir"][1][0]) / 2,
+                      (b["weir"][0][1] + b["weir"][1][1]) / 2]) for b in div]
+    dividers, dstau = [], []
+    for i, b in enumerate(div):
+        a, bb = np.array(b["weir"][0]), np.array(b["weir"][1])
+        up = mids[i + 1] if i + 1 < len(div) else mids[i] + (mids[i] - mids[i - 1])
+        d = bb - a
+        dividers.append((a, bb, np.sign(d[0] * (up[1] - a[1]) - d[1] * (up[0] - a[0]))))
+        dstau.append(b["stau"])
+    dstau = np.array(dstau)
+
+    def value_at(proj, plon, plat):
+        n_up = np.zeros(plon.shape)
+        for a, bb, usign in dividers:
+            d = bb - a
+            n_up += np.sign(d[0] * (plat - a[1]) - d[1] * (plon - a[0])) == usign
+        idx = n_up.astype(int) - 1
+        # below the first weir (n_up == 0) no pool holds the level — leave nodata, the Rhein
+        # backwater there is the ramp's territory
+        return np.where(idx < 0, np.float32(REACH_NODATA),
+                        dstau[np.clip(idx, 0, len(dividers) - 1)])
+
+    w, s, e, n = center.bounds
+    west, north = w - MAIN_CORRIDOR - REACH_RES, n + MAIN_CORRIDOR + REACH_RES
+    width = int(np.ceil((e + MAIN_CORRIDOR - west) / REACH_RES))
+    height = int(np.ceil((north - (s - MAIN_CORRIDOR)) / REACH_RES))
+    out = np.full((height, width), REACH_NODATA, dtype="float32")
+    fill_corridor(out, REACH_NODATA, west, north, REACH_RES, -REACH_RES, center, value_at, MAIN_CORRIDOR)
+
+    ref_path = f"{out_dir}/zs_main.tif"
+    prof = dict(driver="GTiff", dtype="float32", count=1, width=width, height=height, crs="EPSG:4326",
+                nodata=REACH_NODATA, transform=rasterio.transform.from_origin(west, north, REACH_RES, REACH_RES),
+                compress="deflate", tiled=True, blockxsize=512, blockysize=512)
+    with rasterio.open(ref_path, "w", **prof) as dst:
+        dst.write(out, 1)
+    valid = out[out != REACH_NODATA]
+    print(f"wrote {ref_path}: {width}x{height}, Stauziel-in-NHN "
+          f"{valid.min():.2f}..{valid.max():.2f} m over {valid.size:,} cells ({len(dividers)} pools)")
+    return ref_path
+
+
+def _paint_corridor(center, value_at, corridor, ref_path, label, tail, lat_range=None, lon_min=None):
+    """Rasterize value_at over a corridor around `center` onto a bbox-sized EPSG:4326 grid (nodata
+    outside the corridor). `center` may be a LineString (fill_corridor then passes each pixel's
+    arc-length as proj) or a MultiLineString (proj is 0; value_at must key off lon/lat). `tail` is
+    a short count string for the log line (e.g. "10 pools"). `lat_range`/`lon_min` bound the paint
+    at a regime boundary (see IFFEZHEIM_LAT / GEESTHACHT_LON)."""
+    w, s, e, n = center.bounds
+    west, north = w - corridor - REACH_RES, n + corridor + REACH_RES
+    width = int(np.ceil((e + corridor - west) / REACH_RES))
+    height = int(np.ceil((north - (s - corridor)) / REACH_RES))
+    out = np.full((height, width), REACH_NODATA, dtype="float32")
+    col0 = max(0, int((lon_min - west) / REACH_RES)) if lon_min is not None else 0
+    fill_corridor(out, REACH_NODATA, west, north, REACH_RES, -REACH_RES, center, value_at, corridor,
+                  lat_range=lat_range, col0=col0)
+    prof = dict(driver="GTiff", dtype="float32", count=1, width=width, height=height, crs="EPSG:4326",
+                nodata=REACH_NODATA, transform=rasterio.transform.from_origin(west, north, REACH_RES, REACH_RES),
+                compress="deflate", tiled=True, blockxsize=512, blockysize=512)
+    with rasterio.open(ref_path, "w", **prof) as dst:
+        dst.write(out, 1)
+    valid = out[out != REACH_NODATA]
+    print(f"wrote {ref_path}: {width}x{height}, {label} "
+          f"{valid.min():.2f}..{valid.max():.2f} m over {valid.size:,} cells ({tail})")
+    return ref_path
+
+
+def build_rhein_upper(out_dir):
+    """Stauziel surface: the impounded upper Rhein (Basel→Iffezheim) as pool steps -> zs_rhein.tif.
+
+    Ten barrages from Kembs to Iffezheim hold a staircase of pools, each at its barrage's normal
+    retention level (rhein_stau.csv). Unlike the Main, no weir lines are needed: this reach flows
+    due north, so the barrage latitudes (strictly increasing downstream) are the pool dividers — a
+    pixel takes the retention level of the first barrage at or north of it. The corridor follows the
+    OSM navigation centerline (rhein_centerline.wkt: Grand Canal d'Alsace + canalised Rhine), which
+    keeps the fill on the impounded channel and off the low Restrhein running alongside it."""
+    barrages = []
+    with open(RHEIN_STAU_CSV, encoding="utf-8") as f:
+        for r in csv.DictReader(line for line in f if not line.lstrip().startswith("#")):
+            barrages.append((float(r["lat"]), float(r["stauziel_nhn_m"])))
+    barrages.sort()  # by latitude = upstream -> downstream
+    blat = np.array([b[0] for b in barrages])
+    blev = np.array([b[1] for b in barrages])
+    assert (np.diff(blat) > 0).all(), "barrage latitudes must strictly increase downstream"
+
+    def value_at(proj, plon, plat):  # first barrage at/north of the pixel -> its pool's Stauziel
+        idx = np.searchsorted(blat, plat, side="left")
+        # north of Iffezheim no pool holds the level — leave nodata, the GlW ramp's territory
+        return np.where(idx >= len(blat), np.float32(REACH_NODATA), blev[np.minimum(idx, len(blat) - 1)])
+
+    center = shapely.from_wkt(open(RHEIN_CENTERLINE_WKT, encoding="utf-8").read())
+    return _paint_corridor(center, value_at, RHEIN_UP_CORRIDOR,
+                           f"{out_dir}/zs_rhein.tif", "Stauziel-in-NHN", f"{len(barrages)} pools")
+
+
+def _read_stau_csv(path):
+    """[(km, lat, lon, level_nhn)] from a barrage/weir CSV (columns km, lat, lon, stauziel_nhn_m)."""
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        for r in csv.DictReader(line for line in f if not line.lstrip().startswith("#")):
+            rows.append((float(r["km"]), float(r["lat"]), float(r["lon"]), float(r["stauziel_nhn_m"])))
+    return rows
+
+
+def build_impounded(out_dir, name, corridor_wkt, centerline_wkt, stau_csv, corridor, zs_csv=None):
+    """Stauziel surface for a canalised river: pool steps assigned by arc-length along the river.
+
+    The general form of build_main/build_rhein_upper, for a river of any orientation. Two geometries:
+    the **corridor** is the raw OSM river union (``corridor_wkt`` — a MultiLineString is fine) and
+    bounds the fill to the channel at full width; the **centerline** is a single ordered LineString
+    following the channel (shortest path through the river graph), so a pixel's arc-length projected
+    onto it places it in a pool. A coarse barrage chord fails at big meanders — the Cochem loop
+    projects a mid-pool point past the next barrage — so the meander-following centerline is needed.
+    The pixel takes the retention level of the barrage bounding its pool downstream; flow direction
+    is inferred from the levels (they fall downstream), so river-km may run either way. With a ZS_I
+    gauge CSV, each gauge pixel's assigned pool level is asserted against the gauge (0.5 m) —
+    build_main's cross-check, which caught exactly the Cochem-loop misprojection above."""
+    river = shapely.from_wkt(open(corridor_wkt, encoding="utf-8").read())
+    center = shapely.from_wkt(open(centerline_wkt, encoding="utf-8").read())
+    assert center.geom_type == "LineString", f"{name}: centerline must be one LineString"
+    barr = _read_stau_csv(stau_csv)
+    barc = np.asarray(shapely.line_locate_point(center, points([(b[2], b[1]) for b in barr])))
+    lev = np.array([b[3] for b in barr])
+    order = np.argsort(barc)  # by arc along the centerline (downstream->upstream, either km sense)
+    barc, lev = barc[order], lev[order]
+    falls = lev[0] >= lev[-1]  # level falls as arc grows -> downstream is +arc, else -arc
+
+    def value_at(proj, plon, plat):  # arc-length on the centerline places the pixel in a pool
+        s = np.asarray(shapely.line_locate_point(center, points(np.column_stack([plon, plat]))))
+        idx = np.searchsorted(barc, s, side="left") if falls else np.searchsorted(barc, s, side="right") - 1
+        # past the most-downstream barrage no pool holds the level — leave nodata (the mouth is
+        # the neighbouring reach's backwater)
+        return np.where((idx < 0) | (idx >= len(barc)), np.float32(REACH_NODATA),
+                        lev[np.clip(idx, 0, len(barc) - 1)])
+
+    if zs_csv:  # a gauge sits in the pool whose retention level it reports
+        for lon, lat, zs, km in read_gauges(zs_csv, "datum_nhn_m"):
+            got = float(value_at(None, np.array([lon]), np.array([lat]))[0])
+            assert abs(got - zs) < 0.5, f"{name} ZS_I km{km}: pool {got:.2f} != gauge {zs:.2f} — stale table/centerline?"
+
+    return _paint_corridor(river, value_at, corridor, f"{out_dir}/zs_{name}.tif", "Stauziel-in-NHN",
+                           f"{len(barr)} pools")
+
+
+# Free-flowing (un-impounded) reaches built by build_freeflowing: name, gauge CSV (low-water datum
+# in NHN), OSM-river corridor, corridor half-width (deg), log label. GlW for the Rhein; MNW for the
+# Elbe (open proxy for the un-published GlW — see harvest_gauges.py).
+FREEFLOWING = [  # last two fields clip the paint at a regime boundary: (lat_range, lon_min)
+    ("rhein", "rhein_glw.csv", "rhein_river.wkt", 0.025, "GlW-in-NHN", (IFFEZHEIM_LAT, 90.0), None),
+    ("elbe",  "elbe_mnw.csv",  "elbe_river.wkt",  0.03,  "MNW-in-NHN", None, GEESTHACHT_LON),
+    ("oder",  "oder_mnw.csv",  "oder_river.wkt",  0.025, "MNW-in-NHN", None, None),
+    ("weser", "weser_mnw.csv", "weser_river.wkt", 0.02,  "MNW-in-NHN", None, None),  # Hauptweser (Mittelweser steps smoothed)
+]
+
+# Canalised Stauziel rivers built by build_impounded: name, OSM-river corridor, centerline (shortest
+# path for arc-length pools), barrage table, corridor half-width (deg), ZS_I cross-check CSV.
+IMPOUNDED = [
+    ("mosel", "mosel_river.wkt", "mosel_centerline.wkt", "mosel_stau.csv", 0.015, "mosel_zs.csv"),
+    ("saar",  "saar_river.wkt",  "saar_centerline.wkt",  "saar_stau.csv",  0.012, "saar_zs.csv"),
+    ("lahn",  "lahn_river.wkt",  "lahn_centerline.wkt",  "lahn_stau.csv",  0.008, "lahn_zs.csv"),
+]
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--out", required=True, help="output GeoTIFF, e.g. store/datum/dgm_w_lowwater.tif")
     a = p.parse_args()
-    os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
-    build_tidal(a.out)
+    out_dir = f"{a.out}.reaches"  # scratch beside the output; every part is re-derivable
+    os.makedirs(out_dir, exist_ok=True)
+    parts = [build_tidal(out_dir), build_main(out_dir), build_rhein_upper(out_dir)]
+    parts += [build_freeflowing(out_dir, name, os.path.join(HERE, gauge), os.path.join(HERE, riv), corr, label,
+                                lat_range=latr, lon_min=lonm)
+              for name, gauge, riv, corr, label, latr, lonm in FREEFLOWING]
+    parts += [build_impounded(out_dir, name, os.path.join(HERE, riv), os.path.join(HERE, cl),
+                              os.path.join(HERE, stau), corr, os.path.join(HERE, zs))
+              for name, riv, cl, stau, corr, zs in IMPOUNDED]
+    # merge onto one grid (finest wins) — the datum store serves a single raster per name
+    vrt = f"{out_dir}/reference.vrt"
+    subprocess.run(["gdalbuildvrt", "-overwrite", "-resolution", "highest", vrt, *parts], check=True)
+    subprocess.run(["gdal_translate", "-co", "COMPRESS=DEFLATE", "-co", "TILED=YES",
+                    "-co", "BLOCKXSIZE=512", "-co", "BLOCKYSIZE=512", vrt, a.out], check=True)
+    shutil.rmtree(out_dir)
+    print(f"wrote {a.out} ({len(parts)} reach(es))")
 
 
 if __name__ == "__main__":

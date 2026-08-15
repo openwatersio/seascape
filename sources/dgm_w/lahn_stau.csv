@@ -1,0 +1,25 @@
+# Lahn impounded-pool low-water datum: Stauziel (normal retention level) per weir, in NHN. The
+# canalised lower Lahn (Diez km 83 → Lahnstein km 135.7, the Rhine confluence) is a staircase of
+# eleven weir-held pools within the DEM window (km 80–136); each weir holds the reach UPSTREAM of it
+# at its Stauziel. build_reference.py (build_impounded) assigns each channel pixel the retention
+# level of the weir bounding its pool downstream. On the Lahn, river-km increases DOWNSTREAM (km 0
+# at the source, km 137 at the Rhine) — the levels fall with km, and build_impounded infers that.
+#
+# stauziel + km: WSV / WSA-Koblenz "Steckbriefe aller Bauwerke" (LiLa – Living Lahn), the official
+#   structure fact sheets — every value is a published Stauziel (m ü. NHN, DHHN92-era; the four
+#   downstream weirs are "Stauziel mit Bohlenaufsatz", incl. the seasonal plank crest).
+#   https://www.lila-livinglahn.de/fileadmin/files/lila/public/Actions/A1/Grundlagenermittlung/Grundlagen/Teilbericht_Bauwerke_und_Strecke/Steckbriefe_aller_Bauwerke.pdf
+# lat,lon: OSM weir/lock positions (~100 m). Cross-checked against PEGELONLINE ZS_I (lahn_zs.csv):
+#   Diez km83.7 (~105.6) and Kalkofen km106.4 (~93.6). Not for navigation.
+barrage,km,lat,lon,stauziel_nhn_m
+Diez,83.195,50.376,8.003,105.570
+Cramberg,91.820,50.343,7.955,102.104
+Scheidt,96.777,50.337,7.930,97.405
+Kalkofen,105.615,50.314,7.896,93.578
+Hollerich,113.048,50.305,7.833,88.077
+Nassau,117.610,50.317,7.788,82.877
+Dausenau,122.347,50.321,7.743,79.080
+BadEms,125.850,50.332,7.712,75.570
+Nievern,128.631,50.333,7.671,73.050
+Ahl,132.382,50.309,7.640,69.618
+Lahnstein,135.737,50.308,7.617,66.070
