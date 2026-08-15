@@ -531,6 +531,11 @@ class _RowSink:
     # Decimal degrees kept on write: 1e-9 deg is 0.11 mm, four orders below the S-58 vertex floor
     # and below anything the pipeline's own geometry means.
     COORD_DECIMALS = 9
+    # A repair may GROW a row's area (an invalid ring's shoelace cancels against itself) but must
+    # never shrink it: a band or drying part that loses area on write leaves a hole in the chart,
+    # which is the unsafe direction, so the tile fails instead. Sized for float noise on a sum of
+    # degree squares, not for any real geometry.
+    REPAIR_MAX_AREA_LOSS = 1e-9
 
     def __init__(self, seq):
         self.seq = seq
@@ -563,15 +568,31 @@ class _RowSink:
         # none of them invalid in EPSG:3857). Repair those rather than ship an invalid ring into
         # tippecanoe's wagyu: is_valid over a batch is ~18 s at 243k rows, make_valid seconds on
         # the largest offender. Exploding keeps the layer uniformly polygon (FlatGeobuf rejects a
-        # mixed one), since make_valid can return a MultiPolygon or a collection.
+        # mixed one).
         ok = shapely.is_valid(geoms)
         if not ok.all():
-            geoms = [g if v else shapely.make_valid(g) for g, v in zip(geoms, ok)]
+            folded = np.flatnonzero(~ok)
+            before = float(shapely.area(geoms[folded]).sum())
+            # method="structure", not the linework default: linework can return a
+            # GeometryCollection whose polygonal member is itself a MultiPolygon, which ONE explode
+            # leaves nested for the Polygon filter below to delete — silently, and in full.
+            # Structure returns polygons only. It is what repaired_parts picks, on the same rings.
+            geoms = [g if v else shapely.make_valid(g, method="structure", keep_collapsed=False)
+                     for g, v in zip(geoms, ok)]
         gdf = gdf.set_geometry(gpd.GeoSeries(geoms, index=gdf.index, crs="EPSG:4326"))
         if not ok.all():
+            repaired = gdf.index[folded]
             gdf = gdf.explode(index_parts=False)
-            gdf = gdf[gdf.geom_type == "Polygon"]
-            print(f"depare: repaired {int((~ok).sum())} row(s) the 4326 write folded", flush=True)
+            # keep_collapsed=False leaves a wholly collapsed ring as POLYGON EMPTY, which the
+            # driver would write as a null geometry.
+            gdf = gdf[(gdf.geom_type == "Polygon") & ~gdf.is_empty]
+            kept = gdf.index.isin(repaired)
+            after = float(shapely.area(gdf.geometry.to_numpy()[kept]).sum())
+            if after < before * (1 - self.REPAIR_MAX_AREA_LOSS):
+                raise AssertionError(
+                    f"repairing {len(folded)} folded row(s) lost polygonal area: {before!r} -> "
+                    f"{after!r} deg^2")
+            print(f"depare: repaired {len(folded)} row(s) the 4326 write folded", flush=True)
         gdf.to_file(self.seq, driver="GeoJSONSeq", mode="a" if self.count else "w",
                     COORDINATE_PRECISION=self.COORD_DECIMALS)
         self.count += len(gdf)   # rows WRITTEN: a repair can split one row into parts
@@ -975,6 +996,46 @@ def _check():
         "the sink must repair rows the 4326 write leaves invalid"
     assert set(written.geom_type) == {"Polygon"}, \
         f"the layer must stay uniformly polygon, got {set(written.geom_type)}"
+
+    # ...and it must not LOSE a row while repairing it. Three rings at chart scale, one per repair
+    # outcome: a pinch splits into two lobes (a MultiPolygon repair, which a plain explode
+    # survives); a pinch carrying a zero-width spur repairs to a GeometryCollection whose
+    # MultiPolygon member a plain explode leaves nested, for a Polygon-type filter to delete; and a
+    # ring VALID in metres, whose spur flanks sit closer than the 1e-9 deg write grid, folds only
+    # once rounded. AREA is what is asserted, because that deletion is silent and total.
+    x0, y0, side, eps = -234000.0, 6205000.0, 400.0, 2e-5
+    corners = [(x0, y0), (x0 + side, y0 + side), (x0 + side, y0), (x0, y0 + side)]
+    fixtures = {
+        "pinched": (Polygon(corners), side * side / 2),
+        "nested": (Polygon(corners + [(x0, y0), (x0 - side / 2, y0)]), side * side / 2),
+        "write-grid fold": (Polygon([(x0, y0), (x0 + side, y0), (x0 + side, y0 + side),
+                                     (x0 + side / 2 + eps, y0 + side),
+                                     (x0 + side / 2, y0 + side * 1.25),
+                                     (x0 + side / 2 - eps, y0 + side), (x0, y0 + side)]),
+                            side * side),
+    }
+    assert fixtures["write-grid fold"][0].is_valid, \
+        "the write-grid fixture must be valid in EPSG:3857 or it exercises the wrong fold"
+    # Each fixture ships beside one plain valid row, so a fixture the write deletes still leaves a
+    # readable layer and the AREA assertion below is what reports it.
+    _ballast = _box(x0 + 2 * side, y0, x0 + 3 * side, y0 + side)
+    for _name, (_geom, _truth) in fixtures.items():
+        _d = tempfile.mkdtemp()
+        _sink = _RowSink(f"{_d}/rows.geojsons")
+        _sink.write([{"geometry": g, "drval1": -config.DRYING_CAP, "drval2": 0.0,
+                      "sys": None, "kind": None, "rank": DRYING_RANK}
+                     for g in (_geom, _ballast)])
+        _sink.finish(f"{_d}/out.fgb")
+        _got = gpd.read_file(f"{_d}/out.fgb").to_crs("EPSG:3857")
+        _want = _truth + side * side
+        assert set(_got.geom_type) == {"Polygon"} and not _got.is_empty.any(), \
+            f"{_name}: the layer must stay uniformly non-empty polygon"
+        assert abs(_got.area.sum() - _want) <= 1e-5 * _want, \
+            f"{_name}: the sink wrote {_got.area.sum():.2f} m2 of a {_want:.2f} m2 batch"
+    # The guard on that loss trips on a dropped part and not on float noise.
+    _tol = _RowSink.REPAIR_MAX_AREA_LOSS
+    assert 0.0 < 1.0 * (1 - _tol) and not (1.0 - 1e-15) < 1.0 * (1 - _tol), \
+        "the repair area guard must reject a dropped part and tolerate float noise"
 
     # ContourTimeout mapping: a bounded command that exceeds its budget must surface as
     # ContourTimeout (the tile's retry trigger), not a generic failure.
