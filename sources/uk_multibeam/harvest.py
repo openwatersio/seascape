@@ -152,8 +152,9 @@ def serves(url):
 
 def resolve(years, probe=serves):
     """Newest served year per tile. Probed serially: concurrency draws spurious 403/504.
-    Only a confirmed year is written, so an unresolvable one falls through to an older
-    survey rather than putting a URL the build can't fetch in file_list.txt."""
+    Only a definitive 404 demotes a tile to an older survey; a probe that never answers
+    aborts the whole run (after probing everything, for the full picture) — silently
+    falling back could commit an older survey while a newer one exists."""
     resolved, dropped, flaky = [], [], []
     for i, (tile, ys) in enumerate(sorted(years.items()), 1):
         newest, skipped = max(ys), []
@@ -175,11 +176,11 @@ def resolve(years, probe=serves):
             dropped.append(tile)
         if i % 10 == 0:
             print(f"  probed {i}/{len(years)} tiles, {len(resolved)} served")
-    if flaky:
-        print(f"WARNING: {len(flaky)} (tile, year) never answered definitively (a newer survey "
-              f"may exist): {' '.join(flaky)}")
     if dropped:
         print(f"WARNING: {len(dropped)} tile(s) served no year at all: {' '.join(dropped)}")
+    if flaky:
+        sys.exit(f"{len(flaky)} (tile, year) never answered definitively (a newer survey may "
+                 f"exist): {' '.join(flaky)} — nothing written; re-run once the API settles")
     return resolved
 
 
@@ -253,17 +254,25 @@ def _check():
     def flaky(url):  # a 504 must never be read as absence
         raise Unresolved(f"504 on {url}")
 
-    assert resolve({"TA0000": {"2020"}}, probe=flaky) == []
+    try:  # an undefinitive probe must abort the run, not silently demote the tile
+        resolve({"TA0000": {"2020"}}, probe=flaky)
+        assert False, "a flaky probe must abort"
+    except SystemExit as ex:
+        assert "TA0000/2020" in str(ex), ex
     calls = []
 
-    def once(url):  # 504 on the newest, 404 on the next, served on the oldest
+    def once(url):  # 504 on the newest still aborts even though an older year serves
         calls.append(url)
         if url.endswith("2020/0.5/TA0000?subscription-key=dspui"):
             raise Unresolved("504")
         return url.endswith("2011/0.5/TA0000?subscription-key=dspui")
 
-    assert resolve({"TA0000": {"2011", "2015", "2020"}}, probe=once) == [("TA0000", "2011")]
-    assert len(calls) == 3, calls
+    try:
+        resolve({"TA0000": {"2011", "2015", "2020"}}, probe=once)
+        assert False, "a flaky probe must abort"
+    except SystemExit as ex:
+        assert "TA0000/2020" in str(ex), ex
+    assert len(calls) == 3, calls  # still probes to the bottom before aborting
     print("harvest.py self-check ok")
 
 
