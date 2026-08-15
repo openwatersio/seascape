@@ -135,8 +135,9 @@ const EDGE = 0.01;
 
 const depthRamp = (flavor: Flavor, edges: number[]): RampStops => {
   const stops: RampStops = [-10000, flavor.bandColors[0]];
+  // Blend on the shallow side of each edge: the encoder rounds toward shallow
   edges.forEach((d, i) =>
-    stops.push(-d - 0.1, flavor.bandColors[i], -d, flavor.bandColors[i + 1]),
+    stops.push(-d, flavor.bandColors[i], -d + 0.1, flavor.bandColors[i + 1]),
   );
   // The unknown tint is a knife-edge at exact 0 (native code pixels only): pinning drying
   // green at +LSB keeps overzoom's wet/dry blend fractions out of the slate — otherwise the
