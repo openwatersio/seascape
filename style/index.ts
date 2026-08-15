@@ -142,9 +142,20 @@ const depthRamp = (flavor: Flavor, edges: number[]): RampStops => {
   // The unknown tint is a knife-edge at exact 0 (native code pixels only): pinning drying
   // green at +LSB keeps overzoom's wet/dry blend fractions out of the slate — otherwise the
   // whole (0, 1) interval renders as a wide gray band along every foreshore seam.
-  stops.push(-LSB, flavor.bandColors[5], 0, flavor.nodata, LSB, flavor.drying,
-             DRYING_CODE, flavor.drying, LAND_CODE - LSB, flavor.drying,
-             LAND_CODE, flavor.land);
+  stops.push(
+    -LSB,
+    flavor.bandColors[5],
+    0,
+    flavor.nodata,
+    LSB,
+    flavor.drying,
+    DRYING_CODE,
+    flavor.drying,
+    LAND_CODE - LSB,
+    flavor.drying,
+    LAND_CODE,
+    flavor.land,
+  );
   return stops;
 };
 
@@ -341,11 +352,13 @@ export function layers(
   // that GL collision thins the labels. The 0 m drying line is unit-independent
   // and ships once with NO sys (like depare's drying/nodata), so both filters
   // admit sys-less features.
-  const contourLineFilter = (
-    unit === "m"
-      ? ["!=", ["get", "sys"], "ft"]
-      : ["any", ["!", ["has", "sys"]], ["==", ["get", "sys"], "ft"]]
-  ) as unknown as ExpressionSpecification;
+  const contourLineFilter = (unit === "m"
+    ? ["!=", ["get", "sys"], "ft"]
+    : [
+        "any",
+        ["!", ["has", "sys"]],
+        ["==", ["get", "sys"], "ft"],
+      ]) as unknown as ExpressionSpecification;
   // Depth number only, like paper charts (S-4 B-411.3) — the unit lives in the
   // consumer's UI, and soundings are already unitless.
   const contourLabelText: ExpressionSpecification = [
@@ -363,7 +376,8 @@ export function layers(
   const ladder = unit === "m" ? DEPARE_LADDER_M : DEPARE_LADDER_FT;
   const safetyContour =
     safety > 0
-      ? (ladder.find((l) => l >= safety - DRVAL_EPS) ?? ladder[ladder.length - 1])
+      ? (ladder.find((l) => l >= safety - DRVAL_EPS) ??
+        ladder[ladder.length - 1])
       : 0;
   const isSafetyContour: ExpressionSpecification =
     unit === "m"
@@ -393,11 +407,9 @@ export function layers(
   // unknown water — the render now tints 0-fill as unknown water too, and the depare polygon
   // keeps that categorical (and adds the drying tint).
   const bandSys = unit === "m" ? "m" : "ft";
-  const depareFilter = (
-    shading === "bands"
-      ? ["any", ["!", ["has", "sys"]], ["==", ["get", "sys"], bandSys]]
-      : ["!", ["has", "sys"]]
-  ) as unknown as ExpressionSpecification;
+  const depareFilter = (shading === "bands"
+    ? ["any", ["!", ["has", "sys"]], ["==", ["get", "sys"], bandSys]]
+    : ["!", ["has", "sys"]]) as unknown as ExpressionSpecification;
   // Fill: nodata (no drval1) → provisional flat tint; drying (drval1 < 0) → foreshore green;
   // else the band ramp keyed off drval1. `case` short-circuits, so the drval1 comparison only
   // runs once the no-drval1 branch has ruled nodata out.
@@ -532,7 +544,12 @@ export function layers(
         // alarm; safety=0 → all normal.
         "text-color":
           safety > 0
-            ? ["case", ["<=", ["get", "depth_m"], safety], flavor.soundingEmphasis, flavor.label]
+            ? [
+                "case",
+                ["<=", ["get", "depth_m"], safety],
+                flavor.soundingEmphasis,
+                flavor.label,
+              ]
             : flavor.label,
         "text-halo-color": flavor.labelHalo,
         "text-halo-width": 1,
@@ -630,7 +647,10 @@ export function style({
     name: "Open Waters Seascape",
     glyphs,
     sources: { ...osmSource, ...sources({ tilesBase }) },
-    layers: [...osmBase, ...layers(flavor, { unit, safety, shading, hillshade })],
+    layers: [
+      ...osmBase,
+      ...layers(flavor, { unit, safety, shading, hillshade }),
+    ],
   };
 }
 
@@ -687,7 +707,7 @@ export function applyState(
   if (map.getLayer("contour-lines")) {
     map.setFilter("contour-lines", spec["contour-lines"].filter);
     // safety moves the emphasized contour, so the paint is safety-dependent too
-    for (const p of ["line-color", "line-width", "line-opacity"])
+    for (const p of ["line-color", "line-width"])
       map.setPaintProperty("contour-lines", p, spec["contour-lines"].paint[p]);
   }
   if (map.getLayer("depth-hillshade"))
