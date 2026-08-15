@@ -60,6 +60,13 @@ EAST_MARGIN = 0.25    # extend the SKN canvas this far east of the most-upstream
 REACH_RES = 0.001     # ~110 m: a smooth ramp / flat pools resample cleanly onto 2 m tiles
 REACH_NODATA = -9999.0
 
+# Regime boundaries. The reach merge is last-wins where corridors overlap, and the free-flowing
+# ramps are painted after the tidal/Stauziel surfaces, so each ramp must stop at its boundary or
+# it overrides the neighbouring regime (a clamped-endpoint GlW over the Iffezheim pools misses by
+# 20 m+; MNW over tidal SKN reads metres too deep).
+IFFEZHEIM_LAT = 48.8312    # Iffezheim barrage (rhein_stau.csv): ramp north of it, Stauziel south
+GEESTHACHT_LON = 10.334765  # Geesthacht weir (tideelbe_skn.csv anchor): ramp east of it, SKN west
+
 
 def read_gauges(path, value_col):
     """[(lon, lat, value_nhn, km)], km descending, from a checked-in gauge CSV."""
@@ -194,7 +201,8 @@ def _corridor_reach(spine_pts, value_at_factory, ref_path, label, corridor_deg=C
     return ref_path
 
 
-def build_freeflowing(out_dir, name, gauge_csv, river_wkt, corridor, label):
+def build_freeflowing(out_dir, name, gauge_csv, river_wkt, corridor, label,
+                      lat_range=None, lon_min=None):
     """Ramp surface for a free-flowing river: a low-water datum interpolated along the gauges and
     filled over the OSM river corridor.
 
@@ -215,7 +223,7 @@ def build_freeflowing(out_dir, name, gauge_csv, river_wkt, corridor, label):
 
     river = shapely.from_wkt(open(river_wkt, encoding="utf-8").read())
     return _paint_corridor(river, value_at, corridor, f"{out_dir}/ramp_{name}.tif",
-                           label, f"{len(gauges)} gauges")
+                           label, f"{len(gauges)} gauges", lat_range=lat_range, lon_min=lon_min)
 
 
 def build_main(out_dir):
@@ -281,17 +289,20 @@ def build_main(out_dir):
     return ref_path
 
 
-def _paint_corridor(center, value_at, corridor, ref_path, label, tail):
+def _paint_corridor(center, value_at, corridor, ref_path, label, tail, lat_range=None, lon_min=None):
     """Rasterize value_at over a corridor around `center` onto a bbox-sized EPSG:4326 grid (nodata
     outside the corridor). `center` may be a LineString (fill_corridor then passes each pixel's
     arc-length as proj) or a MultiLineString (proj is 0; value_at must key off lon/lat). `tail` is
-    a short count string for the log line (e.g. "10 pools")."""
+    a short count string for the log line (e.g. "10 pools"). `lat_range`/`lon_min` bound the paint
+    at a regime boundary (see IFFEZHEIM_LAT / GEESTHACHT_LON)."""
     w, s, e, n = center.bounds
     west, north = w - corridor - REACH_RES, n + corridor + REACH_RES
     width = int(np.ceil((e + corridor - west) / REACH_RES))
     height = int(np.ceil((north - (s - corridor)) / REACH_RES))
     out = np.full((height, width), REACH_NODATA, dtype="float32")
-    fill_corridor(out, REACH_NODATA, west, north, REACH_RES, -REACH_RES, center, value_at, corridor)
+    col0 = max(0, int((lon_min - west) / REACH_RES)) if lon_min is not None else 0
+    fill_corridor(out, REACH_NODATA, west, north, REACH_RES, -REACH_RES, center, value_at, corridor,
+                  lat_range=lat_range, col0=col0)
     prof = dict(driver="GTiff", dtype="float32", count=1, width=width, height=height, crs="EPSG:4326",
                 nodata=REACH_NODATA, transform=rasterio.transform.from_origin(west, north, REACH_RES, REACH_RES),
                 compress="deflate", tiled=True, blockxsize=512, blockysize=512)
@@ -378,11 +389,11 @@ def build_impounded(out_dir, name, corridor_wkt, centerline_wkt, stau_csv, corri
 # Free-flowing (un-impounded) reaches built by build_freeflowing: name, gauge CSV (low-water datum
 # in NHN), OSM-river corridor, corridor half-width (deg), log label. GlW for the Rhein; MNW for the
 # Elbe (open proxy for the un-published GlW — see harvest_gauges.py).
-FREEFLOWING = [
-    ("rhein", "rhein_glw.csv", "rhein_river.wkt", 0.025, "GlW-in-NHN"),
-    ("elbe",  "elbe_mnw.csv",  "elbe_river.wkt",  0.03,  "MNW-in-NHN"),
-    ("oder",  "oder_mnw.csv",  "oder_river.wkt",  0.025, "MNW-in-NHN"),
-    ("weser", "weser_mnw.csv", "weser_river.wkt", 0.02,  "MNW-in-NHN"),  # Hauptweser (Mittelweser steps smoothed)
+FREEFLOWING = [  # last two fields clip the paint at a regime boundary: (lat_range, lon_min)
+    ("rhein", "rhein_glw.csv", "rhein_river.wkt", 0.025, "GlW-in-NHN", (IFFEZHEIM_LAT, 90.0), None),
+    ("elbe",  "elbe_mnw.csv",  "elbe_river.wkt",  0.03,  "MNW-in-NHN", None, GEESTHACHT_LON),
+    ("oder",  "oder_mnw.csv",  "oder_river.wkt",  0.025, "MNW-in-NHN", None, None),
+    ("weser", "weser_mnw.csv", "weser_river.wkt", 0.02,  "MNW-in-NHN", None, None),  # Hauptweser (Mittelweser steps smoothed)
 ]
 
 # Canalised Stauziel rivers built by build_impounded: name, OSM-river corridor, centerline (shortest
@@ -401,8 +412,9 @@ def main():
     out_dir = f"{a.out}.reaches"  # scratch beside the output; every part is re-derivable
     os.makedirs(out_dir, exist_ok=True)
     parts = [build_tidal(out_dir), build_main(out_dir), build_rhein_upper(out_dir)]
-    parts += [build_freeflowing(out_dir, name, os.path.join(HERE, gauge), os.path.join(HERE, riv), corr, label)
-              for name, gauge, riv, corr, label in FREEFLOWING]
+    parts += [build_freeflowing(out_dir, name, os.path.join(HERE, gauge), os.path.join(HERE, riv), corr, label,
+                                lat_range=latr, lon_min=lonm)
+              for name, gauge, riv, corr, label, latr, lonm in FREEFLOWING]
     parts += [build_impounded(out_dir, name, os.path.join(HERE, riv), os.path.join(HERE, cl),
                               os.path.join(HERE, stau), corr, os.path.join(HERE, zs))
               for name, riv, cl, stau, corr, zs in IMPOUNDED]

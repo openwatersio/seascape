@@ -110,7 +110,10 @@ store expects:
      for the *value*). The **corridor is the river union** (`<river>_river.wkt`, from Overture — see
      `build_geometry.py`), NOT the gauge chord: gauges ~30 km apart make a chord that misses the wide
      outer channel at big meanders (the Rhein's Düsseldorf bends), so the river there fell outside the
-     mask — the fill needed the real river, only the value didn't. **Caveat:** the Weser's Hauptweser
+     mask — the fill needed the real river, only the value didn't. The Rhein and Elbe ramps are
+     clipped at their regime boundaries (the Iffezheim barrage latitude / the Geesthacht weir
+     longitude), so the last-wins reach merge can't let a ramp override the neighbouring Stauziel
+     or SKN surface. **Caveat:** the Weser's Hauptweser
      is only *partly* free-flowing — the Mittelweser (below Minden) is impounded, but its barrages
      publish no ZS_I and MNW ≈ the held pool level there, so the single ramp interpolates through them
      and **smooths those pool steps by ~1–2 m** at each barrage. Acceptable for a non-nav render;
