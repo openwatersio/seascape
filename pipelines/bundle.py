@@ -267,6 +267,7 @@ def stage_build(bundle_dir="store/bundle"):
         mosaic_gti = None
         print("stage-build: no complete local mosaic — manifest ships without mosaic_gti")
     manifest = {
+        "schema": config.SCHEMA,
         "planet": _archive_meta(planet),
         **({"mosaic_gti": mosaic_gti} if mosaic_gti else {}),
         "overlay": {"split_z": SPLIT_Z, "cells": {
@@ -378,6 +379,7 @@ def _check():
             "manifest.json is returned separately so the publisher sends it LAST"
 
         m = json.load(open(manifest_path))
+        assert m["schema"] == config.SCHEMA, m.get("schema")
         assert set(m["planet"]) == {"file", "min_zoom", "max_zoom", "bbox"}, \
             f"planet is the Worker BundleMeta, no more: {sorted(m['planet'])}"
         assert m["planet"]["file"] == "planet.pmtiles" and m["planet"]["max_zoom"] == 8

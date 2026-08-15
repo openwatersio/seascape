@@ -3,8 +3,8 @@
 Each output zoom renders by reading the MOSAIC at that zoom's resolution
   -> depth/zoom-gated smooth AT THAT RESOLUTION (smooth.smooth_array — the ONE smoothing
      function the contour fork also calls, so isobaths agree with the shading)
-  -> land sentinel (clamp to DRYING_CAP+1 so decoded v > DRYING_CAP reads land/out-of-scope) +
-     land-side 0 nudge (land-side exact-0 -> +LSB so decoded 0 stays unambiguously water)
+  -> classify the non-negative domain to the flat category codes (0 unknown-depth water,
+     1 drying, 2 land — docs/schema.md; the UNKNOWN/DRYING/LAND constants below)
   -> Terrarium encode (encode.py's conservative, bias-shallow quantization)
   -> single-zoom pmtiles bundle.py concatenates (store/pmtiles/<stem>.pmtiles).
 

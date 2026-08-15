@@ -30,6 +30,11 @@ import type {
   StyleSpecification,
 } from "@maplibre/maplibre-gl-style-spec";
 
+// The tile-contract version this package targets (docs/schema.md). Compare it
+// against the `schema` field of the endpoint's TileJSON: a mismatch means the
+// tiles may decode plausibly but wrongly — treat it as fatal, not cosmetic.
+export const SCHEMA = 1;
+
 export type Unit = "m" | "ft" | "fm";
 // Water shading: the raster color-relief ramp (continuous, fuzzy edges) or the
 // vector ENC depth-area bands (crisp edges on the charted isobaths, safety

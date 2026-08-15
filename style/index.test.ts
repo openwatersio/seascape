@@ -8,11 +8,17 @@ import {
   sources,
   layers,
   style,
+  SCHEMA,
   type ChartMap,
 } from "./index";
 
 // Expressions are opaque tuple unions; tests poke at their raw stops.
 const raw = (e: unknown) => e as (number | string)[];
+
+test("SCHEMA is the integer tile-contract version", () => {
+  expect(Number.isInteger(SCHEMA)).toBe(true);
+  expect(SCHEMA).toBeGreaterThanOrEqual(1);
+});
 
 test("generated style validates against the MapLibre style spec", () => {
   const variants = [

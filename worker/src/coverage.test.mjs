@@ -11,8 +11,9 @@ const h = {
   maxLon: 180,
   maxLat: 84,
 };
-const tj = coverageTileJSON(h, "https://tiles.example/seascape", "credit");
+const tj = coverageTileJSON(h, "https://tiles.example/seascape", "credit", 1);
 assert.equal(tj.tilejson, "3.0.0");
+assert.equal(tj.schema, 1);
 assert.deepEqual(tj.tiles, [
   "https://tiles.example/seascape/coverage/{z}/{x}/{y}.pbf",
 ]);
@@ -30,7 +31,8 @@ assert.equal(tj.attribution, "credit");
 
 // Absent coverage.pmtiles (a pre-coverage release under a new Worker) degrades
 // to a valid empty document — same tiles URL (its requests 204), never a throw.
-const empty = coverageTileJSON(null, "http://localhost:8787", "");
+const empty = coverageTileJSON(null, "http://localhost:8787", "", 1);
+assert.equal(empty.schema, 1);
 assert.equal(empty.minzoom, 0);
 assert.equal(empty.maxzoom, 0);
 assert.equal(empty.tiles[0], "http://localhost:8787/coverage/{z}/{x}/{y}.pbf");

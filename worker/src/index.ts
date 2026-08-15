@@ -27,7 +27,7 @@
  */
 
 import { PMTiles, Source, RangeResponse } from "pmtiles";
-import { style as seascapeStyle } from "@openwaters/seascape";
+import { style as seascapeStyle, SCHEMA } from "@openwaters/seascape";
 import {
   CachedSource,
   contentEtag,
@@ -83,6 +83,9 @@ interface BundleMeta {
   bbox: [number, number, number, number]; // w, s, e, n
 }
 interface Manifest {
+  // Tile contract version (docs/schema.md), relayed into every TileJSON.
+  // Absent only in manifests staged before the field existed → treat as 1.
+  schema?: number;
   planet: BundleMeta;
   overlay: OverlayIndex; // {split_z, cells: {"z-x-y": max_zoom}}
   source_ids?: string[]; // every configured source (the viewer's provenance palette)
@@ -573,6 +576,25 @@ export default {
           : (["relief", "bands"] as const).find((s) => s === shadingParam);
       if (shadingParam !== null && shading === undefined)
         return bad("shading must be relief or bands");
+      // Same guard as the viewer's: a Worker redeployed against an older or
+      // newer tileset (release.yml republishes prior shas) must not serve a
+      // style that decodes the tiles plausibly but wrongly (docs/schema.md).
+      // A manifestless store (dev/preview) skips the check.
+      const mfSchema = await manifest(renv)
+        .then((m) => m.schema ?? 1)
+        .catch(() => null);
+      if (mfSchema !== null && mfSchema !== SCHEMA)
+        return new Response(
+          `style targets tile schema v${SCHEMA}, but the served tileset is v${mfSchema}`,
+          {
+            status: 503,
+            headers: {
+              "content-type": "text/plain; charset=utf-8",
+              "cache-control": "no-store",
+              ...CORS,
+            },
+          },
+        );
       return json(
         seascapeStyle({
           tilesBase,
@@ -588,6 +610,7 @@ export default {
       const mf = await manifest(renv);
       return json({
         tilejson: "3.0.0",
+        schema: mf.schema ?? 1,
         name: "Open Waters Bathymetry (raster)",
         tiles: [`${tilesBase}/{z}/{x}/{y}.webp`],
         minzoom: mf.planet.min_zoom,
@@ -610,6 +633,7 @@ export default {
       const h = await pm(renv, "vector.pmtiles").getHeader();
       return json({
         tilejson: "3.0.0",
+        schema: mf.schema ?? 1,
         name: "Open Waters Bathymetry",
         tiles: [`${tilesBase}/{z}/{x}/{y}.pbf`],
         minzoom: h.minZoom,
@@ -666,7 +690,9 @@ export default {
       const h = await pm(renv, "coverage.pmtiles")
         .getHeader()
         .catch(() => null);
-      return json(coverageTileJSON(h, tilesBase, mf.attribution ?? ""));
+      return json(
+        coverageTileJSON(h, tilesBase, mf.attribution ?? "", mf.schema ?? 1),
+      );
     }
     // Tiles validate by CONTENT, not release: ETag = hash of the tile bytes
     // (or of the native ancestor a synthesized tile is a pure function of).

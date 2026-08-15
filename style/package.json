@@ -15,7 +15,8 @@
   },
   "files": [
     "dist",
-    "index.ts"
+    "index.ts",
+    "README.md"
   ],
   "repository": {
     "type": "git",
