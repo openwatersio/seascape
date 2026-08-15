@@ -531,6 +531,19 @@ class _RowSink:
     # Decimal degrees kept on write: 1e-9 deg is 0.11 mm, four orders below the S-58 vertex floor
     # and below anything the pipeline's own geometry means.
     COORD_DECIMALS = 9
+    # Every repaired row must keep its own polygonal area, measured against itself at each stage of
+    # the write: a band or drying part that loses area leaves a hole in the chart, which is the
+    # unsafe direction, so the tile fails instead. A repair may GROW a row (an invalid ring's
+    # shoelace cancels against itself) — only loss is a defect.
+    #
+    # ABSOLUTE (deg^2), not relative, because the repair's error is float64 noise on the
+    # COORDINATES and so does not scale with the row's area: measured worst case 3.5e-15 deg^2
+    # across 164 folded rows spanning 12 orders of area (Brittany + Gulf-marsh macrotiles). A
+    # relative gate is therefore both too tight on a sub-metre sliver and far too slack on a
+    # 232 km2 one. This floor is ~300x the observed noise and ~1e4x below the smallest part
+    # SLIVER_MIN_PX can admit (4 px ~ 91 m2 ~ 1.1e-8 deg^2), i.e. ~0.008 m2 of sensitivity on a
+    # row of any size.
+    REPAIR_MAX_AREA_LOSS_DEG2 = 1e-12
 
     def __init__(self, seq):
         self.seq = seq
@@ -547,6 +560,7 @@ class _RowSink:
             return
         import geopandas as gpd
         import numpy as np
+        import pandas as pd
         import shapely
         gdf = gpd.GeoDataFrame(self.pending, crs="EPSG:3857").to_crs("EPSG:4326")
         # Round to the write grid HERE, not in the driver, so what gets validated below is what
@@ -563,15 +577,47 @@ class _RowSink:
         # none of them invalid in EPSG:3857). Repair those rather than ship an invalid ring into
         # tippecanoe's wagyu: is_valid over a batch is ~18 s at 243k rows, make_valid seconds on
         # the largest offender. Exploding keeps the layer uniformly polygon (FlatGeobuf rejects a
-        # mixed one), since make_valid can return a MultiPolygon or a collection.
+        # mixed one).
         ok = shapely.is_valid(geoms)
         if not ok.all():
-            geoms = [g if v else shapely.make_valid(g) for g, v in zip(geoms, ok)]
+            folded = np.flatnonzero(~ok)
+            before = shapely.area(geoms[folded])
+            # method="structure", not the linework default: linework can return a
+            # GeometryCollection whose polygonal member is itself a MultiPolygon, which ONE explode
+            # leaves nested for the Polygon filter below to delete — silently, and in full.
+            # Structure returns polygons only. It is what repaired_parts picks, on the same rings.
+            geoms = [g if v else shapely.make_valid(g, method="structure", keep_collapsed=False)
+                     for g, v in zip(geoms, ok)]
+            healed = shapely.area([geoms[i] for i in folded])
+            lost = np.flatnonzero(before - healed > self.REPAIR_MAX_AREA_LOSS_DEG2)
+            if len(lost):
+                i = lost[0]
+                raise AssertionError(
+                    f"repairing row {folded[i]} of {len(folded)} folded row(s) lost polygonal "
+                    f"area: {before[i]!r} -> {healed[i]!r} deg^2")
         gdf = gdf.set_geometry(gpd.GeoSeries(geoms, index=gdf.index, crs="EPSG:4326"))
         if not ok.all():
+            repaired = gdf.index[folded]
             gdf = gdf.explode(index_parts=False)
-            gdf = gdf[gdf.geom_type == "Polygon"]
-            print(f"depare: repaired {int((~ok).sum())} row(s) the 4326 write folded", flush=True)
+            # keep_collapsed=False leaves a wholly collapsed ring as POLYGON EMPTY, which the
+            # driver would write as a null geometry.
+            gdf = gdf[(gdf.geom_type == "Polygon") & ~gdf.is_empty]
+            # The second stage, and the one that catches the row the first is blind to: a pinched
+            # ring's shoelace cancels to 0, so "the repair did not shrink it" holds even when every
+            # part is then dropped. Exploding and filtering may only redistribute a repaired row's
+            # parts, so this compares EXACTLY (both directions) against the repaired area. Only the
+            # repaired rows are re-measured — the bookkeeping stays off the rows the write leaves
+            # alone.
+            sub = gdf[gdf.index.isin(repaired)]
+            written = (pd.Series(shapely.area(sub.geometry.to_numpy()), index=sub.index)
+                       .groupby(level=0).sum().reindex(repaired, fill_value=0.0).to_numpy())
+            moved = np.flatnonzero(np.abs(healed - written) > self.REPAIR_MAX_AREA_LOSS_DEG2)
+            if len(moved):
+                i = moved[0]
+                raise AssertionError(
+                    f"writing row {repaired[i]} of {len(folded)} repaired row(s) changed "
+                    f"polygonal area: {healed[i]!r} -> {written[i]!r} deg^2")
+            print(f"depare: repaired {len(folded)} row(s) the 4326 write folded", flush=True)
         gdf.to_file(self.seq, driver="GeoJSONSeq", mode="a" if self.count else "w",
                     COORDINATE_PRECISION=self.COORD_DECIMALS)
         self.count += len(gdf)   # rows WRITTEN: a repair can split one row into parts
@@ -975,6 +1021,104 @@ def _check():
         "the sink must repair rows the 4326 write leaves invalid"
     assert set(written.geom_type) == {"Polygon"}, \
         f"the layer must stay uniformly polygon, got {set(written.geom_type)}"
+
+    # ...and it must not LOSE a row while repairing it. Three rings at chart scale, one per repair
+    # outcome: a pinch splits into two lobes (a MultiPolygon repair, which a plain explode
+    # survives); a pinch carrying a zero-width spur repairs to a GeometryCollection whose
+    # MultiPolygon member a plain explode leaves nested, for a Polygon-type filter to delete; and a
+    # ring VALID in metres, whose spur flanks sit closer than the 1e-9 deg write grid, folds only
+    # once rounded. AREA is what is asserted, because that deletion is silent and total.
+    x0, y0, side, eps = -234000.0, 6205000.0, 400.0, 2e-5
+    corners = [(x0, y0), (x0 + side, y0 + side), (x0 + side, y0), (x0, y0 + side)]
+    fixtures = {
+        "pinched": (Polygon(corners), side * side / 2),
+        "nested": (Polygon(corners + [(x0, y0), (x0 - side / 2, y0)]), side * side / 2),
+        "write-grid fold": (Polygon([(x0, y0), (x0 + side, y0), (x0 + side, y0 + side),
+                                     (x0 + side / 2 + eps, y0 + side),
+                                     (x0 + side / 2, y0 + side * 1.25),
+                                     (x0 + side / 2 - eps, y0 + side), (x0, y0 + side)]),
+                            side * side),
+    }
+    assert fixtures["write-grid fold"][0].is_valid, \
+        "the write-grid fixture must be valid in EPSG:3857 or it exercises the wrong fold"
+    # Each fixture ships beside one plain valid row, so a fixture the write deletes still leaves a
+    # readable layer and the AREA assertion below is what reports it.
+    _ballast = _box(x0 + 2 * side, y0, x0 + 3 * side, y0 + side)
+    for _name, (_geom, _truth) in fixtures.items():
+        _d = tempfile.mkdtemp()
+        _sink = _RowSink(f"{_d}/rows.geojsons")
+        _sink.write([{"geometry": g, "drval1": -config.DRYING_CAP, "drval2": 0.0,
+                      "sys": None, "kind": None, "rank": DRYING_RANK}
+                     for g in (_geom, _ballast)])
+        _sink.finish(f"{_d}/out.fgb")
+        _got = gpd.read_file(f"{_d}/out.fgb").to_crs("EPSG:3857")
+        _want = _truth + side * side
+        assert set(_got.geom_type) == {"Polygon"} and not _got.is_empty.any(), \
+            f"{_name}: the layer must stay uniformly non-empty polygon"
+        assert abs(_got.area.sum() - _want) <= 1e-5 * _want, \
+            f"{_name}: the sink wrote {_got.area.sum():.2f} m2 of a {_want:.2f} m2 batch"
+    # The guard on that loss trips on a dropped part and not on the repair's own float noise, whose
+    # measured worst case over 164 real folded rows is 3.5e-15 deg^2 — and it stays that sensitive
+    # on a huge row, which is the point of an absolute floor.
+    _tol = _RowSink.REPAIR_MAX_AREA_LOSS_DEG2
+    assert 1.0 - 0.0 > _tol and 1.6e-2 - (1.6e-2 - 1.1e-8) > _tol, \
+        "the repair area guard must reject a dropped part, at any row size"
+    assert not 3.5e-15 > _tol, "the repair area guard must tolerate the repair's own float noise"
+    # And it is PER ROW. A pinch's shoelace cancels to 0 and repairs to its two real lobes, so it
+    # reads as growth; pair it with a folded row small enough that the growth covers the loss and
+    # the batch TOTAL never drops. Force that pairing — a lossy repair on the second folded row —
+    # and require the write to fail naming the row that lost, which only a per-row test can do.
+    _small = side / 4
+    _losing = Polygon([(x0, y0), (x0 + _small, y0), (x0 + _small, y0 + _small),
+                       (x0 + _small / 2 + eps, y0 + _small),
+                       (x0 + _small / 2, y0 + _small * 1.25),
+                       (x0 + _small / 2 - eps, y0 + _small), (x0, y0 + _small)])
+    assert _losing.area < fixtures["pinched"][1], \
+        "the losing row must be small enough that the pinch's growth hides it in the batch total"
+    _real_make_valid = shapely.make_valid
+    _seen = []
+
+    def _lose_the_second(geom, **kw):
+        _seen.append(geom)
+        return Polygon() if len(_seen) == 2 else _real_make_valid(geom, **kw)
+
+    shapely.make_valid = _lose_the_second
+    _raised = ""
+    try:
+        _d = tempfile.mkdtemp()
+        _sink = _RowSink(f"{_d}/rows.geojsons")
+        _sink.write([{"geometry": g, "drval1": -config.DRYING_CAP, "drval2": 0.0,
+                      "sys": None, "kind": None, "rank": DRYING_RANK}
+                     for g in (fixtures["pinched"][0], _losing)])
+    except AssertionError as e:
+        _raised = str(e)
+    finally:
+        shapely.make_valid = _real_make_valid
+    assert "lost polygonal area" in _raised and "row 1" in _raised, \
+        f"a repair that drops one row's parts must fail the write by row, got {_raised!r}"
+    # The write is guarded at BOTH stages, because the first is blind to exactly the row that
+    # motivates it: the nested fixture's shoelace cancels to 0, so "the repair did not shrink it"
+    # holds no matter what the explode then drops. Force the linework repair whose
+    # GeometryCollection one explode leaves nested, and require the SECOND guard to fail the write.
+    _real_make_valid = shapely.make_valid
+
+    def _linework(geom, **kw):
+        return _real_make_valid(geom)
+
+    shapely.make_valid = _linework
+    _raised = ""
+    try:
+        _d = tempfile.mkdtemp()
+        _sink = _RowSink(f"{_d}/rows.geojsons")
+        _sink.write([{"geometry": fixtures["nested"][0], "drval1": -config.DRYING_CAP,
+                      "drval2": 0.0, "sys": None, "kind": None, "rank": DRYING_RANK}])
+    except AssertionError as e:
+        _raised = str(e)
+    finally:
+        shapely.make_valid = _real_make_valid
+    assert "changed polygonal area" in _raised and "lost polygonal area" not in _raised, \
+        ("a dropped row whose shoelace had cancelled must fail the write at the explode stage, "
+         f"got {_raised!r}")
 
     # ContourTimeout mapping: a bounded command that exceeds its budget must surface as
     # ContourTimeout (the tile's retry trigger), not a generic failure.
