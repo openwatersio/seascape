@@ -1,6 +1,6 @@
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
-import { applyState, readDepth, style } from "@openwaters/seascape";
+import { applyState, readDepth, style, SCHEMA } from "@openwaters/seascape";
 
 // The style itself (sources, layers, depth ramp, unit/safety expressions) lives
 // in the @openwaters/seascape package (style/) — this file is the demo app:
@@ -44,6 +44,27 @@ const map = new maplibregl.Map({
   attributionControl: { compact: true },
 });
 window.map = map; // exposed for debugging / verification
+
+// Schema assert (docs/schema.md): a tileset whose contract moved past this
+// package's SCHEMA can decode plausibly but wrongly (a wrong depth renders
+// exactly like a right one), so a mismatch is fatal — replace the map, don't
+// warn over it. TileJSON without a schema field (pre-schema release) passes.
+fetch(`${tilesBase}/vector.json`)
+  .then((r) => (r.ok ? r.json() : null))
+  .then((tj) => {
+    if (tj?.schema === undefined || tj.schema === SCHEMA) return;
+    map.remove();
+    const el = document.getElementById("map");
+    const msg = document.createElement("div");
+    msg.style.cssText =
+      "display:flex;height:100%;align-items:center;justify-content:center;text-align:center;padding:2em;font:16px/1.5 sans-serif";
+    msg.textContent =
+      `These tiles use schema version ${tj.schema}, but this viewer was built ` +
+      `for schema version ${SCHEMA}. Rendering could silently show wrong depths, ` +
+      `so the chart is disabled. Update the viewer to match the tiles.`;
+    el.replaceChildren(msg);
+  })
+  .catch(() => {}); // unreachable TileJSON already surfaces as a map load error
 
 map.addControl(new maplibregl.NavigationControl());
 map.addControl({

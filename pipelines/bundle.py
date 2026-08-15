@@ -267,6 +267,7 @@ def stage_build(bundle_dir="store/bundle"):
         mosaic_gti = None
         print("stage-build: no complete local mosaic — manifest ships without mosaic_gti")
     manifest = {
+        "schema": config.SCHEMA,
         "planet": _archive_meta(planet),
         **({"mosaic_gti": mosaic_gti} if mosaic_gti else {}),
         "overlay": {"split_z": SPLIT_Z, "cells": {

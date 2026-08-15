@@ -19,9 +19,13 @@ export function coverageTileJSON(
   h: CoverageHeader | null,
   tilesBase: string,
   attribution: string,
+  // Coverage shares the main tile-contract version — it promotes in the same
+  // release unit (docs/schema.md).
+  schema: number,
 ) {
   return {
     tilejson: "3.0.0",
+    schema,
     name: "Open Waters Seascape (source coverage)",
     tiles: [`${tilesBase}/coverage/{z}/{x}/{y}.pbf`],
     minzoom: h?.minZoom ?? 0,

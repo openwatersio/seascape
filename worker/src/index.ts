@@ -83,6 +83,9 @@ interface BundleMeta {
   bbox: [number, number, number, number]; // w, s, e, n
 }
 interface Manifest {
+  // Tile contract version (docs/schema.md), relayed into every TileJSON.
+  // Absent only in manifests staged before the field existed → treat as 1.
+  schema?: number;
   planet: BundleMeta;
   overlay: OverlayIndex; // {split_z, cells: {"z-x-y": max_zoom}}
   source_ids?: string[]; // every configured source (the viewer's provenance palette)
@@ -588,6 +591,7 @@ export default {
       const mf = await manifest(renv);
       return json({
         tilejson: "3.0.0",
+        schema: mf.schema ?? 1,
         name: "Open Waters Bathymetry (raster)",
         tiles: [`${tilesBase}/{z}/{x}/{y}.webp`],
         minzoom: mf.planet.min_zoom,
@@ -610,6 +614,7 @@ export default {
       const h = await pm(renv, "vector.pmtiles").getHeader();
       return json({
         tilejson: "3.0.0",
+        schema: mf.schema ?? 1,
         name: "Open Waters Bathymetry",
         tiles: [`${tilesBase}/{z}/{x}/{y}.pbf`],
         minzoom: h.minZoom,
@@ -648,6 +653,7 @@ export default {
               drval1: "Number",
               drval2: "Number",
               sys: "String",
+              kind: "String",
               rank: "Number",
             },
           },
@@ -666,7 +672,9 @@ export default {
       const h = await pm(renv, "coverage.pmtiles")
         .getHeader()
         .catch(() => null);
-      return json(coverageTileJSON(h, tilesBase, mf.attribution ?? ""));
+      return json(
+        coverageTileJSON(h, tilesBase, mf.attribution ?? "", mf.schema ?? 1),
+      );
     }
     // Tiles validate by CONTENT, not release: ETag = hash of the tile bytes
     // (or of the native ancestor a synthesized tile is a pure function of).

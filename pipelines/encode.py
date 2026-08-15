@@ -168,11 +168,10 @@ def _check():
         assert np.array_equal(decode(encode(np.array([0.0, 1.0, 2.0]), z)),
                               [0.0, 1.0, 2.0]), z
 
-    # Render-path contract (terrain.py clamps land to the sentinel DRYING_CAP+1 and nudges
-    # land-side exact-0 to +LSB before this encode): at EVERY zoom the sentinel decodes above the
-    # cap (so v > DRYING_CAP => land holds despite ceil rounding lifting +17 to +18 at coarse
-    # zooms), exact 0 decodes exactly 0 (water of unknown depth), and +LSB decodes strictly
-    # positive (land). config's cap is the anchor.
+    # Non-negative headroom: at EVERY zoom a value just above the drying cap decodes above the
+    # cap (ceil rounding may lift +17 to +18 at coarse zooms but never below), exact 0 decodes
+    # exactly 0, and +LSB decodes strictly positive — the quantizer never blurs the boundaries
+    # a categorical non-negative domain depends on. config's cap is the anchor.
     import config
     for z in range(0, FULL_RESOLUTION_ZOOM + 1):
         assert decode(encode(np.array([config.DRYING_CAP + 1.0]), z))[0] > config.DRYING_CAP, z

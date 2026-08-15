@@ -107,43 +107,15 @@ For depth **color-relief** shading, contour **labels**, and a layer-toggle UI, s
 demo viewer in [`index.js`](index.js). Attribution is carried in each TileJSON, so
 MapLibre's attribution control credits the sources automatically.
 
-### Raster DEM
+### Tile schema
 
-Terrarium decodes a pixel to `v = R × 256 + G + B / 256 − 32768` metres. The
-negative domain carries depth; the non-negative domain contains three flat
-category codes:
+The full contract — every layer, field, pixel-value meaning, and the semantics no field advertises (chart-datum zero, shoal bias, sign conventions) — is defined in [docs/schema.md](docs/schema.md) and versioned by the integer `schema` field each TileJSON serves. The short version:
 
-- `v < 0` — elevation below the winning source's datum. On measured water
-  pixels, `-v` is depth. Encoding is shallow-biased: quantization never makes
-  a depth deeper. See [Depth datums](#depth-datums) for how to interpret it.
-- `v == 0` — water is present but depth is **unknown** (similar to ENC
-  `UNSARE`), not a measured depth of approximately zero.
-- `v == 1` — **drying foreshore**: seabed above datum that covers and uncovers
-  with the tide. The raster does not carry its drying height; use the `depare`
-  vector layer's `drval1` and `drval2`.
-- `v == 2` — **land or out of scope**, not measured land elevation. Missing
-  raster tiles also return this code, so the DEM cannot provide land relief.
+- **Raster** decodes Terrarium to `v = R × 256 + G + B / 256 − 32768` metres: `v < 0` is depth below the winning source's datum (shallow-biased — quantization never deepens); the non-negative domain is three flat category codes — `0` water of unknown depth, `1` drying foreshore, `2` land. MapLibre must be told `encoding: "terrarium"` directly on the `raster-dem` source — it does not read that setting from TileJSON.
+- **Vector** layers: `depare` depth-area polygons (positive-down `drval1`/`drval2` bounds, drying as negative `drval1`), `contours` isobath lines, `soundings` positive-down spot depths, all in metric and fathom-curve ladders selected by `sys`.
+- **Coverage** is its own tileset: per-source footprint polygons for click-to-identify provenance; keep it a separate MapLibre source so its low-zoom tiles overzoom independently.
 
-The codes decode exactly at native pixels. Values between them can appear at
-resampled or overzoomed boundaries; round to the nearest code, or use `depare`
-for categorical geometry. MapLibre must be told `encoding: "terrarium"`
-directly on the `raster-dem` source—it does not read that setting from
-TileJSON.
-
-### Vector tile schema
-
-The chart-vector TileJSON publishes three source layers:
-
-| Source layer | Geometry and fields                                                                                                                                                                                                                                                                                                                   |
-| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `depare`     | Depth-area polygons. Measured bands have positive-down metre bounds `drval1` (shallow) and `drval2` (deep), plus `sys` (`m` or `ft`) for the isobath ladder. Drying areas have negative `drval1` and no `sys`. Unknown-depth water has no `drval1`; `kind` identifies the mapped-water subtype. `rank` supplies stable fill ordering. |
-| `contours`   | Isobath lines. `depth_m` is signed elevation; `depth_abs_m`, `depth_ft`, and `depth_fm` are positive-down labels. `sys` selects the metre (`m`) or fathom-curve (`ft`) set. The 0 m drying line is the same curve in every unit, so it ships once with no `sys` and belongs to both sets.                                              |
-| `soundings`  | Spot depths in positive-down `depth_m`, `depth_ft`, and `depth_fm`. Values are rounded toward shallower water.                                                                                                                                                                                                                        |
-
-The separate `coverage` TileJSON contains a `coverage` polygon layer with
-`source_id`, `source_name`, and `source_maxzoom`. It is useful for
-click-to-identify provenance; keep it as a separate MapLibre source so its
-low-zoom tiles can be overzoomed independently.
+The reasoning behind these choices — why land carries no elevation, why every rounding errs shallow, why feet mode gets real fathom curves — is in [docs/cartography.md](docs/cartography.md).
 
 ## Depth datums
 
