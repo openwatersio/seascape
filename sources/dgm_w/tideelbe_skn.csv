@@ -17,3 +17,8 @@ Hamburg St. Pauli,9.969965,53.545442,623.1,-1.90
 Hamburg-Harburg,9.991826,53.472726,615.0,-1.92
 Over,10.101120,53.428692,605.273,-1.73
 Zollenspieker,10.185374,53.398709,598.159,-1.23
+# Anchor, not a GDWS gauge: holds Zollenspieker's SKN flat to the Geesthacht weir so the fill
+# corridor reaches the top of the tidal reach (the active km585_600 tile). SKN actually tapers
+# toward NHN approaching the weir, so the held value reads shallow — the safe direction.
+# Position: PEGELONLINE "WEHR GEESTHACHT UP" (downstream face of the weir).
+Wehr Geesthacht,10.334765,53.423294,585.99,-1.23
