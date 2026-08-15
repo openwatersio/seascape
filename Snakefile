@@ -41,10 +41,17 @@ LOCAL_LISTED = [s for s in LISTED if s not in STREAMED]
 
 # offset_surface: <name> ⇒ that source's prep subtracts store/datum/<name>.tif per pixel —
 # the chart datum's height in the source's own vertical frame, for the tidal separations no
-# scalar datum_offset_m can express (pipelines/datum_grid.py builds the reference).
+# scalar datum_offset_m can express. config.DATUM_BUILDERS names the module that composes each;
+# a surface with no builder is a hard error, because the alternative is one builder writing
+# another's filename and silently correcting a coast onto the wrong continent's datum.
+DATUM_BUILDERS = pipeline_config.DATUM_BUILDERS
 DATUM_SURFACES = sorted({name for name in
                          (pipeline_config.load_metadata(s).get("offset_surface")
                           for s in ALL_SOURCES) if name})
+_unbuildable = [n for n in DATUM_SURFACES if n not in DATUM_BUILDERS]
+if _unbuildable:
+    raise WorkflowError(f"offset_surface with no builder in config.DATUM_BUILDERS: "
+                        f"{_unbuildable}")
 
 ONLY = config.get("source")
 if ONLY and ONLY not in PROCESSED + RAW:
@@ -230,14 +237,17 @@ rule fetch_catalog:
 
 # The chart-datum reference a prep subtracts (source_datum --offset-surface) — a support
 # artifact like the landmask, NOT a sources/ entry (everything under sources/ enters the merge).
-# Composing it downloads NOAA's pinned VDatum bundle (3.2 GB, cached beside the output) and runs
-# the per-region formula over it, so the store's copy IS the cache. Keyed on the module that
-# holds both the bundle pin and the composition: a formula fix must not ship under the old grid.
+# Composing one downloads its pinned upstream (NOAA's 3.2 GB VDatum bundle; Shom's BATHYELLI
+# plus IGN's geoid grids) and caches it beside the output, so the store's copy IS the cache.
+# Keyed on the module that holds both the pin and the composition: a formula fix must not ship
+# under the old grid.
 rule datum_surface:
     input:
-        str(SCRIPTS / "datum_grid.py"),
+        lambda wc: str(SCRIPTS / DATUM_BUILDERS[wc.name]),
     output:
         "store/datum/{name}.tif"
+    params:
+        builder=lambda wc: DATUM_BUILDERS[wc.name]
     wildcard_constraints:
         name=pat(DATUM_SURFACES)
     priority: 5_000_000  # a source prep waits on it; same band as the registrations
@@ -249,7 +259,7 @@ rule datum_surface:
     log:
         f"{TMP}/logs/datum_surface/{{name}}.log"
     shell:
-        "{PY}/datum_grid.py --out {output} 2> {log}"
+        "{PY}/{params.builder} --out {output} 2> {log}"
 
 
 # Masks rebuild only when forced (-R landmask): pinned snapshot/release ⇒ no data drift.
