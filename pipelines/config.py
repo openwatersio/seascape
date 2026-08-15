@@ -104,6 +104,22 @@ def load_catalog(source):
     return _catalog_cache[ck]
 
 
+# offset_surface name -> the module that composes store/datum/<name>.tif. One mapping, read by
+# the Snakefile's datum_surface rule (which builder to run) and by the prep-time "not in the
+# store" errors (which builder to name) — the two must not drift, or the error tells you to run
+# the composer for another continent's datum.
+DATUM_BUILDERS = {
+    "navd88_chart": "datum_grid.py",   # US waters, from NOAA's VDatum bundle
+    "ign69_zh": "datum_grid_fr.py",    # French waters, from Shom's BATHYELLI + IGN's geoids
+}
+
+
+def datum_builder(name):
+    """How to build the named offset surface, as a runnable hint for an error message."""
+    script = DATUM_BUILDERS.get(name)
+    return f"{script}" if script else f"the composer for {name!r} (none is registered)"
+
+
 # Build property -> the catalog item's seascape:* field. The catalog item is generated from
 # metadata.json (+ the datum sidecar) at source-prep time, so the two agree; metadata.json stays
 # the fallback until every source has re-registered with an item.
@@ -247,6 +263,13 @@ def _check():
     condition fetch_catalog's shell tests before also fetching bounds.csv."""
     import shutil
     import tempfile
+
+    # Every registered surface names a builder that exists, and each builder composes its own
+    # name — the pairing the datum_surface rule templates and the prep errors quote.
+    for name, script in DATUM_BUILDERS.items():
+        assert os.path.isfile(os.path.join(os.path.dirname(__file__), script)), script
+        assert datum_builder(name) == script, (name, datum_builder(name))
+    assert "none is registered" in datum_builder("_no_such_surface")
 
     d = tempfile.mkdtemp()
     cwd = os.getcwd()

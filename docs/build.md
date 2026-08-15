@@ -2,11 +2,11 @@
 
 How `.github/workflows/build.yml` turns `sources/` into servable tilesets, on one on-demand Hetzner box run as a self-hosted GitHub Actions runner. Companion to [CONTRIBUTING.md](../CONTRIBUTING.md#ci--build--release), which covers the release flow; this documents the build itself and the constraints every change to it must respect.
 
-Point-in-time. This is **phase 4** of [the production-build plan](plans/2026-07-09-production-build.md) ("immutable store + GC"): the matrix fan-out is gone (phase 2), content-hash keys drive incrementality (phase 3), and now the store is **immutable + content-addressed** — every artifact carries its key in its filename, each planet build publishes a **store manifest** and flips a one-object **pointer** last, hydrate reads exactly the referenced artifacts, and deletion is a separate scheduled **GC** (`gc.yml`), the only deletion path. The covering-retile prunes and their guards are deleted, not ported.
+The store lives on a **persistent Hetzner volume** (`seascape-store`, 750 GB) that outlives every box — there is no hydrate and no per-stage push. A build is **one Snakemake invocation over one DAG** against that volume; the only R2 writes are **products**: the content-addressed mosaic publish (tiles + index + a **candidate** pointer, never the serving pointer) and the per-commit `build/<sha>/` bundle set. Deletion is a separate scheduled **GC** (`gc.yml`), the only deletion path. The phase history that led here lives in [the production-build plan](plans/2026-07-09-production-build.md).
 
 ## What it is
 
-A manually-dispatched GitHub Actions workflow that boots one on-demand Hetzner box and **registers it as a self-hosted runner** ([`Cyclenerd/hcloud-github-runner`](https://github.com/Cyclenerd/hcloud-github-runner)), then runs the build **natively on that box** — hydrate the incremental store from R2, run the full `cover → aggregate → mosaic-index → terrain → bundle → vector` pipeline through `just`, push each stage back to R2 — and always-destroys the box. Two tiny `ubuntu-latest` jobs bracket it: `create-runner` boots the box, `delete-runner` tears it down; the compute is a pay-per-build box (~€2/hr → roughly €10 for a forced planet rebuild, €1–3 for a weekly incremental, ~$0 idle). It is dispatch-only on purpose: the incremental store is shared, so routine pushes must not mutate it. Per-commit checks live in `ci.yml`; publishing a finished build is `release.yml`.
+A manually-dispatched GitHub Actions workflow that boots one on-demand Hetzner box, **registers it as a self-hosted runner** ([`Cyclenerd/hcloud-github-runner`](https://github.com/Cyclenerd/hcloud-github-runner)), attaches the persistent store volume, and runs the build **natively on that box** as one `docker.sh snakemake` invocation (default targets `bundles publish_mosaic stage_build vector_selfcheck`) — then always-destroys the box, never the volume. Two tiny `ubuntu-latest` jobs bracket it: `create-runner` boots the box, `delete-runner` tears it down; the compute is a pay-per-build box (~€2/hr → roughly €10 for a forced planet rebuild, €1–3 for an incremental, ~$0 idle). It is dispatch-only on purpose: the store volume is shared state, so routine pushes must not mutate it. Per-commit checks live in `ci.yml`; publishing a finished build is `release.yml`.
 
 Running the build *on* the box rather than SSH-ing into an ephemeral box from a hosted runner deletes the entire SSH surface (keygen / boot-wait / `rsync` / `scp` / `ssh … <<'REMOTE'`, the NAT keepalive tuning, and the `build.env` + `%q` quoting — secrets are native job `env:` now, so nothing is ever `source`d) and, crucially, **lifts the 6 h job cap** (below).
 
@@ -14,30 +14,31 @@ Running the build *on* the box rather than SSH-ing into an ephemeral box from a 
 
 **Dispatch inputs** (Actions → Build → Run workflow, from any branch):
 
-| Input         | Default | Meaning                                                                                  |
-| ------------- | ------- | ---------------------------------------------------------------------------------------- |
-| `bbox`        | empty   | `"W,S,E,N"` regional build; empty = full planet                                          |
-| `force`       | false   | Ignore the content-hash keys, rebuild every tile (escape hatch only — the keys already see code/config changes) |
-| `server_type` | `ccx63` | Hetzner box size — `ccx63` (48 vCPU / 192 GB, dedicated-vCPU quota approved); `ccx33` for a cheap smoke |
+| Input            | Default | Meaning                                                                                  |
+| ---------------- | ------- | ---------------------------------------------------------------------------------------- |
+| `bbox`           | empty   | `"W,S,E,N"` regional build; empty = full planet                                          |
+| `depare`         | true    | Build the DEPARE depth-area layer; uncheck for a raster-only build (`SKIP_DEPARE=1`)     |
+| `force`          | false   | `-F` on the build invocation — ignore freshness (code changes are force-only by design)  |
+| `server_type`    | `ccx33` | `ccx33` (8 vCPU / 32 GB) fits incremental builds; `ccx63` (48 / 192) for wide runs       |
+| `snakemake_args` | empty   | Extra snakemake args, e.g. `-R publish`                                                  |
+| `max_jobs`       | empty   | Scope gate: dry-run first, abort if the planned job count exceeds this or is zero        |
+| `targets`        | the full build | Snakemake targets, e.g. `soundings_all` for an isolated leaf rebuild that must not cascade |
 
 **Repository state**: `sources/<id>/` recipes + `metadata.json`, `pipelines/` code, the toolchain Docker image (deps-only, keyed on `Dockerfile`/`pyproject.toml`/`uv.lock`; code mounts at runtime). The box pulls this image from GHCR and runs everything through `docker run`, exactly like `ci.yml`.
 
-**R2 state** (the `data` bucket, public at `data.openwaters.io`, under `bathymetry/`). The box `rclone copy`s these down on boot (hydrate) and pushes deltas back up:
+**R2 state** (the `data` bucket, public at `data.openwaters.io`, under `bathymetry/`). What the build reads streams over `/vsicurl`; what it writes are published products:
 
 | Prefix                              | Contents                                                                          |
 | ----------------------------------- | --------------------------------------------------------------------------------- |
 | `source/<id>/`                      | Processed COGs (or a raw source's mirrored objects) + `catalog.json` — the single registration artifact (sources.yml owns these; the item carries the per-file bounds, recipe hash + flags the tile keys read) |
 | `polygon/<id>.gpkg`                 | Per-source provenance footprints                                                   |
 | `landmask/`                         | `land.fgb` + `water.fgb` (sources.yml owns these)                                  |
-| `pmtiles/`                          | Per-tile terrain + overview pmtiles, **content-addressed** `<stem>-<key12>.pmtiles` |
-| `contour/`, `soundings/`, `depare/` | Per-tile vector intermediates, `<stem>-<key12>.{fgb,geojson}` (+ a `<stem>-<key12>.empty` marker when a fork legitimately produced no features) |
-| `store/manifests/<ulid>.json`       | One per planet build — the content name of every artifact that build's covering left |
-| `store/manifest.json`               | The **pointer**: names the current manifest; one atomic PUT, flipped last          |
+| `mosaic/`                           | The published mosaic: content-addressed `tiles/<stem>-<hash12>.tif` COGs + `planet-z8-<hash12>.tif` overviews, `index/<idxhash12>.parquet` GeoParquet indexes, candidate pointers `mosaic-candidate-<idxhash12>.gti`, and the serving pointer `mosaic.gti` (written only by release.yml's promotion) |
 | `build/<sha>/`                      | This build's outputs (below)                                                       |
 
-The `pmtiles/`/`contour/`/… prefixes carry **no `.key` sidecars** — the key is in the filename, so freshness is "the named file exists". Superseded keys (a re-tile / re-key / retired diff-era `aggregation/<ulid>/` coverings / legacy mutable names) linger unreferenced until `gc.yml` sweeps them.
+Superseded mosaic objects (a re-tiled key, an unpromoted candidate whose build expired) linger unreferenced until `gc.yml` sweeps them.
 
-Planet builds hydrate **selectively**: the store artifacts the manifest names, plus `catalog.json` + footprints, come down before `cover` (the covering, the tile keys, and the coverage layer need them — the item's `seascape:files` carries each source's per-file bounds); then the masks hydrate (their content hashes enter the tile keys, so the manifest step below must see the same mask state aggregate will), and once the covering exists, `just sources-manifest` derives the exact `(source, filename)` union the key-stale tiles reference and the box `rclone copy --files-from`s those files into the local store — `aggregate` then reads everything from local disk (the preview-local path: no `SOURCE_VSI_BASE`/`LANDMASK`/`WATERMASK` env, so `config.source_path` and the landmask defaults resolve `store/…`). Two real runs that streamed sources per tile banked zero tiles in 2.5–3.9 healthy hours — a coastal macrotile re-read the same S-102/CUDEM bytes over `/vsicurl` for every tile. A registration row whose filename is already an absolute `/vsi` path is filtered out of the hydrate list, passes through `source_path` untouched, and still streams — acceptable fallback. `bbox` builds stay fully streaming (self-contained, no volume), exactly the old behavior.
+A planet build assumes a **warm volume**: the covering, source registrations, and per-stem artifacts persist on `seascape-store` between runs, so `cover` is up-to-date and its stage-1 producers stay dormant (a step guard refuses a blank volume — that's sources.yml's job; smoke a `bbox` before the first full planet dispatch). Raw source bytes stream from the public mirror via `/vsicurl` (`SOURCE_VSI_BASE`); a file already present in the volume's store wins per file (`config.source_path`). The land/water masks are copied from R2 onto the volume and then served from box-local NVMe via per-file bind mounts — every fork's clamp rasterize range-reads them thousands of times, and the binds preserve identical paths and mtimes so provenance is untouched.
 
 **Secrets**: `HCLOUD_TOKEN` (create/destroy the box + volume, held by `create-runner`/`delete-runner`), `RUNNER_PAT` (a fine-grained PAT with repo **Administration: read & write** — the runner action uses it to mint a registration token and register/deregister the self-hosted runner; the job's `GITHUB_TOKEN` can't do this, hence a dedicated secret), `R2_ACCOUNT_ID` + `R2_ACCESS_KEY_ID` + `R2_SECRET_ACCESS_KEY` (rclone reads them as `RCLONE_CONFIG_R2_*`; the AWS S3-API vars ride along for any `/vsis3` path). `github.token` (with `packages: read`) logs the box into GHCR to pull the image. On the box the secrets are **native job `env:`** — never written to a file and never `source`d, so there's no sourced-file injection vector to quote around (the old `build.env` + `%q` is gone).
 
@@ -51,21 +52,20 @@ Everything lands in `bathymetry/build/<sha>/` (byte-compatible with the old buil
 - `coverage.pmtiles` — source-provenance footprints, its own small z0–8 tileset
 - `manifest.json` — planet metadata + overlay cell map + `vector.max_zoom` (the covering's max child_z, which turns on the Worker's vector overzoom); **written and pushed last, its presence marks a complete build** (release.yml refuses a sha without one)
 
-A build from `main` auto-dispatches `release.yml` for its sha; feature-branch builds write `build/<sha>/` but don't ship, and `bbox` builds stage under `build/<sha>-bbox/` — previewable at the same Worker route, invisible to release (it promotes the bare sha).
+Releasing is a separate manual dispatch (`release.yml` promotes a sha a build already produced); `bbox` builds stage under `build/<sha>-bbox/` — previewable at the same Worker route, invisible to release (it promotes the bare sha).
 
 ## The box lifecycle
 
 The workflow is four jobs: `image` (ensure the deps-keyed toolchain image is in GHCR) + `create-runner` → `build` → `delete-runner`. `image` and `create-runner` run in parallel on `ubuntu-latest`; `build` runs on the Hetzner box; `delete-runner` (`if: always()`) tears it down.
 
-1. **Create runner** (`ubuntu-latest`) — for a planet build, first `hcloud volume create` a 400 GB volume (~50 GiB hydrated store + bundle outputs which roughly double during pmtiles finalize ≈ 100 GiB + the dirty-set source hydrate, ~100–200 GiB for the full coastal S-102+CUDEM subset, + headroom), unattached, in the server's location. Then `Cyclenerd/hcloud-github-runner@v1.4.1` (`mode: create`) boots the box (`server_type` from the dispatch input, `location: fsn1`, `image: ubuntu-24.04`), **attaches the volume** at creation (its ID handed to the action's `volume:` input), and registers it as a self-hosted runner labelled with the box name. The action outputs the runner **`label`** (used as the `build` job's `runs-on`) and the **`server_id`**; `create-runner` additionally outputs the **`volume_id`**. A `bbox` build skips the volume entirely and works on the runner's workspace disk.
-2. **Set up** (on the box) — the runner runs as **root** (so no `sudo`) and cloud-init pre-installs git/curl/jq. The `build` job checks out the repo, then a setup step installs Docker + the pinned sha256-verified rclone 1.74.4 + `e2fsprogs`, logs in to GHCR, and `docker pull`s the toolchain image. The main step then mkfs+mounts the volume at the store path (a bbox uses `$GITHUB_WORKSPACE/pipelines/store`), computes `AGG_PROCESSES` / `BUNDLE_PROCESSES` / `TERRAIN_PROCESSES` / `GDAL_CACHEMAX` from the box's cores + RAM, and exports `TOOLCHAIN` = the image tag (in the workflow, not Python — pipelines stay host-agnostic).
-3. **Hydrate** — **manifest-driven** (planet only): read the store pointer, fetch the manifest it names, `rclone copy --files-from` exactly the referenced artifacts. Unreferenced garbage costs no hydrate bytes. No pointer = the first immutable build → clean rebuild (below). After `cover`, hydrate the masks + the stale tiles' source files (see above).
-4. **Build + push + publish the store** — run each stage through `docker run … just <stage>`, pushing to R2 between stages (below); after `terrain`, assemble the store manifest and flip the pointer.
-5. **Destroy** (`delete-runner`, `ubuntu-latest`, `if: always()`) — `Cyclenerd/hcloud-github-runner` (`mode: delete`, using the `server_id`) deletes the server and deregisters the runner; a following step `hcloud volume delete`s the volume (which auto-detached when the server went), then **loudly fails** if a server or volume named for this run still exists — a leaked billable resource must show as a red step, not invisible cost. Resources that never existed (a create-runner failure before the server, a bbox build without a volume) pass clean. The action emits `server_id` *before* its runner-registration wait, so teardown still runs even if the box booted but never finished registering.
+1. **Create runner** (`ubuntu-latest`) — `Cyclenerd/hcloud-github-runner@v1.4.1` (`mode: create`) boots the box (`server_type` from the dispatch input, `location: fsn1`, `image: ubuntu-24.04`) and registers it as a self-hosted runner labelled with the box name; a following step **attaches the persistent `seascape-store` volume** (750 GB, created once — every build reuses it, bbox smokes included: the build always reads the volume's registrations). The action outputs the runner **`label`** (the `build` job's `runs-on`) and the **`server_id`**; the attach step outputs the box **`ip`**, seeded into a pending `build` commit status so operators can ssh in for live diagnosis.
+2. **Set up** (on the box) — the runner runs as **root** (so no `sudo`). The `build` job checks out the repo, installs Docker if missing, mounts the volume whole at the store path (`store/` and `.snakemake/` both persist; a resize grows the filesystem to match), refuses a blank volume, pulls the toolchain image from GHCR, and warms the land/water masks (R2 → volume → per-file NVMe binds).
+3. **Build + publish** — **one `docker.sh snakemake` invocation** over the whole DAG: the `cover` checkpoint re-evaluates into mosaic → forks → bundles → `publish_mosaic` + `stage_build`. When `max_jobs` is set, a scope-gate dry run aborts first on a planner surprise. Budgets derive from the box (`--cores` = 2× vCPUs, `mem_gb` = RAM minus a scaling reserve, `disk_mb` from NVMe free space); `mosaic.py verify` first drops strandings a prior hard teardown left; a heartbeat loop carries the job counter into the commit status every minute.
+4. **Destroy** (`delete-runner`, `ubuntu-latest`, `if: always()`) — `Cyclenerd/hcloud-github-runner` (`mode: delete`, using the `server_id`) deletes the server and deregisters the runner. **The store volume is never deleted** — it *is* the incremental state. A `collect-metrics` job snapshots the provider's CPU/disk/network series while the server still exists. The action emits `server_id` *before* its runner-registration wait, so teardown still runs even if the box booted but never finished registering.
 
-There is **no prune step** — deletion of *store* artifacts is out-of-band (`gc.yml`, below); `delete-runner` only reclaims the box + its scratch volume.
+There is **no prune step** — R2 deletion is out-of-band (`gc.yml`, below), and volume-side orphans (stems that left the covering, retired sources) are tracked in [#148](https://github.com/openwatersio/seascape/issues/148).
 
-**No `timeout-minutes`.** A self-hosted job is **not** subject to the 6 h cap that GitHub-*hosted* runners impose — the ceiling is now the 72 h workflow limit, which is effectively non-binding, so a forced full planet rebuild runs to completion in one window regardless of size (no resume-on-re-dispatch needed). The incremental store still makes re-dispatches cheap (a re-dispatch hydrates the last completed build's manifest and rebuilds only what changed), but a build no longer *has* to fit a window. `ccx63` (48 vCPU / 192 GB) is the default now the dedicated-vCPU quota is approved; `ccx33` is a cheaper smoke.
+**No `timeout-minutes`.** A self-hosted job is **not** subject to the 6 h cap that GitHub-*hosted* runners impose — the ceiling is now the 72 h workflow limit, which is effectively non-binding, so a forced full planet rebuild runs to completion in one window regardless of size (no resume-on-re-dispatch needed). The warm volume still makes re-dispatches cheap (only missing or stale artifacts rebuild), but a build no longer *has* to fit a window. `ccx33` is the default; pick `ccx63` (48 vCPU / 192 GB) for wide runs — cold builds, big invalidations.
 
 ## Watching a build
 
@@ -98,28 +98,21 @@ the `total` row out of that output.
 
 ## The incremental model
 
-Rebuilds are cheap because every store artifact is **content-addressed** ([pipelines/keys.py](../pipelines/keys.py)): its key — a short hash of its inputs ‖ the pipeline modules that produce it ‖ the resolved config the stage read ‖ the toolchain image tag — rides IN its filename (`<stem>-<key12>.<ext>`). Freshness is "the named file exists"; there is no sidecar to match. Anything that moves the key — changed input, code, config, bumped toolchain — writes a NEW name, and a stage rebuilds a name that isn't present. The old covering diff, its `.done` markers, the `.key` sidecars, and the downsample mtime cascade are all gone.
+Rebuilds are cheap because the store persists on the volume and **Snakemake engine provenance** decides freshness: a rule's inputs and params, so an artifact rebuilds when an input or the resolved config it read changed. Volume artifacts are **mutable stem-named files** (`store/mosaic/tiles/{stem}.tif`, `store/pmtiles/{stem}.pmtiles`, …) that overwrite in place — content-addressing happens only at the R2 mosaic publish.
 
-- **Per-fork granularity.** Each aggregation tile carries four keys — terrain, contours, soundings, depare — sharing the merged DEM's determinants (covering row, each intersecting source's `catalog.json` recipe hash + priority/maxzoom/offset/land_clamp, the mask identity, smoothing knobs) plus each fork's own modules and config. A tile re-runs iff any fork's content name (or its `.empty` marker) is absent; fresh forks are skipped. A `CONTOUR_LEVELS` change re-merges tiles and writes new contour/depare names but rewrites no terrain pmtiles, so downsample and the terrain bundle skip entirely.
-- **Write discipline.** A fork **supersedes** its stem's other-key siblings (all keys + the `.empty` marker), then **publishes** atomically (write a temp, `os.replace` into the content name), or writes a `.empty` marker when it produced nothing. So a crash mid-rebuild leaves nothing at the current key → reads stale, never a torn artifact vouching as fresh. The per-sha bundle outputs (`store/bundle/*` + `manifest.json`) stay keyed by a `.key` sidecar (they're never hydrated) and follow the same invalidate-before-write / atomic-write rule.
-- **The key cascade replaces the mtime cascade.** An overview's key hashes its children's keys (read off their content filenames), so a rebuilt child yields a new overview name that isn't present → stale, cascading up by construction; a missing artifact self-heals inherently.
-- **Resume.** Each stage is pushed as it finishes, and the long aggregate stage is additionally pushed every ~20 minutes by a background loop. On re-dispatch the box hydrates the **last completed build's** manifest — its artifacts skip as fresh — and rebuilds only what changed (a build interrupted before its pointer flips redoes its own new work, since that new work is in no manifest yet).
-- **`force: true` survives as an escape hatch only** (`FORCE_REBUILD` ignores freshness). Not required for correctness after code/config changes — the keys see those. Reach for it when the store itself is suspect.
-- **Bootstrap:** the first phase-4 build finds no store pointer → clean rebuild (hydrate nothing). The phase-4 content-address rename makes every phase-3 (logical-named + sidecar) artifact stale anyway, so a full re-key rebuild happens regardless; adopting the old names by renaming isn't worth the fragility. Once this build's manifest lands, the legacy names + sidecars become GC debris.
+- **Per-fork granularity.** Terrain, contours, soundings, and depare are separate jobs off the same merged DEM, so e.g. a contour-levels change re-runs the vector forks without rewriting terrain pmtiles.
+- **Code is deliberately not an input to the heavy merge** — an innocuous edit must not re-merge the planet. Force it explicitly when code changes what a tile contains: `-R mosaic_tile` via `snakemake_args`, or the `force` input (`-F`).
+- **Resume.** The volume carries finished artifacts across re-dispatches; `--rerun-incomplete` plus `mosaic.py verify` (which drops unreadable tiles and empty renders a hard teardown stranded) make a re-dispatch rebuild only what's missing or stale.
+- **`force: true` survives as an escape hatch only.** Reach for it when the store itself is suspect.
 
-## The push protocol
+## The publish protocol
 
-Stages push to R2 as they finish (one `rclone copy` pass — the content name self-marks, so there's no artifact-before-sidecar ordering to get right):
+The build writes R2 exactly twice, both products, both at the end of the DAG:
 
-- `coverage` → `build/<sha>/coverage.pmtiles`
-- `aggregate` → `pmtiles/` + `contour/` + `soundings/` + `depare/` (also pushed every ~20 min mid-stage by a background loop; `rclone copy` is idempotent and skips unchanged keys)
-- `downsample` → `pmtiles/` (overviews)
-- **store manifest + pointer** → `store/manifests/<ulid>.json`, then the pointer `store/manifest.json` **last** (one atomic PUT). This is the store's completeness marker: the next build's hydrate and the GC see the whole old world or the whole new one.
-- `bundle` → `build/<sha>/planet.pmtiles` + `overlay-*.pmtiles`
-- vector (`soundings`, `depare`, `contours`) → `build/<sha>/vector.pmtiles`
-- `build/<sha>/manifest.json` → **last** in the build domain, `release.yml`'s completeness marker
+- **`publish_mosaic`** (`mosaic.py publish`) — hash the finished tile COGs, hardlink them under content names, and push only what R2 lacks (`--ignore-existing`; a content-addressed name's presence is proof of its bytes): `mosaic/tiles/<stem>-<hash12>.tif` and `mosaic/planet-z8-<hash12>.tif`, then the index `mosaic/index/<idxhash12>.parquet`, then the **candidate** pointer `mosaic-candidate-<idxhash12>.gti` **last**. The serving pointer `mosaic.gti` is never written from a build — release.yml's promotion copies the winning candidate over it.
+- **`stage_build`** (`bundle.py stage-build`) — every archive to `build/<sha>/` (or `build/<sha>-bbox/`), then `manifest.json` **last**: its presence marks a complete build (release.yml refuses a sha without one), and its `mosaic_gti` field names the candidate the release will promote — which is also what holds that candidate against GC while the manifest lives.
 
-Every push is `rclone copy`, **never `sync --delete`** — deletion is out-of-band (`gc.yml`). A crash mid-push leaves the old pointer over a complete old store; this build's pushed-but-unreferenced objects are GC debris.
+Every push is `rclone copy`/`copyto`, **never `sync --delete`** — deletion is out-of-band (`gc.yml`). A crash mid-publish leaves the serving pointer untouched over a complete old world; the partial candidate is unpromotable by construction (pointer-last) and falls to GC.
 
 ## Changing a source's resolution cap
 
@@ -148,27 +141,27 @@ A dispatch with `bbox` set builds a regional slice — the primary way to test b
 
 - **Rebuild-scoping steps** (cover, coverage, aggregate, downsample, the vector forks) honor `BBOX` (empty = planet): the box passes `-e BBOX` into every `docker run`, and the covering carries the scope transitively.
 - **Shared-metadata steps** (source prep / `catalog.json`, the land + water masks) are **not in this build at all** — they moved to `sources.yml`, which is always global. A build never writes them.
-- **Planet-scoped-pointer steps** (hydrate, the store manifest + pointer flip) **skip** when BBOX is set — a regional run never writes a planet-scoped pointer (`store/manifest.json`), and content-addressed artifacts from a window can't corrupt the planet store (worst case they add unreferenced keys for the GC). The manifest/pointer block is guarded `if [ -z "$BBOX" ]`.
+- **Publish steps** stage under `build/<sha>-bbox/` when BBOX is set — release.yml promotes only the bare sha, so a regional stage can never ship. The only pointer a build writes is its own mosaic **candidate** GTI, scoped to whatever covering it built; the serving pointer is untouchable from here either way.
 
-A `bbox` build is otherwise **self-contained**: it skips the hydrate and flips no pointer — it may push content-addressed store artifacts (harmless, unreferenced garbage) but its `build/<sha>/` outputs reflect only the window. So `planet.pmtiles`/`vector.pmtiles` from a bbox build reflect only the window (compare a bbox build's tiles over the bbox, not against the planet). A bbox build never releases.
+A `bbox` build is otherwise **self-contained**: its `build/<sha>-bbox/` outputs reflect only the window, so compare a bbox build's tiles over the bbox, not against the planet. Its regional candidate is held against GC only by its own manifest until the `build/` lifecycle rule expires it. A bbox build never releases.
 
 ### One store-mutating workflow at a time, globally
 
 The workflow-level `concurrency: r2-store` group (no `cancel-in-progress`) exists because two writers mutating the store concurrently corrupt it — it's shared with `sources.yml` (whose prepared-source syncs use `--delete`) AND `gc.yml` (the only deletion path), so a build never interleaves with a source refresh or a GC. Don't scope it per-ref.
 
-### No `--delete`; the pointer is the completeness marker; GC is the only deletion path
+### No `--delete`; pointers flip last; GC is the only deletion path
 
-- **No `--delete` anywhere but GC.** Pushes are `rclone copy`, so a re-tile / re-key leaves the old object behind as unreferenced garbage rather than clobbering a concurrent write. It's collected out-of-band.
-- **`store/manifest.json` (the store pointer) flips last** — after every artifact it references is up — so the next build's hydrate and the GC always see a complete store. **`build/<sha>/manifest.json`** likewise flips last in the build domain, `release.yml`'s completeness marker.
-- **GC (`gc.yml`) is the only deletion path.** A re-tile is now purely additive (new content names + a new manifest, pointer flips to it), so no build-time prune exists — the old 25%-guard / pmtiles-before-FGB ordering is deleted, not ported. See [Garbage collection](#garbage-collection).
+- **No `--delete` anywhere but GC.** Pushes are `rclone copy`, so a re-publish leaves superseded objects behind as unreferenced garbage rather than clobbering anything concurrent. It's collected out-of-band.
+- **Pointers flip last.** The candidate GTI publishes after the tiles/planet/index it names; `build/<sha>/manifest.json` flips last in the build domain (release.yml's completeness marker); the serving `mosaic.gti` is written only by release promotion, from a complete candidate.
+- **GC (`gc.yml`) is the only deletion path.** No build-time prune exists. See [Garbage collection](#garbage-collection).
 
-### Code and config changes rebuild themselves
+### Config changes rebuild themselves; code changes are force-only
 
-The historical footgun this replaces: the old covering diff only saw source coverage, so a change to what a tile _contains_ (smoothing, contour levels, encoding, depare logic) marked nothing dirty and shipped a stale planet unless someone remembered `force: true`. The content-hash keys close it — each stage's key hashes the modules and resolved config that produce it, so exactly the affected artifacts rebuild on the next dispatch. `force` remains only as the escape hatch for a corrupted store.
+Config knobs ride as rule inputs and params, so an artifact rebuilds when the resolved config it read changed. Code is deliberately **not** an input to the heavy merge — the historical footgun (an edit silently shipping a stale planet) is traded for an explicit dispatch: when pipeline code changes what a tile contains, force the affected rules (`-R mosaic_tile` via `snakemake_args`, or `force: true`).
 
 ### Pipeline code stays R2-agnostic
 
-`pipelines/*.py` reads and writes the local `store/` and knows nothing about R2, rclone, or the box — all cloud plumbing (hydrate/push, `/vsicurl` bases via env vars like `SOURCE_VSI_BASE`/`LANDMASK`/`WATERMASK`, `AGG_PROCESSES`/`GDAL_CACHEMAX` sizing) lives in the workflow. Keep it that way: it's what makes `just planet` / `just preview` run identically on a laptop. The box's build is just `just planet` decomposed into per-stage `docker run`s with pushes interleaved — the recipes and their order are byte-identical to a local build.
+`pipelines/*.py` reads and writes the local `store/` and knows nothing about R2, rclone, or the box — all cloud plumbing (`/vsicurl` bases via env vars like `SOURCE_VSI_BASE`, core/memory/disk budget sizing) lives in the workflow. Keep it that way: it's what makes `just preview` run identically on a laptop. The box's build is the same Snakemake DAG a local run walks, pointed at the volume's store.
 
 ### Pinned rclone
 
@@ -178,16 +171,19 @@ The box downloads the **pinned, sha256-verified rclone 1.74.4** (same as `source
 
 Deletion is out-of-band: [`.github/workflows/gc.yml`](../.github/workflows/gc.yml) runs weekly (Tuesday) + on dispatch (with a `dry_run` input, default true for a manual run; the cron always deletes), sharing the `r2-store` concurrency group so it can never run during a build or a source refresh. It is the **only deletion path anywhere**.
 
+The referenced set is rooted on the published mosaic:
+
+- `mosaic/mosaic.gti` — the serving pointer — plus the index parquet, `planet-z8` overview, and every tile COG the index's `location` column names. Any failure resolving this set refuses the whole run: a broken serving set is a human's problem, never a delete list.
+- every candidate still named by a live `build/<sha>/manifest.json` (`mosaic_gti`), rooted the same way: a published-but-unreleased build stays promotable until the `build/` lifecycle rule (7 days) expires its manifest. A candidate whose GTI or index never landed can never be promoted, so it's skipped with a note and its debris falls to collection.
+
 It deletes:
 
-- store artifacts under `pmtiles/`/`contour/`/`soundings/`/`depare/` **not referenced by the union of the last N = 3 store manifests** (keeps a couple of builds of hydrate/rollback headroom). Pre-phase-4 mutable-named artifacts + their `.key` sidecars fall out here for free — they sit in those prefixes and no manifest names them;
-- the retired diff-era `aggregation/<ulid>/` coverings (phase 4 hydrates from the manifest — nothing reads a covering from R2);
+- everything else under `mosaic/` — superseded tiles/overviews, old indexes, and old candidate GTIs. A promoted candidate's own copy is included: `release.yml` skips promotion for an already-published sha, so a rollback re-dispatch never re-reads it;
+- the retired store-hydrate prefixes **wholesale** — `pmtiles/`, `contour/`, `soundings/`, `depare/`, `aggregation/`, `store/` — dead since the store moved to the persistent build volume; nothing reads or writes them;
 - retired `source/<id>/bounds.csv` registrations (`catalog.json` carries the per-file rows as `seascape:files` now).
 
-It **never touches**: `build/<sha>/` (an R2 lifecycle rule collects it after 7 days — see `release.yml` — and releases are promoted to the separate tiles bucket, so keeping `build/<sha>/` out of GC scope is the conservative choice), source COGs / `catalog.json`, the store manifests, or the pointer.
+It **never touches**: `build/<sha>/` (read-only roots here; an R2 lifecycle rule collects it after 7 days — see `release.yml` — and releases are promoted to the separate tiles bucket), source COGs / `catalog.json` / `polygon/` / `landmask/` (sources.yml owns them).
 
-Guards: it refuses to delete anything unless the pointer **and** every one of the last N manifests fetch as valid JSON, and unless the referenced set actually matches objects present in the store (a path/listing mismatch must never delete the world); it logs a full per-prefix inventory (kept/deleted) before deleting; and it deletes in bounded batches. The Collect arithmetic + every refusal guard live in one script, [`scripts/gc-collect.sh`](../scripts/gc-collect.sh) — gc.yml invokes it with the rclone backend, and its test [`pipelines/test_gc.sh`](../pipelines/test_gc.sh) (`just test-gc`, run by ci.yml on every push) invokes the same script with the local backend against a synthetic tree, covering the happy path and each refusal — so the workflow and its test cannot drift.
+Guards — **absence is proof, errors are not**: an object genuinely absent from a cleanly-fetched mosaic listing skips (an unpublished candidate is unpromotable debris), but any *error* refuses the whole run — a failed `mosaic/` or `build/` listing, a listed manifest or index that won't read, unparsable Parquet or tile locations, or a referenced object missing from the listing. Treating a transient backend error as absence would silently drop a live root and delete objects the next release needs. It logs a full inventory before deleting, and deletes in bounded batches. The Collect arithmetic + every refusal guard live in one script, [`scripts/gc-collect.sh`](../scripts/gc-collect.sh) — gc.yml invokes it with the rclone backend, and its test [`pipelines/test_gc.sh`](../pipelines/test_gc.sh) (`just test-gc`, run by ci.yml on every push) invokes the same script with the local backend against a synthetic tree, covering the happy path and each refusal — so the workflow and its test cannot drift.
 
-Operationally: before the cron's first live deletion, run a manual dispatch with `dry_run=true` (the default) and eyeball the inventory — kept/deleted counts per prefix should match expectations (a healthy store deletes a small superseded slice; "most of a prefix" flagged means stop and investigate, though the guards should have refused first).
-
-Accepted debt: `store/manifests/*.json` grow unbounded — one small JSON per planet build, so years of weekly builds cost megabytes, not money. If it ever matters, teach the GC to keep the newest ~20 manifests (they're ULID-named, so retention is one `tail -n`); deliberately not built now to keep the first GC's delete surface minimal.
+Operationally: before the cron's first live deletion, run a manual dispatch with `dry_run=true` (the default) and eyeball the inventory — a healthy store flags a small superseded slice of `mosaic/`; "most of the prefix" flagged means stop and investigate, though the guards should have refused first.

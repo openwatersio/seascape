@@ -70,6 +70,7 @@ test-sources:
     uv run python source_check.py --check
     uv run python source_datum.py --check
     uv run python datum_grid.py --check
+    uv run python datum_grid_fr.py --check
     uv run snakemake -s ../Snakefile -n sources > /dev/null
 
 # Build self-checks: the e2e (real stage-1 CLIs + the unified DAG), the `cover` checkpoint
@@ -93,8 +94,8 @@ test-workflows:
     cd "{{justfile_directory()}}" && actionlint
 
 # Test the GC's Collect step (scripts/gc-collect.sh — the exact script gc.yml runs, local
-# backend) against a synthetic store tree: happy path + every refusal guard. Needs bash + jq;
-# ci.yml runs it on every push.
+# backend) against a synthetic store tree: happy path + every refusal guard. Needs bash + jq +
+# python3/pyarrow; ci.yml runs it on every push.
 test-gc:
     bash test_gc.sh
 
