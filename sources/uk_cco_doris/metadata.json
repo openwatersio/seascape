@@ -5,6 +5,7 @@
     "attribution": "This image/map/product was produced using data from DORIS (DORset Integrated Seabed survey), a collaborative project involving Dorset Wildlife Trust, The Maritime and Coastguard Agency, Channel Coastal Observatory and the Royal Navy",
     "license": "Crown Copyright; the FGDC record states no licence and grants reuse in its metadata comment: \"Extracted grid survey data sets (e.g. 1m spacing) published on the website may be freely used for any application (except for products and services used in support of navigation)\" — derived products must be marked \"Not to be used for navigational purposes\"",
     "max_zoom": 15,
+    "valid_range": [-200, 10],
     "unpack": "asc-tile",
     "datum": "Ordnance Datum Newlyn (~MSL); elevation, seafloor negative (like GEBCO) — no transform",
     "crs": "EPSG:27700"
