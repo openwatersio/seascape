@@ -259,7 +259,8 @@ rule datum_surface:
 rule datum_surface_dgm_w:
     input:
         script=str(SOURCES_DIR / "dgm_w" / "build_reference.py"),
-        gauges=str(SOURCES_DIR / "dgm_w" / "tideelbe_skn.csv"),
+        data=sorted(str(p) for p in (SOURCES_DIR / "dgm_w").glob("*.csv"))
+        + sorted(str(p) for p in (SOURCES_DIR / "dgm_w").glob("*.wkt")),
     output:
         "store/datum/dgm_w_lowwater.tif"
     priority: 5_000_000  # a source prep waits on it; same band as the registrations

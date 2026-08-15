@@ -1,0 +1,26 @@
+# Upper (impounded) Rhein low-water datum: normal retention level (Stauziel / cote de retenue
+# normale) per barrage, in NHN. The upper Rhein km 164–334 (Basel→Iffezheim) is a staircase of ten
+# impounded pools, each held at its downstream barrage's retention level; build_reference.py assigns
+# each channel pixel the retention level of the first barrage downstream of it. Because this reach
+# flows due north, the pools separate cleanly by latitude (lat strictly increases downstream), so
+# the barrage latitude is the pool divider — no weir geometry needed (cf. the Main's weir lines).
+#
+# retention: French Wikipedia "Schéma détaillé du Grand canal d'Alsace et du Rhin" longitudinal
+#   profile (ten pool levels 244.26→123.68 m), anchored on Iffezheim's measured operating Stauziel
+#   123.683 m NHN (WSA Oberrhein / de.wikipedia "Staustufe Iffezheim"). The eight French values are
+#   NGF (Lallemand); NGF↔NHN differ up to a few dm, so treat intermediate levels as ±0.3 m in NHN —
+#   fine for a non-navigational depth render. Cross-checks: chute (fall) differences reproduce the
+#   published Kembs/Ottmarsheim/Fessenheim/Gambsheim heads within a few dm; total drop 132.8 m ≈ the
+#   stated ~132 m. lat,lon: the barrage's CEMT-VIb navigation lock from OSM (snapped to the nav
+#   centerline for the divider latitude). km: Rhine PK from fr.wikipedia. Not for navigation.
+barrage,km,lat,lon,stauziel_nhn_m
+Kembs,179.1,47.6525,7.5265,244.26
+Ottmarsheim,194.0,47.7687,7.5265,230.40
+Fessenheim,210.5,47.9105,7.5717,214.90
+Vogelgruen,224.5,48.0194,7.5785,199.20
+Marckolsheim,239.9,48.1496,7.5897,186.90
+Rhinau,256.1,48.2807,7.6789,173.70
+Gerstheim,272.2,48.4007,7.7291,160.40
+Strasbourg,287.3,48.5248,7.7942,148.65
+Gambsheim,308.8,48.6851,7.9109,135.40
+Iffezheim,333.7,48.8312,8.1129,123.683
