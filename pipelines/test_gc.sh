@@ -3,9 +3,11 @@
 # bathymetry-shaped tree, invoking the SAME script gc.yml runs (local backend), so the workflow's
 # Collect step and its test cannot drift. Covers the happy path (the exact delete/keep/purge sets,
 # a pending candidate rooted via its build manifest, and an incomplete candidate that soft-skips)
-# AND every refusal guard: absent pointer (clean no-op), corrupt pointer, a missing/unreadable/
-# empty index, an unparsable tile location, and a referenced object missing from the listing. The
-# delete phase stays in gc.yml; its only arithmetic (the bounded batch split) is checked here too.
+# AND the failure semantics: absence skips (absent pointer no-op, unpublished candidate, an index
+# that never landed, a torn build manifest), errors refuse (corrupt pointer, a missing/unreadable/
+# empty index, an unparsable tile location, a referenced object missing from the listing, a listed
+# build manifest that won't read). The delete phase stays in gc.yml; its only arithmetic (the
+# bounded batch split) is checked here too.
 # Run: `just test-gc` (bash + jq + python3/pyarrow; ci.yml runs it on every push).
 set -euo pipefail
 
@@ -158,6 +160,35 @@ expect_refuse "unparsable tile location" "unparsable tile location"
 mutate; rm "$root/mut/mosaic/tiles/6-0-0-14-dddddddddddd.tif"
 expect_refuse "referenced object missing" "missing from the store listing"
 
+# h) a LISTED build manifest that won't read → refuse (an error is not absence: treating it as
+#    "no candidate" would delete a live build's candidate)
+mutate; chmod 000 "$root/mut/build/aaa111/manifest.json"
+expect_refuse "unreadable build manifest" "listed but unreadable"
+
+# i) a torn (invalid-JSON) build manifest is NOT a refusal — release.yml jq-parses it the same
+#    way, so it can't promote either; its candidate loses the hold and falls to collection
+mutate; echo '{ torn' > "$root/mut/build/aaa111/manifest.json"
+tornout=$(mktemp -d)
+GC_OUT="$tornout" bash "$COLLECT" local "$root/mut" > "$tornout/log" 2>&1 \
+  || { echo "FAIL: torn build manifest must not refuse:"; cat "$tornout/log"; fail=1; }
+grep -q "skipping build/aaa111/manifest.json" "$tornout/log" \
+  || { echo "FAIL: torn build manifest must log a skip"; fail=1; }
+assert_in "mosaic/mosaic-candidate-c2c2c2c2c2c2.gti" "$tornout/gc-delete.txt"
+
+# j) a pending candidate's LISTED index that won't parse → refuse (soft mode only forgives absence)
+mutate; echo "not parquet" > "$root/mut/mosaic/index/c2c2c2c2c2c2.parquet"
+expect_refuse "unreadable pending index" "not readable Parquet"
+
+# k) a pending candidate whose index never landed → skip + collect (absence IS proof: publish
+#    order means no index = the candidate can never be promoted)
+mutate; rm "$root/mut/mosaic/index/c2c2c2c2c2c2.parquet"
+skipout=$(mktemp -d)
+GC_OUT="$skipout" bash "$COLLECT" local "$root/mut" > "$skipout/log" 2>&1 \
+  || { echo "FAIL: absent pending index must not refuse:"; cat "$skipout/log"; fail=1; }
+grep -q "its index never landed" "$skipout/log" \
+  || { echo "FAIL: expected the index-never-landed skip"; fail=1; }
+assert_in "mosaic/mosaic-candidate-c2c2c2c2c2c2.gti" "$skipout/gc-delete.txt"
+
 # g) ABSENT pointer is not a refusal: pre-mosaic store → exit 0 with empty outputs
 mutate; rm "$root/mut/mosaic/mosaic.gti"
 noptr=$(mktemp -d)
@@ -178,4 +209,4 @@ done
 rm -rf "$tmpb"
 
 [ "$fail" -eq 0 ] || exit 1
-echo "gc-sim ok — ${#mosaic_del[@]} mosaic garbage + 1 bounds.csv flagged, ${#mosaic_keep[@]} referenced kept (serving + pending candidate), 6 retired prefixes purged, incomplete candidate skipped, 6 guards refuse, absent-pointer no-op, batches bounded"
+echo "gc-sim ok — ${#mosaic_del[@]} mosaic garbage + 1 bounds.csv flagged, ${#mosaic_keep[@]} referenced kept (serving + pending candidate), 6 retired prefixes purged, 8 guards refuse, 4 absence cases skip/no-op, batches bounded"

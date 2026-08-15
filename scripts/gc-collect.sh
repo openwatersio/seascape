@@ -8,15 +8,20 @@
 #
 # The referenced set is rooted on the published mosaic:
 #   - mosaic/mosaic.gti (the serving pointer): its index parquet, planet-z8 overview, and every
-#     tile COG the index's `location` column names. Any failure here REFUSES — a broken serving
-#     set is a human's problem, never a delete list.
+#     tile COG the index's `location` column names.
 #   - each candidate a live build/<sha>/manifest.json names (.mosaic_gti), rooted the same way: a
 #     published-but-unreleased build must stay promotable, and the build/ lifecycle rule (7 days)
-#     bounds how long that hold lasts. A candidate whose GTI or index never landed can never be
-#     promoted — skipped with a note, so its debris falls to collection.
+#     bounds how long that hold lasts.
 # Everything else under mosaic/ (superseded tiles/overviews, old candidate GTIs + indexes) is the
 # delete set. Published pointers carry absolute /vsicurl public URLs; refs are stripped to
 # store-relative paths before the set arithmetic.
+#
+# Failure semantics — absence is proof, errors are not: a candidate GTI or index ABSENT from the
+# mosaic listing is an incomplete, unpromotable publish (publish uploads tiles → planet → index →
+# GTI last), so it's skipped and its debris collected. Every other failure — a listing error, a
+# listed object that won't read, an index that won't parse, a location the parser doesn't
+# recognize — REFUSES the whole run: treating a transient backend error as absence would silently
+# drop a live root and delete objects the next release needs.
 #
 # Also flags:
 #   - the retired store-hydrate prefixes WHOLESALE (gc-purge-dirs.txt): pmtiles/ contour/
@@ -44,11 +49,24 @@ GC_OUT=${GC_OUT:-/tmp}
 case "$BACKEND" in
   rclone)
     bk_cat()   { rclone cat "$ROOT/$1" 2>/dev/null; }
+    # Error-swallowing listing — ONLY for prefixes where under-listing is fail-safe (it can only
+    # shrink the delete set). Never use it to enumerate roots.
     bk_files() { rclone lsf -R --files-only "$ROOT/$1" 2>/dev/null || true; }
+    # Root enumeration: exit 3 ("directory not found") is a legitimately absent prefix; any other
+    # nonzero is a backend error the caller must refuse on, because a silently-empty listing here
+    # would hide a live root.
+    bk_files_strict() {
+      local out rc=0
+      out=$(rclone lsf -R --files-only "$ROOT/$1" 2>/dev/null) || rc=$?
+      [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ] || return 1
+      [ -z "$out" ] || printf '%s\n' "$out"
+    }
     ;;
   local)
     bk_cat()   { cat "$ROOT/$1" 2>/dev/null; }
     bk_files() { (cd "$ROOT/$1" 2>/dev/null && find . -type f | sed 's#^\./##' | sort) || true; }
+    # Local dirs can't fail transiently — absent = empty, same as rclone's exit 3.
+    bk_files_strict() { bk_files "$1"; }
     ;;
   *) echo "::error::unknown backend '$BACKEND' (rclone|local)" >&2; exit 2 ;;
 esac
@@ -58,50 +76,49 @@ refuse() { echo "::error::$1" >&2; exit 1; }
 python3 -c 'import pyarrow.parquet' 2>/dev/null \
   || refuse "python3 + pyarrow required — the mosaic index is GeoParquet"
 
-# Strip a pointer ref down to its mosaic/-relative path (published candidates and the promoted
-# serving pointer carry absolute /vsicurl URLs so they resolve off the bucket).
+# Published pointers carry absolute /vsicurl public URLs (candidates must resolve off the bucket);
+# strip a ref down to its mosaic/-relative path so the set arithmetic is form-independent.
 strip_ref() { sed -E 's#^/vsicurl/##; s#^https?://[^[:space:]]*/mosaic/##'; }
 
 # root_gti <gti-name> <hard|soft>: parse mosaic/<gti-name>, fetch the index it names, and append
-# the GTI + index + planet overview + every tile location to gc-referenced.txt. hard (the serving
-# pointer) refuses on any failure; soft (a build-manifest candidate) logs and adds nothing — an
-# incompletely-published candidate can never be promoted, so its debris is collectable.
+# the GTI + index + planet overview + every tile location to gc-referenced.txt. soft (a
+# build-manifest candidate) skips when the GTI or index is ABSENT from the mosaic listing — proof
+# of an incomplete, unpromotable publish. Everything else refuses in BOTH modes: a listed object
+# that won't read or parse is a backend error or a parser blind spot, and either one could be
+# hiding a live root.
 root_gti() {
   local gti=$1 mode=$2 xml="$GC_OUT/gc-gti.xml" idx="$GC_OUT/gc-index.parquet" midx planet
+  if [ "$mode" = soft ] && ! grep -qxF "mosaic/$gti" "$GC_OUT/gc-all.txt"; then
+    echo "skipping $gti — never published (absent from the mosaic listing)"; return 0
+  fi
   if ! bk_cat "mosaic/$gti" > "$xml" || [ ! -s "$xml" ]; then
-    if [ "$mode" = hard ]; then refuse "mosaic/$gti unreadable — refusing to GC"; fi
-    echo "skipping $gti — its GTI never landed (incomplete publish)"; return 0
+    refuse "mosaic/$gti unreadable — refusing to GC"
   fi
   midx=$(grep -o '<IndexDataset>[^<]*</IndexDataset>' "$xml" | sed -E 's#</?IndexDataset>##g' | strip_ref || true)
   planet=$(grep -o '<Dataset>[^<]*</Dataset>' "$xml" | sed -E 's#</?Dataset>##g' | strip_ref || true)
   case "$midx" in
     index/*.parquet) ;;
-    *) if [ "$mode" = hard ]; then refuse "mosaic/$gti has no parsable <IndexDataset> — corrupt mosaic pointer, refusing to GC"; fi
-       echo "skipping $gti — unparsable index ref"; return 0 ;;
+    *) refuse "mosaic/$gti has no parsable <IndexDataset> — corrupt mosaic pointer, refusing to GC" ;;
   esac
   case "$planet" in
     planet-z8-*.tif) ;;
-    *) if [ "$mode" = hard ]; then refuse "mosaic/$gti has no parsable overview <Dataset> — corrupt mosaic pointer, refusing to GC"; fi
-       echo "skipping $gti — unparsable planet ref"; return 0 ;;
+    *) refuse "mosaic/$gti has no parsable overview <Dataset> — corrupt mosaic pointer, refusing to GC" ;;
   esac
-  if ! bk_cat "mosaic/$midx" > "$idx" || [ ! -s "$idx" ]; then
-    if [ "$mode" = hard ]; then refuse "mosaic/$midx (named by mosaic/$gti) failed to fetch — pointer/index mismatch, refusing to GC"; fi
+  if [ "$mode" = soft ] && ! grep -qxF "mosaic/$midx" "$GC_OUT/gc-all.txt"; then
     echo "skipping $gti — its index never landed (incomplete publish)"; return 0
+  fi
+  if ! bk_cat "mosaic/$midx" > "$idx" || [ ! -s "$idx" ]; then
+    refuse "mosaic/$midx (named by mosaic/$gti) failed to fetch — pointer/index mismatch, refusing to GC"
   fi
   if ! python3 -c 'import sys, pyarrow.parquet as pq
 for loc in pq.read_table(sys.argv[1], columns=["location"]).column("location").to_pylist():
     print(loc)' "$idx" > "$GC_OUT/gc-locs-raw.txt" 2>/dev/null; then
-    if [ "$mode" = hard ]; then refuse "mosaic/$midx is not readable Parquet — refusing to GC"; fi
-    echo "skipping $gti — its index is not readable Parquet"; return 0
+    refuse "mosaic/$midx is not readable Parquet — refusing to GC"
   fi
   strip_ref < "$GC_OUT/gc-locs-raw.txt" > "$GC_OUT/gc-locs.txt"
-  if [ ! -s "$GC_OUT/gc-locs.txt" ]; then
-    if [ "$mode" = hard ]; then refuse "mosaic/$midx names no tiles — empty index, refusing to GC"; fi
-    echo "skipping $gti — empty index"; return 0
-  fi
+  [ -s "$GC_OUT/gc-locs.txt" ] || refuse "mosaic/$midx names no tiles — empty index, refusing to GC"
   if grep -qvE '^tiles/[^/]+\.tif$' "$GC_OUT/gc-locs.txt"; then
-    if [ "$mode" = hard ]; then refuse "mosaic/$midx contains an unparsable tile location — refusing to GC"; fi
-    echo "skipping $gti — unparsable tile location in its index"; return 0
+    refuse "mosaic/$midx contains an unparsable tile location — refusing to GC"
   fi
   { printf 'mosaic/%s\n' "$gti" "$midx" "$planet"; sed 's#^#mosaic/#' "$GC_OUT/gc-locs.txt"; } >> "$GC_OUT/gc-referenced.txt"
   echo "rooted $gti → $(wc -l < "$GC_OUT/gc-locs.txt") tile(s) + index + planet"
@@ -116,15 +133,30 @@ if ! bk_cat mosaic/mosaic.gti > "$GC_OUT/gc-probe.gti" || [ ! -s "$GC_OUT/gc-pro
   : > "$GC_OUT/gc-purge-dirs.txt"
   exit 0
 fi
+
+# 2) The full mosaic/ listing — BEFORE rooting, because the roots' absence checks read it. The
+#    pointer just read, so an empty listing is a backend/path problem, not an empty store.
+bk_files mosaic | sed 's#^#mosaic/#' | sort -u > "$GC_OUT/gc-all.txt"
+[ -s "$GC_OUT/gc-all.txt" ] || refuse "mosaic listing is empty but the pointer read — listing mismatch, refusing to GC"
+
 root_gti mosaic.gti hard
 
-# 2) Candidates still promotable: named by a live build/<sha>/manifest.json. A torn or invalid
-#    manifest can't be released either (release.yml jq-parses it the same way) — skipped.
-bk_files build | grep '/manifest\.json$' | sort > "$GC_OUT/gc-build-manifests.txt" || true
+# 3) Candidates still promotable: named by a live build/<sha>/manifest.json. The listing is
+#    strict (a listing error would hide a live build and delete its candidate); a manifest that
+#    LISTS but won't read is the same hazard, so it refuses. Only a manifest that reads as
+#    invalid JSON is skipped — release.yml jq-parses it the same way, so it can't promote either.
+bk_files_strict build > "$GC_OUT/gc-build-files.txt" \
+  || refuse "build/ listing failed — a hidden live build would lose its candidate, refusing to GC"
+grep '/manifest\.json$' "$GC_OUT/gc-build-files.txt" | sort > "$GC_OUT/gc-build-manifests.txt" || true
 : > "$GC_OUT/gc-candidates.txt"
 while IFS= read -r m; do
   [ -n "$m" ] || continue
-  gti=$(bk_cat "build/$m" | jq -r '.mosaic_gti // empty' 2>/dev/null) || gti=""
+  bk_cat "build/$m" > "$GC_OUT/gc-bm.json" \
+    || refuse "build/$m is listed but unreadable — refusing to GC"
+  if ! gti=$(jq -r '.mosaic_gti // empty' "$GC_OUT/gc-bm.json" 2>/dev/null); then
+    echo "skipping build/$m — not valid JSON (torn upload; release.yml can't promote it either)"
+    continue
+  fi
   case "$gti" in
     mosaic-candidate-*.gti) echo "$gti" >> "$GC_OUT/gc-candidates.txt" ;;
     "") ;;
@@ -139,24 +171,22 @@ done < "$GC_OUT/gc-candidates.txt"
 sort -u -o "$GC_OUT/gc-referenced.txt" "$GC_OUT/gc-referenced.txt"
 echo "referenced mosaic objects: $(wc -l < "$GC_OUT/gc-referenced.txt")"
 
-# 3) Everything actually under mosaic/. Every referenced object must be PRESENT: a rooted set is
-#    complete by construction (publish uploads tiles → planet → index → GTI, promotion copies a
-#    complete candidate), so a gap means a stale or mismatched listing that would otherwise mark
-#    live objects unreferenced — refuse.
-bk_files mosaic | sed 's#^#mosaic/#' | sort -u > "$GC_OUT/gc-all.txt"
-[ -s "$GC_OUT/gc-all.txt" ] || refuse "mosaic listing is empty but the pointer read — listing mismatch, refusing to GC"
+# 4) Every referenced object must be PRESENT: a rooted set is complete by construction (publish
+#    uploads tiles → planet → index → GTI, promotion copies a complete candidate), so a gap means
+#    a stale or mismatched listing that would otherwise mark live objects unreferenced — refuse.
 missing=$(comm -13 "$GC_OUT/gc-all.txt" "$GC_OUT/gc-referenced.txt" | head -3 | paste -sd' ' -)
 [ -z "$missing" ] || refuse "referenced objects missing from the store listing ($missing …) — refusing to GC"
 
-# 4) Unreferenced mosaic objects → the delete set.
+# 5) Unreferenced mosaic objects → the delete set.
 comm -23 "$GC_OUT/gc-all.txt" "$GC_OUT/gc-referenced.txt" > "$GC_OUT/gc-delete.txt"
 
-# 5) Retired source/<id>/bounds.csv registrations.
+# 6) Retired source/<id>/bounds.csv registrations.
 bk_files source | grep '/bounds\.csv$' | sed 's#^#source/#' >> "$GC_OUT/gc-delete.txt" || true
 sort -u -o "$GC_OUT/gc-delete.txt" "$GC_OUT/gc-delete.txt"
 del=$(wc -l < "$GC_OUT/gc-delete.txt")
 
-# 6) The retired store-hydrate prefixes, purged wholesale wherever still non-empty.
+# 7) The retired store-hydrate prefixes, purged wholesale wherever still non-empty. Plain
+#    bk_files is fine here: a listing error only defers the purge to the next run.
 : > "$GC_OUT/gc-purge-dirs.txt"
 for p in pmtiles contour soundings depare aggregation store; do
   [ -n "$(bk_files "$p" | head -1)" ] && echo "$p" >> "$GC_OUT/gc-purge-dirs.txt"
