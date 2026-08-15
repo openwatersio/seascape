@@ -1,0 +1,10 @@
+{
+    "name": "Multibeam Bathymetry (England nearshore, 0.5 m)",
+    "producer": "Environment Agency",
+    "website": "https://www.data.gov.uk/dataset/52b3a813-69c6-4b6f-8684-fd0bdc4aa71b/multibeam-bathymetry",
+    "license": "Open Government Licence v3.0",
+    "max_zoom": 15,
+    "unpack": "asc-tile",
+    "datum": "Ordnance Datum Newlyn (~MSL); elevation, seafloor negative (like GEBCO) — no transform",
+    "crs": "EPSG:27700"
+}
