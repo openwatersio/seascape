@@ -1,0 +1,13 @@
+{
+    "name": "German Federal Waterway Bathymetry (WSV DGM-W, 2 m) — tidal reaches",
+    "producer": "Wasserstraßen- und Schifffahrtsverwaltung des Bundes (WSV) / Bundesanstalt für Gewässerkunde (BfG)",
+    "website": "https://via.bund.de/wsv/inspire/",
+    "license": "GeoNutzV (attribution: © Wasserstraßen- und Schifffahrtsverwaltung des Bundes)",
+    "max_zoom": 14,
+    "unpack": "zip:*.tif!1",
+    "nodata": -32768,
+    "offset_surface": "dgm_w_lowwater",
+    "clamp_positive": true,
+    "mixed_crs": true,
+    "datum": "SKN (Seekartennull ≈ LAT). Raw DGM-W is orthometric NHN elevation; the prep subtracts the SKN-in-NHN reference surface (BSH SKN-Fläche Nordsee grid + inner-Elbe gauge profile) and clamps above-datum cells to nodata, so the COG is depth below chart datum."
+}

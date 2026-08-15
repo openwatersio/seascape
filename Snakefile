@@ -41,10 +41,12 @@ LOCAL_LISTED = [s for s in LISTED if s not in STREAMED]
 
 # offset_surface: <name> ⇒ that source's prep subtracts store/datum/<name>.tif per pixel —
 # the chart datum's height in the source's own vertical frame, for the tidal separations no
-# scalar datum_offset_m can express (pipelines/datum_grid.py builds the reference).
+# scalar datum_offset_m can express. pipelines/datum_grid.py builds the VDatum references;
+# dgm_w composes its own (rule datum_surface_dgm_w).
 DATUM_SURFACES = sorted({name for name in
                          (pipeline_config.load_metadata(s).get("offset_surface")
                           for s in ALL_SOURCES) if name})
+VDATUM_SURFACES = [n for n in DATUM_SURFACES if n != "dgm_w_lowwater"]
 
 ONLY = config.get("source")
 if ONLY and ONLY not in PROCESSED + RAW:
@@ -239,7 +241,7 @@ rule datum_surface:
     output:
         "store/datum/{name}.tif"
     wildcard_constraints:
-        name=pat(DATUM_SURFACES)
+        name=pat(VDATUM_SURFACES)
     priority: 5_000_000  # a source prep waits on it; same band as the registrations
     retries: 2  # the bundle fetch is one 3.2 GB stream from vdatum.noaa.gov
     resources:
@@ -250,6 +252,26 @@ rule datum_surface:
         f"{TMP}/logs/datum_surface/{{name}}.log"
     shell:
         "{PY}/datum_grid.py --out {output} 2> {log}"
+
+
+# dgm_w's reference is bespoke (the BSH SKN grid + checked-in gauge profiles composed by the
+# source's own script), so it gets its own rule under the same store/datum/ contract.
+rule datum_surface_dgm_w:
+    input:
+        script=str(SOURCES_DIR / "dgm_w" / "build_reference.py"),
+        gauges=str(SOURCES_DIR / "dgm_w" / "tideelbe_skn.csv"),
+    output:
+        "store/datum/dgm_w_lowwater.tif"
+    priority: 5_000_000  # a source prep waits on it; same band as the registrations
+    retries: 2  # the BSH SKN grid fetch is one stream from gdi.bsh.de
+    resources:
+        mem_gb=8  # the widened SKN canvas in memory
+    benchmark:
+        f"{TMP}/bench/datum_surface/dgm_w_lowwater.tsv"
+    log:
+        f"{TMP}/logs/datum_surface/dgm_w_lowwater.log"
+    shell:
+        "{PY}/../sources/dgm_w/build_reference.py --out {output} 2> {log}"
 
 
 # Masks rebuild only when forced (-R landmask): pinned snapshot/release ⇒ no data drift.
