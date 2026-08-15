@@ -5,6 +5,7 @@
     "attribution": "Data/image courtesy of the National Network of Regional Coastal Monitoring Programmes of England and Wales",
     "license": "Open Government Licence v2.0/v3.0 (attribution to the regional monitoring programme named in each grid's metadata; not for navigation — derived products must be marked \"Not to be used for navigational purposes\")",
     "max_zoom": 15,
+    "valid_range": [-200, 10],
     "unpack": "asc-tile",
     "datum": "Ordnance Datum Newlyn (~MSL); elevation, seafloor negative (like GEBCO) — no transform",
     "crs": "EPSG:27700"

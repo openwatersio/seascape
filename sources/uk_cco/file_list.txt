@@ -1,6 +1,6 @@
 # CCO Multibeam Bathymetry (Channel Coastal Observatory / National Network of Regional
 # Coastal Monitoring Programmes, England & Wales) — OGL v2.0/v3.0, NOT for navigation.
-# 760 zips, one per OS 5 km square per resolution (`<square>_<cellsize>m.zip`),
+# 762 zips, one per OS 5 km square per resolution (`<square>_<cellsize>m.zip`),
 # each holding the newest surveyed ESRI ASCII grid of every OS 1 km square it covers.
 # These are our R2 MIRROR: CCO ships data only through a session-cookied basket and a
 # tokenised, server-compiled download, so sources/uk_cco/harvest.py harvests and repacks
@@ -505,6 +505,7 @@ https://data.openwaters.io/bathymetry/mirror/uk_cco/SZ2090_2m.zip
 https://data.openwaters.io/bathymetry/mirror/uk_cco/SZ2575_1m.zip
 https://data.openwaters.io/bathymetry/mirror/uk_cco/SZ2580_1m.zip
 https://data.openwaters.io/bathymetry/mirror/uk_cco/SZ2585_1m.zip
+https://data.openwaters.io/bathymetry/mirror/uk_cco/SZ2585_2m.zip
 https://data.openwaters.io/bathymetry/mirror/uk_cco/SZ2590_0.25m.zip
 https://data.openwaters.io/bathymetry/mirror/uk_cco/SZ2590_1m.zip
 https://data.openwaters.io/bathymetry/mirror/uk_cco/SZ2590_2m.zip
@@ -512,6 +513,7 @@ https://data.openwaters.io/bathymetry/mirror/uk_cco/SZ3075_1m.zip
 https://data.openwaters.io/bathymetry/mirror/uk_cco/SZ3080_1m.zip
 https://data.openwaters.io/bathymetry/mirror/uk_cco/SZ3085_0.25m.zip
 https://data.openwaters.io/bathymetry/mirror/uk_cco/SZ3085_1m.zip
+https://data.openwaters.io/bathymetry/mirror/uk_cco/SZ3085_2m.zip
 https://data.openwaters.io/bathymetry/mirror/uk_cco/SZ3090_0.25m.zip
 https://data.openwaters.io/bathymetry/mirror/uk_cco/SZ3090_1m.zip
 https://data.openwaters.io/bathymetry/mirror/uk_cco/SZ3090_2m.zip
