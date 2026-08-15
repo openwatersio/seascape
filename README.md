@@ -112,7 +112,7 @@ MapLibre's attribution control credits the sources automatically.
 The full contract — every layer, field, pixel-value meaning, and the semantics no field advertises (chart-datum zero, shoal bias, sign conventions) — is defined in [docs/schema.md](docs/schema.md) and versioned by the integer `schema` field each TileJSON serves. The short version:
 
 - **Raster** decodes Terrarium to `v = R × 256 + G + B / 256 − 32768` metres: `v < 0` is depth below the winning source's datum (shallow-biased — quantization never deepens); the non-negative domain is three flat category codes — `0` water of unknown depth, `1` drying foreshore, `2` land. MapLibre must be told `encoding: "terrarium"` directly on the `raster-dem` source — it does not read that setting from TileJSON.
-- **Vector** layers: `depare` depth-area polygons (positive-down `drval1`/`drval2` bounds, drying as negative `drval1`), `contours` isobath lines, `soundings` positive-down spot depths, all in metric and fathom-curve ladders selected by `sys`.
+- **Vector** layers: `depare` depth-area polygons (positive-down `drval1`/`drval2` bounds, drying as negative `drval1`) and `contours` isobath lines, each cut in metric and fathom-curve ladders selected by `sys`; plus `soundings` spot depths, a single set carrying positive-down `depth_m`/`depth_ft`/`depth_fm` directly.
 - **Coverage** is its own tileset: per-source footprint polygons for click-to-identify provenance; keep it a separate MapLibre source so its low-zoom tiles overzoom independently.
 
 The reasoning behind these choices — why land carries no elevation, why every rounding errs shallow, why feet mode gets real fathom curves — is in [docs/cartography.md](docs/cartography.md).

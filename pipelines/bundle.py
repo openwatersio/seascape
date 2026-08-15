@@ -379,6 +379,7 @@ def _check():
             "manifest.json is returned separately so the publisher sends it LAST"
 
         m = json.load(open(manifest_path))
+        assert m["schema"] == config.SCHEMA, m.get("schema")
         assert set(m["planet"]) == {"file", "min_zoom", "max_zoom", "bbox"}, \
             f"planet is the Worker BundleMeta, no more: {sorted(m['planet'])}"
         assert m["planet"]["file"] == "planet.pmtiles" and m["planet"]["max_zoom"] == 8

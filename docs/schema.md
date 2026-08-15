@@ -22,7 +22,7 @@ The codes are flat by design: they have no slope, so client hillshade renders no
 
 ### Quantization
 
-Elevations are rounded at encode time to a per-zoom vertical step, `2^(19−z)/256` m (z0 ≈ 2048 m, z12 = 0.5 m, z19 = full 1/256 m resolution), capped per-pixel at 1/16 of the local depth and floored at 0.25 m so shallow water keeps chart detail at every zoom. Rounding is conservative — always toward shallower — so a decoded depth is never deeper than the source data.
+Elevations are rounded at encode time to a per-zoom vertical step, `2^(19−z)/256` m (z0 ≈ 2048 m, z12 = 0.5 m, z19 = full 1/256 m resolution), capped per-pixel so shallow water keeps chart detail at every zoom: the cap is 1/16 of the local depth, floored at 0.25 m and then snapped **up** to the next power of two (so the packing stays lossless — the effective step can therefore exceed 1/16 of the depth, e.g. 1 m rather than 0.625 m in 10 m of water). Rounding is conservative — always toward shallower — so a decoded depth is never deeper than the source data.
 
 ### Zoom range and overzoom
 
@@ -44,7 +44,7 @@ Zooming out can only shoal: every coarse tile is clamped shoal-ward against the 
 | `depth_abs_m` | Number | The same level as a positive-down integer (`10`) — the label/lookup form. |
 | `depth_ft` | Number | Positive-down integer feet. |
 | `depth_fm` | Number | Positive-down integer fathoms. |
-| `sys` | String | Which contour ladder the curve belongs to: absent for the metric levels, `"ft"` for the fathom curves (depths that are whole fathoms, labelable as feet or fathoms). The 0 m drying line is one curve shared by every unit and never carries `sys`. |
+| `sys` | String | Which contour ladder the curve belongs to: `"m"` for the metric levels, `"ft"` for the fathom curves (depths that are whole fathoms, labelable as feet or fathoms). The 0 m drying line is one curve shared by every unit and never carries `sys`. |
 
 Coarse zooms carry fewer levels (deep-ocean contours thin out zoomed out); a level's presence at a zoom is a display decision, not a schema guarantee.
 
@@ -63,8 +63,8 @@ A partition of the water into polygons, three feature kinds keyed by attribute p
 | Kind | Signature | Meaning |
 |---|---|---|
 | Depth band | `drval1 ≥ 0`, `sys` present | Water between two charted isobaths: `drval1`/`drval2` are the shallow/deep bounds in positive-down metres. `sys` (`"m"` or `"ft"`) tags which isobath ladder cut the band — render one ladder, never both. |
-| Drying | `drval1 < 0`, no `sys` | Drying foreshore; `−drval1` is the drying height above datum. |
-| Unknown water | no `drval1` | Water of unknown depth (the vector twin of raster code 0). `kind` (String), when present, is the mapped-water subtype (`river`, `lake`, `canal`, `reservoir`). |
+| Drying | `drval1 < 0`, no `sys` | Drying foreshore. `drval1`/`drval2` are the drying bucket's fixed bounds (−drying cap and 0) on every feature, **not** a measured per-feature drying height — only the sign is information. |
+| Unknown water | no `drval1` | Water of unknown depth (the vector twin of raster code 0). |
 
 `rank` (Number) orders the features for painting within the fill.
 

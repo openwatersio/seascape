@@ -27,7 +27,7 @@
  */
 
 import { PMTiles, Source, RangeResponse } from "pmtiles";
-import { style as seascapeStyle } from "@openwaters/seascape";
+import { style as seascapeStyle, SCHEMA } from "@openwaters/seascape";
 import {
   CachedSource,
   contentEtag,
@@ -576,6 +576,25 @@ export default {
           : (["relief", "bands"] as const).find((s) => s === shadingParam);
       if (shadingParam !== null && shading === undefined)
         return bad("shading must be relief or bands");
+      // Same guard as the viewer's: a Worker redeployed against an older or
+      // newer tileset (release.yml republishes prior shas) must not serve a
+      // style that decodes the tiles plausibly but wrongly (docs/schema.md).
+      // A manifestless store (dev/preview) skips the check.
+      const mfSchema = await manifest(renv)
+        .then((m) => m.schema ?? 1)
+        .catch(() => null);
+      if (mfSchema !== null && mfSchema !== SCHEMA)
+        return new Response(
+          `style targets tile schema v${SCHEMA}, but the served tileset is v${mfSchema}`,
+          {
+            status: 503,
+            headers: {
+              "content-type": "text/plain; charset=utf-8",
+              "cache-control": "no-store",
+              ...CORS,
+            },
+          },
+        );
       return json(
         seascapeStyle({
           tilesBase,
@@ -653,7 +672,6 @@ export default {
               drval1: "Number",
               drval2: "Number",
               sys: "String",
-              kind: "String",
               rank: "Number",
             },
           },
