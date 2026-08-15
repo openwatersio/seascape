@@ -124,20 +124,21 @@ for loc in pq.read_table(sys.argv[1], columns=["location"]).column("location").t
   echo "rooted $gti → $(wc -l < "$GC_OUT/gc-locs.txt") tile(s) + index + planet"
 }
 
-# 1) The serving pointer. Genuinely ABSENT = pre-mosaic store, nothing to GC yet — empty outputs,
-#    exit 0. Present means the whole serving set must resolve, or the run refuses.
+# 1) The full mosaic/ listing, STRICT and FIRST: it is both the delete universe and the absence
+#    oracle every root consults, so a partial or failed listing here must refuse — it could make a
+#    live candidate look unpublished while its tiles stay deletable. The listing then decides
+#    pointer absence too: no mosaic/mosaic.gti in a clean listing = pre-mosaic store, nothing to
+#    GC yet (empty outputs, exit 0); a transient fetch error can never masquerade as that.
 : > "$GC_OUT/gc-referenced.txt"
-if ! bk_cat mosaic/mosaic.gti > "$GC_OUT/gc-probe.gti" || [ ! -s "$GC_OUT/gc-probe.gti" ]; then
+bk_files_strict mosaic > "$GC_OUT/gc-all-raw.txt" \
+  || refuse "mosaic/ listing failed — refusing to GC (the listing is the delete universe)"
+sed 's#^#mosaic/#' "$GC_OUT/gc-all-raw.txt" | sort -u > "$GC_OUT/gc-all.txt"
+if ! grep -qxF mosaic/mosaic.gti "$GC_OUT/gc-all.txt"; then
   echo "no mosaic pointer — nothing to GC yet (pre-mosaic store)"
   : > "$GC_OUT/gc-delete.txt"
   : > "$GC_OUT/gc-purge-dirs.txt"
   exit 0
 fi
-
-# 2) The full mosaic/ listing — BEFORE rooting, because the roots' absence checks read it. The
-#    pointer just read, so an empty listing is a backend/path problem, not an empty store.
-bk_files mosaic | sed 's#^#mosaic/#' | sort -u > "$GC_OUT/gc-all.txt"
-[ -s "$GC_OUT/gc-all.txt" ] || refuse "mosaic listing is empty but the pointer read — listing mismatch, refusing to GC"
 
 root_gti mosaic.gti hard
 
@@ -174,8 +175,10 @@ echo "referenced mosaic objects: $(wc -l < "$GC_OUT/gc-referenced.txt")"
 # 4) Every referenced object must be PRESENT: a rooted set is complete by construction (publish
 #    uploads tiles → planet → index → GTI, promotion copies a complete candidate), so a gap means
 #    a stale or mismatched listing that would otherwise mark live objects unreferenced — refuse.
-missing=$(comm -13 "$GC_OUT/gc-all.txt" "$GC_OUT/gc-referenced.txt" | head -3 | paste -sd' ' -)
-[ -z "$missing" ] || refuse "referenced objects missing from the store listing ($missing …) — refusing to GC"
+#    (comm writes to a file, not through head: SIGPIPE under pipefail would eat the diagnostic.)
+comm -13 "$GC_OUT/gc-all.txt" "$GC_OUT/gc-referenced.txt" > "$GC_OUT/gc-missing.txt"
+[ ! -s "$GC_OUT/gc-missing.txt" ] \
+  || refuse "referenced objects missing from the store listing ($(head -3 "$GC_OUT/gc-missing.txt" | paste -sd' ' -) …) — refusing to GC"
 
 # 5) Unreferenced mosaic objects → the delete set.
 comm -23 "$GC_OUT/gc-all.txt" "$GC_OUT/gc-referenced.txt" > "$GC_OUT/gc-delete.txt"

@@ -189,6 +189,22 @@ grep -q "its index never landed" "$skipout/log" \
   || { echo "FAIL: expected the index-never-landed skip"; fail=1; }
 assert_in "mosaic/mosaic-candidate-c2c2c2c2c2c2.gti" "$skipout/gc-delete.txt"
 
+# l/m) The rclone backend's strict-listing discrimination, via a stub rclone on PATH: a listing
+#      ERROR refuses (a partial listing is both the delete universe and the absence oracle), while
+#      exit 3 ("directory not found") is a legitimately empty prefix → pre-mosaic no-op.
+stub=$(mktemp -d)
+printf '#!/usr/bin/env bash\nexit 1\n' > "$stub/rclone"; chmod +x "$stub/rclone"
+rc=0; log=$(GC_OUT="$(mktemp -d)" PATH="$stub:$PATH" bash "$COLLECT" rclone "R2:fake/bathymetry" 2>&1) || rc=$?
+if [ "$rc" -eq 0 ] || ! grep -qF "listing failed" <<<"$log"; then
+  echo "FAIL: rclone listing error must refuse:"; echo "$log"; fail=1
+fi
+printf '#!/usr/bin/env bash\nexit 3\n' > "$stub/rclone"
+emptyout=$(mktemp -d)
+GC_OUT="$emptyout" PATH="$stub:$PATH" bash "$COLLECT" rclone "R2:fake/bathymetry" > "$emptyout/log" 2>&1 \
+  || { echo "FAIL: rclone 'directory not found' must be a pre-mosaic no-op:"; cat "$emptyout/log"; fail=1; }
+[ ! -s "$emptyout/gc-delete.txt" ] && [ ! -s "$emptyout/gc-purge-dirs.txt" ] \
+  || { echo "FAIL: pre-mosaic no-op must flag nothing"; fail=1; }
+
 # g) ABSENT pointer is not a refusal: pre-mosaic store → exit 0 with empty outputs
 mutate; rm "$root/mut/mosaic/mosaic.gti"
 noptr=$(mktemp -d)
@@ -209,4 +225,4 @@ done
 rm -rf "$tmpb"
 
 [ "$fail" -eq 0 ] || exit 1
-echo "gc-sim ok — ${#mosaic_del[@]} mosaic garbage + 1 bounds.csv flagged, ${#mosaic_keep[@]} referenced kept (serving + pending candidate), 6 retired prefixes purged, 8 guards refuse, 4 absence cases skip/no-op, batches bounded"
+echo "gc-sim ok — ${#mosaic_del[@]} mosaic garbage + 1 bounds.csv flagged, ${#mosaic_keep[@]} referenced kept (serving + pending candidate), 6 retired prefixes purged, 9 guards refuse, 5 absence cases skip/no-op, batches bounded"
