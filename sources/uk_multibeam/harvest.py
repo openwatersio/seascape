@@ -32,6 +32,12 @@ whole before it answers (up to ~45 s for a large tile), and PACE_S spaces the pr
 sweep doesn't drive the endpoint into blanket 502/504s — unpaced, it does, within a few hundred
 requests, and then nothing resolves until it recovers.
 
+The endpoint is not content-addressable: one tile fetched three times returned 42.1/42.5/44.6 MB
+under three different SHA-256s for an identical member list (compression varies per response),
+and members have changed value range between builds — so a published raster cannot be
+reproduced from a refetch, which is the argument for mirroring this source rather than
+re-fetching it.
+
 Stdlib only, no pipeline coupling.
 """
 
@@ -48,6 +54,10 @@ PRODUCT, RES = "bathymetry_coastal_multibeam", "0.5"
 KEY = "dspui"
 BBOX = (-5.9, 49.8, 2.0, 56.0)  # England coast (incl. Scilly); the EA archive is England-only
 STEP = 0.8                      # cell size in degrees — small enough that no cell truncates
+# Tiles the index advertises that the store serves for NO year. Naming them is what separates a
+# known phantom from the archive quietly losing a tile: both look like a shorter file_list.txt,
+# and only one of them is fine. An unlisted drop aborts the run.
+EXPECTED_DROPS = frozenset({"SC8570", "TF5035", "TM3030"})
 # Every probe makes the server buffer a whole ~25 MB zip, so back-to-back probes degrade the
 # endpoint into 502/504s for everyone. Pace them; the sweep is slow either way.
 PACE_S = 5
@@ -177,10 +187,18 @@ def resolve(years, probe=serves):
         if i % 10 == 0:
             print(f"  probed {i}/{len(years)} tiles, {len(resolved)} served")
     if dropped:
-        print(f"WARNING: {len(dropped)} tile(s) served no year at all: {' '.join(dropped)}")
+        print(f"{len(dropped)} tile(s) served no year at all: {' '.join(dropped)}")
     if flaky:
         sys.exit(f"{len(flaky)} (tile, year) never answered definitively (a newer survey may "
                  f"exist): {' '.join(flaky)} — nothing written; re-run once the API settles")
+    # An unexpected drop is coverage leaving the file list with nothing to notice it, so it
+    # aborts exactly like an unresolvable probe. Confirm a genuinely retired tile by adding it
+    # to EXPECTED_DROPS; anything still served comes back on the next sweep.
+    surprises = sorted(set(dropped) - EXPECTED_DROPS)
+    if surprises:
+        sys.exit(f"{len(surprises)} tile(s) the index lists served no year and are not known "
+                 f"phantoms: {' '.join(surprises)} — nothing written; re-run, and if the store "
+                 "really has retired them add them to EXPECTED_DROPS")
     return resolved
 
 
@@ -244,12 +262,20 @@ def _check():
 
     assert harvest(searcher=once_flaky) == {"TQ0000": {"2020"}}, "a re-swept cell must count"
 
+    phantom = sorted(EXPECTED_DROPS)[0]
     served = {tile_url("TF4590", "2011"), tile_url("TQ0000", "2020")}
     r = resolve({"TF4590": {"2011", "2017"},  # newest 404s → falls back
                  "TQ0000": {"2020"},
-                 "SX0000": {"1999"}},         # nothing served → dropped entirely
+                 phantom: {"1999"}},          # a KNOWN phantom serves nothing → allowed
                 probe=served.__contains__)
     assert r == [("TF4590", "2011"), ("TQ0000", "2020")], r
+
+    try:  # an UNLISTED tile serving no year is coverage vanishing — abort, don't warn
+        resolve({"TQ0000": {"2020"}, "SX0000": {"1999"}}, probe=served.__contains__)
+        assert False, "an unexpected all-404 tile must abort"
+    except SystemExit as ex:
+        assert "SX0000" in str(ex) and "EXPECTED_DROPS" in str(ex), ex
+        assert "TQ0000" not in str(ex), ("only the surprise is named", ex)
 
     def flaky(url):  # a 504 must never be read as absence
         raise Unresolved(f"504 on {url}")
