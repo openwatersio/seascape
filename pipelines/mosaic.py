@@ -146,7 +146,9 @@ def _translate(filepath, tmp_folder):
             f"gdal_translate -q -of COG -a_nodata {NODATA} "
             # IF_SAFER: IF_NEEDED never fires on compressed output, and >4 GB kills the write
             "-co BIGTIFF=IF_SAFER -co COMPRESS=ZSTD -co PREDICTOR=3 -co BLOCKSIZE=512 "
-            "-co OVERVIEWS=FORCE_USE_EXISTING -co NUM_THREADS=ALL_CPUS "
+            # NUM_THREADS=8, not ALL_CPUS — same core-scaled memory as the per-group
+            # translate (aggregation_reproject.translate); the pin rationale lives there.
+            "-co OVERVIEWS=FORCE_USE_EXISTING -co NUM_THREADS=8 "
             f"{src} {tmp_cog}")
     return tmp_cog
 
