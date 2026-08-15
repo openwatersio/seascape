@@ -567,6 +567,29 @@ _CORRUPT = (zipfile.BadZipFile, gzip.BadGzipFile, tarfile.TarError, EOFError,
             lzma.LZMAError, CorruptRaw)
 
 
+# GDAL's ways of saying "these BYTES are wrong" while converting an extracted member. An
+# archive can be a perfectly good zip whose member is truncated — the container's CRC covers
+# what was stored, not whether the upstream stored a whole file — so this failure lands in a
+# shell-out at STAGING, before the transform where CorruptStaged fires. Matched narrowly on
+# purpose: a recipe error (bad glob, zero members, unknown format) exits through sys.exit and
+# never reaches here, and any other RuntimeError re-raises rather than deleting a download.
+_GDAL_BAD_BYTES = (
+    "file short",                                  # AAIGrid: fewer data lines than the header
+    "ireadblock failed",
+    "not recognized as being in a supported file format",
+    "read error",
+    "tifffilltile",
+    "tiffreadencodedtile",
+    "tiffreadencodedstrip",
+)
+
+
+def _gdal_bad_bytes(message):
+    """Does this shell-out failure mean the member's bytes are bad, rather than the recipe?"""
+    low = message.lower()
+    return any(sig in low for sig in _GDAL_BAD_BYTES)
+
+
 def _unpack_one(unpack, raw, root, source, index, url, asc_dir, seen, origin):
     """Materialize one raw asset per its declaration. No declaration = a bare raster.
     The declared format's magic bytes are validated first, so bytes that contradict the
@@ -635,13 +658,20 @@ def stage(source):
         try:
             note = _unpack_one(unpack, raw, root, source, pos, url, asc_dir, seen, origin)
         except _CORRUPT as e:
-            print(f"{origin}: corrupt raw ({e}) — deleted, a rerun refetches it")
-            os.remove(raw)
-            corrupt.append(h)
+            reason = str(e)
+        except RuntimeError as e:
+            # A shell-out failure is a recipe bug unless GDAL says the bytes are bad.
+            if not _gdal_bad_bytes(str(e)):
+                raise
+            reason = f"GDAL could not read an extracted member — {str(e).strip().splitlines()[-1]}"
+        else:
+            for name in _staged_now(root) - before:
+                produced[name] = raw
+            print(f"{origin}: {note}")
             continue
-        for name in _staged_now(root) - before:
-            produced[name] = raw
-        print(f"{origin}: {note}")
+        print(f"{origin}: corrupt raw ({reason}) — deleted {raw}, a rerun refetches it")
+        os.remove(raw)
+        corrupt.append(h)
     if corrupt:
         sys.exit(f"{source}: deleted {len(corrupt)} corrupt raw asset(s) {corrupt} — "
                  "rerun to refetch them")
@@ -1645,6 +1675,39 @@ def _check():
                 # nothing may sit in the empty gap between the void marker and the real data
                 between = got[(got > src.nodata) & (got < -100)]
                 assert between.count() == 0, ("nodata blended into a neighbour", between)
+
+            # A member can be truncated inside a perfectly valid zip — the container's CRC
+            # covers what was STORED, not whether the upstream stored a whole file — so this
+            # fails in a shell-out at STAGING, before the transform where CorruptStaged fires.
+            # The archive is the bad bytes, and upstream nondeterminism means a refetch
+            # plausibly heals it, so the raw goes and the run asks for a rerun.
+            shortid = "_prep_asc_short"
+            shortu = "https://x/tiles/0.5/SH01"
+            seed(shortid, [shortu], {"name": "ASC short", "unpack": "asc-tile",
+                                     "crs": "EPSG:27700"})
+            zb = io.BytesIO()
+            with zipfile.ZipFile(zb, "w") as z:
+                # the header promises 4 rows; only 2 are there
+                z.writestr("sh0102mb.asc",
+                           "ncols 4\nnrows 4\nxllcorner 0\nyllcorner 0\ncellsize 1\n"
+                           "NODATA_value -9999\n-1 -2 -3 -4\n-5 -6 -7 -8\n")
+            with open(raw_of(shortid, shortu), "wb") as f:
+                f.write(zb.getvalue())
+            try:
+                stage(shortid)
+                assert False, "expected a truncated archive member to exit"
+            except SystemExit as e:
+                assert "corrupt raw" in str(e) or "rerun to refetch" in str(e), e
+            assert not os.path.exists(raw_of(shortid, shortu)), \
+                "the archive behind an unreadable member must go, else it re-extracts forever"
+
+            # …but a shell-out that fails for a RECIPE reason must never delete a download.
+            assert not _gdal_bad_bytes("gdalbuildvrt: no such option --bogus")
+            assert not _gdal_bad_bytes("command failed (exit 1): gdal_calc.py ... KeyError")
+            assert _gdal_bad_bytes("ERROR 1: tm5595_20140729mb.asc: File short, "
+                                   "can't read line 1990")
+            assert _gdal_bad_bytes("ERROR 1: IReadBlock failed at X offset 0")
+            assert _gdal_bad_bytes("not recognized as being in a supported file format")
 
             # A grid that declares no NODATA_value at all still gets the -9999 fallback.
             nid = "_prep_asc_no_nodata"
