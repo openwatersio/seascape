@@ -8,11 +8,17 @@ import {
   sources,
   layers,
   style,
+  SCHEMA,
   type ChartMap,
 } from "./index";
 
 // Expressions are opaque tuple unions; tests poke at their raw stops.
 const raw = (e: unknown) => e as (number | string)[];
+
+test("SCHEMA is the integer tile-contract version", () => {
+  expect(Number.isInteger(SCHEMA)).toBe(true);
+  expect(SCHEMA).toBeGreaterThanOrEqual(1);
+});
 
 test("generated style validates against the MapLibre style spec", () => {
   const variants = [
@@ -323,4 +329,48 @@ test("applyState re-derives every unit/safety-dependent property", () => {
   const bare: ChartMap = { ...map, getLayer: () => undefined };
   applyState(bare, { unit: "m", safety: 0 });
   expect(calls).toHaveLength(before);
+});
+
+test("contour labels print the depth number only — no unit suffix", () => {
+  for (const unit of ["m", "ft", "fm"] as const) {
+    const labels = layers(day, { unit }).find((l) => l.id === "contour-labels");
+    const text = (labels as { layout: Record<string, unknown> }).layout["text-field"];
+    expect((text as unknown[])[0]).toBe("to-string");
+  }
+});
+
+test("the safety contour is the one emphasized isobath", () => {
+  const lines = (opts: Parameters<typeof layers>[1]) =>
+    layers(day, opts).find((l) => l.id === "contour-lines") as {
+      paint: Record<string, unknown>;
+    };
+  // 4 m snaps up to the charted 5 m level, matched by the integer depth prop.
+  const metric = lines({ safety: 4 });
+  expect(metric.paint["line-width"]).toEqual([
+    "case",
+    ["==", ["get", "depth_abs_m"], 5],
+    1.5,
+    0.8,
+  ]);
+  expect(JSON.stringify(metric.paint["line-color"])).toContain(
+    day.contourEmphasis,
+  );
+  // Fathom mode matches on the fathom prop: 4 m snaps to the 3 fm curve.
+  expect(lines({ safety: 4, unit: "fm" }).paint["line-width"]).toEqual([
+    "case",
+    ["==", ["get", "depth_fm"], 3],
+    1.5,
+    0.8,
+  ]);
+  // safety 0 turns the emphasis off entirely.
+  expect(lines({ safety: 0 }).paint["line-width"]).toBe(0.8);
+});
+
+test("hillshade option controls the depth-hillshade visibility", () => {
+  const vis = (opts?: Parameters<typeof layers>[1]) =>
+    (layers(day, opts).find((l) => l.id === "depth-hillshade") as {
+      layout: Record<string, unknown>;
+    }).layout.visibility;
+  expect(vis()).toBe("visible");
+  expect(vis({ hillshade: false })).toBe("none");
 });
