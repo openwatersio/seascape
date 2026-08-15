@@ -167,3 +167,15 @@ credentials need read/write on **both** buckets; the Worker's binding
 - Each non-trivial step ships a runnable self-check (`test_*.py`, `python smooth.py`, `python encode.py`).
 - Mark deliberate simplifications with a plain comment naming the ceiling + the upgrade path.
 - Don't commit build artifacts (`pipelines/store/`, `data/`, `dist/`, `output/`).
+
+### Schema
+
+The tile↔client contract is defined in [docs/schema.md](docs/schema.md) and versioned by a single integer, `SCHEMA` (`pipelines/config.py`). The build records it in `manifest.json`, the Worker relays it in every TileJSON document, and the style package exports the version it targets so the viewer can refuse a mismatched tileset.
+
+The bump is decided by rule, not taste:
+
+- **Bump when a previously valid reader becomes wrong**: renaming or removing a layer or field, changing the meaning, unit, datum, or sign convention of an existing field, changing the raster encoding or its quantization, or narrowing a zoom range clients may already request.
+- **Don't bump for** data rebuilds (however much the values move), adding a layer or field, or widening a zoom range. Additive changes are free; the number moves only when something a client already does becomes wrong.
+- **Release rule**: a schema bump makes the next `@openwaters/seascape` release a package **major** — it stops working against the old tiles, which is semver's definition of breaking. The converse does not hold: package majors can happen for API-only reasons, so the package version never encodes the schema number.
+
+A schema bump must update docs/schema.md in the same change — the number is only meaningful with the contract it versions.

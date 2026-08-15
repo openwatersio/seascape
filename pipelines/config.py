@@ -14,6 +14,10 @@ from glob import glob
 
 SOURCES_DIR = os.environ.get("SOURCES_DIR", "../sources")
 
+# Tile contract version (docs/schema.md). Recorded in manifest.json, relayed by the Worker's
+# TileJSON, asserted by style consumers. Bump rule: CONTRIBUTING.md#schema.
+SCHEMA = 1
+
 # Standard INT isobaths (IHO S-4 B-411), metres, most-negative first. The shallow
 # ladder (2/5/10/20/30) is also the S-52 safety-contour value set; fine depth detail
 # between curves is the soundings layer's job, not extra isobaths. 0 is the drying line, the
