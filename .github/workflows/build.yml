@@ -298,6 +298,11 @@ jobs:
           CPL_VSIL_CURL_CACHE_SIZE: "268435456"
           VSI_CACHE: "TRUE"
           VSI_CACHE_SIZE: "33554432"
+          # glibc spawns a malloc arena per contending thread (cap 8x cores = 384 on a ccx63)
+          # and each retains its high-water for the process's life; the same cz15 merge is
+          # 3.4 GB in a 10-core container and 22.4 GB on the 48-core box with every GDAL
+          # knob pinned, and real thread collision is the one axis a laptop cannot fake.
+          MALLOC_ARENA_MAX: "2"
           # LOCAL-disk per-run scratch (docker.sh mounts it at /app/tmp): logs + benchmarks land
           # here, off the network store volume. Step-scoped to avoid redirecting other steps'
           # Python tempfile writes.
