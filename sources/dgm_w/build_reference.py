@@ -20,8 +20,8 @@ alongside it. Not for navigation.
 
 import argparse
 import csv
-import io
 import os
+import shutil
 import zipfile
 
 import numpy as np
@@ -81,13 +81,19 @@ def fill_corridor(out, nodata, west, north, xres, yres, line, value_at, corridor
 
 def build_tidal(ref_path):
     """SKN surface: BSH grid (west) + inner-Elbe gauge corridor (east) -> ref_path."""
-    # BSH SKN grid — extract the NHN band from the zip in memory (no cached upstream archive)
-    r = requests.get(BSH_ZIP, timeout=120)
-    r.raise_for_status()
+    # BSH SKN grid — stream the zip to disk and copy the NHN member out, so memory stays
+    # bounded regardless of the grid edition's size (no cached upstream archive)
+    zip_path = f"{ref_path}.bsh.zip"
+    with requests.get(BSH_ZIP, stream=True, timeout=120) as r:
+        r.raise_for_status()
+        with open(zip_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1 << 20):
+                f.write(chunk)
     bsh_path = f"{ref_path}.bsh.tif"
-    with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+    with zipfile.ZipFile(zip_path) as z:
         with z.open(BSH_MEMBER) as m, open(bsh_path, "wb") as f:
-            f.write(m.read())
+            shutil.copyfileobj(m, f)
+    os.remove(zip_path)
 
     gauges = read_gauges(ELBE_CSV, "skn_nhn_m")
     with rasterio.open(bsh_path) as bsh:
