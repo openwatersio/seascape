@@ -31,6 +31,7 @@ The axes are orthogonal: most sources are static + processed, nz_coastal and CUD
 | [Vaklodingen](vaklodingen/)                                     | 20 m        | z12       | Netherlands                         | NAP (~MSL)              |
 | INFOMAR ([10 m](infomar_10m/), [25 m](infomar_25m/))            | 10 m / 25 m | z13 / z11 | Ireland inshore + shelf             | **LAT**                 |
 | [UK SurfZone](uk_surfzone/)                                     | 2 m         | z15       | England intertidal                  | ODN (~MSL)              |
+| [EA Multibeam](uk_multibeam/)                                   | 0.5 m       | z15       | England nearshore (mostly east coast) | ODN (~MSL)            |
 | [Litto3D Bretagne](litto3d_bretagne/)                           | 5 m         | z14       | Brittany coast                      | **ZH** (IGN69 − `ign69_zh` surface) |
 | [GSC Atlantic](gsc_atlantic/)                                   | 100 m       | ~z10      | Scotian Shelf + NL                  | undocumented (mixed)    |
 | [GSC Pacific](gsc_pacific/)                                     | 10 m        | z13       | BC coast + Salish Sea               | **Chart Datum (LLWLT)** |
