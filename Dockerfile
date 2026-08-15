@@ -42,6 +42,13 @@ ENV GDAL_HTTP_MAX_RETRY=5 \
 # different bound override per invocation.
 ENV GDAL_CACHEMAX=512
 
+# Default worker-thread bound, same shape as the cache bound above: GDAL sizes warp and
+# codec pools from visible cores, and that memory scales with REAL concurrency — one
+# isolated cz15 merge measured 5.5 GB on 8 cores vs 22.4 GB on 48 (jobs are already run
+# many-at-once, so per-process width buys nothing). An explicit -co NUM_THREADS or
+# rasterio.Env overrides per invocation.
+ENV GDAL_NUM_THREADS=8
+
 # tippecanoe (Felt fork) — vector tiles. Pinned at felt/tippecanoe#399 (variable-depth
 # pyramids must honor per-feature tippecanoe.minzoom and never prune children a pending minzoom
 # still needs; the vector bundle depends on both). patches/ carries fixes not yet upstream:

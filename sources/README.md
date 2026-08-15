@@ -36,6 +36,7 @@ The axes are orthogonal: most sources are static + processed, nz_coastal and CUD
 | [CCO Multibeam](uk_cco/)                                        | 0.25–4 m    | z15       | England & Wales nearshore           | ODN (~MSL)              |
 | [DORIS](uk_cco_doris/)                                          | 1 m         | z15       | Dorset coast                        | ODN (~MSL)              |
 | [Litto3D Bretagne](litto3d_bretagne/)                           | 5 m         | z14       | Brittany coast                      | **ZH** (IGN69 − `ign69_zh` surface) |
+| [WSV DGM-W (Germany)](dgm_w/)                                   | 2 m         | z14       | German tidal estuaries (Elbe, Weser, Jade, Nordsee) | **SKN/LAT** (chart datum; inland reaches deferred) |
 | [GSC Atlantic](gsc_atlantic/)                                   | 100 m       | ~z10      | Scotian Shelf + NL                  | undocumented (mixed)    |
 | [GSC Pacific](gsc_pacific/)                                     | 10 m        | z13       | BC coast + Salish Sea               | **Chart Datum (LLWLT)** |
 | [gbr30](gbr30/)                                                 | 30 m        | z12       | GBR + Coral Sea                     | MSL                     |
