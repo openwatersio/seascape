@@ -268,7 +268,11 @@ def build_main(out_dir):
         for a, bb, usign in dividers:
             d = bb - a
             n_up += np.sign(d[0] * (plat - a[1]) - d[1] * (plon - a[0])) == usign
-        return dstau[np.clip(n_up.astype(int) - 1, 0, len(dividers) - 1)]
+        idx = n_up.astype(int) - 1
+        # below the first weir (n_up == 0) no pool holds the level — leave nodata, the Rhein
+        # backwater there is the ramp's territory
+        return np.where(idx < 0, np.float32(REACH_NODATA),
+                        dstau[np.clip(idx, 0, len(dividers) - 1)])
 
     w, s, e, n = center.bounds
     west, north = w - MAIN_CORRIDOR - REACH_RES, n + MAIN_CORRIDOR + REACH_RES
@@ -333,7 +337,9 @@ def build_rhein_upper(out_dir):
     assert (np.diff(blat) > 0).all(), "barrage latitudes must strictly increase downstream"
 
     def value_at(proj, plon, plat):  # first barrage at/north of the pixel -> its pool's Stauziel
-        return blev[np.clip(np.searchsorted(blat, plat, side="left"), 0, len(blat) - 1)]
+        idx = np.searchsorted(blat, plat, side="left")
+        # north of Iffezheim no pool holds the level — leave nodata, the GlW ramp's territory
+        return np.where(idx >= len(blat), np.float32(REACH_NODATA), blev[np.minimum(idx, len(blat) - 1)])
 
     center = shapely.from_wkt(open(RHEIN_CENTERLINE_WKT, encoding="utf-8").read())
     return _paint_corridor(center, value_at, RHEIN_UP_CORRIDOR,
@@ -375,7 +381,10 @@ def build_impounded(out_dir, name, corridor_wkt, centerline_wkt, stau_csv, corri
     def value_at(proj, plon, plat):  # arc-length on the centerline places the pixel in a pool
         s = np.asarray(shapely.line_locate_point(center, points(np.column_stack([plon, plat]))))
         idx = np.searchsorted(barc, s, side="left") if falls else np.searchsorted(barc, s, side="right") - 1
-        return lev[np.clip(idx, 0, len(barc) - 1)]
+        # past the most-downstream barrage no pool holds the level — leave nodata (the mouth is
+        # the neighbouring reach's backwater)
+        return np.where((idx < 0) | (idx >= len(barc)), np.float32(REACH_NODATA),
+                        lev[np.clip(idx, 0, len(barc) - 1)])
 
     if zs_csv:  # a gauge sits in the pool whose retention level it reports
         for lon, lat, zs, km in read_gauges(zs_csv, "datum_nhn_m"):
