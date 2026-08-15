@@ -50,8 +50,10 @@ def recipe_files(wc):
 
 
 def source_priority(wc, input=None, attempt=None):
-    """Longest-first: real raw bytes (MB) once fetched, else a count+zoom+priority guess.
-    Set on prep only — priorities propagate upstream, so fetches inherit it."""
+    """Longest-first: real raw bytes (MB) while they are on disk, else a count+zoom+priority
+    guess. Set on prep only — priorities propagate upstream, so fetches inherit it. Raws are
+    temp(), so the guess is what an already-prepped source scores at plan time; the measured
+    branch still fires mid-run, once its fetches land and before its prep is scheduled."""
     from glob import glob
     raws = glob(f"store/source/{wc.source}/raw/*")
     if raws:

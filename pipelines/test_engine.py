@@ -30,7 +30,10 @@ checkpoint that gates stage 2/3 (``snakemake bundles``) — and asserts:
   - staging inventory: a stale overlay-*.pmtiles on disk is excluded from
     stage_build's uploads and manifest;
   - the hole-free gate fires: a missing per-tile fork output makes the --stable
-    bundle refuse rather than publish a hole.
+    bundle refuse rather than publish a hole;
+  - raws are transient: a real fetch → prep → catalog run over a localhost server
+    leaves the staged COG and discards the raw archive, a clean rerun re-downloads
+    nothing, and a forced re-prep schedules the fetch again.
 
 Run from pipelines/:  uv run python test_engine.py
 """
@@ -402,6 +405,107 @@ def check_shallow_minzoom_filter():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def check_raw_discard():
+    """Raws are temp(): staged, then discarded — and NOT refetched until something needs them.
+
+    Runs the real fetch → prep → catalog chain against a GeoTIFF served from a throwaway
+    localhost HTTP server (requests has no file:// transport, and the point is to exercise
+    source_fetch as it actually runs). Four properties, each a separate way to get this wrong:
+    the raw is gone after prep, a clean rerun does NOT re-download it, a forced re-prep
+    schedules the fetch again rather than failing on the absent input, and — the one that
+    makes a retry cheap — a FAILED prep leaves its raw on disk, so the retry stages the bytes
+    it already has. The server counts its own requests, so "did not refetch" is asserted
+    against the upstream rather than inferred from the DAG.
+    """
+    import functools
+    import http.server
+    import threading
+
+    tmp = tempfile.mkdtemp()
+    served = os.path.join(tmp, "upstream")
+    os.makedirs(served)
+    px, res = 64, 0.01
+    with rasterio.open(os.path.join(served, "tile.tif"), "w", driver="GTiff", height=px,
+                       width=px, count=1, dtype="float32", nodata=-9999, crs="EPSG:4326",
+                       transform=from_origin(0.0, 0.0, res, res)) as d:
+        d.write(np.full((px, px), -30.0, dtype="float32"), 1)
+
+    hits = []
+
+    class Counting(http.server.SimpleHTTPRequestHandler):
+        def do_GET(self):
+            hits.append(self.path)
+            super().do_GET()
+
+        def log_message(self, *a):
+            pass
+
+    handler = functools.partial(Counting, directory=served)
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        sid = "discard"
+        os.makedirs(f"{tmp}/sources/{sid}")
+        with open(f"{tmp}/sources/{sid}/metadata.json", "w") as f:
+            json.dump({"name": sid, "max_zoom": 10, "crs": "EPSG:4326"}, f)
+        with open(f"{tmp}/sources/{sid}/file_list.txt", "w") as f:
+            f.write(f"http://127.0.0.1:{httpd.server_address[1]}/tile.tif\n")
+
+        catalog = f"store/source/{sid}/catalog.json"
+        snake(tmp, "-c", "1", catalog)
+        assert os.path.isfile(f"{tmp}/{catalog}"), "the source must register"
+        assert sorted(glob(f"{tmp}/store/source/{sid}/*.tif")), "the staged COG must survive"
+        left = glob(f"{tmp}/store/source/{sid}/raw/*")
+        assert not left, f"prep must discard its raws, found {left}"
+
+        counts = _job_counts(snake(tmp, "-c", "1", "-n", catalog).stdout)
+        assert not counts, f"a clean rerun must schedule nothing, got {counts}"
+
+        forced = _job_counts(snake(tmp, "-c", "1", "-n", "-R", "prep_source", catalog).stdout)
+        assert forced.get("fetch_item") == 1, \
+            f"a forced re-prep must refetch the discarded raw, got {forced}"
+
+        # A prep that FAILS must keep its raw: temp() collects an input only once every
+        # consuming job succeeded, which is what makes a retry a re-stage and not a re-download.
+        # The induced failure is a real one from source_prep's own repertoire — clamp_positive
+        # over a file that declares no nodata.
+        fid = "discard_fail"
+        os.makedirs(f"{tmp}/sources/{fid}")
+        with rasterio.open(os.path.join(served, "bad.tif"), "w", driver="GTiff", height=px,
+                           width=px, count=1, dtype="float32", crs="EPSG:4326",
+                           transform=from_origin(0.0, 0.0, res, res)) as d:
+            d.write(np.full((px, px), -30.0, dtype="float32"), 1)
+        meta = f"{tmp}/sources/{fid}/metadata.json"
+        with open(meta, "w") as f:
+            json.dump({"name": fid, "max_zoom": 10, "clamp_positive": True}, f)
+        with open(f"{tmp}/sources/{fid}/file_list.txt", "w") as f:
+            f.write(f"http://127.0.0.1:{httpd.server_address[1]}/bad.tif\n")
+
+        fail_catalog = f"store/source/{fid}/catalog.json"
+        proc = snake(tmp, "-c", "1", fail_catalog, check=False)
+        assert proc.returncode != 0, "the induced prep failure must fail the run"
+        assert not os.path.isfile(f"{tmp}/{fail_catalog}"), "a failed prep must not register"
+        kept = glob(f"{tmp}/store/source/{fid}/raw/*")
+        assert len(kept) == 1, f"a failed prep must keep its raw for the retry, found {kept}"
+        downloads = [h for h in hits if h.endswith("/bad.tif")]
+        assert len(downloads) == 1, f"expected exactly one download, got {downloads}"
+
+        # The retry: same raw, repaired recipe. It must stage from the bytes on disk and never
+        # touch the server again.
+        with open(meta, "w") as f:
+            json.dump({"name": fid, "max_zoom": 10, "nodata": -9999}, f)
+        snake(tmp, "-c", "1", fail_catalog)
+        assert os.path.isfile(f"{tmp}/{fail_catalog}"), "the retry must register"
+        assert [h for h in hits if h.endswith("/bad.tif")] == downloads, \
+            f"the retry must not re-download: {hits}"
+        assert not glob(f"{tmp}/store/source/{fid}/raw/*"), "the retry must discard the raw"
+        print("raw discard ok — staged then dropped, kept across a failed prep, "
+              "no refetch until a force needs it")
+    finally:
+        httpd.shutdown()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def check_covering_scope_independent():
     """The covering (the per-stem aggregation CSVs) must be BBOX-INDEPENDENT: BBOX selects WHICH
     stems a build processes, never a stem's CSV CONTENT. Build the covering at planet scope, then
@@ -720,5 +824,6 @@ if __name__ == "__main__":
     check_pmtiles_reproducible()
     check_vector_selfcheck()
     check_shallow_minzoom_filter()
+    check_raw_discard()
     check_covering_scope_independent()
     main()

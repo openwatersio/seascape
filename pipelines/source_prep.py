@@ -11,6 +11,9 @@ the per-source knobs that live in Justfile flags on the legacy chain:
                   separation (source_datum --offset-surface); names a raster in the datum
                   store, e.g. "navd88_chart" (config.DATUM_BUILDERS maps it to its composer)
   clamp_positive  drop cells above the water surface (source_datum --clamp-positive)
+  valid_range     [min, max] in the source's FINAL frame — values outside it are voided
+                  (source_datum --valid-range); the only defence against an upstream that
+                  ships impossible depths as ordinary data rather than as its nodata
   unpack          how to turn each raw asset into staged raster(s); absent = a bare
                   raster (see below)
 
@@ -26,6 +29,13 @@ micro-syntax is `format[:glob][!N]`:
                     py7zr, not GDAL /vsi7z (the CI image's GDAL lacks libarchive)
   asc-mosaic        a zip of ESRI ASCII .asc grids → mosaic to one store/source/<id>/
                     <id>.tif (swissBATHY / Bodensee)
+  asc-tile[:<glob>] a zip OR 7z of ESRI ASCII .asc grids → mosaic THIS asset's members to
+                    one tif, one per asset (uk_multibeam's per-OS-tile zips; Litto3D's
+                    per-prépaquet 7z). The container is sniffed, so one mode serves both.
+                    <glob> selects among the members — omit it to take every .asc, give it
+                    when an asset carries more than one grid of the SAME area at different
+                    resolutions (Litto3D ships MNT1m and MNT5m side by side, and mosaicking
+                    the two together would interleave 1 m and 5 m pixels)
   e00               gunzip → ARC/INFO .e00 export → convert to <id>.tif (Lake Tahoe;
                     the export is gzip-wrapped and the unpacker handles the wrapper)
   gldb              the GLDB v2 tar.gz → one <id>_<lake>.tif per documented-bathymetry
@@ -69,8 +79,8 @@ import config
 import utils
 from convert_e00 import e00_to_tif
 from convert_gldb import gldb_to_tifs
-from source_datum import (coverage_report, dome_report, flatten_compound_crs, surface_path,
-                          transform_file, write_sidecar)
+from source_datum import (assign_declared_crs, coverage_report, dome_report,
+                          flatten_compound_crs, surface_path, transform_file, write_sidecar)
 from source_normalize import normalize_file
 
 # Only trust a URL's trailing extension when it names a real data/archive format;
@@ -97,7 +107,7 @@ def ext_for(url):
 STEM_MAX = 100
 
 
-def staged_name(source, url):
+def staged_name(source, url, ext=None):
     """The staged basename for a bare raster: the URL's own filename beside the item hash that
     names its raw/ download (config.item_hash), so the staged file and raw/<hash> read as a pair.
 
@@ -107,10 +117,14 @@ def staged_name(source, url):
     filename apart — LINZ tiles the same national grid cell in adjacent surveys (23 such pairs
     in nz_coastal), and NCEI names a tile only within its region directory. A URL that names no
     data file (a weblink gateway, e.g. ddm's) has no filename to carry, so it takes the source id.
+
+    ``ext`` overrides the URL's extension for a mode that CONVERTS rather than extracts:
+    asc-tile mosaics an archive into a GeoTIFF, and inheriting the archive's own ".7z" would
+    leave a raster the rest of the lane — which globs ``*.tif`` — never sees.
     """
-    name, _, ext = _url_name(url).rpartition(".")
-    stem = re.sub(r"[^A-Za-z0-9._-]", "_", name).strip(".") if ext.lower() in DATA_EXTS else ""
-    return f"{(stem or source)[:STEM_MAX]}_{config.item_hash(url)}.{ext_for(url)}"
+    name, _, url_ext = _url_name(url).rpartition(".")
+    stem = re.sub(r"[^A-Za-z0-9._-]", "_", name).strip(".") if url_ext.lower() in DATA_EXTS else ""
+    return f"{(stem or source)[:STEM_MAX]}_{config.item_hash(url)}.{ext or ext_for(url)}"
 
 
 def _kind(head):
@@ -132,27 +146,33 @@ def _kind(head):
     return "other"
 
 
-# The magic byte kind each declared format's raw asset must present — sniffing kept only
-# to validate the declaration (e00/tar.gz arrive gzip-wrapped, asc-mosaic as a zip).
+# The magic byte kinds each declared format's raw asset may present — sniffing kept only to
+# validate the declaration (e00/tar.gz arrive gzip-wrapped, asc-mosaic as a zip). asc-tile is
+# the one mode that accepts either container: what it declares is the PAYLOAD (ESRI ASCII
+# grids to mosaic per asset), and whether an upstream ships them zipped or 7z-ed is packaging.
 _EXPECT_KIND = {
-    "zip": "zip",
-    "asc-mosaic": "zip",
-    "tar.gz": "gzip",
-    "e00": "gzip",
-    "gldb": "gzip",
-    "7z": "7z",
-    "netcdf": "netcdf",
+    "zip": frozenset({"zip"}),
+    "asc-mosaic": frozenset({"zip"}),
+    "asc-tile": frozenset({"zip", "7z"}),
+    "tar.gz": frozenset({"gzip"}),
+    "e00": frozenset({"gzip"}),
+    "gldb": frozenset({"gzip"}),
+    "7z": frozenset({"7z"}),
+    "netcdf": frozenset({"netcdf"}),
 }
 
 
-# Archive formats select members by glob; the rest transform the whole asset.
+# Archive formats select members by glob; the rest transform the whole asset. asc-tile sits
+# between: every .asc by default, narrowed by a glob when an asset carries more than one grid.
 _GLOB_FORMATS = {"zip", "tar.gz", "7z"}
+_OPTIONAL_GLOB_FORMATS = {"asc-tile"}
 
 
 def _parse_unpack(spec):
     """Parse a metadata `unpack` string `format[:glob][!N]` → (format, glob, expect).
     `expect` is the exact per-archive match count asserted by `!N` (else None). Archive
-    formats require a member glob; the glob-less formats (e00/netcdf/asc-mosaic/gldb) reject one."""
+    formats require a member glob, asc-tile accepts one, and the rest (e00/netcdf/asc-mosaic/
+    gldb) reject one."""
     fmt, _, rest = spec.partition(":")
     members_glob, expect = (rest or None), None
     if members_glob and "!" in members_glob:
@@ -163,7 +183,7 @@ def _parse_unpack(spec):
         sys.exit(f"unknown unpack format {fmt!r} (expected one of {sorted(_EXPECT_KIND)})")
     if fmt in _GLOB_FORMATS and not members_glob:
         sys.exit(f"unpack {spec!r}: {fmt} needs a member glob, e.g. {fmt!r}:*.tif")
-    if fmt not in _GLOB_FORMATS and (members_glob or expect is not None):
+    if fmt not in _GLOB_FORMATS | _OPTIONAL_GLOB_FORMATS and (members_glob or expect is not None):
         sys.exit(f"unpack {spec!r}: {fmt} takes no member glob or !N")
     return fmt, members_glob, expect
 
@@ -223,6 +243,96 @@ def _stage_asc(raw, asc_dir, seen, origin):
             with open(f"{asc_dir}/{base}", "wb") as f:
                 f.write(z.read(name))
     return f"asc-mosaic, {len(ascs)} tile(s) staged"
+
+
+def _dedupe_entries(entries, origin):
+    """Collapse literal duplicate ENTRIES — the same full member path listed more than once in
+    one archive's directory — to a single name, first-seen order preserved.
+
+    Legal but sloppy, and real: the Environment Agency's 5 km packages list 3 of their 9
+    members twice over (TG5500/2014 ships `tg5400/1/2_20140821mb.asc` duplicated). That is one
+    path naming one file, not two inputs racing for a name, so it must not read as a collision.
+    Byte-identity is checked through the directory's CRCs where the container records them; two
+    entries claiming one path with DIFFERENT bytes stay fatal, because nothing here can know
+    which copy the upstream meant."""
+    first, order = {}, []
+    for name, crc in entries:
+        if name not in first:
+            first[name] = crc
+            order.append(name)
+        elif first[name] is not None and crc is not None and crc != first[name]:
+            sys.exit(f"{origin}: archive lists {name!r} more than once with different bytes "
+                     f"(CRC {first[name]:#010x} vs {crc:#010x}) — which copy is right is not "
+                     "knowable here; the upstream archive needs fixing")
+    return order
+
+
+def _asc_members(raw, kind, members_glob, expect, dest_dir, origin):
+    """Write this archive's selected ESRI ASCII members flat into ``dest_dir``, returning the
+    count. Container-agnostic: the caller has already sniffed zip vs 7z, and only the read
+    mechanics differ (py7zr has no random-access member read, so a 7z extracts to scratch and
+    the members are moved out).
+
+    Members are matched case-insensitively against the FULL member path, so a glob can select
+    on the directory an upstream sorts by — Litto3D's resolutions are `MNT1m/` vs `MNT5m/`
+    directories as much as they are `_MNT1M_` vs `_MNT5M_` filenames.
+
+    Three ways two members can share a name, and they are not the same thing: the SAME path
+    twice is a duplicate entry and collapses (`_dedupe_entries`); two DIFFERENT paths sharing a
+    basename would overwrite each other in this asset's scratch and stay fatal; and the same
+    basename in ANOTHER asset's archive is fine, because each asset mosaics into its own
+    directory — a national grid legitimately repeats tile ids across neighbouring packages."""
+    picks_glob = members_glob or "*.asc"
+    os.makedirs(dest_dir, exist_ok=True)
+    claimed = set()
+
+    def take(name, data):
+        member = os.path.basename(name)
+        _claim(claimed, member, origin)
+        with open(f"{dest_dir}/{member}", "wb") as f:
+            f.write(data)
+
+    if kind == "zip":
+        with zipfile.ZipFile(raw) as z:
+            names = _dedupe_entries(
+                [(i.filename, i.CRC) for i in z.infolist() if not i.is_dir()], origin)
+            picks = _members(names, picks_glob, expect, origin)
+            for name in picks:
+                take(name, z.read(name))
+    else:
+        import py7zr
+        with py7zr.SevenZipFile(raw) as z:
+            names = _dedupe_entries(
+                [(i.filename, getattr(i, "crc32", None)) for i in z.list()
+                 if not i.is_directory], origin)
+            picks = _members(names, picks_glob, expect, origin)
+            tmp = f"{dest_dir}/_7z_extract"
+            shutil.rmtree(tmp, ignore_errors=True)
+            z.extract(path=tmp, targets=picks)
+        for name in picks:
+            with open(f"{tmp}/{name}", "rb") as f:
+                take(name, f.read())
+        shutil.rmtree(tmp, ignore_errors=True)
+    return len(picks)
+
+
+def _stage_asc_tile(raw, root, source, url, kind, members_glob, expect, seen, origin):
+    """A zip or 7z of ESRI ASCII grids → mosaic THIS asset's members into one GeoTIFF. A tiled
+    national product can't take the per-source asc-mosaic: its members span the whole country,
+    so one mosaic of them all would be a single country-sized raster with the gaps between
+    tiles filled in."""
+    base = staged_name(source, url, ext="tif")
+    _claim(seen, base, f"{origin} {url}")
+    # Per-asset scratch, not the shared asc/ dir: asc-tile mosaics each asset on its own, and
+    # a shared dir would let one asset's leftovers join the next asset's mosaic.
+    asc_dir = f"{root}/_asc_{config.item_hash(url)}"
+    shutil.rmtree(asc_dir, ignore_errors=True)
+    try:
+        n = _asc_members(raw, kind, members_glob, expect, asc_dir, origin)
+        _mosaic_asc(root, asc_dir, f"{root}/{base}", origin)
+    finally:
+        shutil.rmtree(asc_dir, ignore_errors=True)
+    return f"asc-tile ({kind}), {n} tile(s) -> {base}"
 
 
 def _stage_7z(raw, root, seen, origin, members_glob, expect):
@@ -320,20 +430,86 @@ def _stage_netcdf(raw, root, url, seen, origin):
     return f"netCDF → {stem}.tif"
 
 
-def _mosaic_asc(root, source, asc_dir):
+# No real depth is 99 km. A grid declaring NODATA_value -9999 can still carry earlier vintages'
+# void markers as ordinary pixels (EA multibeam holds -99999, -999999 and -1e7 among its 0.5 m
+# soundings), and at that resolution a single one wins every merge it touches. Everything above
+# this floor is left alone — the declared value stays authoritative, and the positive outliers
+# the same sweep found are not provably markers.
+SENTINEL_FLOOR = -99999.0
+
+
+def _float32_inputs(ascs, label):
+    """The mosaic's inputs, with any non-Float32 grid promoted through a Float32 VRT.
+
+    gdalbuildvrt REFUSES to mix band types: it keeps the first file's type, SKIPS every input
+    that disagrees, and still exits 0 with only a warning. AAIGrid infers Int32 for a grid whose
+    every value is a bare integer — which is what an all-void EA member looks like — so one of
+    those sorting first pinned the VRT to Int32 and silently dropped the real Float32 soundings
+    beside it (3 of 5 members, 355,796 valid pixels, on TQ9015 alone). Promoting is a header
+    rewrite, no pixels copied."""
+    import rasterio
+    out, promoted = [], 0
+    for asc in ascs:
+        with rasterio.open(asc) as src:
+            if src.dtypes[0] == "float32":
+                out.append(asc)
+                continue
+        vrt = asc + ".f32.vrt"
+        utils.run_command(f"gdal_translate -q -of VRT -ot Float32 {asc} {vrt}", silent=True)
+        out.append(vrt)
+        promoted += 1
+    if promoted:
+        print(f"{label}: promoted {promoted}/{len(ascs)} asc tile(s) to Float32 "
+              "(gdalbuildvrt would have skipped them)")
+    return out
+
+
+def _mask_sentinels(tif, label):
+    """Void every pixel at or below SENTINEL_FLOOR, in place. Returns how many were masked."""
+    import rasterio
+    masked = 0
+    with rasterio.open(tif, "r+") as ds:
+        nodata = ds.nodata if ds.nodata is not None else -9999.0
+        for _, window in ds.block_windows(1):
+            block = ds.read(1, window=window)
+            hit = (block <= SENTINEL_FLOOR) & (block != nodata)
+            if hit.any():
+                block[hit] = nodata
+                ds.write(block, 1, window=window)
+                masked += int(hit.sum())
+    if masked:
+        print(f"{label}: voided {masked} pixel(s) at or below {SENTINEL_FLOOR:g} "
+              "(stray void markers, not soundings)")
+    return masked
+
+
+def _mosaic_asc(root, asc_dir, tif, label):
     """Mosaic the staged ESRI ASCII tiles into one GeoTIFF via a VRT (no -a_srs;
     source_normalize assigns the CRS from metadata), then drop the tiles."""
+    import rasterio
     ascs = sorted(glob(f"{asc_dir}/*.asc"))
+    inputs = _float32_inputs(ascs, label)
     listfile = f"{root}/tiles.txt"
     with open(listfile, "w") as f:
-        f.write("\n".join(ascs) + "\n")
-    vrt = f"{root}/{source}.vrt"
-    tif = f"{root}/{source}.tif"
-    print(f"{source}: mosaicking {len(ascs)} asc tile(s) -> {tif}")
+        f.write("\n".join(inputs) + "\n")
+    vrt = f"{os.path.splitext(tif)[0]}.vrt"
+    print(f"{label}: mosaicking {len(ascs)} asc tile(s) -> {tif}")
+    # No -srcnodata: gdalbuildvrt already reads each member's OWN NODATA_value and masks it,
+    # while -srcnodata forces one value across every member — a member declaring -32768 then
+    # enters with its voids as ordinary -32768 readings. Measured both ways on members that
+    # disagree: the default masks all voids, -srcnodata leaks them in.
     utils.run_command(f"gdalbuildvrt -overwrite -input_file_list {listfile} {vrt}", silent=False)
+    # Assign -9999 ONLY when the grids declare no NODATA_value of their own. -a_nodata relabels
+    # without touching pixels, so forcing it over a grid that says -99999 (Litto3D) leaves every
+    # void as a -99999 m reading that the datum step then "corrects" into a plausible depth.
+    with rasterio.open(vrt) as src:
+        declared = src.nodata
+    nodata_arg = "" if declared is not None else "-a_nodata -9999 "
+    # -ot Float32: depth is a float measurement, and an all-integer grid must not stage as one.
     utils.run_command(
-        f"gdal_translate -q -of GTiff -a_nodata -9999 -co TILED=YES -co COMPRESS=DEFLATE "
-        f"-co NUM_THREADS=ALL_CPUS {vrt} {tif}", silent=False)
+        f"gdal_translate -q -of GTiff -ot Float32 {nodata_arg}-co TILED=YES "
+        f"-co COMPRESS=DEFLATE -co NUM_THREADS=ALL_CPUS {vrt} {tif}", silent=False)
+    _mask_sentinels(tif, label)
     os.remove(vrt)
     os.remove(listfile)
     shutil.rmtree(asc_dir, ignore_errors=True)
@@ -365,12 +541,15 @@ def _raw_hashes(source, root, items):
 
 def _clear_stale(root):
     """Remove every derived/intermediate artifact a prior prep may have left: staged tifs,
-    netCDF translations, gzip spool files, VRT/mosaic scratch, and the asc/ tile dir (stale
+    netCDF translations, gzip spool files, VRT/mosaic scratch, and the asc tile dirs (stale
     .asc tiles would otherwise join the next mosaic; a stale .nc breaks the netCDF hardlink)."""
     for stale in (glob(f"{root}/*.tif") + glob(f"{root}/*.tiff") + glob(f"{root}/*.nc")
                   + glob(f"{root}/_gz_*") + glob(f"{root}/*.vrt") + glob(f"{root}/tiles.txt")):
         os.remove(stale)
-    shutil.rmtree(f"{root}/asc", ignore_errors=True)
+    # asc/ is asc-mosaic's shared dir; _asc_<hash>/ is asc-tile's per-asset scratch, left
+    # behind only by a crash mid-mosaic.
+    for stale_dir in [f"{root}/asc"] + glob(f"{root}/_asc_*"):
+        shutil.rmtree(stale_dir, ignore_errors=True)
     shutil.rmtree(f"{root}/_7z_extract", ignore_errors=True)
     for scratch in glob(f"{root}/seascape-shoal-*"):  # a crashed normalize's pyramid levels
         shutil.rmtree(scratch, ignore_errors=True)
@@ -386,6 +565,29 @@ class CorruptRaw(Exception):
 # zero glob matches, unknown format) sys.exit past it.
 _CORRUPT = (zipfile.BadZipFile, gzip.BadGzipFile, tarfile.TarError, EOFError,
             lzma.LZMAError, CorruptRaw)
+
+
+# GDAL's ways of saying "these BYTES are wrong" while converting an extracted member. An
+# archive can be a perfectly good zip whose member is truncated — the container's CRC covers
+# what was stored, not whether the upstream stored a whole file — so this failure lands in a
+# shell-out at STAGING, before the transform where CorruptStaged fires. Matched narrowly on
+# purpose: a recipe error (bad glob, zero members, unknown format) exits through sys.exit and
+# never reaches here, and any other RuntimeError re-raises rather than deleting a download.
+_GDAL_BAD_BYTES = (
+    "file short",                                  # AAIGrid: fewer data lines than the header
+    "ireadblock failed",
+    "not recognized as being in a supported file format",
+    "read error",
+    "tifffilltile",
+    "tiffreadencodedtile",
+    "tiffreadencodedstrip",
+)
+
+
+def _gdal_bad_bytes(message):
+    """Does this shell-out failure mean the member's bytes are bad, rather than the recipe?"""
+    low = message.lower()
+    return any(sig in low for sig in _GDAL_BAD_BYTES)
 
 
 def _unpack_one(unpack, raw, root, source, index, url, asc_dir, seen, origin):
@@ -405,12 +607,15 @@ def _unpack_one(unpack, raw, root, source, index, url, asc_dir, seen, origin):
     fmt, members_glob, expect = unpack
     with open(raw, "rb") as f:
         kind = _kind(f.read(512))
-    if kind != _EXPECT_KIND[fmt]:
-        raise CorruptRaw(f"declared unpack {fmt!r} expects {_EXPECT_KIND[fmt]} bytes, got {kind}")
+    if kind not in _EXPECT_KIND[fmt]:
+        raise CorruptRaw(f"declared unpack {fmt!r} expects "
+                         f"{'/'.join(sorted(_EXPECT_KIND[fmt]))} bytes, got {kind}")
     if fmt == "zip":
         return _stage_zip(raw, root, seen, origin, members_glob, expect)
     if fmt == "asc-mosaic":
         return _stage_asc(raw, asc_dir, seen, origin)
+    if fmt == "asc-tile":
+        return _stage_asc_tile(raw, root, source, url, kind, members_glob, expect, seen, origin)
     if fmt == "7z":
         return _stage_7z(raw, root, seen, origin, members_glob, expect)
     if fmt == "tar.gz":
@@ -422,7 +627,19 @@ def _unpack_one(unpack, raw, root, source, index, url, asc_dir, seen, origin):
     return _stage_netcdf(raw, root, url, seen, origin)  # fmt == "netcdf"
 
 
+def _staged_now(root):
+    """The staged rasters currently in the source dir, as basenames."""
+    return {os.path.basename(p) for p in glob(f"{root}/*.tif") + glob(f"{root}/*.tiff")}
+
+
 def stage(source):
+    """Materialize every raw, returning {staged basename: the raw path it came from}.
+
+    The map is built by diffing the directory around each unpack rather than by threading a
+    return value through every stager: an ARCHIVE member's staged name is invented by the
+    upstream, derivable from neither the item URL nor an inode (only a bare raster is a hardlink
+    to its raw). Without it a corrupt extracted member could be quarantined while its archive
+    survived, re-extracting the same bad bytes every run under a message promising a refetch."""
     root = f"store/source/{source}"
     spec = config.load_metadata(source).get("unpack")
     unpack = _parse_unpack(spec) if spec else None
@@ -431,24 +648,39 @@ def stage(source):
     asc_dir = f"{root}/asc"
     seen = set()  # staged basenames — collisions across raws/archives hard-error
     corrupt = []
+    produced = {}
     # `pos` (enumeration position) names archive scratch + the error origin only; staged
     # basenames derive from the item URL, and the raw itself lives at raw/<hash>.
     for pos, (h, url) in enumerate(hashes):
         raw = f"{root}/raw/{h}"
         origin = f"{source}[{pos}]"
+        before = _staged_now(root)
         try:
             note = _unpack_one(unpack, raw, root, source, pos, url, asc_dir, seen, origin)
         except _CORRUPT as e:
-            print(f"{origin}: corrupt raw ({e}) — deleted, a rerun refetches it")
-            os.remove(raw)
-            corrupt.append(h)
+            reason = str(e)
+        except RuntimeError as e:
+            # A shell-out failure is a recipe bug unless GDAL says the bytes are bad.
+            if not _gdal_bad_bytes(str(e)):
+                raise
+            reason = f"GDAL could not read an extracted member — {str(e).strip().splitlines()[-1]}"
+        else:
+            for name in _staged_now(root) - before:
+                produced[name] = raw
+            print(f"{origin}: {note}")
             continue
-        print(f"{origin}: {note}")
+        print(f"{origin}: corrupt raw ({reason}) — deleted {raw}, a rerun refetches it")
+        os.remove(raw)
+        corrupt.append(h)
     if corrupt:
         sys.exit(f"{source}: deleted {len(corrupt)} corrupt raw asset(s) {corrupt} — "
                  "rerun to refetch them")
-    if os.path.isdir(asc_dir):
-        _mosaic_asc(root, source, asc_dir)
+    if os.path.isdir(asc_dir):  # asc-mosaic only — asc-tile mosaics per asset and cleans up
+        # Every raw fed this one mosaic, so no single raw owns it: quarantining it would have
+        # to delete the whole source's downloads, which is a decision for an operator.
+        _mosaic_asc(root, asc_dir, f"{root}/{source}.tif", source)
+        produced.pop(f"{source}.tif", None)
+    return produced
 
 
 def _check_raster(path):
@@ -463,20 +695,86 @@ def _check_raster(path):
         raise CorruptRaw(f"not a readable raster: {e}") from e
 
 
-def prep_file(tif, transform, negate, offset, clamp, surface, crs, nodata):
+class CorruptStaged(Exception):
+    """A staged raster whose header parses but whose PIXELS are unreadable. Carries the paths
+    already quarantined, so a pass over many files can report them as one list."""
+
+    def __init__(self, message, removed=()):
+        super().__init__(message)
+        self.removed = list(removed)
+
+
+def _raw_index(root, source, staged_map=None):
+    """(by-inode, by-name) lookups from a staged file back to the raw it came from.
+
+    By inode is exact and needs no naming convention: a bare raster IS its raw, one hardlink to
+    one set of bytes. By name covers the modes that CONVERT, whose staged file is a fresh inode —
+    both names staging can give it, since asc-tile forces the .tif extension. ``staged_map``
+    (what stage() actually produced) covers the rest: an archive member's staged name comes from
+    the upstream and is derivable from neither, so it has to be observed, not computed."""
+    by_inode, by_name = {}, {}
+    for url in config.items(source):
+        raw = f"{root}/raw/{config.item_hash(url)}"
+        if not os.path.exists(raw):
+            continue
+        st = os.stat(raw)
+        by_inode[(st.st_dev, st.st_ino)] = raw
+        for name in (staged_name(source, url), staged_name(source, url, ext="tif")):
+            by_name[name] = raw
+    by_name.update(staged_map or {})  # observed beats derived
+    return by_inode, by_name
+
+
+def _quarantine(tif, raw_index):
+    """Delete an unreadable staged raster together with the raw behind it, returning what went.
+
+    Staging validates a bare raster by HEADER-opening it, so a download truncated inside its
+    pixel data passes that gate and fails later, in the transform. The raw is the bad bytes, and
+    `_clear_stale` re-links the staged file from it every run — so removing only the staged copy
+    reproduces the same failure forever. Removing the raw makes fetch_item reschedule, and the
+    source heals on the next run."""
+    by_inode, by_name = raw_index
+    raw = None
+    try:
+        st = os.stat(tif)
+        raw = by_inode.get((st.st_dev, st.st_ino))
+    except OSError:
+        pass
+    raw = raw or by_name.get(os.path.basename(tif))
+    removed = []
+    for path in (tif, raw):
+        if path and os.path.exists(path):
+            os.remove(path)
+            removed.append(path)
+    return removed
+
+
+def prep_file(tif, transform, negate, offset, clamp, surface, crs, nodata, valid_range,
+              raw_index):
     """One staged raster end to end: datum transform → compound-CRS flatten → normalize to a COG.
     The unit the pool fans out over, so it touches no file but its own — every step writes a
     sibling temp and os.replaces it, and rasterio's GDAL config Env is thread-local.
     Returns (basename, reference-corrected px, valid px, whether a vertical CRS was dropped,
     interpolation-dome candidates)."""
+    import rasterio.errors
     corrected = valid = 0
     domes = None  # only the value transform streams the pixels; without it nothing is scored
-    if transform:
-        corrected, valid, domes = transform_file(tif, negate, offset, clamp, surface)
-    # After the transform, which already reduces the CRS on the files it rewrites; this catches
-    # the rest, so no staged raster reaches a warp carrying a vertical CRS.
-    flattened = flatten_compound_crs(tif)
-    normalize_file(tif, crs, nodata)
+    try:
+        if transform:
+            # Before the transform, not after: an offset surface is resampled onto this file's
+            # own grid, which normalize would not have declared yet.
+            assign_declared_crs(tif, crs)
+            corrected, valid, domes = transform_file(tif, negate, offset, clamp, surface,
+                                                     valid_range)
+        # After the transform, which already reduces the CRS on the files it rewrites; this
+        # catches the rest, so no staged raster reaches a warp carrying a vertical CRS.
+        flattened = flatten_compound_crs(tif)
+        normalize_file(tif, crs, nodata)
+    except rasterio.errors.RasterioIOError as e:
+        # ONLY this: bad bytes, never a bad recipe. A value error, a missing nodata or an
+        # unbuildable COG are all reasons to stop and fix the source, not to delete a download.
+        removed = _quarantine(tif, raw_index)
+        raise CorruptStaged(f"{os.path.basename(tif)}: unreadable pixels ({e})", removed) from e
     return os.path.basename(tif), corrected, valid, flattened, domes
 
 
@@ -498,59 +796,100 @@ PROGRESS_EVERY = 25  # a listed source is ~1,000 files and hours long; log that 
 def _fan_out(source, tifs, workers, job):
     """Run `job(tif)` over every staged tif, `workers` at a time, and return the results in
     `tifs` order — the aggregates (coverage report, sidecar) must not depend on who finished
-    first. The first failure names its file and stops the source: a partially prepped source
-    that registered anyway would ship a datum-uncorrected tile as if it were corrected."""
+    first.
+
+    Two failure kinds, deliberately unalike. Any ordinary failure stops the source at the FIRST
+    one, by name: it means the recipe is wrong, every remaining file would fail the same way,
+    and a partially prepped source that registered anyway would ship a datum-uncorrected tile as
+    if it were corrected. A CorruptStaged does NOT stop the pass — its bytes are already
+    quarantined, and a volume can hold several truncated downloads (cudem had at least two), so
+    stopping at the first would cost one dispatch per bad file. Collect them all, then fail once
+    with the whole list."""
+    results, corrupt, done_n = {}, [], 0
+
+    def record(tif, call):
+        """Run one file, keeping a quarantined one out of the results without stopping."""
+        try:
+            results[tif] = call()
+        except CorruptStaged as e:
+            corrupt.append(e)
+
     if workers == 1:
-        return [job(tif) for tif in tifs]
-    results, done_n = {}, 0
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(job, tif): tif for tif in tifs}
-        for future in as_completed(futures):
-            tif = futures[future]
-            try:
-                results[tif] = future.result()
-            except BaseException as e:
-                for pending in futures:
-                    pending.cancel()
-                raise RuntimeError(f"{source}: {os.path.basename(tif)}: {e}") from e
-            done_n += 1
-            if len(tifs) >= PROGRESS_EVERY * 2 and done_n % PROGRESS_EVERY == 0:
-                print(f"{source}: prepped {done_n}/{len(tifs)} file(s)", flush=True)
+        for tif in tifs:
+            record(tif, lambda t=tif: job(t))
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(job, tif): tif for tif in tifs}
+            for future in as_completed(futures):
+                tif = futures[future]
+                try:
+                    record(tif, future.result)
+                except BaseException as e:
+                    for pending in futures:
+                        pending.cancel()
+                    raise RuntimeError(f"{source}: {os.path.basename(tif)}: {e}") from e
+                done_n += 1
+                if len(tifs) >= PROGRESS_EVERY * 2 and done_n % PROGRESS_EVERY == 0:
+                    print(f"{source}: prepped {done_n}/{len(tifs)} file(s)", flush=True)
+    if corrupt:
+        removed = [path for e in corrupt for path in e.removed]
+        raise CorruptStaged(
+            f"quarantined {len(corrupt)} unreadable file(s) — "
+            + "; ".join(str(e) for e in corrupt)
+            + f". Removed {len(removed)} path(s): {', '.join(removed)} — "
+            "the next run refetches them", removed)
     return [results[tif] for tif in tifs]
 
 
 def prep(source, workers=DEFAULT_WORKERS):
     meta = config.load_metadata(source)
-    stage(source)
+    staged_map = stage(source)
     tifs = sorted(glob(f"store/source/{source}/*.tif"))  # staging canonicalizes .tiff -> .tif (ext_for)
 
     negate = bool(meta.get("negate", False))
     offset = float(meta.get("datum_offset_m", 0.0))
     clamp = bool(meta.get("clamp_positive", False))
     name = meta.get("offset_surface")
-    write_sidecar(source, negate, offset, clamp, name)  # even for a no-op: the catalog's invariant
+    band = meta.get("valid_range")
+    if band is not None and (len(band) != 2 or band[0] >= band[1]):
+        sys.exit(f"{source}: valid_range must be [min, max] with min < max, got {band}")
+    write_sidecar(source, negate, offset, clamp, name,  # even for a no-op: the catalog's invariant
+                  valid_range=band)
     surface = surface_path(name) if name else None
     if surface and not os.path.isfile(surface):
         sys.exit(f"{source}: offset surface {surface} is not in the store — "
                  f"build it with {config.datum_builder(name)}")
-    transform = bool(negate or offset or clamp or surface)
+    transform = bool(negate or offset or clamp or surface or band)
     if transform:
         print(f"{source}: datum negate={negate} offset={offset} surface={name} "
-              f"clamp_positive={clamp}")
+              f"clamp_positive={clamp} valid_range={band}")
     crs, nodata = meta.get("crs"), meta.get("nodata")
     print(f"{source}: prep {len(tifs)} file(s) on {workers} worker(s) "
           f"(crs={crs} nodata={nodata})", flush=True)
 
     job = functools.partial(prep_file, transform=transform, negate=negate, offset=offset,
-                            clamp=clamp, surface=surface, crs=crs, nodata=nodata)
-    per_file = _fan_out(source, tifs, workers, job)
+                            clamp=clamp, surface=surface, crs=crs, nodata=nodata,
+                            valid_range=band,
+                            raw_index=_raw_index(f"store/source/{source}", source, staged_map))
+    try:
+        per_file = _fan_out(source, tifs, workers, job)
+    # A quarantined raw is an operational fact, not a stack trace: the source is red until the
+    # next run refetches, and the message is the whole diagnosis. Both arms are needed — the
+    # serial path raises it bare, the pool path re-raises it wrapped.
+    except CorruptStaged as e:
+        sys.exit(f"{source}: {e}")
+    except RuntimeError as e:
+        if isinstance(e.__cause__, CorruptStaged):
+            sys.exit(str(e))
+        raise
 
     if transform:
         # Rewritten with what the pass measured: how much of the source actually moved, and its
         # dome-candidate count, are only known once every file is transformed.
         write_sidecar(source, negate, offset, clamp, name,
                       coverage_report(source, [r[:3] for r in per_file]) if surface else None,
-                      dome_report(source, [(r[0], r[4]) for r in per_file]))
+                      dome_report(source, [(r[0], r[4]) for r in per_file]),
+                      valid_range=band)
     flattened = sum(r[3] for r in per_file)
     if flattened:
         print(f"{source}: dropped the vertical CRS from {flattened}/{len(tifs)} file(s)")
@@ -582,6 +921,7 @@ def _check():
     import io
     import json
     import tempfile
+    import warnings
 
     import numpy as np
     import rasterio
@@ -682,11 +1022,12 @@ def _check():
             "in-place steps must never write through into raw/"
         with open(f"store/source/{sid}/datum.json") as f:
             sidecar = json.load(f)
-        # dome_candidates is None here, not 0: these staged tifs carry no CRS of their own (the
-        # metadata one is assigned at normalize), so the detector has no metres to size itself by.
+        # dome_candidates is 0, not None: the staged tifs carry no CRS of their own, but the
+        # metadata one is stamped on before the transform, so the detector can size itself in
+        # metres and actually runs.
         assert sidecar == {"negate": True, "offset_m": -1.0, "clamp_positive": False,
-                           "offset_surface": None, "corrected_fraction": None,
-                           "dome_candidates": None}, sidecar
+                           "offset_surface": None, "valid_range": None,
+                           "corrected_fraction": None, "dome_candidates": 0}, sidecar
         for name, want in (("a.tif", -6.0), ("b.tif", -11.0)):  # -(v) - 1
             with rasterio.open(f"store/source/{sid}/{name}") as src:
                 assert src.crs.to_epsg() == 28992, (name, src.crs)
@@ -833,7 +1174,9 @@ def _check():
         except SystemExit as e:
             assert config.DATUM_BUILDERS[registered] in str(e), e
 
-        # Two archives whose members share a basename must hard-error, not silently overwrite.
+        # The EXTRACT modes land every member in the one source dir, so two archives sharing a
+        # member basename really would overwrite each other: hard-error. (asc-tile scopes this
+        # per-archive instead — its members never share a directory. Pinned in its own case.)
         cid = "_prep_collide"
         cu = ["https://x/a.zip", "https://x/b.zip"]
         seed(cid, cu, {"name": "Collide", "unpack": "zip:*.tif"})
@@ -1057,6 +1400,78 @@ def _check():
             except (RuntimeError, ValueError) as e:
                 assert staged_name(fid, fu[1]) in str(e), (workers, e)
 
+        # A staged raster whose HEADER parses but whose pixels are truncated is quarantined with
+        # its raw, not merely failed: staging validates by header-open, so these bytes get past
+        # it every run, and _clear_stale re-links the staged copy from the same bad raw — the
+        # source would fail identically forever. Removing the raw makes fetch_item reschedule.
+        # ONE pass heals EVERY corrupt file: a volume can hold several truncated downloads
+        # (cudem had at least two), and stopping at the first costs one dispatch per bad file.
+        qid = "_prep_quarantine"
+        bad_urls = [f"https://x/truncated{i}.tif" for i in range(2)]
+        ok_urls = [f"https://x/whole{i}.tif" for i in range(2)]
+        qus = bad_urls + ok_urls
+        seed(qid, qus, {"name": "Quarantine", "negate": True})  # negate: forces a pixel read
+        good = io.BytesIO()
+        with rasterio.open(good, "w", driver="GTiff", height=256, width=256, count=1,
+                           dtype="float32", nodata=-9999.0, crs="EPSG:4326",
+                           transform=from_origin(0, 1, 0.001, 0.001),
+                           tiled=True, blockxsize=128, blockysize=128, compress="deflate") as dst:
+            dst.write(np.full((256, 256), -5.0, dtype="float32"), 1)
+        whole = good.getvalue()
+        staged_of = {u: f"store/source/{qid}/{staged_name(qid, u)}" for u in qus}
+        # Both fan-out paths: serial raises CorruptStaged bare, the pool re-raises it wrapped,
+        # and only one of those was reaching the clean exit.
+        for workers in (1, 4):
+            for u in bad_urls:  # header + directory survive, tile data does not
+                with open(raw_of(qid, u), "wb") as f:
+                    f.write(whole[:len(whole) // 2])
+            for u in ok_urls:
+                with open(raw_of(qid, u), "wb") as f:
+                    f.write(whole)
+            try:
+                prep(qid, workers)
+                assert False, f"expected truncated staged rasters to exit (workers={workers})"
+            except SystemExit as e:
+                assert "quarantined 2 unreadable file(s)" in str(e), (workers, e)
+                assert "refetches" in str(e), (workers, e)
+                for u in bad_urls:  # every bad file named, not just the first to fail
+                    assert staged_of[u] in str(e) and raw_of(qid, u) in str(e), (workers, u, e)
+            for u in bad_urls:
+                assert not os.path.exists(staged_of[u]), (workers, u, "staged must be gone")
+                assert not os.path.exists(raw_of(qid, u)), (workers, u, "raw must be gone")
+            for u in ok_urls:  # the readable files still prepped, and keep their raws
+                assert os.path.exists(staged_of[u]), (workers, u, "good file must survive")
+                assert os.path.exists(raw_of(qid, u)), (workers, u, "good raw must survive")
+        # An EXTRACTED member's staged name is the upstream's invention — no inode shared with
+        # the raw, no URL to derive it from — so the quarantine has to learn it from staging.
+        # Without that it deleted the tif and left the archive, which re-extracted the same bad
+        # bytes every run while the message promised a refetch.
+        zqid = "_prep_quarantine_zip"
+        zqu = "https://x/pack.zip"
+        seed(zqid, [zqu], {"name": "Quarantine zip", "unpack": "zip:*.tif", "negate": True})
+        zb = io.BytesIO()
+        with zipfile.ZipFile(zb, "w") as z:
+            z.writestr("inner/member.tif", whole[:len(whole) // 2])  # header ok, pixels cut
+        with open(raw_of(zqid, zqu), "wb") as f:
+            f.write(zb.getvalue())
+        staged_member = f"store/source/{zqid}/member.tif"
+        try:
+            prep(zqid, 1)
+            assert False, "expected a truncated extracted member to exit"
+        except SystemExit as e:
+            assert "quarantined 1 unreadable file(s)" in str(e), e
+            assert staged_member in str(e) and raw_of(zqid, zqu) in str(e), e
+        assert not os.path.exists(staged_member), "the staged member must go"
+        assert not os.path.exists(raw_of(zqid, zqu)), \
+            "the ARCHIVE behind it must go too, else it re-extracts forever"
+
+        # …and with the bad raws gone, the next prep asks for a refetch rather than repeating.
+        try:
+            prep(qid)
+            assert False, "expected the missing raws to exit"
+        except SystemExit as e:
+            assert "missing" in str(e) and "fetch" in str(e), e
+
         # Format registry: an asc-mosaic zip of ESRI ASCII tiles mosaics to <id>.tif (GDAL CLI).
         if shutil.which("gdalbuildvrt") and shutil.which("gdal_translate"):
             aid = "_prep_asc"
@@ -1073,7 +1488,270 @@ def _check():
             assert os.path.isfile(f"store/source/{aid}/{aid}.tif"), "asc zip must mosaic to <id>.tif"
             with rasterio.open(f"store/source/{aid}/{aid}.tif") as src:
                 assert src.shape == (2, 2), src.shape
-            print("source_prep.py self-check ok (incl. asc mosaic)")
+
+            def asc_grid(x_off, value, nodata=-9999):
+                head = (f"ncols 2\nnrows 2\nxllcorner {x_off}\nyllcorner 0\ncellsize 1\n"
+                        + (f"NODATA_value {nodata}\n" if nodata is not None else ""))
+                return head + f"{value} {value}\n{value} {value}\n"
+
+            # asc-tile mosaics each asset on its own, so two disjoint archives stay two
+            # rasters rather than one bounding-box-sized mosaic spanning the gap between them.
+            tid = "_prep_asc_tile"
+            tu = [f"https://x/tiles/0.5/T{i}" for i in range(2)]
+            seed(tid, tu, {"name": "ASC tile", "unpack": "asc-tile", "crs": "EPSG:27700"})
+            for i, u in enumerate(tu):
+                zb = io.BytesIO()
+                with zipfile.ZipFile(zb, "w") as z:
+                    for j in range(2):  # two members per asset, side by side
+                        z.writestr(f"t{i}{j}mb.asc", asc_grid(i * 1000 + j * 2, -1))
+                with open(raw_of(tid, u), "wb") as f:
+                    f.write(zb.getvalue())
+            stage(tid)
+            staged = sorted(glob(f"store/source/{tid}/*.tif"))
+            assert [os.path.basename(p) for p in staged] == sorted(
+                staged_name(tid, u) for u in tu), staged
+            for p in staged:
+                with rasterio.open(p) as src:
+                    assert src.shape == (2, 4), src.shape  # its own two members, not the gap
+                    assert src.read(1).max() < 0, "seafloor stays negative"
+                    # grids declaring no NODATA_value fall back to -9999
+                    assert src.nodata == -9999, (p, src.nodata)
+            assert not glob(f"store/source/{tid}/_asc_*"), "asc-tile must consume its scratch"
+
+            # Collision scope for asc-tile is PER ARCHIVE, unlike the extract modes. Adjacent
+            # EA 5 km tiles genuinely ship the same 1 km cell (the API packages by
+            # intersection), and that is harmless here: members go to per-asset scratch and
+            # mosaic per asset, so the shared cell correctly lands in both neighbours' rasters.
+            shid = "_prep_asc_tile_shared"
+            shu = [f"https://x/tiles/0.5/TG54{i}" for i in range(2)]
+            seed(shid, shu, {"name": "ASC shared", "unpack": "asc-tile", "crs": "EPSG:27700"})
+            for i, u in enumerate(shu):
+                zb = io.BytesIO()
+                with zipfile.ZipFile(zb, "w") as z:
+                    z.writestr("tg5402mb.asc", asc_grid(0, -5))          # the shared cell
+                    z.writestr(f"tg54{i}9mb.asc", asc_grid(2 + i * 2, -6))
+                with open(raw_of(shid, u), "wb") as f:
+                    f.write(zb.getvalue())
+            stage(shid)
+            assert len(glob(f"store/source/{shid}/*.tif")) == 2, \
+                "a member basename shared ACROSS archives must not fail asc-tile"
+
+            # …but two members sharing a basename at DIFFERENT paths inside one archive would
+            # overwrite each other in that asset's scratch, so it stays fatal.
+            dupid = "_prep_asc_tile_dup"
+            dupu = "https://x/tiles/0.5/TG55"
+            seed(dupid, [dupu], {"name": "ASC dup", "unpack": "asc-tile", "crs": "EPSG:27700"})
+            zb = io.BytesIO()
+            with zipfile.ZipFile(zb, "w") as z:
+                z.writestr("a/tg5502mb.asc", asc_grid(0, -5))
+                z.writestr("b/tg5502mb.asc", asc_grid(2, -6))
+            with open(raw_of(dupid, dupu), "wb") as f:
+                f.write(zb.getvalue())
+            try:
+                stage(dupid)
+                assert False, "expected a within-archive basename collision to exit"
+            except SystemExit as e:
+                assert "collision" in str(e) and "tg5502mb.asc" in str(e), e
+
+            # A literal duplicate ENTRY — the same full path listed twice, which the EA's 5 km
+            # packages really do ship — is one file listed twice, not two inputs colliding.
+            # It stages, and the mosaic sees one copy of it.
+            twiceid = "_prep_asc_tile_twice"
+            twiceu = "https://x/tiles/0.5/TG56"
+            seed(twiceid, [twiceu], {"name": "ASC twice", "unpack": "asc-tile",
+                                     "crs": "EPSG:27700"})
+            body = asc_grid(0, -5)
+            zb = io.BytesIO()
+            with warnings.catch_warnings():  # zipfile warns on the duplicate it is asked to write
+                warnings.simplefilter("ignore", UserWarning)
+                with zipfile.ZipFile(zb, "w") as z:
+                    z.writestr("tg5602mb.asc", body)
+                    z.writestr("tg5602mb.asc", body)     # byte-identical, same path
+                    z.writestr("tg5609mb.asc", asc_grid(2, -6))
+            with open(raw_of(twiceid, twiceu), "wb") as f:
+                f.write(zb.getvalue())
+            stage(twiceid)
+            with rasterio.open(
+                    f"store/source/{twiceid}/{staged_name(twiceid, twiceu, ext='tif')}") as src:
+                assert src.shape == (2, 4), src.shape  # two distinct cells, not three
+                assert src.read(1).max() < 0, "seafloor stays negative"
+
+            # …but the same path twice with DIFFERENT bytes is ambiguous, and stays fatal.
+            forkid = "_prep_asc_tile_forked"
+            forku = "https://x/tiles/0.5/TG57"
+            seed(forkid, [forku], {"name": "ASC forked", "unpack": "asc-tile",
+                                   "crs": "EPSG:27700"})
+            zb = io.BytesIO()
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                with zipfile.ZipFile(zb, "w") as z:
+                    z.writestr("tg5702mb.asc", asc_grid(0, -5))
+                    z.writestr("tg5702mb.asc", asc_grid(0, -6))  # same path, other bytes
+            with open(raw_of(forkid, forku), "wb") as f:
+                f.write(zb.getvalue())
+            try:
+                stage(forkid)
+                assert False, "expected a CRC-mismatched duplicate entry to exit"
+            except SystemExit as e:
+                assert "more than once with different bytes" in str(e), e
+                assert "tg5702mb.asc" in str(e), e
+
+            # A grid declaring NODATA_value -9999 can still carry an older vintage's void
+            # marker as an ordinary pixel. At 0.5 m one of those wins every merge it touches,
+            # so anything at or below the sentinel floor is voided whatever the header says —
+            # while a merely deep value, and the unprovable positive outliers, are left alone.
+            sentid = "_prep_asc_sentinel"
+            sentu = "https://x/tiles/0.5/SS01"
+            seed(sentid, [sentu], {"name": "ASC sentinel", "unpack": "asc-tile",
+                                   "crs": "EPSG:27700"})
+            zb = io.BytesIO()
+            with zipfile.ZipFile(zb, "w") as z:
+                z.writestr("ss0102mb.asc",
+                           "ncols 2\nnrows 2\nxllcorner 0\nyllcorner 0\ncellsize 1\n"
+                           "NODATA_value -9999\n-999999 -5.5\n-99999 99\n")
+            with open(raw_of(sentid, sentu), "wb") as f:
+                f.write(zb.getvalue())
+            stage(sentid)
+            with rasterio.open(
+                    f"store/source/{sentid}/{staged_name(sentid, sentu, ext='tif')}") as src:
+                band = src.read(1)
+                assert band[0][0] == src.nodata, ("-999999 must be void", band)
+                assert band[1][0] == src.nodata, ("-99999 must be void", band)
+                assert band[0][1] == np.float32(-5.5), ("a real sounding survives", band)
+                assert band[1][1] == 99, ("a positive outlier is not provably a marker", band)
+
+            # AAIGrid reads a grid whose every value is a bare integer as Int32, and
+            # gdalbuildvrt SKIPS inputs whose type disagrees with the first file's — warning
+            # only, exit 0. An all-void integer member sorting first therefore used to drop
+            # every real Float32 grid beside it. Both must survive, as float32.
+            mixid = "_prep_asc_mixed_dtype"
+            mixu = "https://x/tiles/0.5/MX01"
+            seed(mixid, [mixu], {"name": "ASC mixed", "unpack": "asc-tile",
+                                 "crs": "EPSG:27700"})
+            zb = io.BytesIO()
+            with zipfile.ZipFile(zb, "w") as z:
+                z.writestr("mx0101mb.asc",  # sorts FIRST, all void, no decimal point anywhere
+                           "ncols 2\nnrows 2\nxllcorner 0\nyllcorner 0\ncellsize 1\n"
+                           "NODATA_value -9999\n-9999 -9999\n-9999 -9999\n")
+                z.writestr("mx0102mb.asc",  # the real soundings, float
+                           "ncols 2\nnrows 2\nxllcorner 2\nyllcorner 0\ncellsize 1\n"
+                           "NODATA_value -9999\n-3.25 -3.5\n-3.75 -4.0\n")
+            with open(raw_of(mixid, mixu), "wb") as f:
+                f.write(zb.getvalue())
+            stage(mixid)
+            with rasterio.open(
+                    f"store/source/{mixid}/{staged_name(mixid, mixu, ext='tif')}") as src:
+                assert src.dtypes[0] == "float32", src.dtypes
+                assert src.shape == (2, 4), (src.shape, "the float member must not be skipped")
+                got = src.read(1, masked=True)
+                assert got.count() == 4, (got.count(), "all four soundings survive")
+                assert float(got.min()) == -4.0 and float(got.max()) == -3.25, got
+
+            # Voids must never enter the pixel values, and the mosaic must not let a later
+            # member's holes overpaint an earlier one's soundings — the shape EA ships when it
+            # packages one cell from two survey dates. This is the invariant the whole
+            # near-nodata question turns on, so it is pinned rather than assumed.
+            ovid = "_prep_asc_overlap"
+            ovu = "https://x/tiles/0.5/OV01"
+            seed(ovid, [ovu], {"name": "ASC overlap", "unpack": "asc-tile",
+                               "crs": "EPSG:27700"})
+            zb = io.BytesIO()
+            with zipfile.ZipFile(zb, "w") as z:
+                z.writestr("ov0101_20140101mb.asc",  # sorts first: real soundings
+                           "ncols 2\nnrows 2\nxllcorner 0\nyllcorner 0\ncellsize 1\n"
+                           "NODATA_value -9999\n-5.5 -6.5\n-7.5 -8.5\n")
+                z.writestr("ov0101_20140202mb.asc",  # sorts last, same ground, all void
+                           "ncols 2\nnrows 2\nxllcorner 0\nyllcorner 0\ncellsize 1\n"
+                           "NODATA_value -9999\n-9999 -9999\n-9999 -9999\n")
+            with open(raw_of(ovid, ovu), "wb") as f:
+                f.write(zb.getvalue())
+            stage(ovid)
+            with rasterio.open(
+                    f"store/source/{ovid}/{staged_name(ovid, ovu, ext='tif')}") as src:
+                got = src.read(1, masked=True)
+                assert got.count() == 4, (got.count(), "a later member's voids must not "
+                                          "overpaint an earlier member's soundings")
+                assert float(got.min()) == -8.5 and float(got.max()) == -5.5, got
+                # nothing may sit in the empty gap between the void marker and the real data
+                between = got[(got > src.nodata) & (got < -100)]
+                assert between.count() == 0, ("nodata blended into a neighbour", between)
+
+            # A member can be truncated inside a perfectly valid zip — the container's CRC
+            # covers what was STORED, not whether the upstream stored a whole file — so this
+            # fails in a shell-out at STAGING, before the transform where CorruptStaged fires.
+            # The archive is the bad bytes, and upstream nondeterminism means a refetch
+            # plausibly heals it, so the raw goes and the run asks for a rerun.
+            shortid = "_prep_asc_short"
+            shortu = "https://x/tiles/0.5/SH01"
+            seed(shortid, [shortu], {"name": "ASC short", "unpack": "asc-tile",
+                                     "crs": "EPSG:27700"})
+            zb = io.BytesIO()
+            with zipfile.ZipFile(zb, "w") as z:
+                # the header promises 4 rows; only 2 are there
+                z.writestr("sh0102mb.asc",
+                           "ncols 4\nnrows 4\nxllcorner 0\nyllcorner 0\ncellsize 1\n"
+                           "NODATA_value -9999\n-1 -2 -3 -4\n-5 -6 -7 -8\n")
+            with open(raw_of(shortid, shortu), "wb") as f:
+                f.write(zb.getvalue())
+            try:
+                stage(shortid)
+                assert False, "expected a truncated archive member to exit"
+            except SystemExit as e:
+                assert "corrupt raw" in str(e) or "rerun to refetch" in str(e), e
+            assert not os.path.exists(raw_of(shortid, shortu)), \
+                "the archive behind an unreadable member must go, else it re-extracts forever"
+
+            # …but a shell-out that fails for a RECIPE reason must never delete a download.
+            assert not _gdal_bad_bytes("gdalbuildvrt: no such option --bogus")
+            assert not _gdal_bad_bytes("command failed (exit 1): gdal_calc.py ... KeyError")
+            assert _gdal_bad_bytes("ERROR 1: tm5595_20140729mb.asc: File short, "
+                                   "can't read line 1990")
+            assert _gdal_bad_bytes("ERROR 1: IReadBlock failed at X offset 0")
+            assert _gdal_bad_bytes("not recognized as being in a supported file format")
+
+            # A grid that declares no NODATA_value at all still gets the -9999 fallback.
+            nid = "_prep_asc_no_nodata"
+            nu = "https://x/tiles/0.5/N0"
+            seed(nid, [nu], {"name": "ASC no nodata", "unpack": "asc-tile",
+                             "crs": "EPSG:27700"})
+            zb = io.BytesIO()
+            with zipfile.ZipFile(zb, "w") as z:
+                z.writestr("n0mb.asc", asc_grid(0, -4, nodata=None))
+            with open(raw_of(nid, nu), "wb") as f:
+                f.write(zb.getvalue())
+            stage(nid)
+            with rasterio.open(f"store/source/{nid}/{staged_name(nid, nu, ext='tif')}") as src:
+                assert src.nodata == -9999, src.nodata
+
+            # The SAME mode over a 7z, narrowed by a glob: the container is sniffed, and the
+            # glob keeps a second resolution of the same ground out of the mosaic (Litto3D
+            # ships MNT1m beside MNT5m). Only the 5 m member may reach the raster.
+            sid_7z = "_prep_asc_tile_7z"
+            u7 = "https://x/prepaquet/0225_6770.7z"
+            seed(sid_7z, [u7], {"name": "ASC tile 7z", "unpack": "asc-tile:*_MNT5M_*.asc",
+                                "crs": "EPSG:2154"})
+            import py7zr
+            with py7zr.SevenZipFile(raw_of(sid_7z, u7), "w") as z:
+                for j in range(2):
+                    z.writestr(asc_grid(j * 2, -7, nodata=-99999),
+                               f"d{j}/MNT5m/L3D_{j}_MNT5M_LAMB93.asc")
+                    z.writestr(asc_grid(j * 2, -1, nodata=-99999),
+                               f"d{j}/MNT1m/L3D_{j}_MNT1M_LAMB93.asc")
+                z.writestr("read me", "d0/DC_LITTO3D.txt")
+            stage(sid_7z)
+            # …and it is named for what it IS (a tif), not for the .7z it came out of —
+            # otherwise prep()'s *.tif glob registers nothing at all.
+            staged7 = glob(f"store/source/{sid_7z}/*.tif")
+            assert staged7 == [f"store/source/{sid_7z}/{staged_name(sid_7z, u7, ext='tif')}"], \
+                staged7
+            assert staged7[0].endswith(".tif") and "0225_6770" in staged7[0], staged7
+            with rasterio.open(staged7[0]) as src:
+                assert src.shape == (2, 4), src.shape  # the two 5 m members only
+                assert (src.read(1) == -7).all(), "the 1 m members must not join the mosaic"
+                # the grids' OWN nodata survives — relabelling it would turn every void into
+                # a plausible depth once the datum step shifts it
+                assert src.nodata == -99999, src.nodata
+            print("source_prep.py self-check ok (incl. asc mosaic + asc tile over zip/7z)")
         else:
             print("source_prep.py self-check ok (asc mosaic skipped — no GDAL CLI)")
     finally:

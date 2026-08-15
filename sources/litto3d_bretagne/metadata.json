@@ -1,0 +1,11 @@
+{
+    "name": "Litto3D Bretagne 2018-2021 (5 m coastal lidar)",
+    "producer": "Shom / IGN",
+    "website": "https://diffusion.shom.fr/donnees/altimetrie-littorale/litto3d-bretagne-2018-2021.html",
+    "license": "Licence Ouverte / Etalab (cite \"Shom - IGN, 2024. https://doi.org/10.17183/LITTO3D_BZH_2018_2021\")",
+    "max_zoom": 14,
+    "unpack": "asc-tile:*_MNT5M_*.asc",
+    "datum": "altitude IGN69 (EPSG:5720); chart datum runs 1.3 to 6.8 m below it across the product",
+    "offset_surface": "ign69_zh",
+    "crs": "EPSG:2154"
+}

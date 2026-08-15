@@ -37,29 +37,46 @@ def _decimate_pct(native_m, target_m=COARSEN_TARGET_M):
 def _native_res_m(src):
     """The source's ground pixel size in metres (degrees converted at the equator — footprint-
     grade, exact resolution is discarded downstream). Falls back to the target (no decimation)."""
+    return _raster_info(src)[0]
+
+
+def _raster_info(src):
+    """(ground pixel size in metres, width px, height px)."""
     info = json.loads(subprocess.run(["gdalinfo", "-json", src],
                                      capture_output=True, text=True, check=True).stdout)
+    width, height = info.get("size", [0, 0])
     gt = info.get("geoTransform")
     if not gt or not gt[1]:
-        return COARSEN_TARGET_M
+        return COARSEN_TARGET_M, width, height
     wkt = info.get("coordinateSystem", {}).get("wkt", "").lstrip()
     geographic = wkt.upper().startswith(("GEOGCRS", "GEOGCS"))
-    return abs(gt[1]) * 111_320 if geographic else abs(gt[1])
+    return (abs(gt[1]) * 111_320 if geographic else abs(gt[1])), width, height
+
+
+def _decimated_size(width, height, pct):
+    """The decimated raster's size in PIXELS, never smaller than 1x1.
+
+    Sized in pixels rather than passed to gdal_translate as a percentage: a small raster times a
+    small percentage rounds to a fraction, and `-outsize 2% 2%` on a 27 px tile asks for 0.54 px
+    and fails the whole polygon job. A footprint only needs the tile to survive as SOME pixels."""
+    return max(1, round(width * pct / 100)), max(1, round(height * pct / 100))
 
 
 def polygonize_tif(source, filename):
     src = f"store/source/{source}/{filename}"
     mask = f"store/polygon/{source}/{filename}"
-    pct = _decimate_pct(_native_res_m(src))
+    native_m, width, height = _raster_info(src)
+    pct = _decimate_pct(native_m)
     calc_src = src
     if pct < 100:
+        out_w, out_h = _decimated_size(width, height, pct)
         # -r nearest drops sub-target speckle, which is what we want for a footprint.
         # ponytail: switch to a coverage-preserving resample if a genuinely sparse source ever
         # draws under-covered — no such source today.
         calc_src = f"{mask}.small.tif"
         utils.run_command(
-            f'GDAL_CACHEMAX=1024 gdal_translate -outsize {pct}% {pct}% -r nearest {src} {calc_src}',
-            silent=SILENT)
+            f'GDAL_CACHEMAX=1024 gdal_translate -outsize {out_w} {out_h} -r nearest '
+            f'{src} {calc_src}', silent=SILENT)
     utils.run_command(
         f'GDAL_CACHEMAX=1024 gdal_calc.py -A {calc_src} '
         f'--outfile={mask} --calc="A*0+1" --type=Byte --overwrite', silent=SILENT)
@@ -108,11 +125,50 @@ def merge_source(source):
 
 
 def _check():
+    import shutil
+    import tempfile
+
     assert _decimate_pct(1) == 1        # 1 m native -> 1% (~100 m)
     assert _decimate_pct(10) == 10
     assert _decimate_pct(100) == 100    # already at the target -> no-op
     assert _decimate_pct(450) == 100    # coarser than the target -> never upsampled
-    print("source_polygonize.py ok")
+
+    # A tile small enough that its decimated size rounds below one pixel still has to produce a
+    # raster: uk_cco's 27 px NT9550 asked gdal_translate for 0.54 px and failed the whole source.
+    assert _decimated_size(27, 27, 2) == (1, 1), _decimated_size(27, 27, 2)
+    assert _decimated_size(1, 1, 1) == (1, 1)
+    assert _decimated_size(4000, 2000, 2) == (80, 40)  # the ordinary case is unchanged
+    assert _decimated_size(150, 30, 2) == (3, 1), "each axis floors independently"
+
+    if not (shutil.which("gdal_translate") and shutil.which("gdal_polygonize.py")):
+        print("source_polygonize.py ok (tiny-raster path skipped — no GDAL CLI)")
+        return
+    # …and the whole real path over such a tile, since the failure was in the shell-out.
+    import numpy as np
+    import rasterio
+    from rasterio.transform import from_origin
+
+    d = tempfile.mkdtemp()
+    cwd = os.getcwd()
+    try:
+        os.chdir(d)
+        sid, name = "_poly_tiny", "tiny.tif"
+        utils.create_folder(f"store/source/{sid}")
+        utils.create_folder(f"store/polygon/{sid}")
+        with rasterio.open(f"store/source/{sid}/{name}", "w", driver="GTiff", height=27,
+                           width=27, count=1, dtype="float32", nodata=-9999.0,
+                           crs="EPSG:27700", transform=from_origin(0, 54, 2, 2)) as dst:
+            dst.write(np.full((27, 27), -5.0, dtype="float32"), 1)
+        polygonize_tif(sid, name)
+        out = f"store/polygon/{sid}/{name}.gpkg"
+        assert os.path.isfile(out), "a tiny tile must still polygonize"
+        info = json.loads(subprocess.run(["ogrinfo", "-json", out],
+                                         capture_output=True, text=True, check=True).stdout)
+        assert info["layers"][0]["featureCount"] >= 1, info["layers"][0]["featureCount"]
+    finally:
+        os.chdir(cwd)
+        shutil.rmtree(d, ignore_errors=True)
+    print("source_polygonize.py ok (incl. a sub-pixel decimation)")
 
 
 def main():
