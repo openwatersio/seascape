@@ -80,9 +80,14 @@ def polygonize_tif(source, filename):
     utils.run_command(
         f'GDAL_CACHEMAX=1024 gdal_calc.py -A {calc_src} '
         f'--outfile={mask} --calc="A*0+1" --type=Byte --overwrite', silent=SILENT)
+    out = f"store/polygon/{source}/{filename}.gpkg"
+    # A stale per-file gpkg from an interrupted run must not survive: trailing -overwrite is
+    # misparsed as the layer name by current gdal_polygonize, so remove + lead with the flag.
+    if os.path.isfile(out):
+        os.remove(out)
     utils.run_command(
-        f'GDAL_CACHEMAX=1024 gdal_polygonize.py {mask} -b 1 -f "GPKG" '
-        f'store/polygon/{source}/{filename}.gpkg -overwrite', silent=SILENT)
+        f'GDAL_CACHEMAX=1024 gdal_polygonize.py -overwrite {mask} -b 1 -f "GPKG" '
+        f'{out}', silent=SILENT)
     os.remove(mask)
     if calc_src != src:
         os.remove(calc_src)
@@ -165,6 +170,9 @@ def _check():
         info = json.loads(subprocess.run(["ogrinfo", "-json", out],
                                          capture_output=True, text=True, check=True).stdout)
         assert info["layers"][0]["featureCount"] >= 1, info["layers"][0]["featureCount"]
+        # A stale gpkg from an interrupted run must be replaced, not refused.
+        polygonize_tif(sid, name)
+        assert os.path.isfile(out), "a pre-existing footprint must be rewritten"
     finally:
         os.chdir(cwd)
         shutil.rmtree(d, ignore_errors=True)
