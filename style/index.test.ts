@@ -347,7 +347,7 @@ test("the safety contour is the one emphasized isobath", () => {
     0.8,
   ]);
   expect(JSON.stringify(metric.paint["line-color"])).toContain(
-    day.soundingEmphasis,
+    day.contourEmphasis,
   );
   // Fathom mode matches on the fathom prop: 4 m snaps to the 3 fm curve.
   expect(lines({ safety: 4, unit: "fm" }).paint["line-width"]).toEqual([

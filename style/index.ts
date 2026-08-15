@@ -48,6 +48,7 @@ export interface Flavor {
   label: string;
   labelHalo: string;
   soundingEmphasis: string;
+  contourEmphasis: string;
   font: string[];
   hillshadeShadow: string;
   hillshadeHighlight: string;
@@ -95,6 +96,8 @@ export const day: Flavor = {
   label: "#768c97",
   labelHalo: "#fff",
   soundingEmphasis: "#000",
+  // Safety contour line (S-52 DEPSC day): darker grey, distinct from SNDG2 black.
+  contourEmphasis: "#4C5B63",
   font: ["Noto Sans Regular"],
   hillshadeShadow: "#9adcfe",
   hillshadeHighlight: "#ffffff",
@@ -482,7 +485,7 @@ export function layers(
         // every other contour stays uniform DEPCN weight (S-4 B-411.1 recommends
         // against emphasizing fixed standard contours).
         "line-color": safetyContour
-          ? ["case", isSafetyContour, flavor.soundingEmphasis, flavor.contour]
+          ? ["case", isSafetyContour, flavor.contourEmphasis, flavor.contour]
           : flavor.contour,
         "line-width": safetyContour ? ["case", isSafetyContour, 1.5, 0.8] : 0.8,
       },
