@@ -6,133 +6,171 @@
 # drift. Deletion itself stays in gc.yml (the dry-run gate + bounded batches) — this script only
 # computes, inventories, and refuses.
 #
-# usage: gc-collect.sh <rclone|local> <root> [keep_n]
-#   <root>:  the bathymetry prefix — an rclone remote path (R2:data/bathymetry) or a local dir
-#   keep_n:  union of the newest N store manifests = the referenced set (default 3)
+# The referenced set is rooted on the published mosaic:
+#   - mosaic/mosaic.gti (the serving pointer): its index parquet, planet-z8 overview, and every
+#     tile COG the index's `location` column names. Any failure here REFUSES — a broken serving
+#     set is a human's problem, never a delete list.
+#   - each candidate a live build/<sha>/manifest.json names (.mosaic_gti), rooted the same way: a
+#     published-but-unreleased build must stay promotable, and the build/ lifecycle rule (7 days)
+#     bounds how long that hold lasts. A candidate whose GTI or index never landed can never be
+#     promoted — skipped with a note, so its debris falls to collection.
+# Everything else under mosaic/ (superseded tiles/overviews, old candidate GTIs + indexes) is the
+# delete set. Published pointers carry absolute /vsicurl public URLs; refs are stripped to
+# store-relative paths before the set arithmetic.
+#
+# Also flags:
+#   - the retired store-hydrate prefixes WHOLESALE (gc-purge-dirs.txt): pmtiles/ contour/
+#     soundings/ depare/ aggregation/ store/ — dead since the store moved to the persistent
+#     build volume; nothing reads or writes them.
+#   - retired source/<id>/bounds.csv registrations (catalog.json carries the per-file rows as
+#     seascape:files).
+# NEVER touches: build/<sha>/ (read-only roots here; an R2 lifecycle rule collects the prefix),
+# source COGs / catalog.json / polygon/ / landmask/ (sources.yml owns them).
+#
+# usage: gc-collect.sh <rclone|local> <root>
+#   <root>: the bathymetry prefix — an rclone remote path (R2:data/bathymetry) or a local dir
+# Needs python3 + pyarrow (the mosaic index is GeoParquet).
 #
 # outputs under $GC_OUT (default /tmp):
 #   gc-delete.txt      unreferenced objects to delete, paths relative to <root>
-#   gc-purge-dirs.txt  retired diff-era aggregation/<ulid> covering dirs to purge
+#   gc-purge-dirs.txt  retired prefixes to purge wholesale, relative to <root>
 # exit 0: collected (or nothing to GC yet — empty outputs); nonzero: a guard refused.
 set -euo pipefail
 
-BACKEND=${1:?usage: gc-collect.sh <rclone|local> <root> [keep_n]}
-ROOT=${2:?usage: gc-collect.sh <rclone|local> <root> [keep_n]}
-KEEP=${3:-3}
+BACKEND=${1:?usage: gc-collect.sh <rclone|local> <root>}
+ROOT=${2:?usage: gc-collect.sh <rclone|local> <root>}
 GC_OUT=${GC_OUT:-/tmp}
 
 case "$BACKEND" in
   rclone)
     bk_cat()   { rclone cat "$ROOT/$1" 2>/dev/null; }
     bk_files() { rclone lsf -R --files-only "$ROOT/$1" 2>/dev/null || true; }
-    bk_dirs()  { rclone lsf "$ROOT/$1/" --dirs-only 2>/dev/null | sed 's#/$##' || true; }
     ;;
   local)
     bk_cat()   { cat "$ROOT/$1" 2>/dev/null; }
     bk_files() { (cd "$ROOT/$1" 2>/dev/null && find . -type f | sed 's#^\./##' | sort) || true; }
-    bk_dirs()  { (cd "$ROOT/$1" 2>/dev/null && find . -mindepth 1 -maxdepth 1 -type d | sed 's#^\./##' | sort) || true; }
     ;;
   *) echo "::error::unknown backend '$BACKEND' (rclone|local)" >&2; exit 2 ;;
 esac
 
 refuse() { echo "::error::$1" >&2; exit 1; }
 
-# 1) The pointer must fetch AND parse cleanly, else there's no referenced set to compute — refuse
-#    on a corrupt one. A genuinely-ABSENT pointer is not an error: the store is still
-#    pre-immutable, nothing to collect yet — empty outputs, exit 0.
-if ! bk_cat store/manifest.json > "$GC_OUT/gc-pointer.json" || [ ! -s "$GC_OUT/gc-pointer.json" ]; then
-  echo "no store pointer (or unreadable) — nothing to GC yet (pre-immutable store)"
+python3 -c 'import pyarrow.parquet' 2>/dev/null \
+  || refuse "python3 + pyarrow required — the mosaic index is GeoParquet"
+
+# Strip a pointer ref down to its mosaic/-relative path (published candidates and the promoted
+# serving pointer carry absolute /vsicurl URLs so they resolve off the bucket).
+strip_ref() { sed -E 's#^/vsicurl/##; s#^https?://[^[:space:]]*/mosaic/##'; }
+
+# root_gti <gti-name> <hard|soft>: parse mosaic/<gti-name>, fetch the index it names, and append
+# the GTI + index + planet overview + every tile location to gc-referenced.txt. hard (the serving
+# pointer) refuses on any failure; soft (a build-manifest candidate) logs and adds nothing — an
+# incompletely-published candidate can never be promoted, so its debris is collectable.
+root_gti() {
+  local gti=$1 mode=$2 xml="$GC_OUT/gc-gti.xml" idx="$GC_OUT/gc-index.parquet" midx planet
+  if ! bk_cat "mosaic/$gti" > "$xml" || [ ! -s "$xml" ]; then
+    if [ "$mode" = hard ]; then refuse "mosaic/$gti unreadable — refusing to GC"; fi
+    echo "skipping $gti — its GTI never landed (incomplete publish)"; return 0
+  fi
+  midx=$(grep -o '<IndexDataset>[^<]*</IndexDataset>' "$xml" | sed -E 's#</?IndexDataset>##g' | strip_ref || true)
+  planet=$(grep -o '<Dataset>[^<]*</Dataset>' "$xml" | sed -E 's#</?Dataset>##g' | strip_ref || true)
+  case "$midx" in
+    index/*.parquet) ;;
+    *) if [ "$mode" = hard ]; then refuse "mosaic/$gti has no parsable <IndexDataset> — corrupt mosaic pointer, refusing to GC"; fi
+       echo "skipping $gti — unparsable index ref"; return 0 ;;
+  esac
+  case "$planet" in
+    planet-z8-*.tif) ;;
+    *) if [ "$mode" = hard ]; then refuse "mosaic/$gti has no parsable overview <Dataset> — corrupt mosaic pointer, refusing to GC"; fi
+       echo "skipping $gti — unparsable planet ref"; return 0 ;;
+  esac
+  if ! bk_cat "mosaic/$midx" > "$idx" || [ ! -s "$idx" ]; then
+    if [ "$mode" = hard ]; then refuse "mosaic/$midx (named by mosaic/$gti) failed to fetch — pointer/index mismatch, refusing to GC"; fi
+    echo "skipping $gti — its index never landed (incomplete publish)"; return 0
+  fi
+  if ! python3 -c 'import sys, pyarrow.parquet as pq
+for loc in pq.read_table(sys.argv[1], columns=["location"]).column("location").to_pylist():
+    print(loc)' "$idx" > "$GC_OUT/gc-locs-raw.txt" 2>/dev/null; then
+    if [ "$mode" = hard ]; then refuse "mosaic/$midx is not readable Parquet — refusing to GC"; fi
+    echo "skipping $gti — its index is not readable Parquet"; return 0
+  fi
+  strip_ref < "$GC_OUT/gc-locs-raw.txt" > "$GC_OUT/gc-locs.txt"
+  if [ ! -s "$GC_OUT/gc-locs.txt" ]; then
+    if [ "$mode" = hard ]; then refuse "mosaic/$midx names no tiles — empty index, refusing to GC"; fi
+    echo "skipping $gti — empty index"; return 0
+  fi
+  if grep -qvE '^tiles/[^/]+\.tif$' "$GC_OUT/gc-locs.txt"; then
+    if [ "$mode" = hard ]; then refuse "mosaic/$midx contains an unparsable tile location — refusing to GC"; fi
+    echo "skipping $gti — unparsable tile location in its index"; return 0
+  fi
+  { printf 'mosaic/%s\n' "$gti" "$midx" "$planet"; sed 's#^#mosaic/#' "$GC_OUT/gc-locs.txt"; } >> "$GC_OUT/gc-referenced.txt"
+  echo "rooted $gti → $(wc -l < "$GC_OUT/gc-locs.txt") tile(s) + index + planet"
+}
+
+# 1) The serving pointer. Genuinely ABSENT = pre-mosaic store, nothing to GC yet — empty outputs,
+#    exit 0. Present means the whole serving set must resolve, or the run refuses.
+: > "$GC_OUT/gc-referenced.txt"
+if ! bk_cat mosaic/mosaic.gti > "$GC_OUT/gc-probe.gti" || [ ! -s "$GC_OUT/gc-probe.gti" ]; then
+  echo "no mosaic pointer — nothing to GC yet (pre-mosaic store)"
   : > "$GC_OUT/gc-delete.txt"
   : > "$GC_OUT/gc-purge-dirs.txt"
   exit 0
 fi
-current=$(jq -re '.manifest' "$GC_OUT/gc-pointer.json" 2>/dev/null) \
-  || refuse "store pointer is not valid JSON (or has no .manifest) — refusing to GC"
-echo "pointer → $current"
+root_gti mosaic.gti hard
 
-# 2) The newest N manifests by ULID sort (chronological). The pointer's manifest is the newest (GC
-#    never runs during a build — shared concurrency group) and MUST be among them — a stale or
-#    corrupt listing otherwise refuses rather than under-referencing.
-bk_files store/manifests | grep '\.json$' | sort > "$GC_OUT/gc-all-manifests.txt" || true
-[ -s "$GC_OUT/gc-all-manifests.txt" ] || refuse "no store manifests listed — refusing to GC"
-tail -n "$KEEP" "$GC_OUT/gc-all-manifests.txt" > "$GC_OUT/gc-keep-manifests.txt"
-grep -qxF "${current#manifests/}" "$GC_OUT/gc-keep-manifests.txt" \
-  || refuse "pointer manifest $current not among the newest $KEEP — stale/corrupt listing, refusing to GC"
-
-# 3) Referenced set = union of those manifests' names. Each must fetch and be valid JSON with
-#    .entries — one unreadable manifest refuses the whole run (an incomplete referenced set would
-#    mark live artifacts as garbage).
-: > "$GC_OUT/gc-referenced.txt"
+# 2) Candidates still promotable: named by a live build/<sha>/manifest.json. A torn or invalid
+#    manifest can't be released either (release.yml jq-parses it the same way) — skipped.
+bk_files build | grep '/manifest\.json$' | sort > "$GC_OUT/gc-build-manifests.txt" || true
+: > "$GC_OUT/gc-candidates.txt"
 while IFS= read -r m; do
   [ -n "$m" ] || continue
-  bk_cat "store/manifests/$m" > "$GC_OUT/gc-m.json" || refuse "manifest $m unreadable — refusing to GC"
-  jq -e '.entries' "$GC_OUT/gc-m.json" >/dev/null 2>&1 \
-    || refuse "manifest $m is not valid JSON with .entries — refusing to GC"
-  jq -r '.entries[].name' "$GC_OUT/gc-m.json" >> "$GC_OUT/gc-referenced.txt"
-done < "$GC_OUT/gc-keep-manifests.txt"
+  gti=$(bk_cat "build/$m" | jq -r '.mosaic_gti // empty' 2>/dev/null) || gti=""
+  case "$gti" in
+    mosaic-candidate-*.gti) echo "$gti" >> "$GC_OUT/gc-candidates.txt" ;;
+    "") ;;
+    *) echo "skipping build/$m — unrecognized mosaic_gti '$gti'" ;;
+  esac
+done < "$GC_OUT/gc-build-manifests.txt"
+sort -u -o "$GC_OUT/gc-candidates.txt" "$GC_OUT/gc-candidates.txt"
+while IFS= read -r c; do
+  [ -n "$c" ] || continue
+  root_gti "$c" soft
+done < "$GC_OUT/gc-candidates.txt"
 sort -u -o "$GC_OUT/gc-referenced.txt" "$GC_OUT/gc-referenced.txt"
-ref=$(wc -l < "$GC_OUT/gc-referenced.txt")
-[ "$ref" -gt 0 ] || refuse "referenced set is empty — refusing to GC"
-echo "referenced by the last $KEEP manifests: $ref artifacts"
+echo "referenced mosaic objects: $(wc -l < "$GC_OUT/gc-referenced.txt")"
 
-# 3b) MOSAIC pointer set. The mosaic tile COGs + planet-z8 overview are content-addressed and named
-#     by the store manifests (kept via the union above). But the mosaic.gti POINTER and the per-build
-#     index parquet it names are NOT content-addressed — one current pointer, one index per build —
-#     so keep the current pair explicitly, parsed from the LIVE pointer; every older index +
-#     superseded tile/overview then falls to collection (the unbounded-growth fix). Absent mosaic.gti
-#     = pre-mosaic store, nothing extra to keep.
-if bk_cat mosaic/mosaic.gti > "$GC_OUT/gc-mosaic-gti.xml" 2>/dev/null && [ -s "$GC_OUT/gc-mosaic-gti.xml" ]; then
-  # || true: a match-less grep exits 1 and (pipefail + set -e) would abort silently before the
-  # explicit refuse below — swallow it so the empty-midx guard reports the real reason.
-  midx=$(grep -o '<IndexDataset>[^<]*</IndexDataset>' "$GC_OUT/gc-mosaic-gti.xml" | sed -E 's#</?IndexDataset>##g' || true)
-  [ -n "$midx" ] || refuse "mosaic.gti has no <IndexDataset> — corrupt mosaic pointer, refusing to GC"
-  # midx is relative to the .gti dir (index/<ulid>.parquet) → its store path is mosaic/<midx>.
-  printf 'mosaic/mosaic.gti\nmosaic/%s\n' "$midx" >> "$GC_OUT/gc-referenced.txt"
-  sort -u -o "$GC_OUT/gc-referenced.txt" "$GC_OUT/gc-referenced.txt"
-  echo "mosaic pointer → mosaic/$midx (+ mosaic.gti) kept"
-fi
+# 3) Everything actually under mosaic/. Every referenced object must be PRESENT: a rooted set is
+#    complete by construction (publish uploads tiles → planet → index → GTI, promotion copies a
+#    complete candidate), so a gap means a stale or mismatched listing that would otherwise mark
+#    live objects unreferenced — refuse.
+bk_files mosaic | sed 's#^#mosaic/#' | sort -u > "$GC_OUT/gc-all.txt"
+[ -s "$GC_OUT/gc-all.txt" ] || refuse "mosaic listing is empty but the pointer read — listing mismatch, refusing to GC"
+missing=$(comm -13 "$GC_OUT/gc-all.txt" "$GC_OUT/gc-referenced.txt" | head -3 | paste -sd' ' -)
+[ -z "$missing" ] || refuse "referenced objects missing from the store listing ($missing …) — refusing to GC"
 
-# 4) Every store object in the content-addressed prefixes, path relative to <root> (matching the
-#    manifest 'name' form). mosaic/ is included: its tiles + planet-z8 are content-addressed, and
-#    its non-content pointer/index are held by the mosaic pointer set (3b) so they're never flagged.
-: > "$GC_OUT/gc-all.txt"
-for p in mosaic pmtiles contour soundings depare; do
-  bk_files "$p" | sed "s#^#$p/#" >> "$GC_OUT/gc-all.txt"
-done
-sort -u -o "$GC_OUT/gc-all.txt" "$GC_OUT/gc-all.txt"
-total=$(wc -l < "$GC_OUT/gc-all.txt")
-echo "store objects in content prefixes: $total"
-
-# Sanity: the referenced set must intersect what's actually in the store, or a path/listing
-# mismatch would mark the whole store unreferenced and delete everything.
-kept=$(comm -12 "$GC_OUT/gc-all.txt" "$GC_OUT/gc-referenced.txt" | wc -l)
-[ "$kept" -gt 0 ] || refuse "0 referenced artifacts are present in the store — path mismatch, refusing to GC"
-
-# 5) Unreferenced content objects (pre-phase-4 mutable names + .key sidecars fall out here too —
-#    they sit in these prefixes and no manifest names them).
+# 4) Unreferenced mosaic objects → the delete set.
 comm -23 "$GC_OUT/gc-all.txt" "$GC_OUT/gc-referenced.txt" > "$GC_OUT/gc-delete.txt"
 
-# 6) Named legacy debris beyond the content prefixes: retired source/<id>/bounds.csv
-#    registrations (catalog.json carries the per-file rows as seascape:files now).
+# 5) Retired source/<id>/bounds.csv registrations.
 bk_files source | grep '/bounds\.csv$' | sed 's#^#source/#' >> "$GC_OUT/gc-delete.txt" || true
 sort -u -o "$GC_OUT/gc-delete.txt" "$GC_OUT/gc-delete.txt"
 del=$(wc -l < "$GC_OUT/gc-delete.txt")
 
-# 7) Retired diff-era coverings — whole aggregation/<ulid>/ dirs (nothing reads a covering from
-#    the store under phase 4; hydrate is manifest-driven).
-bk_dirs aggregation > "$GC_OUT/gc-purge-dirs.txt"
+# 6) The retired store-hydrate prefixes, purged wholesale wherever still non-empty.
+: > "$GC_OUT/gc-purge-dirs.txt"
+for p in pmtiles contour soundings depare aggregation store; do
+  [ -n "$(bk_files "$p" | head -1)" ] && echo "$p" >> "$GC_OUT/gc-purge-dirs.txt"
+done
 dirs=$(grep -c . "$GC_OUT/gc-purge-dirs.txt" || true)
 
-# ── Full inventory (per content prefix) BEFORE anything deletes ──
+# ── Full inventory BEFORE anything deletes ──
 echo "── inventory ──"
-for p in mosaic pmtiles contour soundings depare; do
-  pt=$(grep -c "^$p/" "$GC_OUT/gc-all.txt" || true)
-  pd=$(grep -c "^$p/" "$GC_OUT/gc-delete.txt" || true)
-  echo "  $p: $pt objects, $((pt - pd)) kept, $pd to delete"
-done
+mt=$(grep -c '^mosaic/' "$GC_OUT/gc-all.txt" || true)
+md=$(grep -c '^mosaic/' "$GC_OUT/gc-delete.txt" || true)
+echo "  mosaic: $mt objects, $((mt - md)) kept, $md to delete"
 bc=$(grep -c '^source/.*/bounds\.csv$' "$GC_OUT/gc-delete.txt" || true)
 echo "  source/*/bounds.csv: $bc to delete"
-echo "  aggregation/ coverings: $dirs dir(s) to purge"
-echo "totals: $del objects + $dirs covering dir(s) to delete; $kept of $ref referenced objects present"
+echo "  retired prefixes to purge: $(paste -sd' ' "$GC_OUT/gc-purge-dirs.txt")"
+echo "totals: $del objects + $dirs retired prefix(es)"
 echo "── first 20 objects flagged for deletion ──"
 head -20 "$GC_OUT/gc-delete.txt" || true
