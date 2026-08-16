@@ -453,10 +453,11 @@ rule depare_tile:
     output:
         "store/depare/{stem}.fgb"
     params:
-        version=2, # increment to force a rebuild
+        version=3, # increment to force a rebuild
         levels=json.dumps({"m": pipeline_config.DEPARE_LEVELS, "ft": pipeline_config.DEPARE_LEVELS_FT}),
         drying=pipeline_config.DRYING_CAP, sliver=depare_run.SLIVER_MIN_PX,
         simplify_mm=depare_run.SIMPLIFY_MM,
+        nodata_simplify=depare_run.NODATA_SIMPLIFY_PX, nodata_overlap=depare_run.NODATA_OVERLAP_PX,
     priority: vector_tile_priority  # vector band: drain before terrain so the bundle overlaps it
     retries: 2
     resources:
