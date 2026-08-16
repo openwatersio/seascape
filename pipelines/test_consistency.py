@@ -17,7 +17,7 @@ plans above it (where the raster reads the pyramid and the vectors do not re-der
 
 What is asserted, and the bound each rests on:
 
-  1. ONE SURFACE. Over the navigable band the served raster and the forks' window are the same
+  1. ONE SURFACE. Over the water domain the served raster and the forks' window are the same
      array, up to the encode's quantization step: the raster never charts more than one step
      shallower than the vector surface, and never charts deeper than it at all — EXCEPT where
      smooth.pond_fill licensed the vectors to shoal (the enclosed pond), which is asserted to
@@ -271,7 +271,7 @@ def _klass(v):
 # ── the checks ─────────────────────────────────────────────────────────────────────────────────
 
 def check_one_surface(stem, native):
-    """1. The served raster and the forks' window are one surface over the navigable band.
+    """1. The served raster and the forks' window are one surface over the water domain.
 
     The fork window's interior is the anchor tile at res(child_z), the same grid the native render
     tiles it into, so this is a pixel-for-pixel comparison of the shipped product against the
@@ -297,7 +297,7 @@ def check_one_surface(stem, native):
 
     # Compare where both call it charted depth; the non-negative codes are property 2's job.
     band = (fork < 0) & (raster < 0)
-    assert band.sum() > CORE * CORE // 4, f"the navigable band must dominate the fixture: {band.sum()} px"
+    assert band.sum() > CORE * CORE // 4, f"the water domain must dominate the fixture: {band.sum()} px"
     step = np.minimum(encode.quantization_factor(CHILD_Z),
                       2.0 ** np.ceil(np.log2(np.maximum(np.abs(raster) * encode.SHALLOW_REL,
                                                         encode.SHALLOW_MIN_STEP))))
