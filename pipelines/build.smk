@@ -331,42 +331,43 @@ SMOOTH_CFG = json.dumps({} if os.environ.get("SKIP_SMOOTH") else {
     "shoal_clamped": True}, sort_keys=True)
 
 
-# Fork reservations by child_z: ceil(measured max RSS) over the runs 30311420659 /
-# 30320876479 / 30348364325 benchmark corpus, no pad — footprints are window-geometry-
-# deterministic (p50 == max within a class), and the rare over-peak is covered by
-# `attempt` escalation on retry plus the box's 64 GB swap.
-# contour refines in feature batches (contour_run.STREAM_BATCH); run 30360226622 measured
-# 4.7 GB at z14 (batch + gdal_contour child). z15 provisional: features carry more vertices,
-# so the same batch count weighs more.
-CONTOUR_GB = {15: 10, 14: 5}
+# Fork reservations by child_z: ceil(measured max RSS) over run 31946612525's benchmark
+# corpus, no pad — footprints are window-geometry-deterministic (p50 == max within a class),
+# and the rare over-peak is covered by `attempt` escalation on retry plus the box's swap.
+# Every figure here is measured with GDAL_CACHEMAX bounded; an unbounded block cache adds
+# ~9 GB of pure cache per GDAL process and swamps the real working set (build.yml pins it).
+# cz14/15 contour: 17 cz15 rows measured p99 1.56 GB; cz14 mirrors it (no cz14 rows yet).
+CONTOUR_GB = {15: 2, 14: 2}
+WINDOW_GB = {15: 4, 14: 4}
+# cz13-15 soundings carry no measured rows yet — held at the earlier conservative figures;
+# the measured classes (cz8-10, max 0.45 GB) ride the default.
 SOUND_GB = {15: 12, 14: 8, 13: 3}
 # depare reads partition buckets one at a time and writes rows incrementally, so its peak
 # is the biggest band + coverage parts, not the window's whole set.
-# cz8/cz9 = 4 is a deliberate under-reserve (light hedge): the class max (6.5 GB, a
-# continent window) is a single outlier over a cheap deep-ocean majority, so reserving it
-# for all would starve concurrency; the hedge leans on swap + `retries` instead.
-DEPARE_GB = {15: 36, 14: 7, 13: 3, 12: 4, 10: 4, 9: 4, 8: 4}
+# The coarse classes are a deliberate under-reserve (light hedge): three continent-scale
+# stems (root z4/z5) reach 14-21 GB against a p50 of 0.65 over 84 coarse rows, so reserving
+# their tail for the class would starve concurrency to buy three jobs; the hedge leans on
+# physical headroom + swap + `retries`. Their cost is GEOS ladder complexity over a
+# continental extent, which the tile-size model below cannot see — the durable fix is
+# bounding the land cut (docs/plans/2026-07-21-depare-perf.md), not a bigger reservation.
+DEPARE_GB = {15: 8, 14: 4, 13: 3, 12: 4, 10: 3, 9: 3, 8: 3}
 
 # Per-stem depare reservation from the stem's own mosaic tile size — a constant per child_z
-# reserves the class's worst case for every member (36 GB held four cz15 jobs to a 161 GB
-# budget while their live RSS summed to ~12). Fit over run 30634360224's 2,170 rows:
-# rss_GB = 0.28 + 1.805 x tile_GB (p99 residual 0.40 GB; only 7 cz15 anchors, hence the
-# 4 GB pad and the `attempt` escalation carrying the tail). The rows are pre-pond-fill
-# code, which only shrinks depare, so the fit is an upper bound. The tile is absent on a
-# fresh store (DAG evaluation precedes the merges) — fall back to the DEPARE_GB constants.
+# reserves the class's worst case for every member. Least-squares over run 31946612525's
+# cz15 rows: rss_GB = 0.57 + 0.334 x tile_GB (max residual +2.33 GB, hence the 2 GB pad,
+# which leaves 1 of 17 rows over its reservation for `attempt` to carry). The tile is absent
+# on a fresh store (DAG evaluation precedes the merges) — fall back to the DEPARE_GB constants.
 def depare_gb(wc, attempt):
     # Floored per child_z at the class MEDIAN, deliberately not the tail: reservations are
-    # admission control, and reserving the p99 for every member idles the box (36 GB held cz15
-    # to 4-wide while live RSS summed to ~12 GB). Over-admission is the cheaper failure — the
-    # tail rides physical headroom + swap, an OOM'd stem retries at x attempt, and run
-    # 30641774632 ran 21 stems past their reservations with zero failures and the best
-    # utilization measured. Fit floors from that run: cz15 actuals 9.6-19.7 GB, p50 ~12.
+    # admission control, and reserving the p99 for every member idles the box. Over-admission
+    # is the cheaper failure — the tail rides physical headroom + swap, and an OOM'd stem
+    # retries at x attempt. Floors from that run: cz15 p50 3.57 GB over 17 anchors.
     cz = int(wc.stem.split("-")[3])
     try:
-        gb = 0.28 + 1.805 * os.path.getsize(f"store/mosaic/tiles/{wc.stem}.tif") / 1e9 + 2
+        gb = 0.57 + 0.334 * os.path.getsize(f"store/mosaic/tiles/{wc.stem}.tif") / 1e9 + 2
     except OSError:
         gb = DEPARE_GB.get(cz, 3)
-    return max(3, {15: 12, 14: 6}.get(cz, 0), math.ceil(gb)) * attempt
+    return max(3, {15: 4, 14: 3}.get(cz, 0), math.ceil(gb)) * attempt
 
 
 def fork_inputs(wc):
@@ -389,7 +390,10 @@ rule fork_window:
     priority: vector_tile_priority
     retries: 2
     resources:
-        mem_gb=4
+        # smooth.py works the window in blocked passes, so the footprint tracks the strip, not
+        # the window: run 31946612525 measured max 0.74 GB across cz8-10. cz14/15 carry no
+        # measured rows yet and stay at the earlier conservative figure.
+        mem_gb=_fork_gb(WINDOW_GB, 1)
     benchmark:
         f"{TMP}/bench/window/{{stem}}.tsv"
     log:
@@ -435,7 +439,7 @@ rule soundings_tile:
     priority: vector_tile_priority  # vector band: drain before terrain so the bundle overlaps it
     retries: 2
     resources:
-        mem_gb=_fork_gb(SOUND_GB, 2)
+        mem_gb=_fork_gb(SOUND_GB, 1)
     benchmark:
         f"{TMP}/bench/soundings/{{stem}}.tsv"
     log:
@@ -471,9 +475,16 @@ rule depare_tile:
         "{PY}/depare_run.py tile {wildcards.stem} > {log} 2>&1"
 
 
-# Weight like the merge: a native z14 window is the same array size; overview stems are tiny.
-# 1.3 = 20% over the measured z15 ceiling (n=4 Solent renders, 18.3-18.7 GB, a 2% spread —
-# pixel-count-dominated, weight()'s 17.3 GB base estimate + 8%); `attempt` covers the tail.
+# The render streams 1024 px tiles through a bounded thread pool, so its footprint is set by
+# that pool and not by the anchor's window area — weight() (which scales with area, and sizes
+# the scratch below) overstates the cz15 class by ~9x, holding it to 6 concurrent against a
+# 161 GB budget while the box's real usage sat at 26 GB. Measured over run 31946612525: cz15
+# p50 1.50 / p99 2.51 GB over 114 anchors. The default matches what every finer class was
+# already admitted at (p99 <= 0.95 over 12,101 rows); the rule carries no `retries`, so the
+# rare 2.5 GB cz14 tail rides physical headroom, as it already does.
+TERRAIN_GB = {15: 3}
+
+# Scratch DOES scale with the window: the materialized halo-buffered window per render.
 TERRAIN_FACTOR = 1.3
 
 
@@ -503,7 +514,7 @@ rule terrain_render:
         version=1, # increment to force a rebuild
         cfg=json.dumps(terrain_mod._config(), sort_keys=True),
     resources:
-        mem_gb=lambda wc, attempt: utils.weight(wc.stem, factor=TERRAIN_FACTOR) * attempt,
+        mem_gb=_fork_gb(TERRAIN_GB, 1),
         disk_mb=lambda wc: utils.weight(wc.stem, factor=TERRAIN_FACTOR) * 1024,
     benchmark:
         f"{TMP}/bench/terrain/{{stem}}.tsv"
@@ -575,7 +586,9 @@ rule vector_shallow:
         "store/bundle/vector-shallow.pmtiles"
     priority: VECTOR_BAND  # above every terrain render, so the shallow run starts as the layers drain
     resources:
-        mem_gb=20  # UNMEASURED singleton running amid the terrain flood; protective, costs one slot
+        # Reads every stem's shallow geometry in one tippecanoe run: 17.6 GB measured over the
+        # planet covering (run 31946612525), the largest single job in the build.
+        mem_gb=20
     params:
         bbox=os.environ.get("BBOX", ""),  # scope stamp — see mosaic_index
     benchmark:
@@ -598,9 +611,12 @@ rule vector_cell:
         # the completeness evidence the join consumes; declared so a lost sidecar reruns the cell
         sidecar="store/bundle/vector-cell-{cell}.ids.json",
     priority: VECTOR_BAND  # a long pole in the band, so it overlaps the terrain fleet
-    # No threads/mem reservation: the box deliberately oversubscribes CPU (--cores 2x vCPUs) and
-    # binds on RAM, and a cell run has no honest single thread count (serial walk, parallel
-    # read/write). Set mem_gb from the per-cell benchmarks once the first sharded run measures them.
+    # No threads: the box deliberately oversubscribes CPU (--cores 2x vCPUs) and binds on RAM,
+    # and a cell run has no honest single thread count (serial walk, parallel read/write).
+    resources:
+        # p50 0.22 GB over 388 cells, p99 2.70, max 3.25 — the median, not the tail: the rule
+        # carries no `retries`, so the handful of dense coastal cells ride physical headroom.
+        mem_gb=2
     params:
         version=1, # increment to force a rebuild
         bbox=os.environ.get("BBOX", ""),  # scope stamp — see mosaic_index
@@ -621,6 +637,8 @@ rule vector_selfcheck:
     output:
         touch("store/meta/vector-selfcheck.ok")
     priority: VECTOR_BAND
+    resources:
+        mem_gb=8  # holds the sampled parent/child feature sets while comparing: 6.6 GB measured
     benchmark:
         f"{TMP}/bench/vector-selfcheck.tsv"
     log:
@@ -638,7 +656,7 @@ rule vector_join:
         "store/bundle/vector.pmtiles"
     priority: VECTOR_BAND  # the join finishes the vector band before terrain bundling
     resources:
-        mem_gb=20  # UNMEASURED singleton running amid the terrain flood; protective, costs one slot
+        mem_gb=2  # concatenates archives without decoding tiles: 0.69 GB over the planet join
     params:
         bbox=os.environ.get("BBOX", ""),  # scope stamp — see mosaic_index
     benchmark:
