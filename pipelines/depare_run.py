@@ -535,6 +535,9 @@ class _RowSink:
     # construction: snapping to a coarser grid than the driver writes would leave the driver's
     # rounding as an unvalidated last step, and a finer one would not survive the write.
     GRID = 10.0 ** -COORD_DECIMALS
+    # Furthest a snapped vertex can travel: half the cell DIAGONAL, not half its side — the vertex
+    # goes to the nearest lattice point, and the worst case is the cell's centre.
+    SNAP_MAX_SHIFT = GRID * 2 ** 0.5 / 2
     # When a reprojection fold has to be repaired before it can be snapped, the ring's pre-repair
     # shoelace area is ill-defined — which is why this gate is two-term rather than a floor. Fatal
     # only when the loss is BOTH real-part sized (SLIVER_MIN_PX ~ 1.1e-8 deg^2) AND more than 1%
@@ -611,17 +614,26 @@ class _RowSink:
         # Areas and budgets come off the POST-repair geometry: it is what gets snapped, so it is
         # what the snap bound has to describe.
         before = shapely.area(raw)
-        # A vertex moves at most half a cell, so a row's area can move by at most half a cell times
-        # its perimeter — in EITHER direction. That is why the check below is per row: rounding
-        # outward GROWS a row, and in a batch total that growth pays for another row collapsing
-        # (measured on one real batch, 819 of 1658 rows grew and 837 shrank, and the net hid 92%
-        # of the movement). Held on every real row measured, with 40% to spare.
-        budget = shapely.length(raw) * (self.GRID / 2)
+        # A row's area can therefore move by at most SNAP_MAX_SHIFT times its perimeter — in EITHER
+        # direction. That is why the check below is per row: rounding outward GROWS a row, and in a
+        # batch total that growth pays for another row collapsing (measured on one real batch, 819
+        # of 1658 rows grew and 837 shrank, and the net hid 92% of the movement). No real row came
+        # within half of this bound — the worst measured sat at 0.42 of it.
+        budget = shapely.length(raw) * self.SNAP_MAX_SHIFT
         try:
             snapped = shapely.set_precision(raw, self.GRID, mode="valid_output")
         except shapely.errors.GEOSException as e:
             # Everything reaching here is valid in 4326, so a throw is GEOS declining a case the
             # repair above did not cover — not something the caller can be told to fix upstream.
+            # The vectorized call names no row, so re-run one at a time to point at the offender:
+            # a batch-level message on a 50k-row flush is not a lead to follow.
+            for i, g in enumerate(raw):
+                try:
+                    shapely.set_precision(g, self.GRID, mode="valid_output")
+                except shapely.errors.GEOSException as row_e:
+                    raise AssertionError(
+                        f"snapping row {i} of {len(raw)} to the write grid failed, bounds "
+                        f"{[round(float(v), 6) for v in shapely.bounds(g)]}: {row_e}") from row_e
             raise AssertionError(f"snapping to the write grid failed: {e}") from e
         gdf = gdf.set_geometry(gpd.GeoSeries(snapped, index=gdf.index, crs="EPSG:4326"))
         # Snapping a fold apart splits it into lobes, so a row can come back MultiPolygon; explode
@@ -1158,7 +1170,8 @@ def _check():
     # is ill-defined, and resolving the crossing is what the repair is for (measured here at 0.04%
     # of the row). What the write owes past that point is the snap bound the guard applies.
     _repaired = shapely.make_valid(_folded4326, method="structure", keep_collapsed=False)
-    _want, _snap_budget = shapely.area(_repaired), shapely.length(_repaired) * (_RowSink.GRID / 2)
+    _want = shapely.area(_repaired)
+    _snap_budget = shapely.length(_repaired) * _RowSink.SNAP_MAX_SHIFT
     _wrote = shapely.area(_got.geometry.values).sum()
     assert abs(_wrote - _want) <= _snap_budget, \
         f"the folded row moved past its snap budget: {_wrote!r} vs {_want!r} deg^2"
