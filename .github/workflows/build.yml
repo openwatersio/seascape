@@ -469,8 +469,9 @@ jobs:
             --logger seascape --logger-seascape-events /app/tmp/logs/events.jsonl \
             --cores "$cores" --resources mem_gb="$budget_gb" disk_mb="$disk_budget_mb" \
             --config workdir=/app/state tmp=/app/tmp 2>&1 | tee "$buildlog"
-      # Close the `build` status to success so it never lingers at pending, pointing at the
-      # published prefix — build/<sha> for planet, build/<sha>-bbox for a bbox preview.
+      # Close the `build` status to the job's outcome so it never lingers at pending — success
+      # points at the published prefix (build/<sha>, or build/<sha>-bbox for a preview);
+      # failure/cancellation close it red so a stale "pending" can't outlive a dead run.
       - name: Sync rebuilt masks back to the volume
         if: always()
         # Unmount first: writes can't reach the shadowed volume dir while the bind is up.
@@ -484,20 +485,26 @@ jobs:
             fi
           done
       - name: Publish build status
-        if: success()
+        if: always()
         env:
           GH_TOKEN: ${{ github.token }}
           BBOX: ${{ github.event.inputs.bbox }}
+          OUTCOME: ${{ job.status }}
         run: |
           if [ -z "$BBOX" ]; then
-            desc="published build/$GITHUB_SHA"; url="$PUBLIC_BASE/build/$GITHUB_SHA"
+            suffix="build/$GITHUB_SHA"; url="$PUBLIC_BASE/build/$GITHUB_SHA"
           else
-            desc="published build/$GITHUB_SHA-bbox (regional preview)"; url="$PUBLIC_BASE/build/$GITHUB_SHA-bbox"
+            suffix="build/$GITHUB_SHA-bbox (regional preview)"; url="$PUBLIC_BASE/build/$GITHUB_SHA-bbox"
           fi
+          case "$OUTCOME" in
+            success) state="success"; desc="published $suffix" ;;
+            cancelled) state="error"; desc="cancelled before publishing $suffix" ;;
+            *) state="failure"; desc="failed before publishing $suffix" ;;
+          esac
           curl -fsS -X POST -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
-            -d "{\"state\":\"success\",\"context\":\"build\",\"description\":\"$desc\",\"target_url\":\"$url\"}" \
+            -d "{\"state\":\"$state\",\"context\":\"build\",\"description\":\"$desc\",\"target_url\":\"$url\"}" \
             >/dev/null
       # Per-job wall/CPU/max-RSS from the benchmark: directives, plus per-job stderr logs —
       # both live in the box's local-disk scratch (TMP), the durable home is this artifact.
