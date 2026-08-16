@@ -84,14 +84,22 @@ def heal(path):
 def run(folder=DEFAULT_DIR):
     """Heal every FGB under `folder`. Prints one line per repair plus a summary."""
     paths = sorted(glob.glob(os.path.join(folder, "*.fgb")))
-    healed = []
+    healed, removed = [], []
     for p in paths:
-        fixed = heal(p)
+        try:
+            fixed = heal(p)
+        except pyogrio.errors.DataSourceError:
+            # Not an FGB at all — a write truncated by a cancelled run. The artifact is
+            # unrecoverable; removing it makes snakemake rebuild the tile.
+            os.remove(p)
+            removed.append(os.path.basename(p))
+            print(f"removed unreadable {os.path.basename(p)} (rebuilt next run)", flush=True)
+            continue
         if fixed:
             healed.append(os.path.basename(p))
             print(f"healed {os.path.basename(p)}: {', '.join(fixed)} -> numeric", flush=True)
-    print(f"depare schema: {len(paths)} scanned, {len(healed)} healed"
-          + (f" ({', '.join(healed)})" if healed else ""), flush=True)
+    print(f"depare schema: {len(paths)} scanned, {len(healed)} healed, {len(removed)} removed"
+          + (f" ({', '.join(healed + removed)})" if healed or removed else ""), flush=True)
     return healed
 
 
@@ -151,6 +159,14 @@ def _check():
                       "sys": "m", "kind": None, "rank": depare_run.BAND_RANK}])
     assert needs_heal(good) == [], "a numeric tile must not be rewritten"
     assert run(d) == [], "a clean folder must heal nothing"
+
+    # A truncated write from a cancelled run is not an FGB at all: removed, others untouched
+    junk = f"{d}/4-0-14-8.fgb"
+    with open(junk, "wb") as f:
+        f.write(b"\x66\x67\x62\x00partial")
+    assert run(d) == [], "garbage must not report as healed"
+    assert not os.path.exists(junk), "an unreadable artifact must be removed"
+    assert os.path.exists(good), "readable neighbours must survive a removal pass"
     print("heal_depare_schema self-check ok")
 
 
