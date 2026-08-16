@@ -547,11 +547,19 @@ class _RowSink:
     # ABSOLUTE (deg^2), not relative, because the repair's error is float64 noise on the
     # COORDINATES and so does not scale with the row's area: measured worst case 3.5e-15 deg^2
     # across 164 folded rows spanning 12 orders of area (Brittany + Gulf-marsh macrotiles). A
-    # relative gate is therefore both too tight on a sub-metre sliver and far too slack on a
-    # 232 km2 one. This floor is ~300x the observed noise and ~1e4x below the smallest part
-    # SLIVER_MIN_PX can admit (4 px ~ 91 m2 ~ 1.1e-8 deg^2), i.e. ~0.008 m2 of sensitivity on a
-    # row of any size.
-    REPAIR_MAX_AREA_LOSS_DEG2 = 1e-12
+    # The two stages guard different things. Stage B (repaired -> written) compares the same
+    # geometry around explode+filter — exactly zero unless a part was dropped — so it stays
+    # exact-and-fatal; it is the stage the production deletion lived in. Stage A compares
+    # against the PRE-repair shoelace of an invalid ring, which is ill-defined by nature:
+    # a planet census of every case above 1e-12 (71 rows, run 31944844978) measured repair
+    # jitter to 7.4e-10 deg^2 / 1.9e-6 relative, refuting any tight constant. Stage A is
+    # fatal only at real-part scale — a repair that eats actual geometry — and logged below
+    # that, so repair semantics can't kill a tile while an eaten ring still does.
+    REPAIR_WARN_LOSS_DEG2 = 1e-12
+    # fatal: both real-part sized (SLIVER_MIN_PX ~ 1.1e-8 deg^2) AND >1% of the row
+    REPAIR_FATAL_LOSS_DEG2 = 1.1e-8
+    REPAIR_FATAL_LOSS_REL = 0.01
+    REPAIR_MAX_AREA_LOSS_DEG2 = 1e-12  # stage B: exact within float slack
 
     def __init__(self, seq):
         self.seq = seq
@@ -597,12 +605,17 @@ class _RowSink:
             geoms = [g if v else shapely.make_valid(g, method="structure", keep_collapsed=False)
                      for g, v in zip(geoms, ok)]
             healed = shapely.area([geoms[i] for i in folded])
-            lost = np.flatnonzero(before - healed > self.REPAIR_MAX_AREA_LOSS_DEG2)
-            if len(lost):
-                i = lost[0]
+            loss = before - healed
+            fatal = np.flatnonzero((loss > self.REPAIR_FATAL_LOSS_DEG2)
+                                   & (loss > before * self.REPAIR_FATAL_LOSS_REL))
+            if len(fatal):
+                i = fatal[0]
                 raise AssertionError(
                     f"repairing row {folded[i]} of {len(folded)} folded row(s) lost polygonal "
                     f"area: {before[i]!r} -> {healed[i]!r} deg^2")
+            for i in np.flatnonzero(loss > self.REPAIR_WARN_LOSS_DEG2):
+                print(f"depare-repair jitter row {folded[i]}: {before[i]:.6e} -> "
+                      f"{healed[i]:.6e} deg^2", flush=True)
         gdf = gdf.set_geometry(gpd.GeoSeries(geoms, index=gdf.index, crs="EPSG:4326"))
         if not ok.all():
             repaired = gdf.index[folded]
@@ -1349,6 +1362,16 @@ def _check():
     nodata_rows = rows[rows["drval1"].isna()]
     assert nodata_rows.covers(lake.intersection(cell_box(0, 20, 60, 40)).centroid).any(), \
         "the lake's [0, cap] shore ribbon stays part of its nodata polygon"
+    # Stage-A gate arithmetic, pinned against the planet census (run 31944844978, 71 rows):
+    # the worst OBSERVED repair jitter must warn, never kill; part-scale loss must kill.
+    _s = _RowSink
+    _jitter = (3.83e-4, 7.42e-10)   # census worst: 1.9e-6 relative on a small row
+    _sliver = (2e-8, 1.2e-8)        # a SLIVER_MIN_PX-sized part dropped from a small row
+    _eaten = (0.0997, 0.0997)       # a repair that empties a real ring
+    _fatal = lambda a, l: l > _s.REPAIR_FATAL_LOSS_DEG2 and l > a * _s.REPAIR_FATAL_LOSS_REL
+    assert not _fatal(*_jitter), "census-scale repair jitter must not kill a tile"
+    assert _jitter[1] > _s.REPAIR_WARN_LOSS_DEG2, "census-scale jitter must still be logged"
+    assert _fatal(*_sliver) and _fatal(*_eaten), "part-scale and ring-scale loss must be fatal"
     print(f"depare_run self-check ok ({len(bands)} m-bands, {len(drying)} drying, "
           f"{len(gft_bands)} ft-bands)")
 
