@@ -535,10 +535,6 @@ class _RowSink:
     # construction: snapping to a coarser grid than the driver writes would leave the driver's
     # rounding as an unvalidated last step, and a finer one would not survive the write.
     GRID = 10.0 ** -COORD_DECIMALS
-    # How much area one flush may lose to the snap. Only sub-grid geometry can vanish, so this is
-    # a crumb budget, not a tolerance: an order below SLIVER_MIN_PX's smallest real part
-    # (~1.1e-8 deg^2), and six orders above the degenerate slivers actually measured.
-    SNAP_MAX_AREA_LOSS_DEG2 = 1e-9
     # The written field schema, cast at the conversion rather than left to inference. OGR types a
     # GeoJSONSeq field from the VALUES it sees, and a column null in every row types as String — an
     # all-nodata tile carries no drval at all, so its drval1/drval2 land as String and every
@@ -562,6 +558,8 @@ class _RowSink:
         if not self.pending:
             return
         import geopandas as gpd
+        import numpy as np
+        import pandas as pd
         import shapely
         gdf = gpd.GeoDataFrame(self.pending, crs="EPSG:3857").to_crs("EPSG:4326")
         # Snap to the write grid HERE, not in the driver, so what ships is what was validated.
@@ -578,7 +576,13 @@ class _RowSink:
         # and plain rounding ships that fold into tippecanoe's wagyu. Snap-rounding nodes the
         # crossings instead, so GEOS guarantees valid output and there is nothing left to repair.
         raw = gdf.geometry.values
-        before = float(shapely.area(raw).sum())
+        before = shapely.area(raw)
+        # A vertex moves at most half a cell, so a row's area can move by at most half a cell times
+        # its perimeter — in EITHER direction. That is why the check below is per row: rounding
+        # outward GROWS a row, and in a batch total that growth pays for another row collapsing
+        # (measured on one real batch, 819 of 1658 rows grew and 837 shrank, and the net hid 92%
+        # of the movement). Held on every real row measured, with 40% to spare.
+        budget = shapely.length(raw) * (self.GRID / 2)
         try:
             snapped = shapely.set_precision(raw, self.GRID, mode="valid_output")
         except shapely.errors.GEOSException as e:
@@ -595,15 +599,19 @@ class _RowSink:
         # measured at 3e-6 m2 — which the previous repair also dropped.
         gdf = gdf.explode(index_parts=False)
         gdf = gdf[(gdf.geom_type == "Polygon") & ~gdf.is_empty]
-        # The two things the write owes: valid geometry, and no real part deleted. Snapping cannot
-        # GROW area (a vertex moves at most half a cell), so one batch total is enough here — the
-        # per-row bookkeeping a repair needed was only for repairs that can grow one row while
-        # eating another. The floor sits an order below the smallest part SLIVER_MIN_PX admits.
+        # The two things the write owes: valid geometry, and no real part deleted. A row narrower
+        # than a cell may vanish — its whole area is under its own budget, which is the crumb case
+        # — while a row wide enough to draw cannot.
         assert bool(shapely.is_valid(gdf.geometry.to_numpy()).all()), \
             "set_precision must return valid geometry (mode=valid_output)"
-        lost = before - float(shapely.area(gdf.geometry.to_numpy()).sum())
-        assert lost <= self.SNAP_MAX_AREA_LOSS_DEG2, \
-            f"the write snapped away {lost!r} deg^2, more than crumbs"
+        after = (pd.Series(shapely.area(gdf.geometry.to_numpy()), index=gdf.index)
+                 .groupby(level=0).sum().reindex(range(len(raw)), fill_value=0.0).to_numpy())
+        gone = np.flatnonzero(before - after > budget)
+        if len(gone):
+            i = gone[0]
+            raise AssertionError(
+                f"the write snapped row {i} of {len(raw)} from {before[i]!r} to {after[i]!r} "
+                f"deg^2, past its {budget[i]!r} snap budget")
         gdf.to_file(self.seq, driver="GeoJSONSeq", mode="a" if self.count else "w",
                     COORDINATE_PRECISION=self.COORD_DECIMALS)
         self.count += len(gdf)   # rows WRITTEN: a repair can split one row into parts
@@ -1085,6 +1093,39 @@ def _check():
         _sink.finish(f"{_d}/out.fgb")
     finally:
         shapely.make_valid = _real_make_valid
+
+    # The area guard is PER ROW. Snapping rounds some rows outward, so a batch total lets one
+    # row's growth pay for another row vanishing — the failure a flat batch budget cannot see. A
+    # row small enough to sit inside such a budget must still fail on its own account.
+    _keep = _box(x0, y0, x0 + side, y0 + side)
+    _doomed = _box(x0 + 2 * side, y0, x0 + 2 * side + 0.5, y0 + 0.5)  # ~0.25 m2, sub-batch-budget
+    _real_set_precision = shapely.set_precision
+    _seen = []
+
+    def _collapse_the_second(geoms, grid, **kw):
+        _seen.append(1)
+        out = list(_real_set_precision(geoms, grid, **kw))
+        out[1] = Polygon()
+        return np.array(out, dtype=object)
+
+    shapely.set_precision = _collapse_the_second
+    _raised = ""
+    try:
+        _d = tempfile.mkdtemp()
+        _sink = _RowSink(f"{_d}/rows.geojsons")
+        _sink.write([{"geometry": g, "drval1": -config.DRYING_CAP, "drval2": 0.0,
+                      "sys": None, "kind": None, "rank": DRYING_RANK}
+                     for g in (_keep, _doomed)])
+    except AssertionError as e:
+        _raised = str(e)
+    finally:
+        shapely.set_precision = _real_set_precision
+    assert "snapped row 1" in _raised and "snap budget" in _raised, \
+        f"a row the write snaps away must fail on its own budget, got {_raised!r}"
+    # ...and the row is small enough that a batch total would have absorbed it, so the case is a
+    # real distinction rather than one any budget would catch.
+    _lost = gpd.GeoSeries([_doomed], crs=3857).to_crs(4326).area[0]
+    assert _lost < 1e-9, f"the doomed row must fit inside a batch-scale budget, got {_lost!r}"
 
     # The snap must not break the partition. Snap-rounding is topological, not pointwise, so it
     # MAY node a chain it shares with a neighbour — and two bands that stop sharing their boundary
