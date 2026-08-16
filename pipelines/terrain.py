@@ -128,7 +128,9 @@ def _read_window(anchor, cz, halo, out_tif, src=None):
         f"gdalwarp -q -overwrite -r {READ_RESAMPLE} -t_srs EPSG:3857 "
         f"-tr {res} {res} -te {left} {bottom} {right} {top} -dstnodata {NODATA} "
         f"-of GTiff -co TILED=YES -co BLOCKXSIZE=512 -co BLOCKYSIZE=512 -co COMPRESS=ZSTD -co PREDICTOR=3 "
-        f"-co NUM_THREADS=ALL_CPUS {_q(src or gti_abspath())} {out_tif}",
+        # NUM_THREADS=8, not ALL_CPUS: renders fan out per stem; pin rationale in
+        # aggregation_reproject.translate.
+        f"-co NUM_THREADS=8 {_q(src or gti_abspath())} {out_tif}",
         f"terrain window {anchor.z}-{anchor.x}-{anchor.y}@z{cz}")
     return core, halo
 

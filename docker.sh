@@ -40,21 +40,29 @@ state=""; if [ -n "${STATE:-}" ]; then state="-v $STATE:/app/state"; fi
 # CI points TMP (per-run logs/benchmarks) at local disk, off the network volume — forwarded
 # only as the mount SOURCE, never into the container env (keeps container tempfile at /tmp).
 tmp=""; if [ -n "${TMP:-}" ]; then tmp="-v $TMP:/app/tmp"; fi
+# Forward only the knobs that are SET: `docker run -e VAR` with VAR unset on the host
+# does not fall through to the image — it DELETES the Dockerfile's ENV value for VAR
+# (this silently stripped GDAL_CACHEMAX/GDAL_NUM_THREADS from every CI build).
+envs=()
+for v in BBOX SOURCE_VSI_BASE BOUNDS_BASE LANDMASK WATERMASK \
+  GDAL_NUM_THREADS MACROTILE_Z OVERLAY_SPLIT_Z NUM_OVERVIEWS AGG_PROCESSES BUNDLE_PROCESSES GDAL_CACHEMAX \
+  CPL_VSIL_CURL_CHUNK_SIZE CPL_VSIL_CURL_CACHE_SIZE GDAL_HTTP_MULTIPLEX GDAL_HTTP_VERSION \
+  VSI_CACHE VSI_CACHE_SIZE MALLOC_ARENA_MAX GDAL_INGESTED_BYTES_AT_OPEN \
+  MERGE_SCRATCH VECTOR_SCRATCH \
+  SMOOTH_DEM_SIGMA SMOOTH_SLOPE_LOW SMOOTH_SLOPE_HIGH SKIP_SMOOTH \
+  SKIP_CONTOURS SKIP_SOUNDINGS SKIP_DEPARE DEPARE_TIMEOUT DEPARE_CONTOUR_BIN DEPARE_TIMING CONTOUR_NAV_SMOOTH_MAX \
+  SOUND_CELL_PX SOUND_MIN_DEPTH_M DRYING_CAP \
+  RCLONE_CONFIG_R2_TYPE RCLONE_CONFIG_R2_PROVIDER RCLONE_CONFIG_R2_ENDPOINT \
+  RCLONE_CONFIG_R2_ACCESS_KEY_ID RCLONE_CONFIG_R2_SECRET_ACCESS_KEY \
+  RCLONE_CONFIG_R2_NO_CHECK_BUCKET DATA_BUCKET PUBLIC_BASE MIRROR_ALLOW_SHRINK SHA; do
+  if [ -n "${!v+x}" ]; then envs+=(-e "$v"); fi
+done
 # node_modules is shadowed by a named volume: the host's install is
 # platform-specific (darwin vs linux binaries), so the container keeps its own.
 # nofile: ~96 concurrent snakemake jobs' pipes + per-job benchmark /proc reads exhaust
 # the default soft limit in the parent.
 exec docker run --rm $tty $ports $state $tmp --ulimit nofile=65536:65536 \
-  -e BBOX -e SOURCE_VSI_BASE -e BOUNDS_BASE -e LANDMASK -e WATERMASK \
-  -e GDAL_NUM_THREADS -e MACROTILE_Z -e OVERLAY_SPLIT_Z -e NUM_OVERVIEWS -e AGG_PROCESSES -e BUNDLE_PROCESSES -e GDAL_CACHEMAX \
-  -e CPL_VSIL_CURL_CHUNK_SIZE -e CPL_VSIL_CURL_CACHE_SIZE -e GDAL_HTTP_MULTIPLEX -e GDAL_HTTP_VERSION \
-  -e VSI_CACHE -e VSI_CACHE_SIZE -e MALLOC_ARENA_MAX -e GDAL_INGESTED_BYTES_AT_OPEN \
-  -e SMOOTH_DEM_SIGMA -e SMOOTH_SLOPE_LOW -e SMOOTH_SLOPE_HIGH -e SKIP_SMOOTH \
-  -e SKIP_CONTOURS -e SKIP_SOUNDINGS -e SKIP_DEPARE -e DEPARE_TIMEOUT -e DEPARE_CONTOUR_BIN -e DEPARE_TIMING -e CONTOUR_NAV_SMOOTH_MAX \
-  -e SOUND_CELL_PX -e SOUND_MIN_DEPTH_M -e DRYING_CAP \
-  -e RCLONE_CONFIG_R2_TYPE -e RCLONE_CONFIG_R2_PROVIDER -e RCLONE_CONFIG_R2_ENDPOINT \
-  -e RCLONE_CONFIG_R2_ACCESS_KEY_ID -e RCLONE_CONFIG_R2_SECRET_ACCESS_KEY \
-  -e RCLONE_CONFIG_R2_NO_CHECK_BUCKET -e DATA_BUCKET -e PUBLIC_BASE -e MIRROR_ALLOW_SHRINK -e SHA \
+  ${envs[@]+"${envs[@]}"} \
   -v "$PWD:/app" \
   -v seascape-node-modules:/app/node_modules \
   "$image" "${cmd[@]}"

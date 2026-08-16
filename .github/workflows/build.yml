@@ -310,7 +310,20 @@ jobs:
           CPL_VSIL_CURL_CHUNK_SIZE: "5242880"
           CPL_VSIL_CURL_CACHE_SIZE: "268435456"
           VSI_CACHE: "TRUE"
-          VSI_CACHE_SIZE: "33554432"
+          # Per-HANDLE cache, on top of the global curl cache above — a merge holds
+          # 100+ open source handles, so this multiplies. Range reuse lives in the
+          # curl cache; 8 MB here costs no wall time (measured identical at 4 MB).
+          VSI_CACHE_SIZE: "8388608"
+          # The image defaults (Dockerfile) — pinned here too so the build's memory
+          # sizing never rests on env forwarding: unbounded GDAL block cache is 5% of
+          # RAM PER PROCESS (9.2 GiB on a ccx63, dwarfing every mem_gb reservation).
+          GDAL_CACHEMAX: "512"
+          GDAL_NUM_THREADS: "8"
+          # Merge + tippecanoe scratch on the TMP bind (local NVMe): the fallback is
+          # the container tmpdir, which is the image's overlayfs writable layer —
+          # every transient byte paid overlay copy-up on the docker graph dir.
+          MERGE_SCRATCH: /app/tmp/scratch
+          VECTOR_SCRATCH: /app/tmp/scratch
           # glibc spawns a malloc arena per contending thread (cap 8x cores = 384 on a ccx63)
           # and each retains its high-water for the process's life; the same cz15 merge is
           # 3.4 GB in a 10-core container and 22.4 GB on the 48-core box with every GDAL

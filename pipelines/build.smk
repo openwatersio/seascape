@@ -14,6 +14,7 @@
 # soundings_tile, depare_tile, terrain_render, overlay_bundle) keep their wildcards and per-tile
 # input functions — those only run when a job is instantiated, which is after the checkpoint.
 
+import hashlib
 import json
 import math
 
@@ -187,11 +188,18 @@ MERGE_FACTOR = 1.5
 _ORDER = {}
 
 
+def _tie(stem):
+    # weight() is a function of child_z alone, so stems of one class all tie — and a
+    # stable sort would keep their lexicographic (= geographic) order, admitting a slow
+    # region's tiles as one adjacent batch. A hash spreads ties deterministically.
+    return int.from_bytes(hashlib.blake2b(stem.encode(), digest_size=8).digest(), "big")
+
+
 def tile_priority(wc, input=None, attempt=None):
     _, key = _covering_key()
     if key not in _ORDER:
         # render_stems ⊇ covering_stems: terrain_render prioritizes overview stems too
-        stems = sorted(render_stems(), key=utils.weight, reverse=True)
+        stems = sorted(render_stems(), key=lambda s: (-utils.weight(s), _tie(s)))
         n, avg = len(stems), sum(utils.weight(s) for s in stems) / len(stems)
         order, hi, lo, cum = [], 0, n - 1, 0.0
         for i in range(n):

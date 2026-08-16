@@ -383,7 +383,10 @@ def get_grouped_source_items(filepath):
 # need — measured +20% on a 32768 px mosaic tile, against +354% for materializing an intermediate.
 
 COG_MIN_OVERVIEW_PX = 512  # the COG driver's own stopping rule: one 512 block
-_SHOAL_STRIPE_BYTES = 1 << 28  # read budget per stripe; a stripe is 2 source rows per output row
+# Read budget per stripe (2 source rows per output row). Peak RSS is ~5x the stripe
+# (pad copy + quartered np.where + both block_max branches), and past 32 MB the extra
+# width only costs: 256 MB measured 2.1x the memory AND 1.8x the wall of 32 MB.
+_SHOAL_STRIPE_BYTES = 1 << 25
 
 # GDAL's (de)compression thread pool inside ONE worker of a fan-out. Multi-threaded ZSTD is worth
 # having — single-threaded, the full-res read of a pyramid pass is 4x slower (measured 8.2s vs 1.3s
