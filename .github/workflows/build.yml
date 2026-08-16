@@ -279,6 +279,19 @@ jobs:
             nsenter -t 1 -m mountpoint -q "$f" || { echo "bind failed for $f" >&2; exit 1; }
             echo "serving $(basename "$f") from NVMe"
           done
+      - name: Heal legacy depare schemas
+        # A depare tile whose rows are ALL nodata carries no drval, and OGR used to type those
+        # columns String from the staged values — which makes contour_tile's numeric filter
+        # invalid SQL and fails the tile a stage later. depare_run pins the schema on write now,
+        # but that cannot reach artifacts already on the volume: no depare input or param
+        # changed, so Snakemake holds them up to date. Repairing the schema in place is seconds
+        # and keeps the geometry, where a rebuild would recompute the partition for nothing.
+        # A no-op (one metadata read per file) once the fleet is clean.
+        env:
+          STATE: /mnt/seascape-store
+        run: |
+          ./docker.sh run uv run --project /app python \
+            /app/pipelines/heal_depare_schema.py /app/state/store/depare
       - name: Build the mosaic (Snakemake)
         env:
           # Dispatch inputs reach the shell as env vars, never interpolated into a shell line.

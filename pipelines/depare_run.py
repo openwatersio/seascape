@@ -531,6 +531,14 @@ class _RowSink:
     # Decimal degrees kept on write: 1e-9 deg is 0.11 mm, four orders below the S-58 vertex floor
     # and below anything the pipeline's own geometry means.
     COORD_DECIMALS = 9
+    # The written field schema, cast at the conversion rather than left to inference. OGR types a
+    # GeoJSONSeq field from the VALUES it sees, and a column null in every row types as String — an
+    # all-nodata tile carries no drval at all, so its drval1/drval2 land as String and every
+    # numeric read of the layer ("drval1 < 0") is then invalid SQL. Casting fixes the type without
+    # touching the values, so absence survives as NULL. None passes the field through: String is
+    # what sys/kind infer to anyway, and casting a string needs a width that could truncate.
+    FIELDS = (("drval1", "float"), ("drval2", "float"), ("sys", None),
+              ("kind", None), ("rank", "integer"))
     # Every repaired row must keep its own polygonal area, measured against itself at each stage of
     # the write: a band or drying part that loses area leaves a hole in the chart, which is the
     # unsafe direction, so the tile fails instead. A repair may GROW a row (an invalid ring's
@@ -631,11 +639,21 @@ class _RowSink:
         # MultiPolygon of 40k+ parts and exceeds it: 8-63-105-15 and 8-63-106-15 both died here,
         # after the full partition pass had already run. Keep the band ONE feature — splitting it
         # would change feature counts and ids, i.e. the partition contract.
+        layer = os.path.splitext(os.path.basename(self.seq))[0]
         contour_run._run(f"ogr2ogr --config OGR_GEOJSON_MAX_OBJ_SIZE 0 "
-                         f"-f FlatGeobuf -overwrite {final_fgb} {self.seq}",
+                         f"-f FlatGeobuf -overwrite "
+                         f"""-sql '{row_select(layer)}' """
+                         f"{final_fgb} {self.seq}",
                          "ogr2ogr depare")
         os.remove(self.seq)
         return self.count
+
+
+def row_select(layer):
+    """The SELECT that pins a depare layer to _RowSink.FIELDS. Shared with heal_depare_schema, so
+    the written schema has ONE definition — the heal has to cast exactly what the writer casts."""
+    cols = ", ".join(f"CAST({n} AS {t}) AS {n}" if t else n for n, t in _RowSink.FIELDS)
+    return f'SELECT {cols} FROM "{layer}"'
 
 
 def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0):
@@ -1119,6 +1137,32 @@ def _check():
     assert "changed polygonal area" in _raised and "lost polygonal area" not in _raised, \
         ("a dropped row whose shoelace had cancelled must fail the write at the explode stage, "
          f"got {_raised!r}")
+
+    # The written schema is a CONTRACT, not an inference. contour_run reads these rows back with a
+    # numeric filter, and a tile whose rows are ALL nodata carries no drval at all — typed by
+    # inference those columns land String and the filter is invalid SQL, which fails the tile far
+    # downstream of the write that caused it. Both flush shapes must land numeric and answer the
+    # real filter. The layer name carries a hyphen in production, so the SQL must quote it.
+    import pyogrio
+    _where = "sys = 'm' OR drval1 < 0"  # contour_run's metre-pass filter, verbatim
+    _nodata = [{"geometry": _box(0, 0, 1, 1), "drval1": None, "drval2": None, "sys": None,
+                "kind": "lake", "rank": NODATA_RANK}]
+    _band = [{"geometry": _box(2, 0, 3, 1), "drval1": -10.0, "drval2": -5.0, "sys": "m",
+              "kind": None, "rank": BAND_RANK}]
+    for _name, _rows, _hits in (("all-nodata", _nodata, 0), ("mixed", _nodata + _band, 1)):
+        _d = tempfile.mkdtemp()
+        _sink = _RowSink(f"{_d}/depare-rows.geojsons")
+        _sink.write(_rows)
+        _sink.finish(f"{_d}/out.fgb")
+        _types = dict(zip(*(pyogrio.read_info(f"{_d}/out.fgb")[k]
+                            for k in ("fields", "dtypes"))))
+        assert _types.get("drval1") == "float64" and _types.get("drval2") == "float64", \
+            f"{_name} flush must write numeric drval columns, got {_types}"
+        _read = gpd.read_file(f"{_d}/out.fgb", where=_where)
+        assert len(_read) == _hits, \
+            f"{_name} flush must answer contour_run's filter with {_hits} row(s), got {len(_read)}"
+        assert gpd.read_file(f"{_d}/out.fgb")["drval1"].isna().sum() == len(_nodata), \
+            f"{_name} flush must keep an absent drval NULL, not fill it"
 
     # ContourTimeout mapping: a bounded command that exceeds its budget must surface as
     # ContourTimeout (the tile's retry trigger), not a generic failure.

@@ -85,6 +85,7 @@ test-engine:
     uv run python bundle.py --check
     uv run python test_build.py
     uv run python terrain.py --check
+    uv run python heal_depare_schema.py --check
     uv run python test_consistency.py
     # Repo root: the logger plugin has to sit on sys.path under its discoverable name.
     cd "{{justfile_directory()}}" && uv run python -m snakemake_logger_plugin_seascape --check
