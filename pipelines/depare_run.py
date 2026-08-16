@@ -535,6 +535,12 @@ class _RowSink:
     # construction: snapping to a coarser grid than the driver writes would leave the driver's
     # rounding as an unvalidated last step, and a finer one would not survive the write.
     GRID = 10.0 ** -COORD_DECIMALS
+    # When a reprojection fold has to be repaired before it can be snapped, the ring's pre-repair
+    # shoelace area is ill-defined — which is why this gate is two-term rather than a floor. Fatal
+    # only when the loss is BOTH real-part sized (SLIVER_MIN_PX ~ 1.1e-8 deg^2) AND more than 1%
+    # of the row: repair jitter clears neither term, an eaten ring clears both.
+    REPAIR_FATAL_LOSS_DEG2 = 1.1e-8
+    REPAIR_FATAL_LOSS_REL = 0.01
     # The written field schema, cast at the conversion rather than left to inference. OGR types a
     # GeoJSONSeq field from the VALUES it sees, and a column null in every row types as String — an
     # all-nodata tile carries no drval at all, so its drval1/drval2 land as String and every
@@ -586,8 +592,22 @@ class _RowSink:
         # fold, so this costs the untouched majority nothing.
         ok = shapely.is_valid(raw)
         if not ok.all():
+            folded = np.flatnonzero(~ok)
+            pre = shapely.area(raw[folded])
             raw = raw.copy()
-            raw[~ok] = shapely.make_valid(raw[~ok], method="structure", keep_collapsed=False)
+            raw[folded] = shapely.make_valid(raw[folded], method="structure", keep_collapsed=False)
+            post = shapely.area(raw[folded])
+            # A fold's shoelace area is ill-defined, so the repair may jitter it and may GROW it.
+            # What it may not do is eat the ring. Both terms must trip, because either alone is
+            # wrong at some scale — see the constants.
+            loss = pre - post
+            eaten = np.flatnonzero((loss > self.REPAIR_FATAL_LOSS_DEG2)
+                                   & (loss > pre * self.REPAIR_FATAL_LOSS_REL))
+            if len(eaten):
+                i = eaten[0]
+                raise AssertionError(
+                    f"repairing row {folded[i]} of {len(folded)} folded row(s) lost polygonal "
+                    f"area: {pre[i]!r} -> {post[i]!r} deg^2")
         # Areas and budgets come off the POST-repair geometry: it is what gets snapped, so it is
         # what the snap bound has to describe.
         before = shapely.area(raw)
@@ -1144,6 +1164,48 @@ def _check():
         f"the folded row moved past its snap budget: {_wrote!r} vs {_want!r} deg^2"
     assert _want > 0.99 * shapely.area(_folded4326), \
         "resolving the fold must not eat the ring"
+
+    # ...and the gate is WIRED, not just arithmetic: a repair that eats the folded ring kills the
+    # tile rather than shipping a hole. Same fixture, with the repair stubbed to return a crumb.
+    _real_mv = shapely.make_valid
+
+    def _eat_the_ring(geoms, **kw):
+        return np.array([_box(0, 0, 1e-9, 1e-9) for _ in np.atleast_1d(geoms)], dtype=object)
+
+    shapely.make_valid = _eat_the_ring
+    _raised = ""
+    try:
+        _d = tempfile.mkdtemp()
+        _sink = _RowSink(f"{_d}/rows.geojsons")
+        _sink.write([{"geometry": _folder, "drval1": -config.DRYING_CAP, "drval2": 0.0,
+                      "sys": None, "kind": None, "rank": DRYING_RANK}])
+    except AssertionError as e:
+        _raised = str(e)
+    finally:
+        shapely.make_valid = _real_mv
+    assert "lost polygonal area" in _raised, \
+        f"a repair that eats a folded ring must fail the write, got {_raised!r}"
+
+    # The repair gate's arithmetic, pinned against the planet census (run 31944844978, 71 rows)
+    # that the same two-term shape passed at 719739e: the worst OBSERVED repair jitter must not
+    # kill a tile, part-scale and ring-scale loss must.
+    _s = _RowSink
+
+    def _repair_fatal(area, loss):
+        return loss > _s.REPAIR_FATAL_LOSS_DEG2 and loss > area * _s.REPAIR_FATAL_LOSS_REL
+
+    _jitter = (3.83e-4, 7.42e-10)   # census worst: 1.9e-6 relative on a small row
+    _grew = (3.83e-4, -5.0e-10)     # a repair that GREW the row — never fatal
+    _sliver = (2e-8, 1.2e-8)        # a SLIVER_MIN_PX-sized part dropped from a small row
+    _eaten = (0.0997, 0.0997)       # a repair that empties a real ring
+    assert not _repair_fatal(*_jitter), "census-scale repair jitter must not kill a tile"
+    assert not _repair_fatal(*_grew), "a repair that grows the row must not kill a tile"
+    assert _repair_fatal(*_sliver) and _repair_fatal(*_eaten), \
+        "part-scale and ring-scale loss must be fatal"
+    # Each term alone is wrong, which is why both are required: the census jitter clears the
+    # relative term on a small row, and a big row can shed a real part without clearing it.
+    assert _jitter[1] < _s.REPAIR_FATAL_LOSS_DEG2 and _sliver[1] > _s.REPAIR_FATAL_LOSS_DEG2, \
+        "the absolute term must separate census jitter from a real part"
 
     # The area guard is PER ROW. Snapping rounds some rows outward, so a batch total lets one
     # row's growth pay for another row vanishing — the failure a flat batch budget cannot see. A
