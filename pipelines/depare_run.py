@@ -576,6 +576,20 @@ class _RowSink:
         # and plain rounding ships that fold into tippecanoe's wagyu. Snap-rounding nodes the
         # crossings instead, so GEOS guarantees valid output and there is nothing left to repair.
         raw = gdf.geometry.values
+        # Reprojection alone folds some rings, and what set_precision needs is validity HERE, in
+        # 4326 — which validity in metres cannot promise. 3857 -> 4326 is non-linear, so a long
+        # straight edge arrives curved (sagitta ~300 m over a macrotile-length segment, and
+        # simplify_coverage upstream is what makes segments that long) and a spike whose tip sits
+        # inside that band ends up crossing it. Snap-rounding does not absorb that class: GEOS
+        # raises a side-location conflict on all 91 probed cases. So repair the folded minority
+        # first, where the fold actually is. Bit-identical to snapping alone on rows that did not
+        # fold, so this costs the untouched majority nothing.
+        ok = shapely.is_valid(raw)
+        if not ok.all():
+            raw = raw.copy()
+            raw[~ok] = shapely.make_valid(raw[~ok], method="structure", keep_collapsed=False)
+        # Areas and budgets come off the POST-repair geometry: it is what gets snapped, so it is
+        # what the snap bound has to describe.
         before = shapely.area(raw)
         # A vertex moves at most half a cell, so a row's area can move by at most half a cell times
         # its perimeter — in EITHER direction. That is why the check below is per row: rounding
@@ -586,12 +600,9 @@ class _RowSink:
         try:
             snapped = shapely.set_precision(raw, self.GRID, mode="valid_output")
         except shapely.errors.GEOSException as e:
-            # Snap-rounding is not a repair: it nodes crossings the GRID creates, and GEOS gives up
-            # with a side-location conflict on a ring that was already broken before it. Every row
-            # reaches here valid in EPSG:3857 (repaired_parts / coverage_union / make_valid all run
-            # upstream), so this is a broken precondition, not a case to absorb — say so, rather
-            # than let a GEOS message surface a whole stage away from the row that caused it.
-            raise AssertionError(f"the write requires valid EPSG:3857 rows: {e}") from e
+            # Everything reaching here is valid in 4326, so a throw is GEOS declining a case the
+            # repair above did not cover — not something the caller can be told to fix upstream.
+            raise AssertionError(f"snapping to the write grid failed: {e}") from e
         gdf = gdf.set_geometry(gpd.GeoSeries(snapped, index=gdf.index, crs="EPSG:4326"))
         # Snapping a fold apart splits it into lobes, so a row can come back MultiPolygon; explode
         # keeps the layer uniformly polygon (FlatGeobuf rejects a mixed one). A row thinner than
@@ -931,6 +942,7 @@ def _check():
 
     import numpy as np
     import rasterio
+    from pyproj import Transformer
     from rasterio.transform import from_origin
     from shapely.geometry import Point
     from shapely.ops import unary_union
@@ -1011,21 +1023,16 @@ def _check():
     assert simplify_coverage([bowtie], tol_mm) == [bowtie], \
         "a ring the simplifier cannot handle must fall back, not fail the tile"
 
-    # The sink snaps to the write grid instead of repairing, so valid EPSG:3857 input is a
-    # PRECONDITION, not something it fixes. A ring already broken in metres must say so here,
-    # where the row is, rather than surface as a GEOS message a whole stage downstream.
+    # Whatever arrives invalid in 4326 — whether it was already broken in metres or reprojection
+    # folded it — the write absorbs, because that is the only place the fold is visible.
     import geopandas as gpd
     d0 = tempfile.mkdtemp()
     sink = _RowSink(f"{d0}/rows.geojsons")
-    try:
-        sink.write([{"geometry": bowtie, "drval1": 0.0, "drval2": 2.0, "sys": "m",
-                     "kind": None, "rank": BAND_RANK}])
-        raise AssertionError("the sink must refuse a ring that is already invalid in EPSG:3857")
-    except AssertionError as e:
-        assert "requires valid EPSG:3857 rows" in str(e), \
-            f"an invalid input row must name the broken precondition, got {e}"
-    # A VALID ring that the reprojection alone breaks is the sink's own job, and it must come back
-    # valid without any repair — that is what the snap buys.
+    sink.write([{"geometry": bowtie, "drval1": 0.0, "drval2": 2.0, "sys": "m",
+                 "kind": None, "rank": BAND_RANK}])
+    absorbed = gpd.read_file(sink.finish(f"{d0}/bowtie.fgb") and f"{d0}/bowtie.fgb")
+    assert len(absorbed) and bool(shapely.is_valid(absorbed.geometry.values).all()), \
+        "a ring invalid in metres must still reach the FGB, valid"
     sink = _RowSink(f"{d0}/rows.geojsons")
     sink.write([{"geometry": _box(0, 0, 2, 2), "drval1": 0.0, "drval2": 2.0, "sys": "m",
                  "kind": None, "rank": BAND_RANK}])
@@ -1093,6 +1100,50 @@ def _check():
         _sink.finish(f"{_d}/out.fgb")
     finally:
         shapely.make_valid = _real_make_valid
+
+    # A ring VALID in metres that reprojection alone folds — the class snap-rounding refuses.
+    # 3857 -> 4326 bends a long straight edge by its sagitta, and this spike's tip sits inside that
+    # band, so the reprojected ring self-crosses before any rounding. The write must absorb it.
+    _fwd = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+    _A, _B = np.array(_fwd.transform(-81.0, 29.25)), np.array(_fwd.transform(-80.5, 29.75))
+    _dir = (_B - _A) / np.hypot(*(_B - _A))
+    _perp = np.array([_dir[1], -_dir[0]])
+    _mid, _sh = (_A + _B) / 2, 800.0
+    _tip = _mid + _perp * 12.0
+    _far = _mid + _perp * 60_000.0
+    _folder = Polygon([_A, _B, _B + _perp * _sh, _tip + _perp * _sh + _dir * _sh, _tip,
+                       _tip + _perp * _sh - _dir * _sh,
+                       _far + _dir * 20_000.0, _far - _dir * 20_000.0])
+    assert _folder.is_valid, "the reprojection-fold fixture must be valid in EPSG:3857"
+    _folded4326 = gpd.GeoSeries([_folder], crs="EPSG:3857").to_crs("EPSG:4326").values[0]
+    assert not shapely.is_valid(_folded4326), \
+        "the fixture must fold on reprojection alone, before any rounding"
+    # ...and snapping alone cannot take it, which is why the repair above is not optional.
+    try:
+        shapely.set_precision(_folded4326, _RowSink.GRID, mode="valid_output")
+        raise AssertionError("set_precision is expected to refuse a reprojection fold")
+    except shapely.errors.GEOSException:
+        pass
+    _d = tempfile.mkdtemp()
+    _sink = _RowSink(f"{_d}/rows.geojsons")
+    _sink.write([{"geometry": _folder, "drval1": -config.DRYING_CAP, "drval2": 0.0,
+                  "sys": None, "kind": None, "rank": DRYING_RANK}])
+    _sink.finish(f"{_d}/out.fgb")
+    _got = gpd.read_file(f"{_d}/out.fgb")
+    assert len(_got) and bool(shapely.is_valid(_got.geometry.values).all()), \
+        "a reprojection-folded row must reach the FGB, valid"
+    assert set(_got.geom_type) == {"Polygon"} and not _got.is_empty.any(), \
+        "a reprojection-folded row must stay non-empty polygon"
+    # The reference is the REPAIRED ring, not the folded one: a self-crossing ring's shoelace area
+    # is ill-defined, and resolving the crossing is what the repair is for (measured here at 0.04%
+    # of the row). What the write owes past that point is the snap bound the guard applies.
+    _repaired = shapely.make_valid(_folded4326, method="structure", keep_collapsed=False)
+    _want, _snap_budget = shapely.area(_repaired), shapely.length(_repaired) * (_RowSink.GRID / 2)
+    _wrote = shapely.area(_got.geometry.values).sum()
+    assert abs(_wrote - _want) <= _snap_budget, \
+        f"the folded row moved past its snap budget: {_wrote!r} vs {_want!r} deg^2"
+    assert _want > 0.99 * shapely.area(_folded4326), \
+        "resolving the fold must not eat the ring"
 
     # The area guard is PER ROW. Snapping rounds some rows outward, so a batch total lets one
     # row's growth pay for another row vanishing — the failure a flat batch budget cannot see. A
