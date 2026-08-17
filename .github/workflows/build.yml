@@ -448,8 +448,12 @@ jobs:
           # dry-run — before any box-scale execution.
           case "$INPUT_MAX_JOBS" in *[!0-9]*) echo "invalid max_jobs" >&2; exit 1 ;; esac
           if [ -n "$INPUT_MAX_JOBS" ]; then
+            # --rerun-incomplete mirrors the main invocation: a hard box death leaves incomplete
+            # marks on the volume, and a dry run WITHOUT the flag refuses to plan at all
+            # (IncompleteFilesException, run 32030051338) — the gate must survive exactly the
+            # crash it is most needed after.
             ./docker.sh snakemake "${targets[@]}" "${extra[@]}" "${force[@]}" \
-              -n \
+              -n --rerun-incomplete \
               --cores "$cores" --resources mem_gb="$budget_gb" disk_mb="$disk_budget_mb" \
               --config workdir=/app/state tmp=/app/tmp > /var/tmp/scope-gate.txt 2>&1 \
               || { tail -50 /var/tmp/scope-gate.txt >&2; echo "scope-gate dry-run failed" >&2; exit 1; }
