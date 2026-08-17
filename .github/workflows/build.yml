@@ -476,6 +476,11 @@ jobs:
           # device: /actions-runner/_diag"), so the step never even reports a conclusion. A ccx63
           # ships a 960 G root, a ccx33 240 G — a wide plan on the small box exhausted it in 52
           # minutes (run 32024721698, ~8.8k of 22,181 jobs left). Abort in seconds instead.
+          # Re-measure first: the scope gate's dry run executes inside the container and can
+          # leave overlay writes behind, so the floor — and the main run's disk budget — must
+          # describe what is free NOW, not before the gate ran.
+          avail_mb=$(df -BM --output=avail / | tail -1 | tr -dc '0-9')
+          disk_budget_mb=$(( (avail_mb - 20480) * 8 / 10 ))
           # Width from the scope gate when the dispatcher stated one; an unstated scope is
           # treated as wide, because that is what a planet dispatch looks like. A bbox run is
           # narrow by construction (a window, not the planet), so it keeps the loose floor —
