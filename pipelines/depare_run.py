@@ -533,6 +533,17 @@ def read_bucket(raw_fgb, where):
     return g
 
 
+def _polygonal(geom):
+    """The polygonal content of a linework make_valid result: the repaired area can arrive as a
+    GeometryCollection carrying line fragments, whose MultiPolygon member one explode leaves
+    nested for the Polygon-type filter to delete — merge the areal parts instead."""
+    import shapely
+    if geom.geom_type != "GeometryCollection":
+        return geom
+    parts = [g for g in geom.geoms if g.geom_type in ("Polygon", "MultiPolygon")]
+    return shapely.union_all(parts) if parts else shapely.Polygon()
+
+
 class _RowSink:
     """Incremental depare-row writer: batches of {geometry (3857), drval1, drval2, sys, kind,
     rank} append to a GeoJSONSeq in 4326; finish() converts to the final FGB. Absent values are
@@ -616,13 +627,29 @@ class _RowSink:
             # What it may not do is eat the ring. Both terms must trip, because either alone is
             # wrong at some scale — see the constants.
             loss = pre - post
-            eaten = np.flatnonzero((loss > self.REPAIR_FATAL_LOSS_DEG2)
-                                   & (loss > pre * self.REPAIR_FATAL_LOSS_REL))
-            if len(eaten):
-                i = eaten[0]
-                raise AssertionError(
-                    f"repairing row {folded[i]} of {len(folded)} folded row(s) lost polygonal "
-                    f"area: {pre[i]!r} -> {post[i]!r} deg^2")
+            eaten = (loss > self.REPAIR_FATAL_LOSS_DEG2) & (loss > pre * self.REPAIR_FATAL_LOSS_REL)
+            if eaten.any():
+                # The structure repair reads some planet-scale folds as (near) nothing — run
+                # 31984351438 lost three stems to ~1e-7 deg^2 rows repaired to 0. linework builds
+                # area from every enclosed region instead of from ring winding, so retry just the
+                # eaten rows with it, under the same gate: the fallback ships only when it
+                # conserves the area, and a row both repairs lose still kills the tile — now
+                # naming its specimen so the failure is diagnosable from the log alone.
+                redo = folded[eaten]
+                raw[redo] = np.array([_polygonal(g) for g in
+                                      shapely.make_valid(gdf.geometry.values[redo])], dtype=object)
+                post2 = shapely.area(raw[redo])
+                loss2 = pre[eaten] - post2
+                still = np.flatnonzero((loss2 > self.REPAIR_FATAL_LOSS_DEG2)
+                                       & (loss2 > pre[eaten] * self.REPAIR_FATAL_LOSS_REL))
+                if len(still):
+                    i = still[0]
+                    raise AssertionError(
+                        f"repairing row {redo[i]} of {len(folded)} folded row(s) lost polygonal "
+                        f"area: {pre[eaten][i]!r} -> {post2[i]!r} deg^2; specimen: "
+                        f"{shapely.to_wkt(gdf.geometry.values[redo[i]], rounding_precision=9)}")
+                print(f"depare: linework repaired {len(redo)} row(s) the structure repair ate",
+                      flush=True)
         # Areas and budgets come off the POST-repair geometry: it is what gets snapped, so it is
         # what the snap bound has to describe.
         before = shapely.area(raw)
@@ -634,19 +661,25 @@ class _RowSink:
         budget = shapely.length(raw) * self.SNAP_MAX_SHIFT
         try:
             snapped = shapely.set_precision(raw, self.GRID, mode="valid_output")
-        except shapely.errors.GEOSException as e:
-            # Everything reaching here is valid in 4326, so a throw is GEOS declining a case the
-            # repair above did not cover — not something the caller can be told to fix upstream.
-            # The vectorized call names no row, so re-run one at a time to point at the offender:
-            # a batch-level message on a 50k-row flush is not a lead to follow.
+        except shapely.errors.GEOSException:
+            # Everything reaching here is valid in 4326, so a throw is GEOS declining an
+            # arrangement outright — run 31984351438: "unable to assign free hole to a shell" on
+            # one Cornwall row. The vectorized call names no row, so re-run one at a time and
+            # take the declined rows through a pointwise snap + linework repair. The validity
+            # assert and the per-row snap budget below still gate the result, so the fallback can
+            # only ship what the contract allows; its one concession is that repair noding can
+            # add off-grid vertices for the driver to round — the pre-snap-era residual, bounded
+            # to these rows.
+            snapped = raw.copy()
+            rescued = 0
             for i, g in enumerate(raw):
                 try:
-                    shapely.set_precision(g, self.GRID, mode="valid_output")
-                except shapely.errors.GEOSException as row_e:
-                    raise AssertionError(
-                        f"snapping row {i} of {len(raw)} to the write grid failed, bounds "
-                        f"{[round(float(v), 6) for v in shapely.bounds(g)]}: {row_e}") from row_e
-            raise AssertionError(f"snapping to the write grid failed: {e}") from e
+                    snapped[i] = shapely.set_precision(g, self.GRID, mode="valid_output")
+                except shapely.errors.GEOSException:
+                    snapped[i] = _polygonal(shapely.make_valid(
+                        shapely.set_precision(g, self.GRID, mode="pointwise")))
+                    rescued += 1
+            print(f"depare: pointwise-snapped {rescued} row(s) valid_output declined", flush=True)
         gdf = gdf.set_geometry(gpd.GeoSeries(snapped, index=gdf.index, crs="EPSG:4326"))
         # Snapping a fold apart splits it into lobes, so a row can come back MultiPolygon; explode
         # keeps the layer uniformly polygon (FlatGeobuf rejects a mixed one). A row thinner than
@@ -1215,6 +1248,55 @@ def _check():
         shapely.make_valid = _real_mv
     assert "lost polygonal area" in _raised, \
         f"a repair that eats a folded ring must fail the write, got {_raised!r}"
+    assert "specimen: " in _raised and "POLYGON" in _raised, \
+        f"a row both repairs lose must name its specimen WKT, got {_raised[:120]!r}"
+
+    # ...but a fold only the STRUCTURE repair eats must fall back to linework rather than kill
+    # the tile (run 31984351438: three stems, ~1e-7 deg^2 rows repaired to 0). Same fixture, with
+    # only the structure-mode repair stubbed; the gate stays the arbiter, so the fallback ships
+    # because it conserves the area.
+    def _structure_eats(geoms, method=None, **kw):
+        if method == "structure":
+            return np.array([Polygon() for _ in np.atleast_1d(geoms)], dtype=object)
+        return _real_mv(geoms, **kw)
+
+    shapely.make_valid = _structure_eats
+    try:
+        _d = tempfile.mkdtemp()
+        _sink = _RowSink(f"{_d}/rows.geojsons")
+        _sink.write([{"geometry": _folder, "drval1": -config.DRYING_CAP, "drval2": 0.0,
+                      "sys": None, "kind": None, "rank": DRYING_RANK}])
+        _sink.finish(f"{_d}/out.fgb")
+    finally:
+        shapely.make_valid = _real_mv
+    _got = gpd.read_file(f"{_d}/out.fgb")
+    _want_l = shapely.area(_polygonal(_real_mv(_folded4326)))
+    assert len(_got) and abs(shapely.area(_got.geometry.values).sum() - _want_l) <= _snap_budget, \
+        "the linework fallback must conserve the area the structure repair ate"
+
+    # A row valid_output declines outright (GEOS's free-hole-to-shell refusal, run 31984351438)
+    # must take the pointwise-snap + repair fallback and still land valid, whole, and on budget —
+    # every valid_output call refused, so the whole batch rides the fallback.
+    def _refuse_valid_output(geoms, grid, mode="valid_output", **kw):
+        if mode == "valid_output":
+            raise shapely.errors.GEOSException("unable to assign free hole to a shell")
+        return _real_set_precision(geoms, grid, mode=mode, **kw)
+
+    _real_set_precision = shapely.set_precision
+    shapely.set_precision = _refuse_valid_output
+    try:
+        _d = tempfile.mkdtemp()
+        _sink = _RowSink(f"{_d}/rows.geojsons")
+        _sink.write([{"geometry": _folder, "drval1": -config.DRYING_CAP, "drval2": 0.0,
+                      "sys": None, "kind": None, "rank": DRYING_RANK}])
+        _sink.finish(f"{_d}/out.fgb")
+    finally:
+        shapely.set_precision = _real_set_precision
+    _got = gpd.read_file(f"{_d}/out.fgb")
+    assert len(_got) and bool(shapely.is_valid(_got.geometry.values).all()), \
+        "the pointwise fallback must write valid rows"
+    assert abs(shapely.area(_got.geometry.values).sum() - _want) <= _snap_budget, \
+        "the pointwise fallback must conserve the row's area"
 
     # The repair gate's arithmetic, pinned against the planet census (run 31944844978, 71 rows)
     # that the same two-term shape passed at 719739e: the worst OBSERVED repair jitter must not
