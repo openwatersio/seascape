@@ -358,8 +358,13 @@ jobs:
           # not headroom: the mem_gb budget stays sized to physical RAM, and reservations sit
           # ~10% over measured max, so this only turns a rare over-peak from an arbitrary
           # OOM kill into a brief spill. swappiness=10 keeps the working set in RAM.
+          # Sized to the box — an eighth of the root disk, capped at 64 G: the same root disk
+          # holds the docker image, TMP scratch and the logs, so a flat big-box swapfile spends
+          # a small box's scratch space on spill it will never use (ccx63 -> 64 G, ccx33 -> 30 G).
           if [ ! -e /swapfile ]; then
-            fallocate -l 64G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=65536
+            root_mb=$(df -BM --output=size / | tail -1 | tr -dc '0-9')
+            swap_mb=$(( root_mb / 8 )); [ "$swap_mb" -le 65536 ] || swap_mb=65536
+            fallocate -l "${swap_mb}M" /swapfile || dd if=/dev/zero of=/swapfile bs=1M count="$swap_mb"
             chmod 600 /swapfile
             mkswap /swapfile
             swapon /swapfile
@@ -460,6 +465,24 @@ jobs:
               exit 1
             fi
             echo "scope gate ok: $total planned jobs <= max_jobs=$INPUT_MAX_JOBS"
+          fi
+          # Root-disk floor: disk_mb above admits only DECLARED job tmp — swap, the docker image
+          # and its overlay writes, the run logs and any under-declared scratch sit outside that
+          # budget on the same root disk, and when it fills the RUNNER dies ("No space left on
+          # device: /actions-runner/_diag"), so the step never even reports a conclusion. A ccx63
+          # ships a 960 G root, a ccx33 240 G — a wide plan on the small box exhausted it in 52
+          # minutes (run 32024721698, ~8.8k of 22,181 jobs left). Abort in seconds instead.
+          # Width from the scope gate when the dispatcher stated one; an unstated scope is
+          # treated as wide, because that is what a planet dispatch looks like. A bbox run is
+          # narrow by construction (a window, not the planet), so it keeps the loose floor —
+          # bbox smokes are ccx33's documented use and must not demand the big box.
+          floor_mb=$(( 80 * 1024 ))
+          if [ -z "$BBOX" ] && { [ -z "$INPUT_MAX_JOBS" ] || [ "${total:-0}" -gt 2000 ]; }; then
+            floor_mb=$(( 300 * 1024 ))
+          fi
+          if [ "$avail_mb" -lt "$floor_mb" ]; then
+            echo "only $((avail_mb / 1024)) G free on the root disk, under the $((floor_mb / 1024)) G this plan needs for scratch, logs and image layers — re-dispatch with server_type=ccx63, or state a narrow scope with max_jobs if this really is a small run" >&2
+            exit 1
           fi
           # No --prioritize: it flattens the index's whole merge chain to one priority, which
           # lets the scheduler pack small merges ahead of the heavy ones. build.smk's explicit
