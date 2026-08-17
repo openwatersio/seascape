@@ -90,7 +90,7 @@ jobs:
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
         if: steps.have.outputs.exists != 'true'
       - uses: docker/build-push-action@v6
         if: steps.have.outputs.exists != 'true'
