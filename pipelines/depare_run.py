@@ -534,9 +534,10 @@ def read_bucket(raw_fgb, where):
 
 
 def _polygonal(geom):
-    """The polygonal content of a linework make_valid result: the repaired area can arrive as a
-    GeometryCollection carrying line fragments, whose MultiPolygon member one explode leaves
-    nested for the Polygon-type filter to delete — merge the areal parts instead."""
+    """The polygonal content of a linework make_valid result. The repair can return a
+    GeometryCollection mixing polygons with line fragments; downstream, explode() unwraps only
+    one level, so a MultiPolygon nested inside the collection would survive as a MultiPolygon
+    row and be deleted by the Polygon-type filter. Merging the areal parts here keeps them."""
     import shapely
     if geom.geom_type != "GeometryCollection":
         return geom
@@ -1280,8 +1281,12 @@ def _check():
     finally:
         shapely.make_valid = _real_mv
     _got = gpd.read_file(f"{_d}/out.fgb")
-    _want_l = shapely.area(_polygonal(_real_mv(_folded4326)))
-    assert len(_got) and abs(shapely.area(_got.geometry.values).sum() - _want_l) <= _snap_budget, \
+    # This path's pre-snap geometry is the LINEWORK repair, so its budget comes from that
+    # ring's own perimeter, not the structure repair's.
+    _repaired_l = _polygonal(_real_mv(_folded4326))
+    _budget_l = shapely.length(_repaired_l) * _RowSink.SNAP_MAX_SHIFT
+    assert len(_got) and abs(shapely.area(_got.geometry.values).sum()
+                             - shapely.area(_repaired_l)) <= _budget_l, \
         "the linework fallback must conserve the area the structure repair ate"
 
     # A row valid_output declines outright (GEOS's free-hole-to-shell refusal, run 31984351438)
