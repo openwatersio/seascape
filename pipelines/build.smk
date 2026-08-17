@@ -312,16 +312,13 @@ rule publish_mosaic:
 # ── mosaic, as a separate job rather than riding inside the merge                    ──
 
 # The one shared f(depth, zoom) — a knob change reruns stage 3 only, never a merge. Every dial
-# prepare_window applies must appear here, coarsening included: a dial missing from this hash
+# prepare_window applies must appear here: a dial missing from this hash
 # leaves the window artifact fresh, so a sweep silently re-measures the previous surface.
 SMOOTH_CFG = json.dumps({} if os.environ.get("SKIP_SMOOTH") else {
     "sigma": smooth.DEM_SIGMA, "sigma_deep": smooth.DEM_SIGMA_DEEP,
     "mask_sigma": smooth.MASK_SIGMA, "slope_low": smooth.SLOPE_LOW,
     "slope_high": smooth.SLOPE_HIGH, "depth_full": smooth.DEPTH_FULL,
     "depth_smooth": smooth.DEPTH_SMOOTH, "block": smooth.BLOCK,
-    "deep_coarsen_threshold_m": smooth.DEEP_COARSEN_THRESHOLD_M,
-    "deep_coarsen_factor": smooth.DEEP_COARSEN_FACTOR,
-    "deep_coarsen_min_child_z": smooth.DEEP_COARSEN_MIN_CHILD_Z,
     "pond_fill_mm2": smooth.POND_FILL_MM2,
     "pond_fill_extent_m": smooth.POND_FILL_EXTENT_M,
     "pond_fill_max_depth_m": smooth.POND_FILL_MAX_DEPTH_M,
@@ -377,7 +374,7 @@ def fork_inputs(wc):
 
 
 # The forks' shared read surface, built once per stem instead of three times: the buffered
-# window materialized, smoothed, and deep-coarsened. temp() — a z15 window is 4.3 GB and
+# window materialized, smoothed, and pond-filled. temp() — a z15 window is 4.3 GB and
 # only in-flight stems need theirs on disk. Consumers treat it as read-only.
 rule fork_window:
     input:

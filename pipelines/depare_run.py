@@ -219,7 +219,7 @@ def _run_bounded(cmd, what, timeout):
 
 
 def _uniform_coarsen(dem, factor, out):
-    """Whole-window shoal-biased downsample — the retry rescue when even the deep-coarsened window
+    """Whole-window shoal-biased downsample — the retry rescue when even the smoothed window
     times out (shallow-complexity stems the depth gate can't help). gdal_contour reads the small
     raster directly; _depare_dem re-reads res per file, so the sliver gate adapts.
 

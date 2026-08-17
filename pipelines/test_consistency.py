@@ -5,7 +5,7 @@ asserts they still describe the same seabed:
 
   * raster shading   mosaic -> class-aware shoal pyramid (utils._block_reduce) -> read at the
                      target zoom -> smooth -> classify (terrain._encode_tile) -> Terrarium
-  * isobaths         mosaic -> fork window (smooth + deep_coarsen + pond_fill) -> land clamp ->
+  * isobaths         mosaic -> fork window (smooth + pond_fill) -> land clamp ->
                      gdal_contour -> Chaikin/simplify -> clip
   * depth areas      the same fork window -> gdal_contour -p -> coverage simplify -> land cut
 
@@ -17,7 +17,7 @@ plans above it (where the raster reads the pyramid and the vectors do not re-der
 
 What is asserted, and the bound each rests on:
 
-  1. ONE SURFACE. Over the navigable band the served raster and the forks' window are the same
+  1. ONE SURFACE. Over the water domain the served raster and the forks' window are the same
      array, up to the encode's quantization step: the raster never charts more than one step
      shallower than the vector surface, and never charts deeper than it at all — EXCEPT where
      smooth.pond_fill licensed the vectors to shoal (the enclosed pond), which is asserted to
@@ -79,8 +79,8 @@ import utils  # noqa: E402
 
 # ── the fixture ────────────────────────────────────────────────────────────────────────────────
 # One aggregation tile at child_z 14: 1024 px of core at res(14), which is small enough to run in
-# the test suite and deep enough that BOTH extra fork generalizations are live (deep_coarsen from
-# child_z 12, pond_fill from 14) — the divergences property 1 has to bound.
+# the test suite and deep enough that the extra fork generalization is live (pond_fill from
+# child_z 14) — the divergence property 1 has to bound.
 ANCHOR = mercantile.Tile(x=4100, y=4100, z=13)
 CHILD_Z = 14
 CORE = 1024
@@ -148,8 +148,7 @@ def _xy(row, col):
 def _dem():
     rng = np.random.default_rng(7)
     arr = np.full((CORE, CORE), BASIN, dtype="float32")
-    # Noise on the deep basin so deep_coarsen has something to average — without it the pass is a
-    # no-op and property 1's licensed-divergence branch never runs.
+    # Noise on the deep basin, so the deep blur has a gradient to work on rather than a flat field.
     arr[DEEP_BOX] = DEEP + rng.normal(0, 30, arr[DEEP_BOX].shape)
     row, col = np.indices(arr.shape)
     dr, dc = row - SHOAL_CENTRE[0], col - SHOAL_CENTRE[1]
@@ -272,7 +271,7 @@ def _klass(v):
 # ── the checks ─────────────────────────────────────────────────────────────────────────────────
 
 def check_one_surface(stem, native):
-    """1. The served raster and the forks' window are one surface over the navigable band.
+    """1. The served raster and the forks' window are one surface over the water domain.
 
     The fork window's interior is the anchor tile at res(child_z), the same grid the native render
     tiles it into, so this is a pixel-for-pixel comparison of the shipped product against the
@@ -297,8 +296,8 @@ def check_one_surface(stem, native):
                 native[(CHILD_Z, ANCHOR.x * span + i, ANCHOR.y * span + j)]
 
     # Compare where both call it charted depth; the non-negative codes are property 2's job.
-    band = (fork < 0) & (raster < 0) & (fork > smooth.DEEP_COARSEN_THRESHOLD_M)
-    assert band.sum() > CORE * CORE // 4, f"the navigable band must dominate the fixture: {band.sum()} px"
+    band = (fork < 0) & (raster < 0)
+    assert band.sum() > CORE * CORE // 4, f"the water domain must dominate the fixture: {band.sum()} px"
     step = np.minimum(encode.quantization_factor(CHILD_Z),
                       2.0 ** np.ceil(np.log2(np.maximum(np.abs(raster) * encode.SHALLOW_REL,
                                                         encode.SHALLOW_MIN_STEP))))
@@ -322,14 +321,8 @@ def check_one_surface(stem, native):
         ("the fork surface leaves the water domain outside the pond fill: rows "
          f"{rows.min()}..{rows.max()}, cols {cols.min()}..{cols.max()}")
 
-    # deep_coarsen is the other licensed divergence; the two inequalities above already confine it
-    # to below the threshold, since `band` holds every pixel it is not allowed to touch.
-    deep_moved = (fork <= smooth.DEEP_COARSEN_THRESHOLD_M) & (fork < 0) & (raster < 0) & \
-                 (np.abs(raster - fork) > step + 1e-6)
-    assert deep_moved.any(), "the deep basin must actually exercise deep_coarsen"
-    print(f"  one-surface ok — {int(band.sum())} navigable px agree within one quantization step; "
-          f"{int(filled.sum())} px of pond fill and {int(deep_moved.sum())} px of deep coarsening "
-          "are the only divergences")
+    print(f"  one-surface ok — {int(band.sum())} water px agree within one quantization step; "
+          f"{int(filled.sum())} px of pond fill are the only divergence")
 
 
 def _sweep():
@@ -401,10 +394,6 @@ def check_bracketing(tiles, z, bands):
     Per LADDER: the metre and fathom sets are two independent partitions of the same water, so
     pooling them would widen every bracket to the union of two unrelated buckets.
 
-    Restricted to the navigable band. Below smooth.DEEP_COARSEN_THRESHOLD_M the vectors are cut
-    from 8x block means, which move in BOTH directions against the raster's un-coarsened value, so
-    no bracket exists there by design (measured 116 m on this fixture's noisy deep basin).
-
     The deeper-than-the-band bound is exact at every zoom — a coarse tile is clamped against the
     shoal reduction of the zoom below (property 3), and the native zoom brackets exactly, so the
     coarse value can be no deeper than a band under its own footprint. Only the shallower-than-
@@ -422,8 +411,8 @@ def check_bracketing(tiles, z, bands):
         for row, col in _sweep():
             x, y = _xy(row, col)
             v, footprint = _at(tiles, z, x, y)
-            if v >= 0 or v <= smooth.DEEP_COARSEN_THRESHOLD_M:
-                continue  # flat codes are property 2's job; the deep is coarsened out of scope
+            if v >= 0:
+                continue  # flat codes are property 2's job
             under = tree.query(box(*footprint))
             assert len(under), \
                 f"z{z} {sys_tag} row {row} col {col}: charted {v} m with no depare band beneath it"
