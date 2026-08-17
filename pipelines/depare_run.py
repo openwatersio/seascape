@@ -665,19 +665,28 @@ class _RowSink:
             # Everything reaching here is valid in 4326, so a throw is GEOS declining an
             # arrangement outright — run 31984351438: "unable to assign free hole to a shell" on
             # one Cornwall row. The vectorized call names no row, so re-run one at a time and
-            # take the declined rows through a pointwise snap + linework repair. The validity
-            # assert and the per-row snap budget below still gate the result, so the fallback can
-            # only ship what the contract allows; its one concession is that repair noding can
-            # add off-grid vertices for the driver to round — the pre-snap-era residual, bounded
-            # to these rows.
+            # take the declined rows through a pointwise snap + linework repair, iterated to a
+            # fixed point ON the write grid: repair noding adds off-grid vertices, and shipping
+            # those would leave the driver's rounding as the last, unvalidated operation. The
+            # validity assert and the per-row snap budget below still gate the result; a row
+            # that will not close still kills the tile, named.
             snapped = raw.copy()
             rescued = 0
             for i, g in enumerate(raw):
                 try:
                     snapped[i] = shapely.set_precision(g, self.GRID, mode="valid_output")
                 except shapely.errors.GEOSException:
-                    snapped[i] = _polygonal(shapely.make_valid(
-                        shapely.set_precision(g, self.GRID, mode="pointwise")))
+                    cur = shapely.set_precision(g, self.GRID, mode="pointwise")
+                    for _ in range(4):
+                        cur = shapely.set_precision(_polygonal(shapely.make_valid(cur)),
+                                                    self.GRID, mode="pointwise")
+                        if shapely.is_valid(cur):
+                            break
+                    else:
+                        raise AssertionError(
+                            f"snapping row {i} of {len(raw)} to the write grid failed to "
+                            f"converge; specimen: {shapely.to_wkt(g, rounding_precision=9)}")
+                    snapped[i] = cur
                     rescued += 1
             print(f"depare: pointwise-snapped {rescued} row(s) valid_output declined", flush=True)
         gdf = gdf.set_geometry(gpd.GeoSeries(snapped, index=gdf.index, crs="EPSG:4326"))
@@ -687,14 +696,15 @@ class _RowSink:
         # measured at 3e-6 m2 — which the previous repair also dropped.
         gdf = gdf.explode(index_parts=False)
         gdf = gdf[(gdf.geom_type == "Polygon") & ~gdf.is_empty]
-        # The two things the write owes: valid geometry, and no real part deleted. A row narrower
-        # than a cell may vanish — its whole area is under its own budget, which is the crumb case
-        # — while a row wide enough to draw cannot.
+        # The two things the write owes: valid geometry, and no real area moved — in EITHER
+        # direction, since a fallback repair that conjured area into a neighbouring band would
+        # pass a loss-only gate. A row narrower than a cell may vanish — its whole area is under
+        # its own budget, which is the crumb case — while a row wide enough to draw cannot.
         assert bool(shapely.is_valid(gdf.geometry.to_numpy()).all()), \
             "set_precision must return valid geometry (mode=valid_output)"
         after = (pd.Series(shapely.area(gdf.geometry.to_numpy()), index=gdf.index)
                  .groupby(level=0).sum().reindex(range(len(raw)), fill_value=0.0).to_numpy())
-        gone = np.flatnonzero(before - after > budget)
+        gone = np.flatnonzero(np.abs(before - after) > budget)
         if len(gone):
             i = gone[0]
             raise AssertionError(
@@ -1297,6 +1307,11 @@ def _check():
         "the pointwise fallback must write valid rows"
     assert abs(shapely.area(_got.geometry.values).sum() - _want) <= _snap_budget, \
         "the pointwise fallback must conserve the row's area"
+    # ...and land every vertex ON the write grid: the gates validate pre-driver geometry, so an
+    # off-grid repair vertex would make the driver's rounding the last, unvalidated operation.
+    _coords = shapely.get_coordinates(_got.geometry.values)
+    assert (_coords == np.round(_coords, _RowSink.COORD_DECIMALS)).all(), \
+        "the pointwise fallback must land every vertex on the write grid"
 
     # The repair gate's arithmetic, pinned against the planet census (run 31944844978, 71 rows)
     # that the same two-term shape passed at 719739e: the worst OBSERVED repair jitter must not
@@ -1351,6 +1366,29 @@ def _check():
     # real distinction rather than one any budget would catch.
     _lost = gpd.GeoSeries([_doomed], crs=3857).to_crs(4326).area[0]
     assert _lost < 1e-9, f"the doomed row must fit inside a batch-scale budget, got {_lost!r}"
+
+    # The budget is TWO-sided: a snap (or fallback repair) that conjures area past the budget is
+    # a band inflated into its neighbour, and a loss-only gate would wave it through.
+    def _grow_the_second(geoms, grid, **kw):
+        out = list(_real_set_precision(geoms, grid, **kw))
+        _b = shapely.bounds(out[1])
+        out[1] = shapely.box(_b[0] - 1e-3, _b[1] - 1e-3, _b[2] + 1e-3, _b[3] + 1e-3)
+        return np.array(out, dtype=object)
+
+    shapely.set_precision = _grow_the_second
+    _raised = ""
+    try:
+        _d = tempfile.mkdtemp()
+        _sink = _RowSink(f"{_d}/rows.geojsons")
+        _sink.write([{"geometry": g, "drval1": -config.DRYING_CAP, "drval2": 0.0,
+                      "sys": None, "kind": None, "rank": DRYING_RANK}
+                     for g in (_keep, _doomed)])
+    except AssertionError as e:
+        _raised = str(e)
+    finally:
+        shapely.set_precision = _real_set_precision
+    assert "snapped row 1" in _raised and "snap budget" in _raised, \
+        f"a row the write grows past its budget must fail, got {_raised!r}"
 
     # The snap must not break the partition. Snap-rounding is topological, not pointwise, so it
     # MAY node a chain it shares with a neighbour — and two bands that stop sharing their boundary
