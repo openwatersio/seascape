@@ -1,7 +1,7 @@
 # Use Official OSGeo image (Ubuntu 24.04 + current GDAL with the HDF5/BAG drivers).
 # Bumping it (GDAL/GEOS/PROJ) must bump `version` on mosaic_tile, the fork rules, and
 # terrain_render (build.smk) — tools are not rule inputs.
-FROM ghcr.io/osgeo/gdal:ubuntu-full-3.13.1
+FROM ghcr.io/osgeo/gdal:ubuntu-full-3.13.2
 
 LABEL org.opencontainers.image.source="https://github.com/openwatersio/seascape"
 LABEL org.opencontainers.image.description="Bathymetry → tile pipeline)"
