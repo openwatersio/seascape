@@ -533,7 +533,10 @@ jobs:
             cancelled) state="error"; desc="cancelled before publishing $suffix" ;;
             *) state="failure"; desc="failed before publishing $suffix" ;;
           esac
-          curl -fsS -X POST -H "Authorization: Bearer $GH_TOKEN" \
+          # --retry over transient API errors: this step is pure bookkeeping, and a single 503
+          # here painted an entirely successful 721-job build as a failed run (run 32030835194).
+          curl -fsS --retry 5 --retry-all-errors --max-time 120 -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
             -d "{\"state\":\"$state\",\"context\":\"build\",\"description\":\"$desc\",\"target_url\":\"$url\"}" \
