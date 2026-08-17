@@ -21,10 +21,11 @@ water compose without extra layers or archives:
      (MVT has no null; the fill's "no drval1" case renders S-52's NODATA fill) — plus a
      `kind` passthrough of the Overture subtype (river/lake/canal/reservoir).
 
-The three are pairwise disjoint by construction — bands are the DEM's water pixels
-(amax <= 0), drying is the disjoint [0, DRYING_CAP] bucket ∩ effective water, and nodata is
-the mapped water MINUS both — so style ordering is cosmetic. The `rank` sort attribute
-survives only as a stable tie-breaker at an incidental simplification-wobble edge (nodata 0
+Bands and drying are pairwise disjoint by construction — bands are the DEM's water pixels
+(amax <= 0), drying is the disjoint [0, DRYING_CAP] bucket ∩ effective water. Nodata is the
+mapped water MINUS both, then dilated NODATA_OVERLAP_PX so every line it was cut on (stem
+seam, OSM shoreline, coverage edge) overlaps its neighbour instead of opening a background
+hairline between two opaque fills. The `rank` sort attribute resolves that overlap (nodata 0
 < bands 1 < drying 2: real depth over no-data, foreshore over the shoal band it abuts).
 
 sys multiplexing: the bands duplicate per sys (the ladders differ), but drying and nodata
@@ -45,10 +46,12 @@ Per tile: bands (gdal_contour -p at DEPARE_LEVELS / DEPARE_LEVELS_FT, drop land,
 + drying (the metre ladder's [0, DRYING_CAP] bucket ∩ effective water, drval1 < 0) + nodata
 (inland-water polygons minus the DEM's water coverage and the drying) -> clip to the
 unbuffered tile bbox in shapely (polygon-only by construction, see _polys) -> 4326 ->
-store/depare/{stem}.fgb. Same seam contract as contours: deterministic on the buffered grid,
-so neighbouring tiles' features abut exactly at the clip line. The vector bundle folds these into
-the `depare` layer of the sharded variable-depth run (contour_run), gated at z6 by a per-feature
-tippecanoe.minzoom (contour_run.DEPARE_MINZOOM).
+store/depare/{stem}.fgb. Same seam contract as contours for bands and drying: deterministic
+on the buffered grid, so neighbouring tiles' features abut exactly at the clip line. Nodata
+rows instead ship dilated NODATA_OVERLAP_PX past the clip line, overlapping the neighbour
+tile's — abutment can't survive the per-piece nodata simplify, overlap can. The vector
+bundle folds these into the `depare` layer of the sharded variable-depth run (contour_run),
+gated at z6 by a per-feature tippecanoe.minzoom (contour_run.DEPARE_MINZOOM).
 """
 
 import os
@@ -76,9 +79,9 @@ if config.CONTOUR_LEVELS != config.CONTOUR_LEVELS_DEFAULT:
           file=sys.stderr)
 
 # Fill draw order for the `rank` sort attribute (a style fill-sort-key draws higher on top).
-# All three kinds are disjoint by construction, so rank is cosmetic — a stable tie-breaker at
-# an incidental simplification-wobble edge: real depth (bands) over no-data (nodata), and
-# drying over the shoal band it abuts along their shared 0 m seam.
+# Load-bearing where the NODATA_OVERLAP_PX dilation slides nodata under its neighbours: real
+# depth (bands) over no-data (nodata), and drying over the shoal band it abuts along their
+# shared 0 m seam.
 NODATA_RANK = 0
 BAND_RANK = 1
 DRYING_RANK = 2
@@ -157,6 +160,15 @@ MM_PER_PX = 0.28
 # 1.4 M vertices, sub-resolution features dropping out naturally). Bands and drying take SIMPLIFY_MM
 # through coverage simplification instead, which is what keeps their shared edges bit-identical.
 NODATA_SIMPLIFY_PX = float(os.environ.get("NODATA_SIMPLIFY_PX", "1"))
+
+# Every line a nodata ring is cut on — the stem seam, the OSM shoreline, the coverage edge — abuts
+# a fill drawn from independently simplified geometry (the neighbour stem, the basemap's land, the
+# depth bands), and each side's simplification wobble opens background hairlines between the two
+# opaque fills. Dilating the finished rows by this many stem MVT pixels turns abutment into
+# overlap, which draws as nothing: bands and drying outrank nodata, land draws over water, and
+# nodata-on-nodata is one fill. 2 px covers the ≤1 px simplify recede plus tile-time wobble;
+# mitre join so a dense shoreline gains no arc vertices at its corners.
+NODATA_OVERLAP_PX = float(os.environ.get("NODATA_OVERLAP_PX", "2"))
 
 # Fixed-precision grid (metres) for overlays against multi-piece unions: GEOS 3.13's
 # float OverlayNG returns an empty overlay against some unions whose pairwise overlays are
@@ -687,6 +699,7 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0):
     min_area = SLIVER_MIN_PX * res * res       # slivers where a vector edge meets the raster shore
     stem_res = get_resolution(child_z)          # the stem's own MVT pixel, EPSG:3857 metres
     nodata_tol = NODATA_SIMPLIFY_PX * stem_res  # generalize nodata to the stem's resolution
+    nodata_pad = NODATA_OVERLAP_PX * stem_res   # dilate finished nodata rows over every cut line
     band_tol = SIMPLIFY_MM / MM_PER_PX * stem_res  # the S-58 vertex floor at this stem's scale
     # Drying legibility: area at the STEM's scale (what a reader sees), width in the DEM's own
     # pixel (what drew the ribbon) — the two differ on the coarsened retry window.
@@ -854,6 +867,10 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0):
                         s = p.simplify(nodata_tol, preserve_topology=True)
                         if s.is_empty:
                             continue
+                        # Dilate the survivor over every line it was cut on — past the clip line
+                        # (the stem seam) and past the raw outline (the shoreline) — so the
+                        # abutting fills overlap instead of opening hairlines (NODATA_OVERLAP_PX).
+                        s = s.buffer(nodata_pad, join_style="mitre", mitre_limit=2.0)
                         sink.write([{"geometry": sp, "drval1": None, "drval2": None,
                                      "sys": None, "kind": kind, "rank": NODATA_RANK}
                                     for sp in _polys(s)], flush=False)
@@ -1185,11 +1202,14 @@ def _check():
     except ContourTimeout:
         pass
 
-    # nodata simplification: a dense OSM-style outline generalizes to the stem's resolution,
-    # shedding vertices while its area barely moves — and the post-clip, per-piece simplify
-    # never pushes a piece's boundary outward across the clip line (the seam contract).
+    # nodata simplification + dilation: a dense OSM-style outline generalizes to the stem's
+    # resolution, shedding vertices while its area barely moves. The post-clip simplify recedes
+    # ≤ tol from every line the piece was cut on; the NODATA_OVERLAP_PX dilation must push the
+    # finished row back over all of them — across the clip line (the stem seam) and past the raw
+    # outline (the shoreline) — so the abutting fills overlap instead of opening hairlines.
     from shapely import get_num_coordinates
     tol = NODATA_SIMPLIFY_PX * get_resolution(14)
+    pad = NODATA_OVERLAP_PX * get_resolution(14)
     ring = [(1000.0 * np.cos(t) + 0.37 * tol * np.sin(60 * t),
              1000.0 * np.sin(t) + 0.37 * tol * np.cos(60 * t))
             for t in np.linspace(0, 2 * np.pi, 4000, endpoint=False)]  # dense, sub-tol wobble
@@ -1197,16 +1217,16 @@ def _check():
     simp = dense.simplify(tol, preserve_topology=True)
     assert get_num_coordinates(simp) < get_num_coordinates(dense) / 4, "nodata simplify must shed vertices"
     assert abs(simp.area - dense.area) < 0.02 * dense.area, "nodata simplify must preserve area"
-    # A piece clipped to a box, then simplified: its vertices are a subset inside the clip box, so
-    # the shared edge stays exactly on the clip line (post-clip simplify never crosses the seam).
     clipbox = _box(0, -2000, 2000, 2000)  # cuts the disc through its centre at x=0
     for piece in _polys(dense.intersection(clipbox)):
         s = piece.simplify(tol, preserve_topology=True)
         if s.is_empty:
             continue
-        for sp in _polys(s):
-            xs = [c[0] for c in sp.exterior.coords]
-            assert min(xs) >= -1e-6, "post-clip simplify must not push a vertex across the clip line"
+        s = s.buffer(pad, join_style="mitre", mitre_limit=2.0)
+        assert s.is_valid and s.covers(piece), \
+            "a dilated nodata row must cover its own cut piece (no shoreline sliver)"
+        assert s.bounds[0] < -pad / 2, \
+            "a dilated nodata row must cross the clip line (seam overlap, not abutment)"
 
     d = tempfile.mkdtemp()
     h = w = 60
