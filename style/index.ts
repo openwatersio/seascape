@@ -103,10 +103,23 @@ export function sources({
 }
 
 // ─── Layers ──────────────────────────────────────────────────────────────────
-// One entry per layer family, in paint order. `unit` picks every sounding and
-// contour label and which isobath set shows; `safety` moves the hazard tint
-// and the emphasized contour. Everything is a literal, so runtime changes go
-// through applyState(), which regenerates these.
+// One entry per layer family. `unit` picks every sounding and contour label
+// and which isobath set shows; `safety` moves the hazard tint and the
+// emphasized contour. Everything is a literal, so runtime changes go through
+// applyState(), which regenerates these.
+//
+// The array encodes TWO orderings at once:
+//  - Paint: later draws on top. Areas lowest, hillshade texture over the fills
+//    but under contour-lines so isobaths stay crisp, lines above areas —
+//    S-52 10.3.4.1's tie-break (lines over areas, points over both).
+//  - Symbol placement runs in REVERSE: the last symbol layer claims space
+//    first and wins cross-layer collisions. Soundings sit after contour-labels
+//    on purpose — a collision renderer culls (the paper regime, S-4: labels
+//    are fitted into gaps after soundings), so the contour label that repeats
+//    along its line yields to the point number that exists exactly once.
+//    Moving soundings earlier would let a repeating "10" delete them.
+//    source-labels last: the provenance overlay, when toggled on, is a
+//    diagnostic and outranks chart text while in use.
 export function layers(
   flavor: Flavor = day,
   {
