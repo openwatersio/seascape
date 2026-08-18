@@ -1,11 +1,11 @@
 /**
  * @openwaters/seascape — MapLibre GL style for the Open Waters bathymetry tiles.
  *
- * Follows the protomaps-basemaps split: layer *structure* lives in these
- * functions, appearance lives in a plain "flavor" object, and the consumer owns
- * the style — either assembled piecemeal (`sources()` + `layers()` concat with
- * other layer groups) or whole via `style()` (what the tile Worker serves at
- * /style.json).
+ * Follows the protomaps-basemaps split: layer *structure* lives in the
+ * per-layer modules (one file per layer family), appearance lives in a plain
+ * "flavor" object (flavor.ts), and the consumer owns the style — either
+ * assembled piecemeal (`sources()` + `layers()` concat with other layer
+ * groups) or whole via `style()` (what the tile Worker serves at /style.json).
  *
  *   import { style } from "@openwaters/seascape";
  *   new maplibregl.Map({ style: style({ tilesBase }) });
@@ -15,282 +15,54 @@
  *
  * Runtime parameters: `unit` ("m" | "ft" | "fm") and `safety` (metres, 0 = off)
  * appear in the generated expressions as literals — every label, isobath
- * filter, sounding emphasis, and the depth-shading ramp. Literal expressions
- * run on any GL JS with color-relief (MapLibre >= 5.6). To change them on a
- * live map, applyState() re-derives the handful of unit/safety-dependent
- * properties and sets them in place; or fetch a regenerated style
+ * filter, and the depth-shading ramp. Literal expressions run on any GL JS
+ * with color-relief (MapLibre >= 5.6). To change them on a live map,
+ * applyState() re-derives each layer's declared state-dependent properties and
+ * sets them in place; or fetch a regenerated style
  * (`/style.json?unit=ft&safety=3`). `shading` ("relief" | "bands") picks the
  * water shading: the raster ramp, or the vector ENC depth-area bands above z6
  * (the relief keeps z<6 either way).
  */
 import type {
-  ExpressionSpecification,
   LayerSpecification,
   SourceSpecification,
   StyleSpecification,
 } from "@maplibre/maplibre-gl-style-spec";
+import {
+  DEFAULT_SAFETY,
+  DEFAULT_SHADING,
+  DEFAULT_UNIT,
+  day,
+  type Flavor,
+  type Shading,
+  type Unit,
+} from "./flavor.js";
+import { depthShadingLayer, depthShadingState } from "./depth-shading.js";
+import { depthAreasLayer, depthAreasState } from "./depth-areas.js";
+import { hillshadeLayer, hillshadeState } from "./hillshade.js";
+import {
+  contourLabelsLayer,
+  contourLabelsState,
+  contourLinesLayer,
+  contourLinesState,
+} from "./contours.js";
+import { soundingsLayer, soundingsState } from "./soundings.js";
+import { coverageLayers } from "./coverage.js";
+
+export { day, type Flavor, type Shading, type Unit } from "./flavor.js";
+export { depthRelief } from "./depth-shading.js";
+export { depthAreasColor } from "./depth-areas.js";
 
 // The tile-contract version this package targets (docs/schema.md). Compare it
 // against the `schema` field of the endpoint's TileJSON: a mismatch means the
 // tiles may decode plausibly but wrongly — treat it as fatal, not cosmetic.
 export const SCHEMA = 1;
 
-export type Unit = "m" | "ft" | "fm";
-// Water shading: the raster color-relief ramp (continuous, fuzzy edges) or the
-// vector ENC depth-area bands (crisp edges on the charted isobaths, safety
-// snapped to the next-deeper charted level). Never both at once — the 0.85
-// opacities would compound.
-export type Shading = "relief" | "bands";
-
-export interface Flavor {
-  bandColors: string[]; // deepest → shoalest (6 entries)
-  bandEdges: { m: number[]; ft: number[] }; // band-edge depths, metres
-  hazard: string;
-  land: string;
-  drying: string;
-  nodata: string;
-  contour: string;
-  label: string;
-  labelHalo: string;
-  soundingEmphasis: string;
-  contourEmphasis: string;
-  font: string[];
-  /** Soundings only. S-4 B-412.1 sets them in sloping numerals; upright is reserved for
-   *  soundings of lower reliability (B-412.4). */
-  soundingFont: string[];
-  hillshadeShadow: string;
-  hillshadeHighlight: string;
-  coverage: string;
-}
-
-// ─── Flavor (appearance only — custom looks are spread-overrides) ────────────
-// Depth-shading tints follow chart convention: shoal-dark → deep-white
-// (INT/NOAA), flat white beyond the deepest edge so tint stays monotonic in
-// depth. Bands are perceptually spaced (adjacent ΔE ≥ 7 after 0.85-opacity
-// compositing), weighted toward the shoal bands where depth discrimination
-// matters. Band edges sit on isobaths the chart draws — metric levels, or the
-// classic fathom curves in ft/fm mode — so tint boundaries land on contour
-// lines rather than between them (paper-chart practice).
-export const day: Flavor = {
-  bandColors: [
-    "#e9f7ff", // deepest band
-    "#c9e9fd",
-    "#a5d9fb",
-    "#7fc7f8",
-    "#5db5f0",
-    "#3fa2e4", // shoalest band
-  ],
-  bandEdges: {
-    m: [50, 20, 10, 5, 2],
-    ft: [30, 10, 5, 3, 1].map((fm) => fm * 1.8288), // fathom curves 30/10/5/3/1 fm
-  },
-  // One perceptual step darker than the shoalest band — water shallower than
-  // the safety depth.
-  hazard: "#1f86cb",
-  // Land above datum: translucent buff wash (paper-chart figure-ground — white
-  // stays unambiguously "deep water"); a raster base reads through it.
-  land: "rgba(247,240,221,0.66)",
-  // Drying areas (S-52 DEPIT day green): seabed above chart datum that covers
-  // and uncovers with the tide. Darker than the shoalest band — charts weight
-  // the foreshore as the heaviest tint in the shoaling sequence.
-  drying: "#58af9c",
-  // Unknown-depth water (ENC DEPARE nodata): mapped water we hold no depth for. Painted
-  // the hazard tint — unsurveyed water warrants the same caution as known-unsafe water
-  // (ECDIS treats it as unsafe for the safety check; S-52 hatching is the eventual upgrade).
-  nodata: "#1f86cb",
-  // Isobaths and their labels recede in chart grey (S-52 DEPCN/SNDG1 #768C97);
-  // only unsafe soundings jump, in soundingEmphasis (SNDG2).
-  contour: "#768c97",
-  label: "#768c97",
-  labelHalo: "rgba(255,255,255,0.5)",
-  soundingEmphasis: "#000",
-  // Safety contour line (S-52 DEPSC day): darker grey, distinct from SNDG2 black.
-  contourEmphasis: "#4C5B63",
-  font: ["Noto Sans Medium"],
-  soundingFont: ["Noto Sans Medium Italic"],
-  hillshadeShadow: "#9adcfe",
-  hillshadeHighlight: "#ffffff",
-  coverage: "#f58231",
-};
-
-// Mariner-setting defaults for layers()/style() when the caller omits them.
-const DEFAULT_UNIT: Unit = "m";
-const DEFAULT_SAFETY = 2;
-const DEFAULT_SHADING: Shading = "relief";
-
-// The depare layer's data floor (tippecanoe -Z in the pipeline) and the contour
-// lines' presentation floor — depth shading carries lower zooms.
-const BANDS_MIN_ZOOM = 6;
-
-// Sub-unit digits on soundings are REAL subscript glyphs (U+2080-2089) from the self-hosted
-// stack — the type designer set the drop and the sidebearings. The alternative, a scaled
-// `format` section with vertical-align, aligns em-boxes rather than baselines, so the digit
-// sat visibly high and tight against the integer. A hair space (U+200A, also in the stack)
-// gives the pair its air.
-const SUB = "\u2080\u2081\u2082\u2083\u2084\u2085\u2086\u2087\u2088\u2089";
-const SUBSCRIPT = [...SUB].map((c, i) => (i ? "\u200A" + c : ""));
-
 // Self-hosted (openwatersio/tile-fonts). The MapLibre demo stack this replaced is a subset —
 // of the ten subscript digits it ships three — and a missing glyph is not an error, it simply
 // does not draw, so a decimetre digit would vanish off the chart.
 const DEFAULT_GLYPHS =
   "https://tiles.openwaters.io/fonts/{fontstack}/{range}.pbf";
-
-// ─── Depth-shading ramp (elevation → colour) ─────────────────────────────────
-// The hazard tint folds into this one color-relief ramp: two color-relief
-// layers on one DEM source don't composite (only the first renders), so water
-// shallower than the safety depth is painted into the ramp itself.
-type RampStops = (number | string)[]; // alternating elevation, colour
-
-// Terrarium's vertical LSB. The encoder clamps water to <= -LSB; the non-negative domain is
-// categorical (0 unknown-depth water, 1 drying foreshore, 2 land — flat codes, exact at every
-// zoom): the shoal tint runs flat to -LSB, then the code tints; fractional values between codes
-// are overzoom/interpolation transitions and blend smoothly.
-const LSB = 1 / 256;
-const DRYING_CODE = 1;
-const LAND_CODE = 2;
-
-// Width (metres) of the normal→hazard colour transition at the safety depth.
-const EDGE = 0.01;
-
-const depthRamp = (flavor: Flavor, edges: number[]): RampStops => {
-  const stops: RampStops = [-10000, flavor.bandColors[0]];
-  // Blend on the shallow side of each edge: the encoder rounds toward shallow
-  edges.forEach((d, i) =>
-    stops.push(-d, flavor.bandColors[i], -d + 0.1, flavor.bandColors[i + 1]),
-  );
-  // The unknown tint is a knife-edge at exact 0 (native code pixels only): pinning drying
-  // green at +LSB keeps overzoom's wet/dry blend fractions out of the slate — otherwise the
-  // whole (0, 1) interval renders as a wide gray band along every foreshore seam.
-  stops.push(
-    -LSB,
-    flavor.bandColors[5],
-    0,
-    flavor.nodata,
-    LSB,
-    flavor.drying,
-    DRYING_CODE,
-    flavor.drying,
-    LAND_CODE - LSB,
-    flavor.drying,
-    LAND_CODE,
-    flavor.land,
-  );
-  return stops;
-};
-
-// Colour of the ramp at elevation e (linear-interpolated). Used to pin a
-// normal-coloured stop right at the safety depth so the flip to the hazard
-// colour is a crisp ~0.01 m edge at ANY safety value — otherwise the blend
-// feathers by however far −safety lands from the nearest ramp stop.
-const rampColorAt = (ramp: RampStops, e: number): string => {
-  for (let i = 2; i < ramp.length; i += 2)
-    if (e <= (ramp[i] as number)) {
-      const e0 = ramp[i - 2] as number,
-        c0 = ramp[i - 1] as string;
-      const e1 = ramp[i] as number,
-        c1 = ramp[i + 1] as string;
-      if (c0[0] !== "#" || c1[0] !== "#") return c0;
-      const t = (e - e0) / (e1 - e0);
-      const p = (c: string) =>
-        [1, 3, 5].map((k) => parseInt(c.slice(k, k + 2), 16));
-      const a = p(c0),
-        b = p(c1);
-      return `rgb(${a.map((v, k) => Math.round(v + t * (b[k] - v))).join(",")})`;
-    }
-  return ramp[1] as string;
-};
-
-// The color-relief expression for the active unit system and safety depth.
-// Unit/safety changes rebuild this and apply it with
-// setPaintProperty("depth-shading", ...) — applyState() does exactly that.
-export function depthRelief(
-  flavor: Flavor = day,
-  { unit = "m", safety = 0 }: { unit?: Unit; safety?: number } = {},
-): ExpressionSpecification {
-  // The crisp-edge stops below need s + EDGE to land strictly between the
-  // safety depth and the -LSB water stop, or the interpolate stops go out of
-  // ascending order and MapLibre rejects the whole expression. No real safety
-  // depth is centimetres, so floor tiny values instead of failing.
-  if (safety > 0) safety = Math.max(safety, EDGE + 2 * LSB);
-  const ramp = depthRamp(flavor, flavor.bandEdges[unit === "m" ? "m" : "ft"]);
-  const s = -safety;
-  const stops: RampStops = [];
-  for (let i = 0; i < ramp.length; i += 2)
-    if (!(safety > 0) || (ramp[i] as number) < s)
-      stops.push(ramp[i], ramp[i + 1]);
-  // Crisp edge: normal colour pinned at the safety depth, hazard from just
-  // shallower up to shore.
-  if (safety > 0)
-    stops.push(
-      s,
-      rampColorAt(ramp, s),
-      s + EDGE,
-      flavor.hazard,
-      -LSB,
-      flavor.hazard,
-      0,
-      flavor.nodata,
-      LSB,
-      flavor.drying,
-      DRYING_CODE,
-      flavor.drying,
-      LAND_CODE - LSB,
-      flavor.drying,
-      LAND_CODE,
-      flavor.land,
-    );
-  return [
-    "interpolate",
-    ["linear"],
-    ["elevation"],
-    ...stops,
-  ] as unknown as ExpressionSpecification;
-}
-
-// ─── Depth-area (ENC DEPARE) band colour ─────────────────────────────────────
-// Charted isobath ladders, positive-down metres — must mirror pipelines/config.py
-// DEPARE_LEVELS / DEPARE_LEVELS_FT (the bucket edges baked into the depare
-// layer). The safety contour snaps UP this ladder to the next-deeper rung
-// (ECDIS behaviour, bias shallow) — vector bands can only flip at charted
-// levels, unlike the raster ramp's continuous crisp edge.
-const DEPARE_LADDER_M = [
-  2, 5, 10, 20, 30, 50, 100, 200, 300, 500, 1000, 2000, 3000, 4000, 5000, 6000,
-  8000, 10000,
-];
-const DEPARE_LADDER_FT = [
-  1, 2, 3, 5, 10, 20, 30, 50, 100, 200, 300, 500, 1000, 2000, 3000, 5000,
-].map((fm) => fm * 1.8288);
-
-// Comparisons against drval1 subtract this: tiles may carry the fathom-curve
-// drvals (1.8288, 5.4864, …) as 32-bit floats, which can land a hair below the
-// exact edge value. Ladder rungs are ≥ ~1.8 m apart, so 0.01 m is safely
-// inside every gap.
-const DRVAL_EPS = 0.01;
-
-// Fill colour for the depare partitions: the band tint keyed off drval1 (the
-// band's shallow bound), with every band shallower than the snapped safety
-// contour painted the hazard tint. Literals only, like depthRelief — runtime
-// changes go through applyState().
-export function depthAreasColor(
-  flavor: Flavor = day,
-  { unit = "m", safety = 0 }: { unit?: Unit; safety?: number } = {},
-): ExpressionSpecification {
-  const metric = unit === "m";
-  const edges = [...flavor.bandEdges[metric ? "m" : "ft"]].reverse(); // shoalest → deepest
-  const step: unknown[] = ["step", ["get", "drval1"], flavor.bandColors[5]];
-  edges.forEach((d, i) => step.push(d - DRVAL_EPS, flavor.bandColors[4 - i]));
-  if (!(safety > 0)) return step as unknown as ExpressionSpecification;
-  const ladder = metric ? DEPARE_LADDER_M : DEPARE_LADDER_FT;
-  const snap =
-    ladder.find((l) => l >= safety - DRVAL_EPS) ?? ladder[ladder.length - 1];
-  return [
-    "case",
-    ["<", ["get", "drval1"], snap - DRVAL_EPS],
-    flavor.hazard,
-    step,
-  ] as unknown as ExpressionSpecification;
-}
 
 // ─── Sources ─────────────────────────────────────────────────────────────────
 // tilesBase is the Worker endpoint; the sources reference its TileJSON docs
@@ -331,6 +103,10 @@ export function sources({
 }
 
 // ─── Layers ──────────────────────────────────────────────────────────────────
+// One entry per layer family, in paint order. `unit` picks every sounding and
+// contour label and which isobath set shows; `safety` moves the hazard tint
+// and the emphasized contour. Everything is a literal, so runtime changes go
+// through applyState(), which regenerates these.
 export function layers(
   flavor: Flavor = day,
   {
@@ -352,337 +128,14 @@ export function layers(
     hillshade?: boolean;
   } = {},
 ): LayerSpecification[] {
-  // `unit` picks every sounding/contour label and which isobath set shows;
-  // `safety` sets the unsafe-sounding emphasis. Everything is a literal, so
-  // runtime changes go through applyState(), which regenerates these.
-  //
-  // Soundings: props depth_m / depth_ft / depth_fm, all floored toward shallower by
-  // soundings_run.py — splitting the digits here must not re-round. The whole part is the chart
-  // number and the sub-unit is set smaller and dropped below it, never shown when zero
-  // (S-4 B-412.1).
-  const subUnitSounding = (
-    whole: ExpressionSpecification,
-    sub: ExpressionSpecification,
-  ): ExpressionSpecification => [
-    "concat",
-    ["to-string", whole],
-    [
-      "match",
-      sub,
-      1,
-      SUBSCRIPT[1],
-      2,
-      SUBSCRIPT[2],
-      3,
-      SUBSCRIPT[3],
-      4,
-      SUBSCRIPT[4],
-      5,
-      SUBSCRIPT[5],
-      6,
-      SUBSCRIPT[6],
-      7,
-      SUBSCRIPT[7],
-      8,
-      SUBSCRIPT[8],
-      9,
-      SUBSCRIPT[9],
-      "",
-    ],
-  ];
-  // Metres: the tenths digit is decimetres. `round` on the residual recovers it through float
-  // dust (3.9 % 1 == 0.9000000000000004).
-  const metreSounding = subUnitSounding(
-    ["floor", ["get", "depth_m"]],
-    ["round", ["*", 10, ["%", ["get", "depth_m"], 1]]],
-  );
-  // Fathoms: "Fathoms and Feet up to 11 fathoms and in fathoms only in depths greater than 11
-  // fathoms" (Canada CHS Chart 1, 2022). A fathom is exactly six feet, so both digits come off
-  // depth_ft and the tiles never carry a mixed-radix number.
-  const FT_PER_FATHOM = 6;
-  const FATHOM_FEET_MAX_FM = 11;
-  const fathomSounding = subUnitSounding(
-    ["floor", ["/", ["get", "depth_ft"], FT_PER_FATHOM]],
-    [
-      "case",
-      [">=", ["get", "depth_ft"], FATHOM_FEET_MAX_FM * FT_PER_FATHOM],
-      0,
-      ["%", ["get", "depth_ft"], FT_PER_FATHOM],
-    ],
-  );
-  const soundingText: ExpressionSpecification =
-    unit === "ft"
-      ? ["to-string", ["get", "depth_ft"]]
-      : unit === "m"
-        ? metreSounding
-        : fathomSounding;
-  // Contours: metre isobaths (sys != "ft", also legacy no-sys tiles) vs the
-  // fathom-curve set (sys == "ft"), which labels as feet or fathoms. Both
-  // systems label every curve — the standard isobath sets are sparse enough
-  // that GL collision thins the labels. The 0 m drying line is unit-independent
-  // and ships once with NO sys (like depare's drying/nodata), so both filters
-  // admit sys-less features.
-  const contourLineFilter = (unit === "m"
-    ? ["!=", ["get", "sys"], "ft"]
-    : [
-        "any",
-        ["!", ["has", "sys"]],
-        ["==", ["get", "sys"], "ft"],
-      ]) as unknown as ExpressionSpecification;
-  // Depth number only, like paper charts (S-4 B-411.3) — the unit lives in the
-  // consumer's UI, and soundings are already unitless.
-  const contourLabelText: ExpressionSpecification = [
-    "to-string",
-    [
-      "get",
-      unit === "ft" ? "depth_ft" : unit === "fm" ? "depth_fm" : "depth_abs_m",
-    ],
-  ];
-
-  // The safety contour snaps UP the charted ladder to the next-deeper level, exactly
-  // as depthAreasColor recolours the bands, so the emphasized line always bounds the
-  // hazard tint. Contours carry integer depth props (depth_abs_m / depth_fm,
-  // contour_run.py), so the match is exact equality on the active system's prop.
-  const ladder = unit === "m" ? DEPARE_LADDER_M : DEPARE_LADDER_FT;
-  const safetyContour =
-    safety > 0
-      ? (ladder.find((l) => l >= safety - DRVAL_EPS) ??
-        ladder[ladder.length - 1])
-      : 0;
-  const isSafetyContour: ExpressionSpecification =
-    unit === "m"
-      ? ["==", ["get", "depth_abs_m"], safetyContour]
-      : ["==", ["get", "depth_fm"], Math.round(safetyContour / 1.8288)];
-
-  // Shared label styling so soundings and contour labels read as one chart. S-52
-  // puts a sounding digit at ~3.5 mm (§5.2.1(2)) = ~13 px of digit height, and a
-  // digit is ~0.71 em, so the 18 px em at chart scale is the standard's size, not
-  // a large one. The ramp down at coarse zooms is a deliberate deviation from
-  // S-52 §3.1.5 ("text size should never be decreased when zooming out"): that
-  // rule assumes ECDIS's fixed compilation scale, and at a z8 overview the full-
-  // size type shouts over a whole sea. The decimetre subscript glyph is cut at
-  // roughly 0.6 em by the typeface, so the low anchor is also its legibility floor.
-  const labelSize: ExpressionSpecification = [
-    "interpolate",
-    ["linear"],
-    ["zoom"],
-    8,
-    12,
-    13,
-    16,
-  ];
-
-  const coverageColor = flavor.coverage;
-
-  // The depare layer carries three ENC DEPARE feature kinds in one fill, keyed by attribute
-  // presence: depth bands (drval1/drval2, sys-tagged per m/ft ladder, drval1 >= 0), drying
-  // foreshore (drval1 < 0, no sys), and unknown-depth water (no drval1, no sys). Bands
-  // duplicate per sys, so only the active ladder shows, and only in bands mode; drying +
-  // nodata have NO sys and ship once, so `!has sys` selects them and they render in BOTH
-  // shading modes — relief filters the bands out (the raster ramp carries depth; two 0.85
-  // fills would compound) but keeps the honesty fills, since a #24-cleared lake must read as
-  // unknown water — the render now tints 0-fill as unknown water too, and the depare polygon
-  // keeps that categorical (and adds the drying tint).
-  const bandSys = unit === "m" ? "m" : "ft";
-  const depareFilter = (shading === "bands"
-    ? ["any", ["!", ["has", "sys"]], ["==", ["get", "sys"], bandSys]]
-    : ["!", ["has", "sys"]]) as unknown as ExpressionSpecification;
-  // Fill: nodata (no drval1) → provisional flat tint; drying (drval1 < 0) → foreshore green;
-  // else the band ramp keyed off drval1. `case` short-circuits, so the drval1 comparison only
-  // runs once the no-drval1 branch has ruled nodata out.
-  const depareColor = [
-    "case",
-    ["!", ["has", "drval1"]],
-    flavor.nodata,
-    ["<", ["get", "drval1"], 0],
-    flavor.drying,
-    depthAreasColor(flavor, { unit, safety }),
-  ] as unknown as ExpressionSpecification;
-  // nodata carries the provisional lighter wash it had as its own layer; bands + drying stay
-  // at the depth-fill opacity.
-  const depareOpacity = [
-    "case",
-    ["!", ["has", "drval1"]],
-    0.55,
-    0.85,
-  ] as unknown as ExpressionSpecification;
-
   return [
-    {
-      id: "depth-shading",
-      type: "color-relief",
-      source: dem,
-      // Bands mode: the vector depth areas take over at their z6 data floor;
-      // the relief carries lower zooms (same palette, so the handoff is a
-      // sharpness change, not a colour change).
-      ...(shading === "bands" ? { maxzoom: BANDS_MIN_ZOOM } : {}),
-      paint: {
-        "color-relief-color": depthRelief(flavor, { unit, safety }),
-        "color-relief-opacity": 0.85,
-        // Linear resampling paints a light seam along every unknown-water boundary
-        resampling: "nearest",
-      },
-    },
-    {
-      // ENC DEPARE fill — the vector twin of depth-shading, carrying all three depare
-      // feature kinds keyed by attribute presence (see the expressions above): depth bands
-      // (crisp tint per drval1, safety recolour snapped to the next-deeper charted level),
-      // drying foreshore (INT-1 green, negative drval1), and unknown-depth water (provisional
-      // flat tint, no drval1). The three are disjoint by construction, so `fill-sort-key: rank`
-      // is only a stable tie-breaker at an incidental simplification-wobble edge — nodata under
-      // bands (real depth wins), drying over the shoal band it abuts along their shared 0 m seam.
-      // Bands are filtered out in relief mode (the raster ramp carries depth); drying
-      // + nodata stay in both modes. Where no drying/nodata polygon covers a >=0 pixel the DEM
-      // ramp still paints the land wash, so a mask miss degrades to plain land, never to
-      // water-over-land.
-      id: "depth-areas",
-      type: "fill",
-      source: vector,
-      "source-layer": "depare",
-      filter: depareFilter,
-      minzoom: BANDS_MIN_ZOOM,
-      layout: { "fill-sort-key": ["get", "rank"] },
-      paint: {
-        "fill-color": depareColor,
-        "fill-opacity": depareOpacity,
-      },
-    },
-    {
-      id: "depth-hillshade",
-      type: "hillshade",
-      source: dem,
-      layout: { visibility: hillshade ? "visible" : "none" },
-      paint: {
-        "hillshade-exaggeration": 0.5,
-        "hillshade-shadow-color": flavor.hillshadeShadow,
-        "hillshade-highlight-color": flavor.hillshadeHighlight,
-        "hillshade-illumination-direction": 315,
-      },
-    },
-    {
-      id: "contour-lines",
-      type: "line",
-      source: vector,
-      "source-layer": "contours",
-      filter: contourLineFilter,
-      // Presentation floor, not a data limit: below z6 isobaths read as clutter over depth shading.
-      minzoom: 6,
-      // Full-strength linework at DEPCN weight — translucent hairlines read as
-      // shading artefacts rather than isobaths.
-      paint: {
-        // The safety contour is the one emphasized isobath — thicker, in the emphasis
-        // colour, like S-52's DEPSC over DEPCN (IMO MSC.232 requires the emphasis);
-        // every other contour stays uniform DEPCN weight (S-4 B-411.1 recommends
-        // against emphasizing fixed standard contours).
-        "line-color": safetyContour
-          ? ["case", isSafetyContour, flavor.contourEmphasis, flavor.contour]
-          : flavor.contour,
-        "line-width": safetyContour ? ["case", isSafetyContour, 1.5, 0.8] : 0.8,
-      },
-    },
-    {
-      id: "contour-labels",
-      type: "symbol",
-      source: vector,
-      "source-layer": "contours",
-      filter: contourLineFilter,
-      minzoom: 8,
-      layout: {
-        "symbol-placement": "line",
-        "text-field": contourLabelText,
-        "text-size": labelSize,
-        "text-font": flavor.font,
-        "text-letter-spacing": 0.1,
-        "text-max-angle": 30,
-        "text-padding": 50,
-      },
-      paint: {
-        "text-color": flavor.label,
-        "text-halo-color": flavor.labelHalo,
-        "text-halo-width": 1,
-      },
-    },
-    {
-      id: "soundings",
-      type: "symbol",
-      source: vector,
-      "source-layer": "soundings",
-      minzoom: 7,
-      layout: {
-        "text-field": soundingText,
-        "text-font": flavor.soundingFont,
-        "text-size": labelSize,
-        "text-padding": 8,
-        // Lower sorts first and wins the collision. A prime sounding outranks the whole field —
-        // "must always be shown" (S-4 B-410b) fails if a deeper neighbour can displace it — and
-        // the rest fall back to shoalest-first, so where two ordinary soundings collide the
-        // safer number survives.
-        "symbol-sort-key": [
-          "case",
-          ["==", ["get", "prime"], 1],
-          -1e6,
-          ["get", "depth_m"],
-        ] as unknown as ExpressionSpecification,
-      },
-      paint: {
-        // One colour for the whole field, like a paper chart: S-4 sets every sounding in
-        // one style and reserves type distinctions for reliability (B-412.4), not depth —
-        // hazard is carried by the depth-area tint and the isobaths themselves. `prime` (the
-        // least depth inside a closed isobath) still governs retention and collision priority
-        // above, but it is a topological fact of the build window, not a hazard ranking: a
-        // coastal shelf whose contour closes beyond the window edge is never prime, while a
-        // 0.5 m wrinkle at 29 m is, so inking it black read exactly backwards.
-        "text-color": flavor.label,
-        "text-halo-color": flavor.labelHalo,
-        "text-halo-width": 1,
-      },
-    },
-    // Source coverage (provenance): footprint polygons with props source_id /
-    // source_name / source_maxzoom, from the standalone coverage tileset.
-    // Hidden by default; a viewer can toggle them on for click-to-identify.
-    {
-      id: "source-fill",
-      type: "fill",
-      source: coverage,
-      "source-layer": "coverage",
-      layout: { visibility: "none" },
-      paint: { "fill-color": coverageColor, "fill-opacity": 0.12 },
-    },
-    {
-      // Brightened fill of one source (filter set by the consumer on click).
-      id: "source-highlight",
-      type: "fill",
-      source: coverage,
-      "source-layer": "coverage",
-      filter: ["==", ["get", "source_id"], "__none__"],
-      layout: { visibility: "none" },
-      paint: { "fill-color": coverageColor, "fill-opacity": 0.4 },
-    },
-    {
-      id: "source-outline",
-      type: "line",
-      source: coverage,
-      "source-layer": "coverage",
-      layout: { visibility: "none" },
-      paint: { "line-color": coverageColor, "line-width": 1.5 },
-    },
-    {
-      id: "source-labels",
-      type: "symbol",
-      source: coverage,
-      "source-layer": "coverage",
-      layout: {
-        visibility: "none",
-        "text-field": ["get", "source_name"],
-        "text-size": 11,
-        "text-font": flavor.font,
-      },
-      paint: {
-        "text-color": coverageColor,
-        "text-halo-color": flavor.labelHalo,
-        "text-halo-width": 1.2,
-      },
-    },
+    depthShadingLayer(flavor, { dem, unit, safety, shading }),
+    depthAreasLayer(flavor, { vector, unit, safety, shading }),
+    hillshadeLayer(flavor, { dem, hillshade }),
+    contourLinesLayer(flavor, { vector, unit, safety }),
+    contourLabelsLayer(flavor, { vector, unit }),
+    soundingsLayer(flavor, { vector, unit }),
+    ...coverageLayers(flavor, { coverage }),
   ];
 }
 
@@ -750,15 +203,28 @@ export interface ChartMap {
   getLayer(id: string): unknown;
 }
 
-// Change the mariner settings on a live map: re-derive the unit/safety-
-// dependent layer properties (depth ramp, isobath filters, label text, unsafe-
-// sounding emphasis) and set them in place — the in-place equivalent of
-// reloading a regenerated style. Takes the full settings each call: nothing
-// map-side stores the previous values, so callers pass what their controls
-// currently show. `shading` also gates the depare fill's filter (relief hides
-// the depth bands but keeps drying/nodata), so pass the current mode — it
-// defaults to the relief mode when omitted. Layers absent from the map
-// (composed subsets) are skipped.
+// Which properties applyState re-derives, declared BY each layer module beside
+// the layer it describes — a layer that gains a state-dependent property
+// declares it there, in the same diff, instead of this file quietly not
+// updating it (the failure mode of the hardcoded per-layer switch this table
+// replaced).
+const STATEFUL: Record<string, string[]> = {
+  "depth-shading": depthShadingState,
+  "depth-areas": depthAreasState,
+  "depth-hillshade": hillshadeState,
+  "contour-lines": contourLinesState,
+  "contour-labels": contourLabelsState,
+  soundings: soundingsState,
+};
+
+// Change the mariner settings on a live map: re-derive each layer's declared
+// state-dependent properties (depth ramp, isobath filters, label text) and set
+// them in place — the in-place equivalent of reloading a regenerated style.
+// Takes the full settings each call: nothing map-side stores the previous
+// values, so callers pass what their controls currently show. `shading` also
+// gates the depare fill's filter (relief hides the depth bands but keeps
+// drying/nodata), so pass the current mode — it defaults to the relief mode
+// when omitted. Layers absent from the map (composed subsets) are skipped.
 export function applyState(
   map: ChartMap,
   {
@@ -771,52 +237,31 @@ export function applyState(
 ): void {
   const spec = Object.fromEntries(
     layers(flavor, { unit, safety, shading, hillshade }).map((l) => [l.id, l]),
-  ) as Record<string, { filter?: unknown; layout?: any; paint?: any }>;
-  if (map.getLayer("depth-shading"))
-    map.setPaintProperty(
-      "depth-shading",
-      "color-relief-color",
-      spec["depth-shading"].paint["color-relief-color"],
-    );
-  if (map.getLayer("depth-areas")) {
-    map.setFilter("depth-areas", spec["depth-areas"].filter);
-    map.setPaintProperty(
-      "depth-areas",
-      "fill-color",
-      spec["depth-areas"].paint["fill-color"],
-    );
-  }
-  if (map.getLayer("contour-lines")) {
-    map.setFilter("contour-lines", spec["contour-lines"].filter);
-    // safety moves the emphasized contour, so the paint is safety-dependent too
-    for (const p of ["line-color", "line-width"])
-      map.setPaintProperty("contour-lines", p, spec["contour-lines"].paint[p]);
-  }
-  if (map.getLayer("depth-hillshade"))
-    map.setLayoutProperty(
-      "depth-hillshade",
-      "visibility",
-      spec["depth-hillshade"].layout.visibility,
-    );
-  if (map.getLayer("contour-labels")) {
-    map.setFilter("contour-labels", spec["contour-labels"].filter);
-    map.setLayoutProperty(
-      "contour-labels",
-      "text-field",
-      spec["contour-labels"].layout["text-field"],
-    );
-  }
-  if (map.getLayer("soundings")) {
-    map.setLayoutProperty(
-      "soundings",
-      "text-field",
-      spec["soundings"].layout["text-field"],
-    );
-    map.setPaintProperty(
-      "soundings",
-      "text-color",
-      spec["soundings"].paint["text-color"],
-    );
+  ) as Record<
+    string,
+    {
+      filter?: unknown;
+      layout?: Record<string, unknown>;
+      paint?: Record<string, unknown>;
+    }
+  >;
+  for (const [id, props] of Object.entries(STATEFUL)) {
+    if (!map.getLayer(id)) continue;
+    for (const prop of props) {
+      if (prop === "filter") map.setFilter(id, spec[id].filter);
+      else if (prop.startsWith("layout."))
+        map.setLayoutProperty(
+          id,
+          prop.slice(7),
+          spec[id].layout?.[prop.slice(7)],
+        );
+      else if (prop.startsWith("paint."))
+        map.setPaintProperty(
+          id,
+          prop.slice(6),
+          spec[id].paint?.[prop.slice(6)],
+        );
+    }
   }
 }
 
