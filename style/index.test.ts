@@ -342,7 +342,7 @@ test("contour labels print the depth number only — no unit suffix", () => {
   }
 });
 
-test("soundings drop the sub-unit digit, and never show a zero one", () => {
+test("soundings set the sub-unit as a real subscript glyph, never a zero one", () => {
   const field = (unit: "m" | "ft" | "fm") =>
     (
       layers(day, { unit }).find((l) => l.id === "soundings") as {
@@ -356,38 +356,35 @@ test("soundings drop the sub-unit digit, and never show a zero one", () => {
 
   const print = (unit: "m" | "fm", props: Record<string, number>, zoom = 12) => {
     const compiled = createExpression(field(unit), {
-      type: "formatted",
+      type: "string",
       "property-type": "data-driven",
       expression: { interpolated: false, parameters: ["zoom", "feature"] },
     });
     assert(compiled.result === "success");
-    return (
-      compiled.value.evaluate({ zoom }, { properties: props }) as {
-        sections: { text: string; scale: number | null }[];
-      }
-    ).sections.map((s) => [s.text, s.scale]);
+    return String(compiled.value.evaluate({ zoom }, { properties: props }));
   };
   const m = (depth_m: number, zoom?: number) => print("m", { depth_m }, zoom);
   const fm = (depth_ft: number) => print("fm", { depth_ft });
-  // The sub-unit scale is a tuning knob; assert the structure it produces, not its value.
-  const sub = m(3.9)[1][1] as number;
-  expect(sub).toBeGreaterThan(0).toBeLessThan(1);
+  const HAIR = "\u200a"; // hair space
 
   // Metres: decimetres to 21 m, half metres 21-31 (a .5 residual), whole metres beyond.
-  expect(m(3.9)).toEqual([["3", null], ["9", sub]]);
-  expect(m(23.5)).toEqual([["23", null], ["5", sub]]);
-  expect(m(5.0)).toEqual([["5", null], ["", sub]]);
-  expect(m(137)).toEqual([["137", null], ["", sub]]);
+  // Real subscript glyphs (the typeface owns drop and size), a hair space for air, and no
+  // decimal separator — S-4 B-412.1 separates only when the digits share a baseline, and on
+  // the fathom ladder a point would misread 3 fathoms 4 feet as 3.4 fathoms.
+  expect(m(3.9)).toBe("3" + HAIR + "\u2089");
+  expect(m(23.5)).toBe("23" + HAIR + "\u2085");
+  expect(m(5.0)).toBe("5");
+  expect(m(137)).toBe("137");
   // Sub-units are a function of depth (S-4 B-412), never of scale.
-  expect(m(3.9, 8)).toEqual([["3", null], ["9", sub]]);
+  expect(m(3.9, 8)).toBe("3" + HAIR + "\u2089");
 
   // Fathoms derive both digits from whole feet: 22 ft is 3 fathoms 4 feet.
-  expect(fm(22)).toEqual([["3", null], ["4", sub]]);
-  expect(fm(18)).toEqual([["3", null], ["", sub]]); // exactly 3 fathoms — no feet digit
+  expect(fm(22)).toBe("3" + HAIR + "\u2084");
+  expect(fm(18)).toBe("3"); // exactly 3 fathoms — no feet digit
   // From 11 fathoms the chart drops feet entirely (Canada CHS Chart 1, 2022).
-  expect(fm(11 * 6)).toEqual([["11", null], ["", sub]]);
-  expect(fm(11 * 6 + 5)).toEqual([["11", null], ["", sub]]);
-  expect(fm(10 * 6 + 5)).toEqual([["10", null], ["5", sub]]); // …but not one fathom earlier
+  expect(fm(11 * 6)).toBe("11");
+  expect(fm(11 * 6 + 5)).toBe("11");
+  expect(fm(10 * 6 + 5)).toBe("10" + HAIR + "\u2085"); // …but not one fathom earlier
 });
 
 test("a prime sounding outranks the field for collisions, in uniform ink", () => {
@@ -427,10 +424,11 @@ test("glyphs are self-hosted, and soundings alone are set sloping", () => {
     (s.layers.find((l) => l.id === id) as { layout: Record<string, unknown> })
       .layout["text-font"];
   // S-4 B-412.1 sets soundings in sloping numerals; B-412.4 reserves upright for soundings of
-  // lower reliability, so nothing else on the chart borrows the italic face.
-  expect(fontOf("soundings")).toEqual(["Noto Sans Italic"]);
-  expect(fontOf("contour-labels")).toEqual(["Noto Sans Regular"]);
-  expect(fontOf("source-labels")).toEqual(["Noto Sans Regular"]);
+  // lower reliability, so nothing else on the chart borrows an italic face. The weight is a
+  // flavor-tuning knob — the POSTURE is the invariant.
+  expect((fontOf("soundings") as string[])[0]).toMatch(/ Italic$/);
+  expect((fontOf("contour-labels") as string[])[0]).not.toMatch(/Italic/);
+  expect((fontOf("source-labels") as string[])[0]).not.toMatch(/Italic/);
 });
 
 test("the safety contour is the one emphasized isobath", () => {

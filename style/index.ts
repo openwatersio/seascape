@@ -102,12 +102,12 @@ export const day: Flavor = {
   // only unsafe soundings jump, in soundingEmphasis (SNDG2).
   contour: "#768c97",
   label: "#768c97",
-  labelHalo: "rgba(255,255,255,0.8)",
+  labelHalo: "rgba(255,255,255,0.5)",
   soundingEmphasis: "#000",
   // Safety contour line (S-52 DEPSC day): darker grey, distinct from SNDG2 black.
   contourEmphasis: "#4C5B63",
-  font: ["Noto Sans Regular"],
-  soundingFont: ["Noto Sans Italic"],
+  font: ["Noto Sans Medium"],
+  soundingFont: ["Noto Sans Medium Italic"],
   hillshadeShadow: "#9adcfe",
   hillshadeHighlight: "#ffffff",
   coverage: "#f58231",
@@ -122,14 +122,13 @@ const DEFAULT_SHADING: Shading = "relief";
 // lines' presentation floor — depth shading carries lower zooms.
 const BANDS_MIN_ZOOM = 6;
 
-// Decimetre digit on soundings. S-52's glyphs (PresLib SOUNDG10-19 vs SOUNDG50-59)
-// are the same 8x11 size and differ only by a 4-unit drop, so the decimetre reads
-// at full weight on screen; S-4 B-412.1's "visibly smaller" is the paper rule.
-// vertical-align only offsets a section when its size differs, so the scale buys
-// the drop. It has to be small enough that 1.3 m never reads as 13 m — the two
-// occur side by side in the same view — which measured out at 0.6, not the ~0.8
-// that matches S-52's 4-of-11 geometry.
-const SUBSCRIPT_SCALE = 0.666;
+// Sub-unit digits on soundings are REAL subscript glyphs (U+2080-2089) from the self-hosted
+// stack — the type designer set the drop and the sidebearings. The alternative, a scaled
+// `format` section with vertical-align, aligns em-boxes rather than baselines, so the digit
+// sat visibly high and tight against the integer. A hair space (U+200A, also in the stack)
+// gives the pair its air.
+const SUB = "\u2080\u2081\u2082\u2083\u2084\u2085\u2086\u2087\u2088\u2089";
+const SUBSCRIPT = [...SUB].map((c, i) => (i ? "\u200A" + c : ""));
 
 // Self-hosted (openwatersio/tile-fonts). The MapLibre demo stack this replaced is a subset —
 // of the ten subscript digits it ships three — and a missing glyph is not an error, it simply
@@ -365,33 +364,31 @@ export function layers(
     whole: ExpressionSpecification,
     sub: ExpressionSpecification,
   ): ExpressionSpecification => [
-    "format",
+    "concat",
     ["to-string", whole],
-    {},
     [
       "match",
       sub,
       1,
-      "1",
+      SUBSCRIPT[1],
       2,
-      "2",
+      SUBSCRIPT[2],
       3,
-      "3",
+      SUBSCRIPT[3],
       4,
-      "4",
+      SUBSCRIPT[4],
       5,
-      "5",
+      SUBSCRIPT[5],
       6,
-      "6",
+      SUBSCRIPT[6],
       7,
-      "7",
+      SUBSCRIPT[7],
       8,
-      "8",
+      SUBSCRIPT[8],
       9,
-      "9",
+      SUBSCRIPT[9],
       "",
     ],
-    { "font-scale": SUBSCRIPT_SCALE, "vertical-align": "bottom" },
   ];
   // Metres: the tenths digit is decimetres. `round` on the residual recovers it through float
   // dust (3.9 % 1 == 0.9000000000000004).
@@ -459,11 +456,21 @@ export function layers(
 
   // Shared label styling so soundings and contour labels read as one chart. S-52
   // puts a sounding digit at ~3.5 mm (§5.2.1(2)) = ~13 px of digit height, and a
-  // digit is ~0.71 em, so 18 px em is the standard's size, not a large one. Flat
-  // across zoom because "text size should never be decreased when zooming out"
-  // (S-52 §3.1.5) — low-zoom clutter is thinned by per-feature minzoom and label
-  // collision, never by shrinking the type.
-  const labelSize = 13;
+  // digit is ~0.71 em, so the 18 px em at chart scale is the standard's size, not
+  // a large one. The ramp down at coarse zooms is a deliberate deviation from
+  // S-52 §3.1.5 ("text size should never be decreased when zooming out"): that
+  // rule assumes ECDIS's fixed compilation scale, and at a z8 overview the full-
+  // size type shouts over a whole sea. The decimetre subscript glyph is cut at
+  // roughly 0.6 em by the typeface, so the low anchor is also its legibility floor.
+  const labelSize: ExpressionSpecification = [
+    "interpolate",
+    ["linear"],
+    ["zoom"],
+    8,
+    12,
+    13,
+    16,
+  ];
 
   const coverageColor = flavor.coverage;
 
@@ -605,6 +612,7 @@ export function layers(
         "text-field": soundingText,
         "text-font": flavor.soundingFont,
         "text-size": labelSize,
+        "text-padding": 8,
         // Lower sorts first and wins the collision. A prime sounding outranks the whole field —
         // "must always be shown" (S-4 B-410b) fails if a deeper neighbour can displace it — and
         // the rest fall back to shoalest-first, so where two ordinary soundings collide the
@@ -615,7 +623,6 @@ export function layers(
           -1e6,
           ["get", "depth_m"],
         ] as unknown as ExpressionSpecification,
-        "text-padding": 20,
       },
       paint: {
         // One colour for the whole field, like a paper chart: S-4 sets every sounding in
