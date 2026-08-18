@@ -112,7 +112,162 @@ def _ring_minzoom(level_pos):
     return prev
 
 
-def _tc(minz, child_z, prime=False):
+# ── Error-driven repair (S-4 B-410a as the selector, not just the gate) ─────────────────────
+# After the lattice + primes, each display zoom's field is tested by interpolation against the
+# DEM and repaired where it lies: a pixel shoaler than the charted field implies is the B-410a
+# safety direction (tight tolerance); a pixel much deeper is the B-403.1a "full range of depth"
+# direction (loose tolerance — this is what makes a dredged channel's deep line appear, with no
+# thalweg extraction — measured on the New York window: 26 insertions at 26-31 m through the
+# ~10 m ambient of the Ambrose corridor, including the Narrows scour, from the deep rule alone).
+# Insertions land at their measured pixel with the repaired zoom as minzoom,
+# so a sounding's minzoom is the coarsest zoom that needed it — significance grading by
+# construction. All knobs env-tunable on a re-run; SOUND_REPAIR=0 leaves the field as built.
+SOUND_REPAIR = os.environ.get("SOUND_REPAIR", "1") == "1"
+# Shoal-side: insert where ground is shoaler than interpolation by more than this (fraction of
+# charted depth, with an absolute floor to ride over DEM noise). OFF by default: B-410a's mariner
+# interpolates from soundings AND contours, and with the isobaths charted (cut from this same DEM)
+# the measured shoal residual at charted precision is 0.08% before any repair — while a
+# soundings-only interpolant manufactures shoal "violations" in the tent around every deep
+# insertion, cascading pitch-spaced points zoom after zoom (measured: every zoom capped out and
+# z13 nearest-neighbour medians of 0.5 px). The shoal side is already guarded by the shoalest-
+# per-cell lattice, the prime rings, and the band tints; enable for a source where those fail.
+REPAIR_SHOAL = os.environ.get("REPAIR_SHOAL", "0") == "1"
+REPAIR_SHOAL_ABS_M = float(os.environ.get("REPAIR_SHOAL_ABS_M", "0.5"))
+REPAIR_SHOAL_FRAC = float(os.environ.get("REPAIR_SHOAL_FRAC", "0.10"))
+# Deep-side: insert where ground is deeper than interpolation by more than this.
+REPAIR_DEEP_ABS_M = float(os.environ.get("REPAIR_DEEP_ABS_M", "2.0"))
+REPAIR_DEEP_FRAC = float(os.environ.get("REPAIR_DEEP_FRAC", "0.5"))
+# Minimum screen-px spacing (at the zoom being repaired) between an insertion and any sounding
+# already displayed there. 0 = no spacing constraint (label collision is the only thinning).
+REPAIR_SPACING_PX = float(os.environ.get("REPAIR_SPACING_PX", "8"))
+# One pass per zoom, judged against the field as it stood — iterating re-judges against the
+# freshly inserted points, and each deep insertion tents the interpolant into shoal-side
+# "violations" around itself (and vice versa), a seesaw that piled 3,400 sub-pixel points onto
+# the marsh fixture without converging. The cap is a runaway guard, not a tuning knob.
+REPAIR_BATCH = int(os.environ.get("REPAIR_BATCH", "400"))
+_M_PER_PX_Z0 = 40075016.685578488 / 512   # 3857 metres per 512px-tile screen pixel at z0
+
+
+# Sounding kinds: how a point entered the field decides its zoom capping and tile properties.
+KIND_LATTICE = 0   # capped to its pyramid level, except the finest level
+KIND_PRIME = 1     # least depth in a closed isobath: uncapped, carries prime=1
+KIND_REPAIR = 2    # B-410a/B-403.1a insertion: uncapped from the zoom that needed it
+
+
+def _displayed_at(pts, zoom, child_z):
+    """Indices of pts displayed at `zoom` under _tc's placement: capped lattice levels show at
+    exactly their zoom; primes and repair insertions ride uncapped from their minzoom."""
+    out = []
+    for i, (_d, _x, _y, mz, kind) in enumerate(pts):
+        uncapped = kind != KIND_LATTICE or mz >= child_z
+        if (uncapped and zoom >= mz) or (not uncapped and zoom == mz):
+            out.append(i)
+    return out
+
+
+def _repair(src, nodata, bbox, pts, z, child_z):
+    """Per display zoom, coarse to fine: interpolate the displayed field, find where the DEM
+    contradicts it beyond tolerance, insert the offending ground at its measured pixel, repeat.
+    Inserted soundings are uncapped from the repaired zoom, so they join every finer field.
+    Returns (pts, per-zoom insertion counts)."""
+    import numpy as np
+    from scipy.interpolate import LinearNDInterpolator
+    from rasterio.windows import Window
+
+    transform = src.transform
+    W, H = src.width, src.height
+    k = max(1, -(-max(W, H) // SHOAL_DETECT_PX))
+    small = src.read(1, out_shape=(max(1, H // k), max(1, W // k)))
+    wet = (small != nodata) & (small < 0)
+    rows, cols = np.nonzero(wet)
+    sx, sy = transform * (cols * k + k / 2.0, rows * k + k / 2.0)
+    inb = (sx >= bbox.left) & (sx <= bbox.right) & (sy >= bbox.bottom) & (sy <= bbox.top)
+    rows, cols, sx, sy = rows[inb], cols[inb], sx[inb], sy[inb]
+    actual = -small[rows, cols].astype(float)
+
+    def pin(r, c, shoal, want=None):
+        """One small full-res read around decimated pixel (r, c) -> a measured pixel.
+
+        Shoal-side takes the shoalest pixel: understating depth is the safe error. Deep-side
+        takes the pixel CLOSEST to the decimated value instead — pinning extremes mints sharp
+        control points whose own interpolation tents then violate the opposite tolerance, and
+        the repair chases its tail (measured: marsh shoal violations rose 0.08% -> 6.6% while
+        3,600 points piled in at sub-pixel pitch)."""
+        pad = k + 1
+        r0, c0 = max(0, r * k - pad), max(0, c * k - pad)
+        r1, c1 = min(H, r * k + k + pad), min(W, c * k + k + pad)
+        fine = src.read(1, window=Window(c0, r0, c1 - c0, r1 - r0))
+        fwet = (fine != nodata) & (fine < 0)
+        if not fwet.any():
+            return None
+        if shoal:
+            pick = np.where(fwet, fine, -np.inf)
+            by, bx = np.unravel_index(np.argmax(pick), fine.shape)
+        else:
+            pick = np.where(fwet, np.abs(-fine - want), np.inf)
+            by, bx = np.unravel_index(np.argmin(pick), fine.shape)
+        return -float(fine[by, bx]), c0 + bx + 0.5, r0 + by + 0.5
+
+    inserted = {}
+    for zoom in range(z, child_z + 1):
+        spacing_m = REPAIR_SPACING_PX * _M_PER_PX_Z0 / (1 << zoom)
+        idx = _displayed_at(pts, zoom, child_z)
+        if len(idx) < 3:
+            continue
+        fx = np.array([pts[i][1] for i in idx]); fy = np.array([pts[i][2] for i in idx])
+        fd = np.array([pts[i][0] for i in idx])
+        expected = LinearNDInterpolator(np.column_stack([fx, fy]), fd)(
+            np.column_stack([sx, sy]))
+        ok = ~np.isnan(expected)
+        shoal_err = np.where(ok, expected - actual, -np.inf)   # >0: ground shoaler than charted
+        deep_err = np.where(ok, actual - expected, -np.inf)    # >0: ground deeper than charted
+        shoal_bad = (shoal_err > np.maximum(REPAIR_SHOAL_ABS_M, REPAIR_SHOAL_FRAC * actual)) \
+            if REPAIR_SHOAL else np.zeros_like(shoal_err, dtype=bool)
+        deep_bad = (deep_err > np.maximum(REPAIR_DEEP_ABS_M, REPAIR_DEEP_FRAC * actual)) \
+            & (actual <= SHOAL_RING_MAX_DEPTH_M)
+        # Deep-side repair stops at the navigational band. B-403.1a's "full range of depth"
+        # is about navigable water — a channel, an anchorage; abyssal slope texture belongs
+        # to contours and the relief. Without the bound the flat-deep control fixture drew
+        # 1,018 insertions (99% closer together than a label) bounding 3,000 m slopes.
+        err = np.where(shoal_bad, shoal_err, np.where(deep_bad, deep_err, -np.inf))
+        order = np.argsort(-err)
+        order = order[err[order] > 0]
+        if not order.size:
+            continue
+        # Greedy, worst first: a DEEP insertion must clear the spacing floor against the
+        # displayed field and this pass's own insertions — it exists for legibility, so
+        # legibility may thin it. A SHOAL insertion is safety data (B-410a): spacing never
+        # suppresses it, only the decimation pitch dedupes it, and label collision resolves
+        # crowding at render time with the shoalest number winning.
+        taken = []
+        fxy = np.column_stack([fx, fy])
+        pitch = k * abs(transform.a)
+        for j in order:
+            px_, py_ = sx[j], sy[j]
+            floor_m = pitch if shoal_bad[j] else max(spacing_m, pitch)
+            # Both sides keep at least the decimation pitch from the existing field: a shoal
+            # violation within a pitch of a charted sounding is a near-duplicate of it, not a
+            # suppressed hazard, and without this each zoom's pass stacks sub-pixel shoal points
+            # around the previous zoom's deep insertions (measured: NN medians of 0.5 px at z13).
+            if np.hypot(fxy[:, 0] - px_, fxy[:, 1] - py_).min() < floor_m:
+                continue
+            if any((px_ - tx) ** 2 + (py_ - ty) ** 2 < floor_m * floor_m for tx, ty in taken):
+                continue
+            got = pin(int(rows[j]), int(cols[j]), bool(shoal_bad[j]), want=float(actual[j]))
+            if got is None or got[0] < SOUND_MIN_DEPTH_M:
+                continue
+            d, pc, pr = got
+            x, y = transform * (pc, pr)
+            pts.append((d, x, y, zoom, KIND_REPAIR))
+            taken.append((x, y))
+            if len(taken) >= REPAIR_BATCH:
+                break
+        if taken:
+            inserted[zoom] = len(taken)
+    return pts, inserted
+
+
+def _tc(minz, child_z, kind=KIND_LATTICE):
     """Per-feature tippecanoe zoom placement. Coarser levels swap out as the next
     finer field arrives (maxzoom == their own zoom). The finest level (minz ==
     child_z) declares NO maxzoom so it persists to the tileset max: child_z is the
@@ -121,10 +276,12 @@ def _tc(minz, child_z, prime=False):
     at child_z blanked the layer there (soundings gone at z11+ over Denmark while
     contours carried on).
 
-    A prime sounding — the least depth inside a closed isobath — is never CAPPED, so it can never
-    be swapped out by a finer field as the mariner zooms in. Its minzoom is its enclosing
-    isobath's display zoom — see _ring_minzoom."""
-    if prime:
+    A prime sounding (least depth inside a closed isobath) is never CAPPED, so it can never be
+    swapped out by a finer field as the mariner zooms in; its minzoom is its enclosing isobath's
+    display zoom (_ring_minzoom). A repair insertion is likewise uncapped: it exists because the
+    field failed B-410a/B-403.1a at its minzoom, and the finer fields it joins only interpolate
+    better for having it."""
+    if kind != KIND_LATTICE:
         return {"minzoom": minz}
     return {"minzoom": minz} if minz == child_z else {"minzoom": minz, "maxzoom": minz}
 
@@ -163,13 +320,13 @@ def _depths(depth_pos):
     }
 
 
-def _props(depth_pos, prime):
+def _props(depth_pos, kind):
     """Tile properties for one sounding. A least depth inside a closed isobath is the top of
     S-4 B-410b's selection hierarchy, so the chart has to be able to SET it apart, not merely keep
     it — `prime` is what lets the style weight it. Emitted only when true: an absent key costs a
     vector tile nothing, and prime soundings are a small minority of the field."""
     props = _depths(depth_pos)
-    if prime:
+    if kind == KIND_PRIME:
         props["prime"] = 1
     return props
 
@@ -366,7 +523,7 @@ def _pyramid(src, nodata, bbox, min_depth, z, child_z):
         if in_bbox(x, y):
             # Displays exactly where its enclosing isobath displays (_ring_minzoom); never
             # capped, so the least depth accompanies the ring at every zoom the ring survives.
-            pts.append((float(d), x, y, max(z, rmz), True))
+            pts.append((float(d), x, y, max(z, rmz), KIND_PRIME))
 
     max_shift = max((s for _, s in SOUND_THIN_TIERS), default=0)
     for level in range(max(0, child_z - z) + 1 + max_shift):
@@ -382,7 +539,7 @@ def _pyramid(src, nodata, bbox, min_depth, z, child_z):
                     continue
                 x, y = transform * (cx[gy, gx], cy[gy, gx])
                 if in_bbox(x, y):
-                    pts.append((float(d), x, y, disp, False))
+                    pts.append((float(d), x, y, disp, KIND_LATTICE))
         g, cx, cy = _reduce_shoalest(g, cx, cy)
     return pts
 
@@ -396,18 +553,22 @@ def _sound_dem(dem, tile_obj, z, child_z, tmp, label):
     with rasterio.open(dem) as src:
         nodata = src.nodata if src.nodata is not None else NODATA
         pts = _pyramid(src, nodata, bbox, SOUND_MIN_DEPTH_M, z, child_z)
+        if SOUND_REPAIR and pts:
+            pts, ins = _repair(src, nodata, bbox, pts, z, child_z)
+            if ins:
+                print(f"repair {label}: " + " ".join(f"z{k}+{v}" for k, v in sorted(ins.items())))
     if not pts:
         print(f"soundings: no wet cells for {label}")
         return None
 
     to4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
     feats = []
-    for d, x3857, y3857, minz, prime in pts:
+    for d, x3857, y3857, minz, kind in pts:
         lon, lat = to4326.transform(x3857, y3857)
         # Each level shows at exactly one zoom (one field per zoom);
-        # the finest level rides uncapped to the tileset max — see _tc.
-        feats.append({"type": "Feature", "tippecanoe": _tc(minz, child_z, prime),
-                      "properties": _props(d, prime),
+        # the finest level, primes and repair insertions ride uncapped — see _tc.
+        feats.append({"type": "Feature", "tippecanoe": _tc(minz, child_z, kind),
+                      "properties": _props(d, kind),
                       "geometry": {"type": "Point", "coordinates": [round(lon, 6), round(lat, 6)]}})
 
     final = f"{tmp}/soundings.geojsons"
@@ -510,19 +671,20 @@ def _check():
 
     # prime rides to the tiles as a property so the style can weight it; an ordinary sounding
     # carries no key at all, so it costs the tiles nothing.
-    assert _props(3.0, True) == {"depth_m": 3, "depth_ft": 9, "depth_fm": 1, "prime": 1}
-    assert "prime" not in _props(3.0, False)
+    assert _props(3.0, KIND_PRIME) == {"depth_m": 3, "depth_ft": 9, "depth_fm": 1, "prime": 1}
+    assert "prime" not in _props(3.0, KIND_LATTICE) and "prime" not in _props(3.0, KIND_REPAIR)
 
     # zoom placement: coarser levels swap out at their own zoom; the finest level
     # (minz == child_z) is uncapped so it persists above the local source ceiling
     assert _tc(8, 10) == {"minzoom": 8, "maxzoom": 8}
     assert _tc(10, 10) == {"minzoom": 10}
-    assert _tc(8, 10, prime=True) == {"minzoom": 8}   # a least depth is never capped
+    assert _tc(8, 10, KIND_PRIME) == {"minzoom": 8}   # a least depth is never capped
+    assert _tc(8, 10, KIND_REPAIR) == {"minzoom": 8}  # …and neither is a repair insertion
     # …but never past its ring: a prime's minzoom is its enclosing isobath's display zoom.
     # Here the deepest enclosing ring (50 m) draws from z7, so the base zoom (8) binds.
     with rasterio.open(p) as src:
-        promoted = {mz for _d, _x, _y, mz, pr in
-                    _pyramid(src, NODATA, bbox, 1.0, z=8, child_z=9) if pr}
+        promoted = {mz for _d, _x, _y, mz, kind in
+                    _pyramid(src, NODATA, bbox, 1.0, z=8, child_z=9) if kind == KIND_PRIME}
     assert promoted == {8}, promoted
 
     # Enclosed shoals run on the CELL GRID, never the pixels — the whole window is never held in
@@ -602,7 +764,52 @@ def _check():
     assert any(d == 1200.0 and mz == 9 for d, _x, _y, mz, _p in mixed)
     assert all(d == 190.0 for d, _x, _y, mz, _p in mixed if mz == 8)
     # …and the shoal is enclosed by the 200 m isobath, so it is also charted as a prime sounding
-    assert any(d == 190.0 and p for d, _x, _y, _mz, p in mixed), "enclosed 190 m shoal must be prime"
+    assert any(d == 190.0 and kk == KIND_PRIME for d, _x, _y, _mz, kk in mixed), "enclosed 190 m shoal must be prime"
+    # Repair: two shoals share one cell, so the lattice emits only the shoaler and the field
+    # lies about the other; a trench pixel is hidden by shoalest-wins entirely. Shoal-side and
+    # deep-side repair must chart both, at their measured pixels, uncapped from the failing zoom.
+    global SOUND_REPAIR, REPAIR_SHOAL, REPAIR_SPACING_PX
+    rrr = np.full((512, 512), -40.0, "float32")
+    rrr[100, 100] = -1.0     # cell (0,0)'s shoalest — the lattice charts this one
+    rrr[120, 119] = -1.2     # same cell, 2 km away: invisible to the lattice, in the field's hull
+    rrr[240, 140] = -150.0   # deep trench pixel, in the navigational band and inside the z8
+                             # field's convex hull (single-pass repair cannot test beyond it):
+                             # shoalest-wins can never emit it
+    rrr[350, 60] = -150.0    # second trench, outside the z8 hull but inside z9's — visible
+                             # only to the finer zoom's pass
+    rp = f"{tmp}/repair.tif"
+    with rasterio.open(rp, "w", driver="GTiff", height=512, width=512, count=1, dtype="float32",
+                       nodata=NODATA, crs="EPSG:3857",
+                       transform=from_origin(0, 51200, 100, 100)) as dst:
+        dst.write(rrr, 1)
+    rbox = SimpleNamespace(left=0, bottom=0, right=51200, top=51200)
+    SOUND_REPAIR = True
+    REPAIR_SHOAL = True
+    with rasterio.open(rp) as src:
+        base = _pyramid(src, NODATA, rbox, 1.0, z=8, child_z=9)
+        fixed, ins = _repair(src, NODATA, rbox, list(base), 8, 9)
+    reps = [t for t in fixed if t[4] == KIND_REPAIR]
+    assert ins and reps, "repair must insert where the field fails B-410a/B-403.1a"
+    assert any(abs(d - 1.2) < 1e-6 for d, *_ in reps), reps[:4]      # the hidden shoal, exact pixel value
+    assert any(d > 100 for d, *_ in reps), "the trench (deep side) must be charted"
+    # EVERY zoom gets its own pass — a violation visible only in a finer zoom's field must be
+    # repaired there. The trench at (350, 60) sits outside the z8 field's convex hull (4 points)
+    # but inside z9's (16 points), so it is only detectable at z9: insertions must be recorded at
+    # BOTH zooms or the loop returned early (the bug an adversarial review caught after the
+    # z8-only symptom was rationalized away instead of read).
+    assert set(ins) == {8, 9}, ins
+    assert any(t[3] == 9 and t[4] == KIND_REPAIR and t[0] > 100 for t in fixed), \
+        "the z9-only trench must be inserted with minzoom 9"
+
+    # The spacing knob thins: a huge floor suppresses insertions near the displayed field.
+    REPAIR_SPACING_PX = 1e9
+    with rasterio.open(rp) as src:
+        _, ins2 = _repair(src, NODATA, rbox, list(base), 8, 9)
+    assert sum(ins2.values() or [0]) < sum(ins.values()), (ins, ins2)
+    REPAIR_SPACING_PX = 0.0
+    SOUND_REPAIR = False
+    REPAIR_SHOAL = False
+
     print("soundings_run self-check ok")
 
 
