@@ -1,6 +1,6 @@
 #!/usr/bin/env -S uv run --script
-"""Local profiling fixtures: small real windows over the Gulf marsh and the Delmarva lagoons, cut
-from the published mosaic COGs by range read.
+"""Local profiling fixtures: small real windows over the Gulf marsh, the Delmarva lagoons and the
+Iberian abyssal plain, cut from the published mosaic COGs by range read.
 
 A real z15 marsh stem is a z8 macrotile: 65666 px square, 17.2 GB as Float32. That does not run
 on a 17 GB laptop, so the fixtures are synthetic macrotile-z stems over the same ground —
@@ -57,12 +57,19 @@ SITES = {
                     "open bay with real -2/-5 m bathymetry; the level-set control"),
     "delmarva": ("8-74-99-14-3fb472fde1f8.tif", -75.9103, 37.2197,
                  "back-barrier lagoons; the drying fragmentation site, 713 parts at z12"),
+    "iberian-abyssal": ("8-110-91-10-db6827ae146c.tif", -24.61, 45.58,
+                        "deep flat GEBCO-only ocean; the control every other site lacks — every "
+                        "shoal-water measurement needs ground where it should trivially pass"),
 }
 
 # A crop must carry its macrotile's OWN child_z or it is not the surface production contours:
 # the Delmarva macrotile is cz14, and reading it at CHILD_Z would invent detail the mosaic
 # does not hold.
-SITE_CHILD_Z = {"delmarva": 14}
+SITE_CHILD_Z = {"delmarva": 14, "iberian-abyssal": 10}
+
+# Sites whose macrotile is coarse enough that a z12 stem would be a few hundred pixels. Build
+# these at a lower z so the crop is a comparable amount of ground: the core is 2^(cz-z)*512 px.
+SITE_Z = {"iberian-abyssal": 8}
 
 # Published mask sizes, so a stale mask can never silently change a measurement. A stale or
 # absent water.fgb changes the nodata layer AND the drying cut, which is exactly the mechanism
@@ -99,7 +106,7 @@ def build(sites=None, z=12):
     stems = []
     for site in sites:
         tile, lon, lat, _why = SITES[site]
-        stem = stem_for(site, z)
+        stem = stem_for(site, SITE_Z.get(site, z))
         stems.append(stem)
         out = f"{tiles}/{stem}.tif"
         if os.path.exists(out):
@@ -145,7 +152,8 @@ def masks():
 
 def _list():
     for site in SITES:
-        for z in (12, 11, 10, 9):
+        base = SITE_Z.get(site, 12)
+        for z in range(base, base - 4, -1):
             stem = stem_for(site, z)
             (_bounds, res, w, h) = geometry(stem)
             gb = w * h * 4 / 1e9
