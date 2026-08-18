@@ -2,7 +2,7 @@
 
 _Written 2026-08-17. Point-in-time; the code is the source of truth._
 
-Status: in progress — Phases 1-3 implemented, awaiting a soundings rebuild; Phases 4-5 open.
+Status: in progress — Phases 1-4 implemented and committed on `soundings-chart-conformance`; Phase 5 (drying) blocked on the datum workstream.
 
 ## Problem
 
@@ -15,11 +15,11 @@ The findings, numbered as the phases below cite them:
 | 1 | Decimetre labels printed from sources not on chart datum (MSL-referenced UK/NZ/NL/AU sources) | Out of scope — datum workstream |
 | 2 | No data-quality attribution: GEBCO-derived and 0.25 m multibeam soundings render identically (`M_QUAL` is mandatory, S-57 UOC §2.2.3) | Out of scope — quality workstream |
 | 3 | 1.0 m floor deleted the least depths S-4 B-410b ranks highest | Fixed — 0.2 m, from the measured waterline-noise knee |
-| 4 | Only the shoalest pixel per cell is emitted, so a channel's deep line can never appear (B-410b also wants maximum depths; B-403.1a "the full range of depth") | Open |
+| 4 | Only the shoalest pixel per cell is emitted, so a channel's deep line can never appear (B-410b also wants maximum depths; B-403.1a "the full range of depth") | Fixed — error-driven deep-side repair; the Ambrose corridor gains its 26–31 m line and axis infill with no channel-specific code |
 | 5 | Metre precision bands cut at 6 m; S-4 B-412 says decimetres to 21 m, half-metres to 31 m | Fixed |
 | 6 | Whole fathoms everywhere; charts print fathoms-and-feet below 11 fathoms | Fixed — derived from `depth_ft` in the style |
 | 7 | No drying heights (S-4 B-413: shown as soundings, rounded up, underlined) | Blocked on finding 1 |
-| 8 | Sounding density is uniform per cell — responds to depth (thin tiers) but not to seabed roughness (S-4 B-410d wants both) | Open |
+| 8 | Sounding density is uniform per cell — responds to depth (thin tiers) but not to seabed roughness (S-4 B-410d wants both) | Largely fixed — repair insertions land where interpolation fails, which is where structure is; the lattice itself stays uniform |
 | 9 | Nothing verified S-4 B-410a's "final test of depth selection" (interpolation from the charted field) | Fixed — standing gate in `perf/soundings.py` |
 | 10 | Zoom thinning graded by a sounding's own depth, not its significance (S-57 UOC table 2.5 grades SCAMIN by significance, 1→4 steps) | Largely answered — prime retention + ring-tied display; full grading only if the B-410a residual demands it |
 | 11 | All soundings set upright — the posture S-4 B-412.4 reserves for *unreliable* soundings; B-412.1 wants sloping numerals | Fixed — Noto Sans Italic, self-hosted |
