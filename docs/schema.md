@@ -52,8 +52,8 @@ Coarse zooms carry fewer levels (deep-ocean contours thin out zoomed out); a lev
 
 | Field | Type | Meaning |
 |---|---|---|
-| `depth_m` | Number | Depth in metres, **positive-down** (unlike `contours.depth_m`), floored toward shallower; carries one decimal shallower than 6 m, whole metres beyond. |
-| `depth_ft` | Number | Integer feet, floored toward shallower. |
+| `depth_m` | Number | Depth in metres, **positive-down** (unlike `contours.depth_m`), floored toward shallower. The tenths digit is decimetres. Precision follows the charted band (S-4 B-412): decimetres shallower than 21 m, half metres from 21 to 31 m, whole metres beyond. |
+| `depth_ft` | Number | Integer feet, floored toward shallower. A chart sets fathoms-and-feet below 11 fathoms; a fathom is exactly six feet, so a renderer derives both from this field (`floor(depth_ft / 6)` and `depth_ft % 6`). |
 | `depth_fm` | Number | Integer fathoms, floored toward shallower. |
 
 ### `depare` — depth-area polygons (ENC DEPARE)

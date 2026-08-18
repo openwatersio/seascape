@@ -409,9 +409,13 @@ def require_stable_complete(layer, stems, files):
 # depth — tippecanoe detects per layer).
 # depare's kind stays in the FGBs but OUT of the tiles: nothing reads it (the style keys on
 # sys/drval1 presence and sorts by rank), and it measured -3.9% on the dominant coarse-stem class.
+# `-y` is an ALLOWLIST: an attribute missing from this list is silently dropped from the tiles,
+# however faithfully the pipeline wrote it. `prime` marks a sounding as the least depth inside a
+# closed isobath (S-4 B-410b), which is what lets the style weight it — it is carried on a small
+# minority of features and absent on the rest.
 VECTOR_ATTRS = ["depth_m", "depth_abs_m", "sys", "depth_ft", "depth_fm",
-                "drval1", "drval2", "rank"]
-VECTOR_TYPES = ["depth_abs_m:int", "depth_ft:int", "depth_fm:int", "rank:int"]
+                "drval1", "drval2", "rank", "prime"]
+VECTOR_TYPES = ["depth_abs_m:int", "depth_ft:int", "depth_fm:int", "rank:int", "prime:int"]
 DEPARE_MINZOOM = 6  # depare's zoom floor, now per-feature (was depare_run's run-level -Z)
 # Geometric self-check thresholds, calibrated on the NY-harbor archive (2026-07-29). Decoded tiles
 # include their buffer ring, and a parent's ring spans 2× its children's in shared-map units, so
