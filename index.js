@@ -62,7 +62,7 @@ fetch(`${tilesBase}/vector.json`)
       `These tiles use schema version ${tj.schema}, but this viewer was built ` +
       `for schema version ${SCHEMA}. Rendering could silently show wrong depths, ` +
       `so the chart is disabled. Update the viewer to match the tiles.`;
-    // el.replaceChildren(msg);
+    el.replaceChildren(msg);
   })
   .catch(() => {}); // unreachable TileJSON already surfaces as a map load error
 
