@@ -62,7 +62,7 @@ fetch(`${tilesBase}/vector.json`)
       `These tiles use schema version ${tj.schema}, but this viewer was built ` +
       `for schema version ${SCHEMA}. Rendering could silently show wrong depths, ` +
       `so the chart is disabled. Update the viewer to match the tiles.`;
-    el.replaceChildren(msg);
+    // el.replaceChildren(msg);
   })
   .catch(() => {}); // unreachable TileJSON already surfaces as a map load error
 
@@ -229,13 +229,15 @@ map.on("click", async (e) => {
 
   const lines = [];
   if (ele != null) {
-    const depth = Math.round(-ele);
+    // Floored toward shallower, like the soundings (soundings_run.py): a reported
+    // depth must never overstate the water, so 16.6 m reads 16, not 17.
+    const depth = -ele;
     // Non-negative values are category codes (0 unknown water, 1 drying, 2 land);
     // overzoom fractions between codes round to the nearest one.
     lines.push(
       `<strong>${
         ele < 0
-          ? `${depth}m (${Math.round(depth * 3.28084)}ft)`
+          ? `${Math.floor(depth)}m (${Math.floor(depth * 3.28084)}ft)`
           : ["unknown depth", "drying", "land"][Math.min(Math.round(ele), 2)]
       }</strong>`,
     );

@@ -1,5 +1,8 @@
-import { expect, test } from "vitest";
-import { validateStyleMin } from "@maplibre/maplibre-gl-style-spec";
+import { assert, expect, test } from "vitest";
+import {
+  createExpression,
+  validateStyleMin,
+} from "@maplibre/maplibre-gl-style-spec";
 import {
   applyState,
   day,
@@ -311,18 +314,18 @@ test("applyState re-derives every unit/safety-dependent property", () => {
       )!.value,
     ),
   ).toContain(day.hazard);
-  // Label text follows the unit.
+  // Label text follows the unit — fathoms read off whole feet, six to the fathom.
   expect(
     JSON.stringify(
       calls.find((c) => c.fn === "layout" && c.layer === "soundings")!.value,
     ),
-  ).toContain("depth_fm");
-  // Unsafe-sounding emphasis carries the safety literal.
-  expect(
-    JSON.stringify(
-      calls.find((c) => c.fn === "paint" && c.layer === "soundings")!.value,
-    ),
-  ).toContain("5");
+  ).toContain("depth_ft");
+  // Sounding colour is uniform (paper-chart practice; hazard lives in the tint): it must not
+  // vary with the safety depth or any per-feature property.
+  const soundPaint = JSON.stringify(
+    calls.find((c) => c.fn === "paint" && c.layer === "soundings")!.value,
+  );
+  expect(soundPaint).toBe(JSON.stringify(day.label));
 
   // Layers absent from the map (composed subsets) are skipped entirely.
   const before = calls.length;
@@ -337,6 +340,97 @@ test("contour labels print the depth number only — no unit suffix", () => {
     const text = (labels as { layout: Record<string, unknown> }).layout["text-field"];
     expect((text as unknown[])[0]).toBe("to-string");
   }
+});
+
+test("soundings drop the sub-unit digit, and never show a zero one", () => {
+  const field = (unit: "m" | "ft" | "fm") =>
+    (
+      layers(day, { unit }).find((l) => l.id === "soundings") as {
+        layout: Record<string, unknown>;
+      }
+    ).layout["text-field"];
+
+  // Feet have no sub-division on a chart (US Chart No. 1 §I), so they just print.
+  expect((field("ft") as unknown[])[0]).toBe("to-string");
+  expect(JSON.stringify(field("ft"))).toContain("depth_ft");
+
+  const print = (unit: "m" | "fm", props: Record<string, number>, zoom = 12) => {
+    const compiled = createExpression(field(unit), {
+      type: "formatted",
+      "property-type": "data-driven",
+      expression: { interpolated: false, parameters: ["zoom", "feature"] },
+    });
+    assert(compiled.result === "success");
+    return (
+      compiled.value.evaluate({ zoom }, { properties: props }) as {
+        sections: { text: string; scale: number | null }[];
+      }
+    ).sections.map((s) => [s.text, s.scale]);
+  };
+  const m = (depth_m: number, zoom?: number) => print("m", { depth_m }, zoom);
+  const fm = (depth_ft: number) => print("fm", { depth_ft });
+  // The sub-unit scale is a tuning knob; assert the structure it produces, not its value.
+  const sub = m(3.9)[1][1] as number;
+  expect(sub).toBeGreaterThan(0).toBeLessThan(1);
+
+  // Metres: decimetres to 21 m, half metres 21-31 (a .5 residual), whole metres beyond.
+  expect(m(3.9)).toEqual([["3", null], ["9", sub]]);
+  expect(m(23.5)).toEqual([["23", null], ["5", sub]]);
+  expect(m(5.0)).toEqual([["5", null], ["", sub]]);
+  expect(m(137)).toEqual([["137", null], ["", sub]]);
+  // Sub-units are a function of depth (S-4 B-412), never of scale.
+  expect(m(3.9, 8)).toEqual([["3", null], ["9", sub]]);
+
+  // Fathoms derive both digits from whole feet: 22 ft is 3 fathoms 4 feet.
+  expect(fm(22)).toEqual([["3", null], ["4", sub]]);
+  expect(fm(18)).toEqual([["3", null], ["", sub]]); // exactly 3 fathoms — no feet digit
+  // From 11 fathoms the chart drops feet entirely (Canada CHS Chart 1, 2022).
+  expect(fm(11 * 6)).toEqual([["11", null], ["", sub]]);
+  expect(fm(11 * 6 + 5)).toEqual([["11", null], ["", sub]]);
+  expect(fm(10 * 6 + 5)).toEqual([["10", null], ["5", sub]]); // …but not one fathom earlier
+});
+
+test("a prime sounding outranks the field for collisions, in uniform ink", () => {
+  const snd = layers(day, { unit: "m", safety: 2 }).find(
+    (l) => l.id === "soundings",
+  ) as { layout: Record<string, unknown>; paint: Record<string, unknown> };
+
+  // S-4 B-410b's "must always be shown" fails if a deeper neighbour can displace the least
+  // depth over a shoal, so prime sorts ahead of every ordinary sounding (lower wins).
+  const key = createExpression(snd.layout["symbol-sort-key"], {
+    type: "number",
+    "property-type": "data-driven",
+    expression: { interpolated: false, parameters: ["zoom", "feature"] },
+  });
+  assert(key.result === "success");
+  const sort = (p: Record<string, number>) =>
+    key.value.evaluate({ zoom: 12 }, { properties: p }) as number;
+  expect(sort({ depth_m: 40, prime: 1 })).toBeLessThan(sort({ depth_m: 0.2 }));
+  expect(sort({ depth_m: 3 })).toBeLessThan(sort({ depth_m: 9 }));
+
+  // …but it gets no ink of its own: prime is a topological fact of the build window (a shelf
+  // whose contour closes past the window edge is never prime), not a hazard ranking, and
+  // painting it black read as one. One colour for the whole field, like paper (S-4 B-412).
+  expect(snd.paint["text-color"]).toBe(day.label);
+});
+
+test("glyphs are self-hosted, and soundings alone are set sloping", () => {
+  const s = style({ tilesBase: "https://t.example/seascape" });
+  // The MapLibre demo stack ships 3 of the 10 subscript digits, and a missing glyph does not
+  // error — it just leaves the decimetre off the chart. Never point back at it.
+  expect(s.glyphs).toBe(
+    "https://tiles.openwaters.io/fonts/{fontstack}/{range}.pbf",
+  );
+  expect(s.glyphs).not.toContain("demotiles");
+
+  const fontOf = (id: string) =>
+    (s.layers.find((l) => l.id === id) as { layout: Record<string, unknown> })
+      .layout["text-font"];
+  // S-4 B-412.1 sets soundings in sloping numerals; B-412.4 reserves upright for soundings of
+  // lower reliability, so nothing else on the chart borrows the italic face.
+  expect(fontOf("soundings")).toEqual(["Noto Sans Italic"]);
+  expect(fontOf("contour-labels")).toEqual(["Noto Sans Regular"]);
+  expect(fontOf("source-labels")).toEqual(["Noto Sans Regular"]);
 });
 
 test("the safety contour is the one emphasized isobath", () => {

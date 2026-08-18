@@ -55,6 +55,9 @@ export interface Flavor {
   soundingEmphasis: string;
   contourEmphasis: string;
   font: string[];
+  /** Soundings only. S-4 B-412.1 sets them in sloping numerals; upright is reserved for
+   *  soundings of lower reliability (B-412.4). */
+  soundingFont: string[];
   hillshadeShadow: string;
   hillshadeHighlight: string;
   coverage: string;
@@ -99,11 +102,12 @@ export const day: Flavor = {
   // only unsafe soundings jump, in soundingEmphasis (SNDG2).
   contour: "#768c97",
   label: "#768c97",
-  labelHalo: "#fff",
+  labelHalo: "rgba(255,255,255,0.8)",
   soundingEmphasis: "#000",
   // Safety contour line (S-52 DEPSC day): darker grey, distinct from SNDG2 black.
   contourEmphasis: "#4C5B63",
   font: ["Noto Sans Regular"],
+  soundingFont: ["Noto Sans Italic"],
   hillshadeShadow: "#9adcfe",
   hillshadeHighlight: "#ffffff",
   coverage: "#f58231",
@@ -118,8 +122,20 @@ const DEFAULT_SHADING: Shading = "relief";
 // lines' presentation floor — depth shading carries lower zooms.
 const BANDS_MIN_ZOOM = 6;
 
+// Decimetre digit on soundings. S-52's glyphs (PresLib SOUNDG10-19 vs SOUNDG50-59)
+// are the same 8x11 size and differ only by a 4-unit drop, so the decimetre reads
+// at full weight on screen; S-4 B-412.1's "visibly smaller" is the paper rule.
+// vertical-align only offsets a section when its size differs, so the scale buys
+// the drop. It has to be small enough that 1.3 m never reads as 13 m — the two
+// occur side by side in the same view — which measured out at 0.6, not the ~0.8
+// that matches S-52's 4-of-11 geometry.
+const SUBSCRIPT_SCALE = 0.666;
+
+// Self-hosted (openwatersio/tile-fonts). The MapLibre demo stack this replaced is a subset —
+// of the ten subscript digits it ships three — and a missing glyph is not an error, it simply
+// does not draw, so a decimetre digit would vanish off the chart.
 const DEFAULT_GLYPHS =
-  "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf";
+  "https://tiles.openwaters.io/fonts/{fontstack}/{range}.pbf";
 
 // ─── Depth-shading ramp (elevation → colour) ─────────────────────────────────
 // The hazard tint folds into this one color-relief ramp: two color-relief
@@ -341,16 +357,68 @@ export function layers(
   // `safety` sets the unsafe-sounding emphasis. Everything is a literal, so
   // runtime changes go through applyState(), which regenerates these.
   //
-  // Soundings: props depth_m / depth_ft / depth_fm, all floored toward
-  // shallower; depth_m already carries one decimal in the shoal band (<6 m)
-  // and an integer deeper, so metres just print it.
-  const soundingText: ExpressionSpecification = [
-    "to-string",
+  // Soundings: props depth_m / depth_ft / depth_fm, all floored toward shallower by
+  // soundings_run.py — splitting the digits here must not re-round. The whole part is the chart
+  // number and the sub-unit is set smaller and dropped below it, never shown when zero
+  // (S-4 B-412.1).
+  const subUnitSounding = (
+    whole: ExpressionSpecification,
+    sub: ExpressionSpecification,
+  ): ExpressionSpecification => [
+    "format",
+    ["to-string", whole],
+    {},
     [
-      "get",
-      unit === "ft" ? "depth_ft" : unit === "fm" ? "depth_fm" : "depth_m",
+      "match",
+      sub,
+      1,
+      "1",
+      2,
+      "2",
+      3,
+      "3",
+      4,
+      "4",
+      5,
+      "5",
+      6,
+      "6",
+      7,
+      "7",
+      8,
+      "8",
+      9,
+      "9",
+      "",
     ],
+    { "font-scale": SUBSCRIPT_SCALE, "vertical-align": "bottom" },
   ];
+  // Metres: the tenths digit is decimetres. `round` on the residual recovers it through float
+  // dust (3.9 % 1 == 0.9000000000000004).
+  const metreSounding = subUnitSounding(
+    ["floor", ["get", "depth_m"]],
+    ["round", ["*", 10, ["%", ["get", "depth_m"], 1]]],
+  );
+  // Fathoms: "Fathoms and Feet up to 11 fathoms and in fathoms only in depths greater than 11
+  // fathoms" (Canada CHS Chart 1, 2022). A fathom is exactly six feet, so both digits come off
+  // depth_ft and the tiles never carry a mixed-radix number.
+  const FT_PER_FATHOM = 6;
+  const FATHOM_FEET_MAX_FM = 11;
+  const fathomSounding = subUnitSounding(
+    ["floor", ["/", ["get", "depth_ft"], FT_PER_FATHOM]],
+    [
+      "case",
+      [">=", ["get", "depth_ft"], FATHOM_FEET_MAX_FM * FT_PER_FATHOM],
+      0,
+      ["%", ["get", "depth_ft"], FT_PER_FATHOM],
+    ],
+  );
+  const soundingText: ExpressionSpecification =
+    unit === "ft"
+      ? ["to-string", ["get", "depth_ft"]]
+      : unit === "m"
+        ? metreSounding
+        : fathomSounding;
   // Contours: metre isobaths (sys != "ft", also legacy no-sys tiles) vs the
   // fathom-curve set (sys == "ft"), which labels as feet or fathoms. Both
   // systems label every curve — the standard isobath sets are sparse enough
@@ -389,16 +457,13 @@ export function layers(
       ? ["==", ["get", "depth_abs_m"], safetyContour]
       : ["==", ["get", "depth_fm"], Math.round(safetyContour / 1.8288)];
 
-  // Shared label styling so soundings and contour labels read as one chart.
-  const labelSize: ExpressionSpecification = [
-    "interpolate",
-    ["linear"],
-    ["zoom"],
-    8,
-    9,
-    13,
-    12,
-  ];
+  // Shared label styling so soundings and contour labels read as one chart. S-52
+  // puts a sounding digit at ~3.5 mm (§5.2.1(2)) = ~13 px of digit height, and a
+  // digit is ~0.71 em, so 18 px em is the standard's size, not a large one. Flat
+  // across zoom because "text size should never be decreased when zooming out"
+  // (S-52 §3.1.5) — low-zoom clutter is thinned by per-feature minzoom and label
+  // collision, never by shrinking the type.
+  const labelSize = 13;
 
   const coverageColor = flavor.coverage;
 
@@ -538,24 +603,29 @@ export function layers(
       minzoom: 7,
       layout: {
         "text-field": soundingText,
-        "text-font": flavor.font,
+        "text-font": flavor.soundingFont,
         "text-size": labelSize,
-        "symbol-sort-key": ["get", "depth_m"], // shoalest first → wins collisions
-        "text-padding": 8,
+        // Lower sorts first and wins the collision. A prime sounding outranks the whole field —
+        // "must always be shown" (S-4 B-410b) fails if a deeper neighbour can displace it — and
+        // the rest fall back to shoalest-first, so where two ordinary soundings collide the
+        // safer number survives.
+        "symbol-sort-key": [
+          "case",
+          ["==", ["get", "prime"], 1],
+          -1e6,
+          ["get", "depth_m"],
+        ] as unknown as ExpressionSpecification,
+        "text-padding": 20,
       },
       paint: {
-        // Soundings at or shoaler than the safety depth print in the emphasis
-        // colour (S-52's SNDG2 black-by-day) and the hazard tint carries the
-        // alarm; safety=0 → all normal.
-        "text-color":
-          safety > 0
-            ? [
-                "case",
-                ["<=", ["get", "depth_m"], safety],
-                flavor.soundingEmphasis,
-                flavor.label,
-              ]
-            : flavor.label,
+        // One colour for the whole field, like a paper chart: S-4 sets every sounding in
+        // one style and reserves type distinctions for reliability (B-412.4), not depth —
+        // hazard is carried by the depth-area tint and the isobaths themselves. `prime` (the
+        // least depth inside a closed isobath) still governs retention and collision priority
+        // above, but it is a topological fact of the build window, not a hazard ranking: a
+        // coastal shelf whose contour closes beyond the window edge is never prime, while a
+        // 0.5 m wrinkle at 29 m is, so inking it black read exactly backwards.
+        "text-color": flavor.label,
         "text-halo-color": flavor.labelHalo,
         "text-halo-width": 1,
       },
