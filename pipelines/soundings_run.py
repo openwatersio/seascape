@@ -367,15 +367,9 @@ def _shoalest_grid(src, nodata, min_depth):
     return g, cx, cy
 
 
-# Working size cap for enclosed-shoal detection, in pixels per side. The window itself is never
-# held whole — a z8 stem at cz14 is 32768 px square, 4.3 GB as float32 — so detection reads a
-# decimated overview and refines each hit at full resolution.
-SHOAL_DETECT_PX = 4096
-
-
 # Working size cap for enclosed-shoal detection, in pixels per side. The window is never held
 # whole — a z8 stem at cz14 is 32898 px square, 4.33 GB as float32 — so detection runs on one
-# decimated read bounded to this.
+# decimated read bounded to this, and refines each hit at full resolution.
 SHOAL_DETECT_PX = 4096
 
 
