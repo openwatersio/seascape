@@ -7,7 +7,7 @@ MapLibre GL style for the [Open Waters Seascape](https://github.com/openwatersio
 ## Quick start
 
 ```js
-import maplibregl from "maplibre-gl";
+import * as maplibregl from "maplibre-gl";
 import { style } from "@openwaters/seascape";
 
 const map = new maplibregl.Map({
