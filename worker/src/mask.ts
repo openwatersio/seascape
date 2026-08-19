@@ -4,7 +4,7 @@
 // OSM effective-land line. Mirrors landmask.rasterize: burn land = 1, then water = 0 (the
 // water burn only ever re-opens water). See docs/plans/2026-07-23-worker-land-mask.md.
 import { VectorTile } from "@mapbox/vector-tile";
-import Protobuf from "pbf";
+import { PbfReader } from "pbf";
 
 const TILE = 512;
 
@@ -51,7 +51,7 @@ export function rasterizeMask(
   maskMaxZoom: number,
 ): Uint8Array {
   const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-  const vt = new VectorTile(new Protobuf(u8));
+  const vt = new VectorTile(new PbfReader(u8));
   return rasterizeLayers(
     vt.layers["land"] as MaskLayer | undefined,
     vt.layers["water"] as MaskLayer | undefined,

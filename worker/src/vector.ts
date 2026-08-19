@@ -45,7 +45,7 @@
  * inputs and diff per feature; encodeTile / decodeTile bracket it for the wire.
  */
 import { VectorTile } from "@mapbox/vector-tile";
-import Pbf from "pbf";
+import { PbfReader } from "pbf";
 import vtpbf from "vt-pbf";
 
 // Feature geometry types (MVT geomtype == tippecanoe VT_*): 1 point, 2 line, 3 polygon.
@@ -103,7 +103,7 @@ const idiv = (a: number, b: number): number => Math.trunc(a / b);
 // ── decode / encode (wire ⇄ decoded layers) ─────────────────────────────────
 export function decodeTile(bytes: ArrayBuffer | Uint8Array): DecodedLayer[] {
   const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-  const vt = new VectorTile(new Pbf(u8));
+  const vt = new VectorTile(new PbfReader(u8));
   const out: DecodedLayer[] = [];
   for (const name of Object.keys(vt.layers)) {
     const layer = vt.layers[name];
