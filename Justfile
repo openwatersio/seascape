@@ -152,4 +152,5 @@ test-perf:
     uv run python perf/fixtures.py --check
     uv run python perf/metrics.py --check
     uv run python perf/bench.py --check
+    uv run python perf/soundings.py --check
     uv run python perf/gates.py --check
