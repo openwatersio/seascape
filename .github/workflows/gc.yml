@@ -60,7 +60,7 @@ jobs:
   gc:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6 # for scripts/gc-collect.sh
+      - uses: actions/checkout@v7 # for scripts/gc-collect.sh
 
       - name: Install pinned rclone
         run: |
