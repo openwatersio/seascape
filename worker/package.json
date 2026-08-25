@@ -9,9 +9,9 @@
   },
   "dependencies": {
     "@jsquash/webp": "^1.5.0",
-    "@mapbox/vector-tile": "^2.0.5",
+    "@mapbox/vector-tile": "^3.0.0",
     "@openwaters/seascape": "*",
-    "pbf": "^4.0.2",
+    "pbf": "^5.0.0",
     "pmtiles": "^4.5.0",
     "vt-pbf": "^3.1.3"
   },
