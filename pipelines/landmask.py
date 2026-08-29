@@ -85,7 +85,7 @@ LAND_POLYGONS_URL = "https://osmdata.openstreetmap.de/download/land-polygons-spl
 # snapshot; bump it to the current Overture release when re-preparing (listing:
 # https://docs.overturemaps.org/release/). GDAL opens the partition directory as one
 # dataset (~65M features); the bucket is anonymous, so no credentials in the read path.
-OVERTURE_RELEASE = "2026-06-17.0"
+OVERTURE_RELEASE = "2026-07-22.0"
 OVERTURE_BUCKET_URL = "https://overturemaps-us-west-2.s3.us-west-2.amazonaws.com"
 OVERTURE_PREFIX = f"release/{OVERTURE_RELEASE}/theme=base/type=water/"
 # Where the release's parquet parts are staged (26 GB / 32 files). Kept per release so a
