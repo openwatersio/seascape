@@ -100,31 +100,6 @@ test-workflows:
 test-gc:
     bash test_gc.sh
 
-# Build contour-p, the DEPARE partition tool production uses (DEPARE_CONTOUR_BIN). Measuring
-# marsh stems with stock gdal_contour measures a path that doesn't ship — the patch is 7x on a
-# 4096px crop and 40x on a full z15 wetland window. Needs the local gdal-config to match the
-# Dockerfile's pinned GDAL_MS_COMMIT.
-contour-p:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    commit=b2e6057d1d0f2cb4c11bfdf79ab1a61def0ce9ca
-    src="{{justfile_directory()}}"; build=$(mktemp -d); out=store/profile/bin
-    mkdir -p "$out" "$build/ms"
-    cp "$src/tools/contour-p/contour-p.cpp" "$build/"
-    for f in point.h square.h utility.h level_generator.h segment_merger.h \
-             contour_generator.h polygon_ring_appender.h; do
-      curl -fsSL "https://raw.githubusercontent.com/OSGeo/gdal/$commit/alg/marching_squares/$f" \
-        -o "$build/ms/$f"
-    done
-    cd "$build" && git apply --directory=ms -p3 \
-      "$src/patches/gdal-polygon-ring-appender-quadratic.patch"
-    g++ -O2 -std=c++17 -I. $(gdal-config --cflags) contour-p.cpp \
-      -o "$src/pipelines/$out/contour-p" $(gdal-config --libs)
-    # usage exits 2 by design; pipefail must not read that as a failed build
-    ("$src/pipelines/$out/contour-p" 2>&1 || true) | grep -q usage
-    rm -rf "$build"
-    echo "contour-p ready: pipelines/$out/contour-p"
-
 # Cut the local marsh profiling fixtures (small real windows over the Gulf, range-read from the
 # published mosaic COGs) into store/profile/root. Needs R2 read creds — the public host refuses
 # range requests.

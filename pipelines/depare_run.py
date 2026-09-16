@@ -512,16 +512,8 @@ def partitions(dem, levels, raw_fgb, timeout=0):
     Callers select depth bands (amax <= 0), the [0, DRYING_CAP] drying bucket
     (0 < amax <= cap), and drop land (amax above the shallowest positive level)."""
     fl = " ".join(str(l) for l in levels)
-    # DEPARE_CONTOUR_BIN picks the polygon-contour binary: builds set it to contour-p, whose
-    # output is byte-identical to gdal_contour -p but near-linear where marsh ring counts make
-    # stock quadratic (see the Dockerfile stanza). Identical output is why switching it back
-    # forces nothing.
-    bin_ = os.environ.get("DEPARE_CONTOUR_BIN", "gdal_contour")
-    if bin_ == "gdal_contour":
-        cmd = f"gdal_contour -q -p -amin amin -amax amax -fl {fl} -f FlatGeobuf {dem} {raw_fgb}"
-    else:
-        cmd = f"{bin_} {dem} {raw_fgb} {fl}"
-    _run_bounded(cmd, f"{bin_} -p", timeout)
+    cmd = f"gdal_contour -q -p -amin amin -amax amax -fl {fl} -f FlatGeobuf {dem} {raw_fgb}"
+    _run_bounded(cmd, "gdal_contour -p", timeout)
     _mark(f"gdal_contour[{os.path.basename(raw_fgb)}]")
     return raw_fgb
 

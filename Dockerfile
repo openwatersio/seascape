@@ -1,7 +1,11 @@
-# Use Official OSGeo image (Ubuntu 24.04 + current GDAL with the HDF5/BAG drivers).
+# Official OSGeo image, built from GDAL master (the HDF5/BAG drivers, plus the fast
+# `gdal_contour -p` that the DEPARE partition pass depends on: OSGeo/gdal#14983 for the
+# near-linear ring appender, #15181 for quadratic segment merging, #15182 for CPLQuadTree
+# degradation after feature removal — all merged after 3.13.3, so no release carries them).
+# Digest-pinned because the tag floats with master.
 # Bumping it (GDAL/GEOS/PROJ) must bump `version` on mosaic_tile, the fork rules, and
 # terrain_render (build.smk) — tools are not rule inputs.
-FROM ghcr.io/osgeo/gdal:ubuntu-full-3.13.3
+FROM ghcr.io/osgeo/gdal:ubuntu-full-latest@sha256:05c65b38a829ae31bf227845168211c23086184f9928e0a9347305868ca7a27f
 
 LABEL org.opencontainers.image.source="https://github.com/openwatersio/seascape"
 LABEL org.opencontainers.image.description="Bathymetry → tile pipeline)"
@@ -62,28 +66,7 @@ RUN git init -q /tmp/tippecanoe \
   && git fetch -q --depth 1 https://github.com/felt/tippecanoe.git 0badb242bea6f77c8e388898868801f3f3a9088b \
   && git checkout -q FETCH_HEAD \
   && git apply /tmp/patches/wagyu-drop-unplaceable-hole.patch \
-  && make -j"$(nproc)" && make install && rm -rf /tmp/tippecanoe
-
-# contour-p — the DEPARE partition pass's polygon-contour tool: GDAL's marching_squares
-# headers at the base image's commit, plus the patch in patches/. GDAL's
-# PolygonRingAppender attaches rings in O(rings^2 x vertices), so a marsh coastline's
-# ~100k disjoint 0 m rings never finished a gdal_contour -p ladder (measured on a z15
-# wetland window: 4839 s stock, 121 s patched, byte-identical bands). Upstream as
-# OSGeo/gdal#14983 (after #1750/#2241, unfixed post-#2908) — when it lands in the base
-# image, delete this stanza and DEPARE_CONTOUR_BIN with it.
-# Headers are fetched at the BASE IMAGE's GDAL commit: a base-image bump must re-pin
-# GDAL_MS_COMMIT and re-verify the patch applies.
-ARG GDAL_MS_COMMIT=b2e6057d1d0f2cb4c11bfdf79ab1a61def0ce9ca
-COPY tools/contour-p /tmp/contour-p
-RUN cd /tmp/contour-p && mkdir ms \
-  && for f in point.h square.h utility.h level_generator.h segment_merger.h \
-              contour_generator.h polygon_ring_appender.h; do \
-       curl -fsSL "https://raw.githubusercontent.com/OSGeo/gdal/${GDAL_MS_COMMIT}/alg/marching_squares/$f" -o "ms/$f" || exit 1; \
-     done \
-  && git apply --directory=ms -p3 /tmp/patches/gdal-polygon-ring-appender-quadratic.patch \
-  && g++ -O2 -std=c++17 -I. $(gdal-config --cflags) contour-p.cpp -o /usr/local/bin/contour-p $(gdal-config --libs) \
-  && contour-p 2>&1 | grep -q usage \
-  && rm -rf /tmp/contour-p /tmp/patches
+  && make -j"$(nproc)" && make install && rm -rf /tmp/tippecanoe /tmp/patches
 
 # go-pmtiles — the vector bundle's `pmtiles merge` joins the fringe-filtered cell shards into one
 # sparse vector.pmtiles (a pure concat of structurally-disjoint tiles, no tile-join boundary MERGE).

@@ -194,7 +194,7 @@ Pulled from `snakemake-bench-30506340413` (27 cz15 depare rows):
 
 Local peak RSS is **not** comparable to these rows — macOS `libmalloc` vs Linux `glibc`, different arena and reclaim behaviour. Use the local rig for wall, phase ranking, and geometry counts; use the box's TSVs for memory.
 
-Two toolchain notes. `contour-p` must be built locally (`just contour-p`) — production sets `DEPARE_CONTOUR_BIN` to it, and measuring with stock `gdal_contour` measures a path that does not ship (3.18 s → 0.44 s on a crop, identical output; 4839 s → 121 s on a full wetland window). And `DEPARE_TIMEOUT` must stay unset while measuring: a timeout reroutes through `_uniform_coarsen`, which is a different algorithm, so `bench.py` refuses to run with it set.
+Two toolchain notes. The local GDAL must carry the polygon-contour fixes (OSGeo/gdal#14983, #15181, #15182, all in master; the container pins it) — measuring on a released GDAL measures a path that does not ship, quadratic in ring count where production is not (4839 s → 121 s on a full wetland window). And `DEPARE_TIMEOUT` must stay unset while measuring: a timeout reroutes through `_uniform_coarsen`, which is a different algorithm, so `bench.py` refuses to run with it set.
 
 ## 4. Design
 
@@ -298,7 +298,6 @@ Gate 6 (named-route continuity) is implemented but has no data: `perf/routes.geo
 **Every change here is profiled locally before a production build.** The loop:
 
 ```
-just contour-p                                    # once — production's DEPARE_CONTOUR_BIN
 just perf-fixtures                                # once — small real windows over the marsh
 just perf depare 12-1015-1699-15 base             # baseline on unmodified HEAD
 #   ... make the change ...
@@ -309,6 +308,6 @@ just perf-gate vector <before.fgb> <after.fgb>    # partition, displacement, rou
 just test-perf                                    # every harness self-check
 ```
 
-One thing the rig cannot answer, so it stays on the box: **peak RSS**. macOS `libmalloc` and Linux `glibc` differ in arena and reclaim behaviour, so local peaks are indicative only — the box's benchmark TSVs (`gh run download <id> -n snakemake-bench-<id>`) are the authority, as used in §3d. Wall, phase ranking and geometry counts do transfer: GDAL 3.13.1 and GEOS 3.13.1 match the container, and a production-scale window runs locally in full (§3c).
+One thing the rig cannot answer, so it stays on the box: **peak RSS**. macOS `libmalloc` and Linux `glibc` differ in arena and reclaim behaviour, so local peaks are indicative only — the box's benchmark TSVs (`gh run download <id> -n snakemake-bench-<id>`) are the authority, as used in §3d. Wall, phase ranking and geometry counts do transfer, provided the local GDAL matches the container's — it pins GDAL master for the fast `gdal_contour -p` (OSGeo/gdal#14983, #15181, #15182), and a released GDAL is quadratic in ring count on exactly the marsh stems this rig measures. A production-scale window runs locally in full (§3c).
 
 `DEPARE_TIMING` is not enabled on the box and its depare logs arrive empty (the truncating `2> {log}` redirect noted in `93da2d3`), so the §3c phase attribution exists from one local run only. **Enable `DEPARE_TIMING` in CI** so the split can be confirmed on Linux at scale rather than inferred from a laptop.

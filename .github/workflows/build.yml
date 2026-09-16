@@ -343,9 +343,6 @@ jobs:
           # the pathological deep/complex stems hit this — they retry coarser instead of pinning
           # a core for 8 h+ (depare_run.tile).
           export DEPARE_TIMEOUT="${DEPARE_TIMEOUT:-3600}"
-          # Patched-appender polygon contour tool (Dockerfile; exact-geometry-equivalent to
-          # gdal_contour -p, near-linear on marsh-coast ring counts that make stock quadratic).
-          export DEPARE_CONTOUR_BIN="${DEPARE_CONTOUR_BIN:-contour-p}"
           # Per-phase wall marks in every depare log (depare_run._mark) — ~17 lines per stem,
           # and the only way to attribute a slow stem to its phase without a local reproduction.
           export DEPARE_TIMING="${DEPARE_TIMING:-1}"
