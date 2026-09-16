@@ -605,7 +605,7 @@ class _RowSink:
         # Trim to the Web Mercator world BEFORE the transform (WORLD_HALF_M). Correct geometry
         # never leaves the square, so the bounds test spares every row the intersection.
         b = shapely.bounds(gdf.geometry.values)
-        past = (b[:, 0] < -WORLD_HALF_M) | (b[:, 2] > WORLD_HALF_M)
+        past = ((b[:, :2] < -WORLD_HALF_M) | (b[:, 2:] > WORLD_HALF_M)).any(axis=1)
         if past.any():
             trimmed = gdf.geometry.values.copy()
             trimmed[past] = shapely.intersection(
