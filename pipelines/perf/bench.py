@@ -30,7 +30,6 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 # production-scale number is the point.
 ROOT = os.environ.get("PERF_ROOT", f"{REPO}/pipelines/store/profile/root")
 RESULTS = f"{REPO}/pipelines/store/profile/results.jsonl"
-CONTOUR_P = f"{REPO}/pipelines/store/profile/bin/contour-p"
 SAMPLE_S = 0.25
 
 STAGES = {
@@ -80,7 +79,7 @@ def provenance():
         # DEPARE_TIMEOUT must be empty: a timeout silently reroutes through _uniform_coarsen,
         # which is a different algorithm, so a timed-out run is not comparable to a clean one.
         "env": {k: os.environ.get(k, "") for k in
-                ("DEPARE_CONTOUR_BIN", "DEPARE_TIMEOUT", "SLIVER_MIN_PX", "NODATA_SIMPLIFY_PX",
+                ("DEPARE_TIMEOUT", "SLIVER_MIN_PX", "NODATA_SIMPLIFY_PX",
                  "LANDMASK", "WATERMASK", "GDAL_CACHEMAX", "SKIP_SMOOTH",
                  "SMOOTH_POND_FILL_MM2", "SMOOTH_POND_FILL_EXTENT_M",
                  "SMOOTH_POND_FILL_MAX_DEPTH_M")},
@@ -94,7 +93,6 @@ def run(stage, stem, label):
         sys.exit("refusing to measure with DEPARE_TIMEOUT set — the retry path is a different "
                  "algorithm (see _uniform_coarsen)")
     env = {**os.environ}
-    env.setdefault("DEPARE_CONTOUR_BIN", CONTOUR_P)
     env["DEPARE_TIMING"] = "1"
     cmd = ["uv", "run", "--project", REPO, "python", f"{REPO}/pipelines/{script}"] + args(stem)
     t0 = time.monotonic()
