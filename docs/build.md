@@ -65,7 +65,7 @@ The workflow is four jobs: `image` (ensure the deps-keyed toolchain image is in 
 
 There is **no prune step** — R2 deletion is out-of-band (`gc.yml`, below), and volume-side orphans (stems that left the covering, retired sources) are tracked in [#148](https://github.com/openwatersio/seascape/issues/148).
 
-**No `timeout-minutes`.** A self-hosted job is **not** subject to the 6 h cap that GitHub-*hosted* runners impose — the ceiling is now the 72 h workflow limit, which is effectively non-binding, so a forced full planet rebuild runs to completion in one window regardless of size (no resume-on-re-dispatch needed). The warm volume still makes re-dispatches cheap (only missing or stale artifacts rebuild), but a build no longer *has* to fit a window. `ccx33` is the default; pick `ccx63` (48 vCPU / 192 GB) for wide runs — cold builds, big invalidations.
+**`timeout-minutes: 2880`.** A self-hosted job is **not** subject to the 6 h cap that GitHub-*hosted* runners impose, but it does inherit a 360 min default unless the job overrides it — so `build` sets an explicit **48 h** ceiling. That is generous for an incremental run and reachable by a wide one: run 35124735536 planned 33,150 jobs. A run that hits the cap is recoverable rather than lost — every finished artifact is banked on the store volume, so a re-dispatch resumes from it. The warm volume still makes re-dispatches cheap (only missing or stale artifacts rebuild), but a build no longer *has* to fit a window. `ccx33` is the default; pick `ccx63` (48 vCPU / 192 GB) for wide runs — cold builds, big invalidations.
 
 ## Watching a build
 
