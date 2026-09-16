@@ -172,6 +172,7 @@ def _repair(src, nodata, bbox, pts, z, child_z):
     Returns (pts, per-zoom insertion counts)."""
     import numpy as np
     from scipy.interpolate import LinearNDInterpolator
+    from scipy.spatial import QhullError
     from rasterio.windows import Window
 
     transform = src.transform
@@ -216,8 +217,14 @@ def _repair(src, nodata, bbox, pts, z, child_z):
             continue
         fx = np.array([pts[i][1] for i in idx]); fy = np.array([pts[i][2] for i in idx])
         fd = np.array([pts[i][0] for i in idx])
-        expected = LinearNDInterpolator(np.column_stack([fx, fy]), fd)(
-            np.column_stack([sx, sy]))
+        try:
+            expected = LinearNDInterpolator(np.column_stack([fx, fy]), fd)(
+                np.column_stack([sx, sy]))
+        except QhullError:
+            # Three or more soundings in a line clear the count guard but span no area, and
+            # qhull refuses a degenerate hull. A field with no interior contradicts nothing,
+            # so this zoom has nothing to repair.
+            continue
         ok = ~np.isnan(expected)
         shoal_err = np.where(ok, expected - actual, -np.inf)   # >0: ground shoaler than charted
         deep_err = np.where(ok, actual - expected, -np.inf)    # >0: ground deeper than charted
@@ -801,6 +808,16 @@ def _check():
         _, ins2 = _repair(src, NODATA, rbox, list(base), 8, 9)
     assert sum(ins2.values() or [0]) < sum(ins.values()), (ins, ins2)
     REPAIR_SPACING_PX = 0.0
+
+    # A collinear displayed field spans no area, so qhull cannot triangulate it. The count guard
+    # admits it (three points is enough to be a line), and the tile must survive: skipping the
+    # zoom's pass leaves the field unrepaired, which is the correct answer for a field with no
+    # interior. Planet run 35124735536 lost stem 8-158-70-10 to exactly this.
+    line = [(10.0, 5000.0 + i * 5000.0, 25600.0, 8, KIND_LATTICE) for i in range(3)]
+    with rasterio.open(rp) as src:
+        _, ins3 = _repair(src, NODATA, rbox, list(line), 8, 8)
+    assert not ins3, ins3
+
     SOUND_REPAIR = False
     REPAIR_SHOAL = False
 
