@@ -170,6 +170,13 @@ NODATA_SIMPLIFY_PX = float(os.environ.get("NODATA_SIMPLIFY_PX", "1"))
 # mitre join so a dense shoreline gains no arc vertices at its corners.
 NODATA_OVERLAP_PX = float(os.environ.get("NODATA_OVERLAP_PX", "2"))
 
+# Web Mercator's world half-width, in metres. 3857 -> 4326 normalizes longitude, so a vertex past
+# this edge lands on the FAR side of the antimeridian and its ring stretches around the globe as a
+# valid full-width bar at its latitude. The NODATA_OVERLAP_PX dilation is what reaches past, on the
+# edge stem whose clip box ends exactly here — and out there it has no neighbour to overlap, so the
+# write trims to this square first.
+WORLD_HALF_M = 20037508.342789244
+
 # Fixed-precision grid (metres) for overlays against multi-piece unions: GEOS 3.13's
 # float OverlayNG returns an empty overlay against some unions whose pairwise overlays are
 # correct (verified on 6-21-22-9; point-in-polygon arbitration); snap-rounded overlay is the
@@ -594,7 +601,18 @@ class _RowSink:
         import numpy as np
         import pandas as pd
         import shapely
-        gdf = gpd.GeoDataFrame(self.pending, crs="EPSG:3857").to_crs("EPSG:4326")
+        gdf = gpd.GeoDataFrame(self.pending, crs="EPSG:3857")
+        # Trim to the Web Mercator world BEFORE the transform (WORLD_HALF_M). Correct geometry
+        # never leaves the square, so the bounds test spares every row the intersection.
+        b = shapely.bounds(gdf.geometry.values)
+        past = (b[:, 0] < -WORLD_HALF_M) | (b[:, 2] > WORLD_HALF_M)
+        if past.any():
+            trimmed = gdf.geometry.values.copy()
+            trimmed[past] = shapely.intersection(
+                trimmed[past], shapely.box(-WORLD_HALF_M, -WORLD_HALF_M,
+                                           WORLD_HALF_M, WORLD_HALF_M))
+            gdf = gdf.set_geometry(gpd.GeoSeries(trimmed, index=gdf.index, crs="EPSG:3857"))
+        gdf = gdf.to_crs("EPSG:4326")
         # Snap to the write grid HERE, not in the driver, so what ships is what was validated.
         # GRID matches COORDINATE_PRECISION below, which is what makes this the LAST operation
         # geometry undergoes: the driver's own rounding is then a no-op on an already-snapped
@@ -1238,6 +1256,24 @@ def _check():
         f"the folded row moved past its snap budget: {_wrote!r} vs {_want!r} deg^2"
     assert _want > 0.99 * shapely.area(_folded4326), \
         "resolving the fold must not eat the ring"
+
+    # A nodata row dilated past the world's east edge, as NODATA_OVERLAP_PX does on the
+    # easternmost stem, whose clip box ends exactly there. Untrimmed, the inverse transform puts
+    # the dilated vertices at -180 and the ring spans every longitude on Earth.
+    _edge = _box(WORLD_HALF_M - 500.0, 9.55e6, WORLD_HALF_M, 9.56e6).buffer(
+        NODATA_OVERLAP_PX * get_resolution(14), join_style="mitre", mitre_limit=2.0)
+    _wrapped = gpd.GeoSeries([_edge], crs="EPSG:3857").to_crs("EPSG:4326").values[0].bounds
+    assert _wrapped[2] - _wrapped[0] > 300, \
+        "the fixture must wrap the antimeridian without the trim"
+    _d = tempfile.mkdtemp()
+    _sink = _RowSink(f"{_d}/rows.geojsons")
+    _sink.write([{"geometry": _edge, "drval1": None, "drval2": None,
+                  "sys": None, "kind": "lake", "rank": NODATA_RANK}])
+    _sink.finish(f"{_d}/out.fgb")
+    _got = gpd.read_file(f"{_d}/out.fgb")
+    _w = shapely.bounds(_got.geometry.values)
+    assert len(_got) and (_w[:, 2] - _w[:, 0]).max() < 0.01, \
+        f"a row dilated past the world edge must not wrap: {_got.total_bounds!r}"
 
     # ...and the gate is WIRED, not just arithmetic: a repair that eats the folded ring kills the
     # tile rather than shipping a hole. Same fixture, with the repair stubbed to return a crumb.
