@@ -174,10 +174,13 @@ def _fork_gb(table, default):
 
 
 # The merge streams block-wise, so its footprint never scales with window size the way
-# weight() assumes: ceil(measured max) per child_z over the 2026-07-28 corpora (z15 8.4 GB
-# vs the 27 GB weight-based reserve that admitted 5 merges where 17 fit). disk_mb stays
-# weight-based — scratch (the -tmp reprojected tiffs) does scale with the window.
-MOSAIC_GB = {15: 9, 14: 7, 13: 3, 12: 2, 11: 2, 10: 2}
+# weight() assumes: ceil(measured max) per child_z, plus a 1 GB pad. The figures hold only
+# with MALLOC_ARENA_MAX pinned (build.yml) — glibc keeps a per-contending-thread arena at its
+# high-water for the process's life, which on a 48-core box dwarfs the real working set.
+# Run 35124735536 on a ccx63: cz15 max 1.9 GB over 59 rows, cz13 1.5 over 23, cz12 1.1 over 28.
+# cz14 carries no rows and sits between its neighbours. disk_mb stays weight-based — scratch
+# (the -tmp reprojected tiffs) does scale with the window.
+MOSAIC_GB = {15: 3, 14: 3, 13: 2, 12: 2, 11: 2, 10: 2}
 MERGE_FACTOR = 1.5
 
 
@@ -335,7 +338,10 @@ SMOOTH_CFG = json.dumps({} if os.environ.get("SKIP_SMOOTH") else {
 # ~9 GB of pure cache per GDAL process and swamps the real working set (build.yml pins it).
 # cz14/15 contour: 17 cz15 rows measured p99 1.56 GB; cz14 mirrors it (no cz14 rows yet).
 CONTOUR_GB = {15: 2, 14: 2}
-WINDOW_GB = {15: 4, 14: 4}
+# Window: run 35124735536 measured cz15 max 1.0 GB over 4 rows and 0.7 GB over 976 cz8-11 rows.
+# smooth.py works the window in blocked passes, so the footprint tracks the strip, not the
+# window area — a cz15 window is 4.3 GB on disk and never resident.
+WINDOW_GB = {15: 2, 14: 2}
 # cz13-15 soundings carry no measured rows yet — held at the earlier conservative figures;
 # the measured classes (cz8-10, max 0.45 GB) ride the default.
 SOUND_GB = {15: 12, 14: 8, 13: 3}
@@ -414,7 +420,9 @@ rule contour_tile:
     priority: vector_tile_priority  # vector band: drain before terrain so the bundle overlaps it
     retries: 2
     resources:
-        mem_gb=_fork_gb(CONTOUR_GB, 3)
+        # The default covers cz8-11, measured max 0.3 GB over 85 rows (run 35124735536): the
+        # isobaths come off the depare partition, so a coarse stem reads few, simple bands.
+        mem_gb=_fork_gb(CONTOUR_GB, 1)
     benchmark:
         f"{TMP}/bench/contour/{{stem}}.tsv"
     log:
