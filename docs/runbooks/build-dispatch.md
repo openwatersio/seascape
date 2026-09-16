@@ -18,12 +18,12 @@ Snakemake job identity is **params + inputs + code**, and the planner is the onl
 | Dispatch | Expected jobs |
 | --- | --- |
 | One stage across the covering (depare, soundings, contours, windows — each) | ≈ `N` |
-| Vector tail (cells + shallow + join + bundles + stage) | ≈ `N` + 5 |
+| Vector tail (cells + shallow + join + bundles + stage) | ≈ `N` + `C` + 5, where `C` is the populated overlay-cell count (one `overlay_bundle` each) |
 | Terrain renders | ≈ `2.4 x N` (one per output zoom per anchor, so it scales with the pyramid, not the covering alone) |
 | A vector-wide rebuild (the four fork stages + vector tail + terrain cascade) | ≈ `7 x N` |
 | Incremental after a code-only change | single digits |
 
-Worked example: run 35124735536 planned **33,150** against a 4,459-stem covering — four fork stages (17,836), terrain (10,557), vector cells (4,459), the re-keyed merges (267) and the bundle tail (31).
+Worked example: run 35124735536 planned **33,150** against a 4,459-stem covering — four fork stages (17,836), terrain (10,557), vector cells (4,459), the re-keyed merges (267) and the bundle tail (31, of which 23 are overlay cells).
 
 To predict scope before dispatching, dry-run locally against a representative store (the bbox root in `pipelines/`, with the same `BBOX` its provenance records) and read the job stats **and** the `reason:` lines per rule — the reasons, not the counts, tell you whether the plan matches your intent.
 

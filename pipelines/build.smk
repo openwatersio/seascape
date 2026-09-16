@@ -174,12 +174,13 @@ def _fork_gb(table, default):
 
 
 # The merge streams block-wise, so its footprint never scales with window size the way
-# weight() assumes: ceil(measured max) per child_z, plus a 1 GB pad. The figures hold only
-# with MALLOC_ARENA_MAX pinned (build.yml) — glibc keeps a per-contending-thread arena at its
+# weight() assumes: ceil(measured max) per child_z, floored at 2, with a 1 GB pad at cz14/15
+# where the coastal tail is the thinnest-sampled and the heaviest. The figures hold only with
+# MALLOC_ARENA_MAX pinned (build.yml) — glibc keeps a per-contending-thread arena at its
 # high-water for the process's life, which on a 48-core box dwarfs the real working set.
 # Run 35124735536 on a ccx63: cz15 max 1.9 GB over 59 rows, cz13 1.5 over 23, cz12 1.1 over 28.
-# cz14 carries no rows and sits between its neighbours. disk_mb stays weight-based — scratch
-# (the -tmp reprojected tiffs) does scale with the window.
+# cz14 carries no rows and mirrors cz15. disk_mb stays weight-based — scratch (the -tmp
+# reprojected tiffs) does scale with the window.
 MOSAIC_GB = {15: 3, 14: 3, 13: 2, 12: 2, 11: 2, 10: 2}
 MERGE_FACTOR = 1.5
 

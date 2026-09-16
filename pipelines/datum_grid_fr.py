@@ -456,6 +456,18 @@ def _check():
     assert np.nanmax(np.abs(got[interior] - want[interior])) < 1e-9, \
         float(np.nanmax(np.abs(got[interior] - want[interior])))
 
+    # Nodes in a line span no area, so there is no triangulation to blend over. This surface is
+    # subtracted from charted depths, so that must stop the build with a readable reason rather
+    # than return an all-NaN grid that drops the correction silently.
+    flat = np.c_[np.linspace(1.0, 2.0, 40), np.full(40, 44.5),
+                 np.full(40, 41.0), np.full(40, 0.1)]
+    try:
+        interpolate(flat, *grid_axes(flat, res=0.01)[:2])
+    except ValueError as e:
+        assert "span no area" in str(e), str(e)
+    else:
+        raise AssertionError("collinear nodes must refuse to interpolate")
+
     # The distance bound is what keeps the hull from inventing a reference across a gap: two
     # clusters 1 deg (~80 km) apart must not be bridged, however happily Delaunay spans them.
     split = np.vstack([nodes, np.c_[pts + [2.0, 0.0], plane, np.full(len(pts), 0.1)]])
