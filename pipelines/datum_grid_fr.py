@@ -224,10 +224,19 @@ def interpolate(nodes, lons, lats, max_node_km=MAX_NODE_KM):
     return a value outside the range of the nodes that produced it, which is what keeps a
     reference that gets subtracted from charted depths honest."""
     from scipy.interpolate import LinearNDInterpolator
-    from scipy.spatial import cKDTree
+    from scipy.spatial import QhullError, cKDTree
 
     grid_lon, grid_lat = np.meshgrid(lons, lats)
-    values = LinearNDInterpolator(nodes[:, :2], nodes[:, 2])(grid_lon, grid_lat)
+    try:
+        values = LinearNDInterpolator(nodes[:, :2], nodes[:, 2])(grid_lon, grid_lat)
+    except QhullError as e:
+        # Collinear nodes span no area, so there is no triangulation to blend over. Raise
+        # rather than return an empty surface: this reference is subtracted from charted
+        # depths, and a grid that is silently all-NaN drops the correction instead of
+        # reporting that it has none.
+        raise ValueError(
+            f"BATHYELLI nodes span no area ({len(nodes)} nodes); no datum surface can be "
+            f"interpolated from them") from e
 
     # Distances in km, not degrees: a degree of longitude is 2/3 of a degree of latitude here,
     # so a bound measured in degrees would reach half again as far east-west as intended.
@@ -446,6 +455,18 @@ def _check():
     assert interior.sum() > 0.5 * got.size, f"only {interior.sum()} of {got.size} interpolated"
     assert np.nanmax(np.abs(got[interior] - want[interior])) < 1e-9, \
         float(np.nanmax(np.abs(got[interior] - want[interior])))
+
+    # Nodes in a line span no area, so there is no triangulation to blend over. This surface is
+    # subtracted from charted depths, so that must stop the build with a readable reason rather
+    # than return an all-NaN grid that drops the correction silently.
+    flat = np.c_[np.linspace(1.0, 2.0, 40), np.full(40, 44.5),
+                 np.full(40, 41.0), np.full(40, 0.1)]
+    try:
+        interpolate(flat, *grid_axes(flat, res=0.01)[:2])
+    except ValueError as e:
+        assert "span no area" in str(e), str(e)
+    else:
+        raise AssertionError("collinear nodes must refuse to interpolate")
 
     # The distance bound is what keeps the hull from inventing a reference across a gap: two
     # clusters 1 deg (~80 km) apart must not be bridged, however happily Delaunay spans them.
