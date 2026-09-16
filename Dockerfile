@@ -1,6 +1,8 @@
-# Official OSGeo image, built from GDAL master (the HDF5/BAG drivers, plus the
-# near-linear `gdal_contour -p` that the DEPARE partition pass depends on — OSGeo/gdal#14983,
-# merged after 3.13.3). Digest-pinned because the tag floats with master.
+# Official OSGeo image, built from GDAL master (the HDF5/BAG drivers, plus the fast
+# `gdal_contour -p` that the DEPARE partition pass depends on: OSGeo/gdal#14983 for the
+# near-linear ring appender, #15181 for quadratic segment merging, #15182 for CPLQuadTree
+# degradation after feature removal — all merged after 3.13.3, so no release carries them).
+# Digest-pinned because the tag floats with master.
 # Bumping it (GDAL/GEOS/PROJ) must bump `version` on mosaic_tile, the fork rules, and
 # terrain_render (build.smk) — tools are not rule inputs.
 FROM ghcr.io/osgeo/gdal:ubuntu-full-latest@sha256:05c65b38a829ae31bf227845168211c23086184f9928e0a9347305868ca7a27f
