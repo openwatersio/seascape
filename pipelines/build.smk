@@ -454,7 +454,7 @@ rule depare_tile:
     output:
         "store/depare/{stem}.fgb"
     params:
-        version=3, # increment to force a rebuild
+        version=4, # increment to force a rebuild
         levels=json.dumps({"m": pipeline_config.DEPARE_LEVELS, "ft": pipeline_config.DEPARE_LEVELS_FT}),
         drying=pipeline_config.DRYING_CAP, sliver=depare_run.SLIVER_MIN_PX,
         simplify_mm=depare_run.SIMPLIFY_MM,
