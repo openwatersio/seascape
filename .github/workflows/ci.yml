@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions: { contents: read, packages: write }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ghcr-login
       - name: Already in GHCR?
         id: have
@@ -50,7 +50,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions: { contents: read, packages: read }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ghcr-login
       - name: Test suite (self-checks + workflow lint)
         run: docker run --rm -v "$PWD:/app" "$IMAGE:$IMAGE_TAG" just test
@@ -68,7 +68,7 @@ jobs:
   web:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with: { node-version: 22, cache: npm }
       - name: Build viewer

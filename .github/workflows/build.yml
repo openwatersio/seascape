@@ -80,7 +80,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions: { contents: read, packages: write }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ghcr-login
       - name: Already in GHCR?
         id: have
@@ -188,7 +188,7 @@ jobs:
       # to release.yml (which promotes the bare sha), so a regional stage can never ship.
       SHA: ${{ github.event.inputs.bbox && format('{0}-bbox', github.sha) || github.sha }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       # Idempotent box setup — docker + the store volume mount. STATE is the volume root
       # (contains store/ and .snakemake/), mounted whole so both persist. A build assumes a
       # warm volume — refuse to run against a blank one (that's sources.yml's job).
@@ -561,7 +561,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Fetch Hetzner host metrics
         continue-on-error: true
         env:
