@@ -224,10 +224,19 @@ def interpolate(nodes, lons, lats, max_node_km=MAX_NODE_KM):
     return a value outside the range of the nodes that produced it, which is what keeps a
     reference that gets subtracted from charted depths honest."""
     from scipy.interpolate import LinearNDInterpolator
-    from scipy.spatial import cKDTree
+    from scipy.spatial import QhullError, cKDTree
 
     grid_lon, grid_lat = np.meshgrid(lons, lats)
-    values = LinearNDInterpolator(nodes[:, :2], nodes[:, 2])(grid_lon, grid_lat)
+    try:
+        values = LinearNDInterpolator(nodes[:, :2], nodes[:, 2])(grid_lon, grid_lat)
+    except QhullError as e:
+        # Collinear nodes span no area, so there is no triangulation to blend over. Raise
+        # rather than return an empty surface: this reference is subtracted from charted
+        # depths, and a grid that is silently all-NaN drops the correction instead of
+        # reporting that it has none.
+        raise ValueError(
+            f"BATHYELLI nodes span no area ({len(nodes)} nodes); no datum surface can be "
+            f"interpolated from them") from e
 
     # Distances in km, not degrees: a degree of longitude is 2/3 of a degree of latitude here,
     # so a bound measured in degrees would reach half again as far east-west as intended.
