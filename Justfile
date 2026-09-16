@@ -85,6 +85,13 @@ test-engine:
     uv run python bundle.py --check
     uv run python test_build.py
     uv run python terrain.py --check
+    # The forks off the merged DEM, each the shape of a whole product: their self-checks are
+    # where the geometry invariants live, so CI must run them and not just the modules around
+    # them. A collinear sounding field reached a planet build because this line was missing.
+    uv run python soundings_run.py check
+    uv run python depare_run.py check
+    uv run python contour_run.py check
+    uv run python smooth.py
     uv run python heal_depare_schema.py --check
     uv run python test_consistency.py
     # Repo root: the logger plugin has to sit on sys.path under its discoverable name.

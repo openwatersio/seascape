@@ -815,8 +815,9 @@ def _check():
     # interior. Planet run 35124735536 lost stem 8-158-70-10 to exactly this.
     line = [(10.0, 5000.0 + i * 5000.0, 25600.0, 8, KIND_LATTICE) for i in range(3)]
     with rasterio.open(rp) as src:
-        _, ins3 = _repair(src, NODATA, rbox, list(line), 8, 8)
+        kept, ins3 = _repair(src, NODATA, rbox, list(line), 8, 8)
     assert not ins3, ins3
+    assert kept == line, kept   # the field ships as-is: nothing inserted, nothing dropped
 
     SOUND_REPAIR = False
     REPAIR_SHOAL = False
