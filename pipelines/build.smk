@@ -343,8 +343,12 @@ CONTOUR_GB = {15: 2, 14: 2}
 # smooth.py works the window in blocked passes, so the footprint tracks the strip, not the
 # window area — a cz15 window is 4.3 GB on disk and never resident.
 WINDOW_GB = {15: 2, 14: 2}
-# cz13-15 soundings carry no measured rows yet — held at the earlier conservative figures;
-# the measured classes (cz8-10, max 0.45 GB) ride the default.
+# Held well above the measured peaks on purpose. Run 35149243490 measured cz15 max 4.1 GB over
+# 116 rows and cz14 max 2.8 over 133, against these 12 and 8 — but that run also peaked at 107 GB
+# resident and spilled 24 GB to swap on a 184 GB box, so the slack these reservations hold back is
+# doing real work. Cutting them admits more soundings concurrently and spends exactly the headroom
+# the coarse depare stems ride (cz8 measured 20.8 GB against a 3 GB reserve). Refit them together
+# with the global budget, on a run that is not already swapping — not on their own.
 SOUND_GB = {15: 12, 14: 8, 13: 3}
 # depare reads partition buckets one at a time and writes rows incrementally, so its peak
 # is the biggest band + coverage parts, not the window's whole set.
