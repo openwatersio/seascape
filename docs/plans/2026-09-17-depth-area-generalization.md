@@ -1,25 +1,14 @@
 # Depth areas compiled per usage band
 
-_Written 2026-09-17 after planet run 35232921772 stopped on the Rhine–Meuse delta cell. Point-in-time; the code is the source of truth. Companion to [2026-07-30-shallow-coarsening.md](2026-07-30-shallow-coarsening.md) (the native-resolution operators this builds on), [depth-areas.md](depth-areas.md) (the layer's contract) and [2026-07-21-depare-perf.md](2026-07-21-depare-perf.md). Standards and literature cited here are catalogued with verification status in [../nautical-chart-references.md](../nautical-chart-references.md)._
+_Written 2026-09-17 after planet run 35232921772 stopped on the Dutch-coast cell `8-131-84`. Point-in-time; the code is the source of truth. Companion to [2026-07-30-shallow-coarsening.md](2026-07-30-shallow-coarsening.md) (the native-resolution operators this builds on), [depth-areas.md](depth-areas.md) (the layer's contract) and [2026-07-21-depare-perf.md](2026-07-21-depare-perf.md). Standards and literature cited here are catalogued with verification status in [../nautical-chart-references.md](../nautical-chart-references.md)._
 
 ## 1. Why
 
 The depth-area layer ships one partition, cut at each stem's native resolution, into every zoom from 6 up. Contours carry a per-curve zoom ladder (`contour_run.CONTOUR_TIERS`) and soundings carry pyramid levels, but `contour_run._build_seqs_and_run` hands every depth-area polygon the same `DEPARE_MINZOOM` of 6. An overview tile therefore carries the full-resolution partition, and on an intricate coast that partition is enormous.
 
-Measured on the stem that stopped the run, `8-131-84-12` (4.2–5.6°E, 51.6–52.5°N: Rotterdam, the Haringvliet and the Voordelta):
+Planet run 35232921772 stopped on cell `8-131-84` (the Dutch coast from the Haringvliet to the Zaanstreek) when tile `10/525/337` reached 993,779 bytes against the 800,000 ceiling, `--coalesce-smallest-as-needed` armed, and the pass discarded soundings the cell census then correctly refused. That tile was a clamp defect, not a generalization problem: 17,913 sub-pixel drainage ditches in the water mask let a coarse source's polder elevation through as 0–2 m depth bands — 556,559 polygons and 36,534 soundings on the specks. #196 gives the clamp's water exemption a width floor of the source's own cell; the stem drops to 380 polygons and 221 soundings and the tile to 42 KB. In the last full planet run (32030835194) that cell was the only one of 4,292 whose overview tiles exceeded the ceiling before coalescing, so with the floor in place no cell does.
 
-| | value |
-| --- | --- |
-| depth-area polygons | 556,559 |
-| vertices per polygon, median | 5 (a single quadrilateral) |
-| depare FGB | 173 MB, against a median of 0.2 MB over 4,768 stems |
-| polygons under 4×4 px at z10 | **82.1%**, carrying **40.5%** of all vertices |
-| the same threshold at z12 | 1.55% |
-| tile `10/525/337` | 993,779 bytes against the 800,000 ceiling |
-
-The tile exceeded the budget, `--coalesce-smallest-as-needed` armed, and the pass discarded 198 soundings on its way to fitting — which the cell census then correctly refused. So the run stopped on a legitimate guard, over geometry that is four-fifths invisible at the zoom it was drawn at.
-
-This stem is not the worst. The heavy tail of the store is `5-9-9-9` (Hudson Bay) at 345 MB, `8-70-104-14` (Georgia sea islands) at 332 MB, `8-70-103-14` at 319 MB, `8-62-105-14` (Atchafalaya) at 221 MB — every one a marsh, delta or archipelago coast where the ground oscillates across a band boundary pixel to pixel and `gdal_contour -p` polygonises it into salt and pepper. Byte levers alone do not reach this: a five-vertex quadrilateral does not simplify, and the followups' `-D` overview detail only shrinks coordinates. The problem is feature count, and feature count at overview zooms is a generalization problem.
+What remains is the shape of the layer at overview zooms, on ground that really is water. The heavy tail of the store is `5-9-9-9` (Hudson Bay) at 345 MB, `8-70-104-14` (Georgia sea islands) at 332 MB, `8-70-103-14` at 319 MB, `8-62-105-14` (Atchafalaya) at 221 MB — every one a marsh, delta or archipelago coast where the ground oscillates across a band boundary pixel to pixel and `gdal_contour -p` polygonises it into salt and pepper. Their bytes are vertices rather than parts: the Georgia cell holds 28,430 depth-area polygons at ~11 KB each. Its overview tiles fit only because the tile writer collapses whatever is sub-pixel at each zoom — 20,690 polygons at z8, 8,705 at z10, 3,348 at z12 on that cell, and 43,621 / 20,988 / 2,413 on the Barataria cell (`tiny_polygons` per zoom, run 32030835194). On the Georgia fixture `12-1122-1670-14`, 90% of parts are under 16 px² at z10 and 65% at z12, carrying 15% and 6% of the vertices. A partition thinned per tile by the writer is the per-feature hiding the standards forbid (§2): it is decided by pixel size rather than depth, it can drop a shoal as readily as a pit, and every overview zoom still reads the full native partition into the shallow run. That is the case for compiling a partition per band. It is a cartographic and cost case, not a build blocker.
 
 ## 2. What the standards say
 
@@ -65,7 +54,7 @@ A tier has two independent dials: the **surface** it is cut from (which resoluti
 
 Fathom curves follow the rule `contour_minzoom` applies today: a curve shows once it is at least as deep as the tier's shallowest metre level. Zero closes the shoalest band at the shoreline in every tier, and the `[0, DRYING_CAP]` drying bucket rides every tier's metre pass exactly as it rides the native one.
 
-**The surface dial is set unconditionally.** Tier D is cut from the z11 pyramid level rather than the native window. For a cz15 marsh stem, the native cut is 16× finer than a z11 pixel, which is the same over-resolution that produced 82% sub-legible parts on the Rhine–Meuse stem at z10, two zooms further in. Cutting at z11 resolution changes nothing about which contours a user sees; it generalizes the band edges shoal-ward exactly as tiers A–C do, and it is the re-grid step the hydrographic offices perform at every compilation scale.
+**The surface dial is set unconditionally.** Tier D is cut from the z11 pyramid level rather than the native window. For a cz15 marsh stem, the native cut is 16× finer than a z11 pixel, which is the over-resolution that leaves 90% of the Georgia fixture's parts under 16 px² at z10, two zooms further in. Cutting at z11 resolution changes nothing about which contours a user sees; it generalizes the band edges shoal-ward exactly as tiers A–C do, and it is the re-grid step the hydrographic offices perform at every compilation scale.
 
 **The ladder dial at z11–12 is decided by the fixtures.** The first pass keeps every level so no contour line changes. NOAA's table draws 5 m from Approach scale (1:90,000 ≈ z13) and 2 m from 1:45,000 (≈ z14); at z11–12 it draws 20, 30, 50 and nothing shoaler. This ladder is one band finer than NOAA's at every scale, which is a legitimate choice for a small-craft chart and costs geometry. If the surface tiering alone brings the cz15 marsh cells' z11–12 tiles under budget with the Töpfer gate met, the finer ladder stays. If it does not, tier D thins to 10 m and deeper, with 5 m entering at z13 and 2 m at z14 (§6, question 1).
 
@@ -100,7 +89,7 @@ The shallow run (z0 to the split) consumes tiers A and B only, which turns its i
 
 ### 3e. What to expect
 
-On the Rhine–Meuse stem at z10, tier C's ladder has no 2 m or 5 m level and its surface is four times coarser than native, so the 0/2/5 oscillation that produced half a million quadrilaterals is not cut at all. Töpfer's law says the areal feature count should fall by roughly an order of magnitude over those two zoom steps; the ladder change alone should beat that on a marsh, because the fragmentation lives in the levels being omitted. The 993 KB tile should come in far under the 800 KB ceiling with the coalesce pass never arming, which is the design intent of that ceiling.
+On the Georgia and Terrebonne fixtures at z10, tier C's ladder has no 2 m or 5 m level and its surface is four times coarser than native, so the 0/2/5 oscillation that fragments a marsh partition is not cut at all. Töpfer's law says the areal feature count should fall by roughly an order of magnitude over those two zoom steps; the ladder change alone should beat that on a marsh, because the fragmentation lives in the levels being omitted. The writer's `tiny_polygons` counts above are the baseline: the 8,705 Georgia parts the writer collapses at z10 should never be cut in the first place, and what the tier does emit is legible by construction.
 
 Across the store, the 200–345 MB partitions become tier E only; tiers A–D for the same stems are kilobytes to low megabytes. The per-cell overview tile bytes and the shallow run's input size — items 10 and 11 of the post-build followups — are both addressed by the same mechanism.
 
@@ -113,21 +102,21 @@ Every operator here has a gate that fails on the mistake it is capable of, most 
 - **Partition contract, per tier.** Gate 4: pairwise-disjoint interiors within a ladder, area conserved through the dissolve to the recorded tolerance.
 - **Legibility, per tier.** New. No band part under 4 mm² at tier scale unless every neighbour is deeper (a kept peak). Count the kept peaks and report them; they are the exaggeration backlog.
 - **Töpfer, per tier.** New. Areal feature count falls by at least ~85% at each step down the ladder over the same stem — E to D, D to C, C to B. A tier that fails is under-generalized; the gate is a floor on ambition, not a selection rule, and it is the measurement that decides the z11–12 ladder question.
-- **Channels stay open at every tier.** Gate 6, the named routes in `perf/routes.geojson`, at each tier — and this matters more at coarse zooms, where NOAA's own 0.5 mm waterway floor is 30 m at z12, wider than parts of the GIWW. Add a Rhine route (Nieuwe Waterweg) and a Great Lakes route to the file alongside the Gulf set.
+- **Channels stay open at every tier.** Gate 6, the named routes in `perf/routes.geojson`, at each tier — and this matters more at coarse zooms, where NOAA's own 0.5 mm waterway floor is 30 m at z12, wider than parts of the GIWW. Add a Rhine route (Nieuwe Waterweg), the Noordzeekanaal and a Great Lakes route to the file alongside the Gulf set.
 - **Seams, per tier.** `seam_check check_depare` and `check_contours` on an adjacent stem pair at each tier, since each tier is an independent cut whose only seam guarantee is the origin-anchored surface.
-- **Bytes.** The Rhine–Meuse fixture's cell run at every zoom under `VECTOR_CELL_TILE_BYTES` with zero coalesce events, and the shallow run's worst tile likewise.
+- **Bytes.** The Georgia, Terrebonne and Amsterdam fixtures' cell runs at every zoom under `VECTOR_CELL_TILE_BYTES` with zero coalesce events, and the shallow run's worst tile likewise. Tile bytes are within budget everywhere after #196; this gate keeps them there.
 - **Safety contour at every zoom.** `ab_check`: at each zoom the band set equals the tier's ladder, and a safety depth between levels snaps to the next-deeper level *present at that zoom* — the style is unchanged and keys on `drval1`, so this is a tiles-side check that the snap target exists.
 
 ## 5. Sequence
 
 Every step is measured on the local rig before any box time, per the loop in the shallow-coarsening plan (`just perf-fixtures`, `just perf depare <stem> <label>`, `just perf-compare`, `just perf-gate`).
 
-1. **Fixtures.** Add the Rhine–Meuse stem as a site (`8-131-84-12`: crop centred on the Haringvliet mouth) and Georgia's `8-70-104-14`; keep `terrebonne`, `delmarva` and `iberian-abyssal` as the marsh, lagoon and open-ocean controls. Extend `perf/bench.py` to run a cell bundle on a fixture so tile bytes per zoom are a measured number, not a box surprise. Baseline parts, vertices, bytes and tile bytes per zoom on unmodified code.
+1. **Fixtures.** Sites: `amsterdam` (`8-131-84-12`, cut as the z10 tile itself and reclamped with the #196 floor until the mosaic republishes), `georgia` (`8-70-104-14`), with `terrebonne`, `delmarva` and `iberian-abyssal` as the marsh, lagoon and open-ocean controls. Extend `perf/bench.py` to run a cell bundle on a fixture so tile bytes per zoom are a measured number, not a box surprise. Baseline parts, vertices, bytes and tile bytes per zoom on unmodified code.
 2. **Tier surface and tier cut.** `depare_run.tile` loops tiers; for A–D it reads the tier surface through `terrain._read_window` and calls `_depare_dem` with the tier zoom; tier E is the current path. Multiple outputs in `build.smk`, `version` bumped, the tier ladder in `params` so a ladder change re-keys. Measure parts and vertices per tier against the Töpfer gate.
 3. **Zoom columns.** `maxzoom` in `_fgb_to_seq`; the shallow and cell runs select tiers by zoom; `contour_run.tile` derives lines per tier; `contour_minzoom` and its call sites go. Census and `vector_selfcheck` green on the fixtures.
 4. **The dissolve.** §3c with the never-deeper and legibility gates; measure what the kept-peak count looks like on the marsh fixtures.
 5. **Docs.** `schema.md` gains the sentence contours already have — coarse zooms carry fewer bands, and which levels bound a band at a zoom is a display decision, not a schema guarantee. `cartography.md` gets a section beside "Contour generalization by zoom". The comment above `DEPARE_MINZOOM` and the shallow-run and cell-run tile-bytes notes in `contour_run` change to describe the tiers.
-6. **Box.** A bbox smoke over the Rhine–Meuse stem (the build lane's documented practice), then the planet. This re-keys every `depare_tile`, which regenerates every window and cascades to contours and soundings through the temp-window rule in the dispatch runbook — a full vector rebuild, to be sequenced with a release rather than paid on its own.
+6. **Box.** A bbox smoke over the Georgia and Amsterdam stems (the build lane's documented practice), then the planet. This re-keys every `depare_tile`, which regenerates every window and cascades to contours and soundings through the temp-window rule in the dispatch runbook — a full vector rebuild, to be sequenced with a release rather than paid on its own.
 
 ## 6. Open questions
 
