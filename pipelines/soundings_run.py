@@ -154,6 +154,21 @@ KIND_PRIME = 1     # least depth in a closed isobath: uncapped, carries prime=1
 KIND_REPAIR = 2    # B-410a/B-403.1a insertion: uncapped from the zoom that needed it
 
 
+def _owns(bbox, x, y):
+    """Whether a stem owns the point — half-open, so adjacent stems partition the plane.
+
+    A stem owns its west and north edges and cedes its east and south. Closed intervals let both
+    neighbours claim a point on a shared edge, and the two disagree about where it lands: the
+    emitting stem's vector cell counts it, while the tiler puts a coordinate on the east/south
+    edge in the NEIGHBOUR's tile, which that cell's fringe filter drops as not its own. The
+    sounding then exists in no tile and fails the cell census. Working on extents hides this —
+    a polygon straddling the edge is clipped, but a point is dimensionless and simply lands on
+    one side. Planet run 35149243490 lost 7 cells this way, 1 sounding of 989,648 in the worst.
+
+    Vectorizes: `&` over numpy arrays, and over Python bools for the scalar callers."""
+    return (x >= bbox.left) & (x < bbox.right) & (y > bbox.bottom) & (y <= bbox.top)
+
+
 def _displayed_at(pts, zoom, child_z):
     """Indices of pts displayed at `zoom` under _tc's placement: capped lattice levels show at
     exactly their zoom; primes and repair insertions ride uncapped from their minzoom."""
@@ -182,7 +197,7 @@ def _repair(src, nodata, bbox, pts, z, child_z):
     wet = (small != nodata) & (small < 0)
     rows, cols = np.nonzero(wet)
     sx, sy = transform * (cols * k + k / 2.0, rows * k + k / 2.0)
-    inb = (sx >= bbox.left) & (sx <= bbox.right) & (sy >= bbox.bottom) & (sy <= bbox.top)
+    inb = _owns(bbox, sx, sy)
     rows, cols, sx, sy = rows[inb], cols[inb], sx[inb], sy[inb]
     actual = -small[rows, cols].astype(float)
 
@@ -506,7 +521,7 @@ def _pyramid(src, nodata, bbox, min_depth, z, child_z):
     import numpy as np
     transform = src.transform
     pts = []
-    in_bbox = lambda x, y: bbox.left <= x <= bbox.right and bbox.bottom <= y <= bbox.top
+    in_bbox = lambda x, y: bool(_owns(bbox, x, y))
 
     # ONE decimated read, shared with ring detection; the DEM is
     # never held whole (a z8 stem at cz14 is 4.33 GB as float32).
@@ -808,6 +823,22 @@ def _check():
         _, ins2 = _repair(src, NODATA, rbox, list(base), 8, 9)
     assert sum(ins2.values() or [0]) < sum(ins.values()), (ins, ins2)
     REPAIR_SPACING_PX = 0.0
+
+    # Adjacent stems must PARTITION the plane, not overlap on the seam: a point on a shared edge
+    # belongs to exactly one of them. Both claiming it is what put a sounding in a tile its own
+    # cell's fringe filter drops, leaving it in no tile at all (run 35149243490).
+    _west = SimpleNamespace(left=0.0, bottom=0.0, right=100.0, top=100.0)
+    _east = SimpleNamespace(left=100.0, bottom=0.0, right=200.0, top=100.0)
+    _south = SimpleNamespace(left=0.0, bottom=-100.0, right=100.0, top=0.0)
+    _se = SimpleNamespace(left=100.0, bottom=-100.0, right=200.0, top=0.0)
+    # The shared corner (100, 0) belongs to the DIAGONAL neighbour, so the quad must be complete
+    # for the count to mean anything — a three-stem fixture reports it as orphaned.
+    for _x, _y in ((100.0, 50.0), (0.0, 0.0), (100.0, 0.0), (50.0, 0.0)):
+        _owners = sum(bool(_owns(b, _x, _y)) for b in (_west, _east, _south, _se))
+        assert _owners == 1, f"({_x}, {_y}) claimed by {_owners} stems, not exactly 1"
+    assert bool(_owns(_west, 0.0, 100.0)), "a stem owns its own west/north corner"
+    assert not _owns(_west, 100.0, 50.0), "a stem cedes its east edge"
+    assert not _owns(_west, 50.0, 0.0), "a stem cedes its south edge"
 
     # A collinear displayed field spans no area, so qhull cannot triangulate it. The count guard
     # admits it (three points is enough to be a line), and the tile must survive: skipping the
