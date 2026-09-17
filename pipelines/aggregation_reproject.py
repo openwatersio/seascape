@@ -502,13 +502,16 @@ def reproject(filepath):
             # read negative on land. Clamp valid ^ land ^ <0 -> 0 right after warp, so the
             # merge/contour/soundings never see the false water. The mask rasterizes onto the
             # SAME buffered -te/-tr the warp used (all groups warp at `maxzoom`), so it aligns
-            # pixel-for-pixel and tile halos clamp identically. Rasterize once per tile (atomic,
-            # so a crashed rasterize can't leave a truncated mask this cache would trust), reuse
-            # across flagged sources. Fails loudly if LANDMASK is unreadable (ogr2ogr raises).
-            mask_tif = f"{tmp_folder}/landmask.tif"
+            # pixel-for-pixel and tile halos clamp identically. Rasterized once per tile and
+            # cell size (atomic, so a crashed rasterize can't leave a truncated mask this cache
+            # would trust). Fails loudly if LANDMASK is unreadable (ogr2ogr raises).
+            # Mapped water narrower than the source's own cell never opens the clamp: the
+            # source holds no depth there, only the land elevation of the polder around it.
+            min_w = cell_px * resolution
+            mask_tif = f"{tmp_folder}/landmask-{min_w:.0f}.tif"
             if not os.path.isfile(mask_tif):
                 landmask.rasterize(buffered_bounds(aggregation_tile, buffer_3857_rounded),
-                                   resolution, mask_tif)
+                                   resolution, mask_tif, min_water_width=min_w)
             landmask.clamp(out_tiff, mask_tif)
             # #24 inverse clamp: where this coarse source fabricates POSITIVE land over mapped
             # inland water (a lake it holds no bathymetry for), clear it to nodata so the merge
@@ -519,10 +522,10 @@ def reproject(filepath):
             # degrades to land-clamp-only (today's behavior), like rasterize's water subtraction.
             water_tif = None
             if landmask._present(landmask.water_path()):
-                water_tif = f"{tmp_folder}/watermask.tif"
+                water_tif = f"{tmp_folder}/watermask-{min_w:.0f}.tif"
                 if not os.path.isfile(water_tif):
                     landmask.rasterize_water(buffered_bounds(aggregation_tile, buffer_3857_rounded),
-                                             resolution, water_tif)
+                                             resolution, water_tif, min_water_width=min_w)
                 landmask.clamp_positive_water(out_tiff, water_tif)
             # 4th-quadrant clamp: shoreline cells reading positive just SEAWARD of the land line
             # (combined mask==0, outside inland water) are false drying — the depare/drying bucket

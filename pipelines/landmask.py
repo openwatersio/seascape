@@ -595,9 +595,32 @@ def _present(p):
     return p.startswith("/vsi") or os.path.isfile(p)
 
 
-def rasterize(bounds_3857, res, out_tif, src=None, water_src=None, all_touched=False):
+def _clip_water(water, bounds_3857, out_gpkg, min_width=0.0):
+    """The inland-water polygons touching bounds_3857, as a GPKG clip (an empty selection burns
+    as a clean no-op). kind <> 'physical': marine bays/straits are mapped without island holes,
+    so burning them back to water would erase real islands — inland kinds only. min_width
+    (3857 m) drops water narrower than that, measured as 2·area/perimeter: a coarse source
+    holds no depth for a ditch or canal narrower than its own cell, so the clamp stays and
+    the depare nodata layer says "unknown" there instead of the source's land elevation."""
+    xmin, ymin, xmax, ymax = bounds_3857
+    utils.run_command(
+        f"ogr2ogr -f GPKG -overwrite -nln water -where \"kind <> 'physical'\" "
+        f"-spat {xmin} {ymin} {xmax} {ymax} {out_gpkg} {water}")
+    if min_width > 0:
+        # Second pass over the small clip, not the planet mask: the SQLite dialect would
+        # scan past the FlatGeobuf spatial index.
+        wide = out_gpkg + ".wide.gpkg"
+        utils.run_command(
+            f"ogr2ogr -f GPKG -overwrite -nln water -dialect SQLITE -sql \"SELECT * FROM water "
+            f"WHERE 2 * ST_Area(geom) / ST_Perimeter(geom) >= {min_width}\" {wide} {out_gpkg}")
+        os.replace(wide, out_gpkg)
+
+
+def rasterize(bounds_3857, res, out_tif, src=None, water_src=None, all_touched=False,
+              min_water_width=0.0):
     """Burn the land mask onto a Byte raster (1=land, 0=water) on the given 3857 grid, then
-    subtract inland water (burn 0 over land) where a water mask is present.
+    subtract inland water (burn 0 over land) where a water mask is present — only water at
+    least `min_water_width` (3857 m) wide, see _clip_water.
 
     all_touched burns both passes with -at: every pixel a polygon touches, not just pixel
     centres. At a coarse grid a narrow island rim slips through centre sampling and keeps
@@ -648,12 +671,7 @@ def rasterize(bounds_3857, res, out_tif, src=None, water_src=None, all_touched=F
             "-co SPARSE_OK=YES "
             f"{clip} {tmp_out}")
         if _present(water):
-            # kind <> 'physical': marine bays/straits are mapped without island holes, so
-            # burning them back to water would erase real islands (they can open nothing
-            # else — seaward of the coastline is already water). Inland kinds only.
-            utils.run_command(
-                f"ogr2ogr -f GPKG -overwrite -where \"kind <> 'physical'\" "
-                f"-spat {xmin} {ymin} {xmax} {ymax} {water_clip} {water}")
+            _clip_water(water, bounds_3857, water_clip, min_water_width)
             utils.run_command(f"gdal_rasterize {at}-burn 0 {water_clip} {tmp_out}")
         os.replace(tmp_out, out_tif)  # atomic: out_tif only ever exists complete
     finally:
@@ -662,7 +680,7 @@ def rasterize(bounds_3857, res, out_tif, src=None, water_src=None, all_touched=F
                 os.remove(f)
 
 
-def rasterize_water(bounds_3857, res, out_tif, water_src=None):
+def rasterize_water(bounds_3857, res, out_tif, water_src=None, min_water_width=0.0):
     """Burn ONLY the inland-water polygons onto a Byte raster (1=inland water, 0=elsewhere) on
     the given 3857 grid — the key for the #24 inverse clamp. This is deliberately NOT the combined
     land mask: there ocean and lake are both 0, so a positive->nodata clamp keyed on it would punch
@@ -678,11 +696,7 @@ def rasterize_water(bounds_3857, res, out_tif, water_src=None):
     clip = out_tif + ".clip.gpkg"
     tmp_out = out_tif + ".tmp.tif"
     try:
-        # Same marine exclusion as rasterize(): a bay polygon over an island would key the
-        # #24 nodata clamp onto dry land.
-        utils.run_command(
-            f"ogr2ogr -f GPKG -overwrite -where \"kind <> 'physical'\" "
-            f"-spat {xmin} {ymin} {xmax} {ymax} {clip} {water}")
+        _clip_water(water, bounds_3857, clip, min_water_width)
         utils.run_command(
             f"gdal_rasterize -burn 1 -ot Byte -init 0 -te {xmin} {ymin} {xmax} {ymax} "
             f"-tr {res} {res} -co COMPRESS=DEFLATE -co BIGTIFF=IF_SAFER -co TILED=YES "
@@ -1008,6 +1022,10 @@ def _check():
         json.dump({"type": "FeatureCollection", "features": [{"type": "Feature",
                    "properties": {"kind": "lake"}, "geometry": {"type": "Polygon", "coordinates":
                                 [[[1.4, 1.4], [1.6, 1.4], [1.6, 1.6], [1.4, 1.6], [1.4, 1.4]]]}},
+                  # A ditch ~1.2 px wide inside the land box (the check grid is ~1 km/px).
+                  {"type": "Feature", "properties": {"kind": "canal"}, "geometry": {
+                      "type": "Polygon", "coordinates":
+                      [[[1.2, 1.25], [1.35, 1.25], [1.35, 1.261], [1.2, 1.261], [1.2, 1.25]]]}},
                   # A marine bay overlapping the land box's corner — an "island" under a
                   # holeless bay polygon. Must never subtract from the mask.
                   {"type": "Feature", "properties": {"kind": "physical"},
@@ -1100,6 +1118,25 @@ def _check():
     br, bc = rowcol(tr, bx, by)
     assert land[br, bc] == 1 and lw[br, bc] == 1, \
         "a marine 'physical' polygon must never erase land from the mask"
+
+    # Width floor: the ditch opens the clamp at no floor but not at 3 px; the lake (~24 px
+    # wide) opens it either way. Same rule on the water-only raster.
+    (dx,), (dy,) = _tf("EPSG:4326", "EPSG:3857", [1.28], [1.2555])
+    dr, dc = rowcol(tr, dx, dy)
+    (kx,), (ky,) = _tf("EPSG:4326", "EPSG:3857", [1.5], [1.5])
+    kr, kc = rowcol(tr, kx, ky)
+    assert lw[dr, dc] == 0 and lw[kr, kc] == 0, "ditch and lake both burn at no floor"
+    floor = f"{d}/mask_floor.tif"
+    rasterize(te, res, floor, src=land_fgb, water_src=water_fgb, min_water_width=3 * res)
+    with rasterio.open(floor) as m:
+        lf = m.read(1)
+    assert lf[dr, dc] == 1, "a ditch narrower than the floor must stay clamped"
+    assert lf[kr, kc] == 0, "a lake wider than the floor must still open the clamp"
+    floor_w = f"{d}/water_floor.tif"
+    rasterize_water(te, res, floor_w, water_src=water_fgb, min_water_width=3 * res)
+    with rasterio.open(floor_w) as m:
+        wf = m.read(1)
+    assert wf[dr, dc] == 0 and wf[kr, kc] == 1, "the water-only raster must honour the floor"
 
     # Seam determinism (with the water burn active): the same world cells rasterize identically
     # from a shifted (still grid-aligned) extent — the overlap is byte-identical, so tile halos
