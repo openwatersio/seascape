@@ -502,13 +502,13 @@ def reproject(filepath):
             # read negative on land. Clamp valid ^ land ^ <0 -> 0 right after warp, so the
             # merge/contour/soundings never see the false water. The mask rasterizes onto the
             # SAME buffered -te/-tr the warp used (all groups warp at `maxzoom`), so it aligns
-            # pixel-for-pixel and tile halos clamp identically. Rasterized once per tile and
-            # cell size (atomic, so a crashed rasterize can't leave a truncated mask this cache
-            # would trust). Fails loudly if LANDMASK is unreadable (ogr2ogr raises).
+            # pixel-for-pixel and tile halos clamp identically. Rasterized per flagged group
+            # (atomic, so a crashed rasterize can't leave a truncated mask this cache would
+            # trust). Fails loudly if LANDMASK is unreadable (ogr2ogr raises).
             # Mapped water narrower than the source's own cell never opens the clamp: the
             # source holds no depth there, only the land elevation of the polder around it.
             min_w = cell_px * resolution
-            mask_tif = f"{tmp_folder}/landmask-{min_w:.0f}.tif"
+            mask_tif = f"{tmp_folder}/landmask-g{i}.tif"
             if not os.path.isfile(mask_tif):
                 landmask.rasterize(buffered_bounds(aggregation_tile, buffer_3857_rounded),
                                    resolution, mask_tif, min_water_width=min_w)
@@ -517,15 +517,17 @@ def reproject(filepath):
             # inland water (a lake it holds no bathymetry for), clear it to nodata so the merge
             # fills it to 0 and Part 3's nodata depth-area renders instead of tan false land.
             # Keys on a water-ONLY raster, never the combined mask above (ocean and lake are both
-            # 0 there, so it would hole the coastal ocean). Same buffered -te/-tr, cached per tile
-            # across flagged sources. Skipped cleanly when no water feed is published — the mask
-            # degrades to land-clamp-only (today's behavior), like rasterize's water subtraction.
+            # 0 there, so it would hole the coastal ocean), and on ALL mapped water, no width
+            # floor: a positive reading under a sub-cell ditch must clear to unknown too, or the
+            # render's own water mask reads the surviving land elevation as drying. Same buffered
+            # -te/-tr, cached per tile across flagged sources. Skipped cleanly when no water feed
+            # is published — the mask degrades to land-clamp-only, like rasterize's subtraction.
             water_tif = None
             if landmask._present(landmask.water_path()):
-                water_tif = f"{tmp_folder}/watermask-{min_w:.0f}.tif"
+                water_tif = f"{tmp_folder}/watermask.tif"
                 if not os.path.isfile(water_tif):
                     landmask.rasterize_water(buffered_bounds(aggregation_tile, buffer_3857_rounded),
-                                             resolution, water_tif, min_water_width=min_w)
+                                             resolution, water_tif)
                 landmask.clamp_positive_water(out_tiff, water_tif)
             # 4th-quadrant clamp: shoreline cells reading positive just SEAWARD of the land line
             # (combined mask==0, outside inland water) are false drying — the depare/drying bucket

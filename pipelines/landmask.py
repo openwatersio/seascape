@@ -680,7 +680,7 @@ def rasterize(bounds_3857, res, out_tif, src=None, water_src=None, all_touched=F
                 os.remove(f)
 
 
-def rasterize_water(bounds_3857, res, out_tif, water_src=None, min_water_width=0.0):
+def rasterize_water(bounds_3857, res, out_tif, water_src=None):
     """Burn ONLY the inland-water polygons onto a Byte raster (1=inland water, 0=elsewhere) on
     the given 3857 grid — the key for the #24 inverse clamp. This is deliberately NOT the combined
     land mask: there ocean and lake are both 0, so a positive->nodata clamp keyed on it would punch
@@ -696,7 +696,7 @@ def rasterize_water(bounds_3857, res, out_tif, water_src=None, min_water_width=0
     clip = out_tif + ".clip.gpkg"
     tmp_out = out_tif + ".tmp.tif"
     try:
-        _clip_water(water, bounds_3857, clip, min_water_width)
+        _clip_water(water, bounds_3857, clip)
         utils.run_command(
             f"gdal_rasterize -burn 1 -ot Byte -init 0 -te {xmin} {ymin} {xmax} {ymax} "
             f"-tr {res} {res} -co COMPRESS=DEFLATE -co BIGTIFF=IF_SAFER -co TILED=YES "
@@ -1120,7 +1120,8 @@ def _check():
         "a marine 'physical' polygon must never erase land from the mask"
 
     # Width floor: the ditch opens the clamp at no floor but not at 3 px; the lake (~24 px
-    # wide) opens it either way. Same rule on the water-only raster.
+    # wide) opens it either way. The water-only raster (the positive->nodata clamp's key)
+    # takes no floor: a positive reading under a sub-cell ditch must still clear to unknown.
     (dx,), (dy,) = _tf("EPSG:4326", "EPSG:3857", [1.28], [1.2555])
     dr, dc = rowcol(tr, dx, dy)
     (kx,), (ky,) = _tf("EPSG:4326", "EPSG:3857", [1.5], [1.5])
@@ -1132,11 +1133,6 @@ def _check():
         lf = m.read(1)
     assert lf[dr, dc] == 1, "a ditch narrower than the floor must stay clamped"
     assert lf[kr, kc] == 0, "a lake wider than the floor must still open the clamp"
-    floor_w = f"{d}/water_floor.tif"
-    rasterize_water(te, res, floor_w, water_src=water_fgb, min_water_width=3 * res)
-    with rasterio.open(floor_w) as m:
-        wf = m.read(1)
-    assert wf[dr, dc] == 0 and wf[kr, kc] == 1, "the water-only raster must honour the floor"
 
     # Seam determinism (with the water burn active): the same world cells rasterize identically
     # from a shifted (still grid-aligned) extent — the overlap is byte-identical, so tile halos
@@ -1167,6 +1163,7 @@ def _check():
         wonly = m.read(1)
     assert (wonly == 1).any() and (wonly == 0).any(), "water-only mask needs both water and non-water"
     assert not ((wonly == 1) & (land == 0)).any(), "the water box sits inside the land box"
+    assert wonly[dr, dc] == 1 and wonly[kr, kc] == 1, "the water-only raster keys on all mapped water"
     ocean_only = f"{d}/ocean_only.tif"  # an offshore extent selects zero water -> all 0, no error
     rasterize_water((xmax + 1e6, ymin, xmax + 1e6 + 200 * res, ymax), res, ocean_only, water_src=water_fgb)
     with rasterio.open(ocean_only) as m:
