@@ -559,11 +559,11 @@ def main():
 
         native = _served(f"store/pmtiles/{stem}.pmtiles")
         coarse_tiles = _served(f"store/pmtiles/{coarse}.pmtiles")
-        native = config.depare_tiers(CHILD_Z)[-1].name  # the tier cut from the native window
-        rows = gpd.read_file(f"store/depare/{stem}-{native}.fgb").to_crs("EPSG:3857")
+        native_tier = config.depare_tiers(CHILD_Z)[-1].name  # the tier cut from the native window
+        rows = gpd.read_file(f"store/depare/{stem}-{native_tier}.fgb").to_crs("EPSG:3857")
         bands = rows[rows["drval1"].notna() & (rows["drval1"] >= 0)]
         drying = rows[rows["drval1"].notna() & (rows["drval1"] < 0)]
-        contours = gpd.read_file(f"store/contour/{stem}-{native}.fgb").to_crs("EPSG:3857")
+        contours = gpd.read_file(f"store/contour/{stem}-{native_tier}.fgb").to_crs("EPSG:3857")
         assert len(bands) and len(drying) and len(contours), (
             f"the fixture must produce all three layers ({len(bands)} bands, "
             f"{len(drying)} drying, {len(contours)} contours)")
