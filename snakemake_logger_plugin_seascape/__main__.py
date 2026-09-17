@@ -101,6 +101,25 @@ def check():
     handler.emit(record(LogEvent.JOB_ERROR, level=logging.ERROR, jobid=42, rule_name="depare_tile"))
     assert len(handler.stream.getvalue().splitlines()) == before, "failure reported twice"
 
+    # …but a RETRY re-enters the SAME jobid, so that dedup must not also skip clearing it from the
+    # in-flight set. A phantom there inflates `N running` and pins `oldest` on a job that already
+    # failed, for the rest of the run — run 35149243490 reported a depare stem as the oldest
+    # running job for hours after it had exhausted its retries, which is the line operators trust.
+    handler.emit(
+        record(
+            LogEvent.JOB_INFO,
+            jobid=42,
+            rule_name="depare_tile",
+            wildcards={"stem": "9-1-2-12"},
+            resources={"mem_gb": 6, "tmpdir": "/tmp"},
+            benchmark=bench,
+            log=["/app/tmp/logs/depare/9-1-2-12.log"],
+        )
+    )
+    assert 42 in handler.running, "the retry must register as in flight"
+    handler.emit(record(LogEvent.JOB_ERROR, level=logging.ERROR, jobid=42, rule_name="depare_tile"))
+    assert 42 not in handler.running, "a failed retry must not linger in the in-flight set"
+
     # Warnings reach the console and the JSONL both; a plain info line only the console.
     handler.emit(record(msg="WARNING: only 12G free", level=logging.WARNING))
     assert "only 12G free" in handler.stream.getvalue()
@@ -119,7 +138,11 @@ def check():
     with open(events) as f:
         rows = [json.loads(line) for line in f]
     kinds = [row["event"] for row in rows]
-    assert kinds == ["job_started", "job_finished", "job_error", "message"], kinds
+    # The retry emits its own job_started — each attempt is a real start, and the stream is what
+    # post-run analysis counts attempts from. Its failure adds no second job_error: the dedup keeps
+    # the first report, which is the one carrying the wildcards.
+    assert kinds == ["job_started", "job_finished", "job_error",
+                     "job_started", "message"], kinds
     assert rows[0]["reason"].startswith("Updated input files"), rows[0]
     assert rows[1]["benchmark"]["max_rss"] == "7372.80", rows[1]
     assert rows[1]["duration"] >= 0, rows[1]
