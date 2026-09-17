@@ -86,6 +86,11 @@ def run(folder=DEFAULT_DIR):
     paths = sorted(glob.glob(os.path.join(folder, "*.fgb")))
     healed, removed = [], []
     for p in paths:
+        # A waterless tile writes a 0-byte sentinel (depare_run.tile), which the reader rejects
+        # exactly like a truncated write. Deleting it rebuilds the tile to another 0 bytes, every
+        # run, along with its window, contours and vector cell.
+        if os.path.getsize(p) == 0:
+            continue
         try:
             fixed = heal(p)
         except pyogrio.errors.DataSourceError:
@@ -167,6 +172,14 @@ def _check():
     assert run(d) == [], "garbage must not report as healed"
     assert not os.path.exists(junk), "an unreadable artifact must be removed"
     assert os.path.exists(good), "readable neighbours must survive a removal pass"
+
+    # …but the waterless-tile sentinel is 0 bytes, which the reader rejects the same way. Removing
+    # it rebuilds the tile to another 0 bytes and takes its window, contours and cell with it —
+    # run 35228557771 planned 762 jobs off 143 of these instead of the 40 it owed.
+    empty = f"{d}/4-1-15-8.fgb"
+    open(empty, "wb").close()
+    assert run(d) == [], "an empty sentinel must not report as healed"
+    assert os.path.exists(empty), "the waterless-tile sentinel must survive the heal pass"
     print("heal_depare_schema self-check ok")
 
 
