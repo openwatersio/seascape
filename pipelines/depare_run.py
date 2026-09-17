@@ -42,16 +42,19 @@ each polygon, opening see-through cracks between bands. Generalization is COVERA
 simplification instead (simplify_coverage), which simplifies each shared edge once, for
 both its owners, at the S-58 vertex floor.
 
-Per tile: bands (gdal_contour -p at DEPARE_LEVELS / DEPARE_LEVELS_FT, drop land, drval/sys)
-+ drying (the metre ladder's [0, DRYING_CAP] bucket ∩ effective water, drval1 < 0) + nodata
-(inland-water polygons minus the DEM's water coverage and the drying) -> clip to the
-unbuffered tile bbox in shapely (polygon-only by construction, see _polys) -> 4326 ->
-store/depare/{stem}.fgb. Same seam contract as contours for bands and drying: deterministic
-on the buffered grid, so neighbouring tiles' features abut exactly at the clip line. Nodata
-rows instead ship dilated NODATA_OVERLAP_PX past the clip line, overlapping the neighbour
-tile's — abutment can't survive the per-piece nodata simplify, overlap can. The vector
-bundle folds these into the `depare` layer of the sharded variable-depth run (contour_run),
-gated at z6 by a per-feature tippecanoe.minzoom (contour_run.DEPARE_MINZOOM).
+Per tile and per zoom tier (config.depare_tiers — each tier is a separately compiled partition,
+the way an ENC compiles a cell per usage band: cut from the mosaic pyramid level at the tier's
+first zoom with the isobath ladder drawn there, the final tier from the native window): bands
+(gdal_contour -p at the tier's metre / fathom ladder, drop land, drval/sys) + drying (the metre
+ladder's [0, DRYING_CAP] bucket ∩ effective water, drval1 < 0) + nodata (inland-water polygons
+minus the DEM's water coverage and the drying) -> clip to the unbuffered tile bbox in shapely
+(polygon-only by construction, see _polys) -> 4326 -> store/depare/{stem}-t{z}.fgb. Same seam
+contract as contours for bands and drying: deterministic on the buffered grid, so neighbouring
+tiles' features abut exactly at the clip line. Nodata rows instead ship dilated
+NODATA_OVERLAP_PX past the clip line, overlapping the neighbour tile's — abutment can't survive
+the per-piece nodata simplify, overlap can. The vector bundle folds these into the `depare`
+layer of the sharded variable-depth run (contour_run), each tier's rows carrying the tier's
+zoom range as tippecanoe.minzoom/maxzoom.
 """
 
 import os
@@ -65,10 +68,8 @@ import contour_run
 import utils
 from aggregation_reproject import get_resolution
 
-# The bands' zoom floor (z6, matching the style's depth-areas/contour-lines minzoom) is now applied
-# per feature by the vector bundle (contour_run.DEPARE_MINZOOM): partitions can't be level-thinned
-# per zoom like the lines' CONTOUR_TIERS (dropping one leaves a hole), so the floor is the low-zoom
-# cost control — the raster depth shading carries z<6.
+# Below the first tier's zoom (z6, matching the style's depth-areas/contour-lines minzoom) the
+# raster depth shading carries the water alone.
 
 # DEPARE_LEVELS derives from CONTOUR_LEVELS, which the style hand-mirrors (style/index.ts
 # DEPARE_LADDER_M/FT) — warn when an env override diverges the bands from the style. Upgrade
@@ -142,6 +143,11 @@ SLIVER_MIN_PX = float(os.environ.get("SLIVER_MIN_PX", "4"))
 # is 16 mm² at the STEM's own compilation scale (a rendering pixel is MM_PER_PX at scale, so a map
 # mm is res/MM_PER_PX projected metres), never a pinned zoom. Set either to 0 to disable the gate.
 DRYING_LEGIBLE_MM2 = float(os.environ.get("DRYING_LEGIBLE_MM2", "16"))
+# Band and nodata legibility at a tier's display scale: 4 mm² is the minimum area for a
+# solid-fill polygon in a subdivision (Galanda 2003). A band part under it dissolves into a
+# shallower neighbour or, with land or drying all round, drops — a pit removed, never a peak
+# (Guilbert & Zhang 2012); a nodata part under it drops. 0 disables.
+LEGIBLE_MM2 = float(os.environ.get("DEPARE_LEGIBLE_MM2", "4"))
 DRYING_MIN_WIDTH_PX = float(os.environ.get("DRYING_MIN_WIDTH_PX", "1"))
 
 # S-58 Ed. 7.0.0 check 571 caps ENC vertex density at 0.3 mm at compilation scale — the only hard
@@ -762,7 +768,60 @@ def row_select(layer):
     return f'SELECT {cols} FROM "{layer}"'
 
 
-def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0):
+def _dissolve_sublegible(bands, drvals, min_area):
+    """Generalize one ladder's simplified partition at its display scale. Parts under min_area
+    (m²), smallest first: with a shallower neighbour (smaller drval1) the part merges into the
+    shallowest of them — the area now reads shoaler, a pit removed; with no band neighbour at
+    all (land, drying or nodata all round) it drops, which reads as not-water; with every
+    neighbour deeper it is a shoal and stays. Merges are exact unions along shared edges, so
+    the partition stays disjoint and no area is invented. Returns the bands in place."""
+    import numpy as np
+    import shapely
+    from shapely.strtree import STRtree
+    parts, lvl = [], []
+    for i, g in enumerate(bands):
+        for p in _polys(g):
+            parts.append(p)
+            lvl.append(i)
+    if not parts:
+        return bands
+    geoms = list(parts)
+    tree = STRtree(parts)
+    owner = list(range(len(parts)))  # a dissolved part resolves to what absorbed it
+
+    def find(i):
+        while owner[i] != i:
+            owner[i] = owner[owner[i]]
+            i = owner[i]
+        return i
+
+    alive = [True] * len(parts)
+    d1 = [drvals[l][0] for l in lvl]  # per part
+    for i in np.argsort(shapely.area(parts)):
+        if shapely.area(geoms[i]) >= min_area or not alive[i]:
+            continue
+        nb = {find(j) for j in tree.query(parts[i], predicate="touches") if j != i}
+        nb.discard(i)
+        nb = [j for j in nb if alive[j]]
+        if not nb:
+            alive[i] = False
+            continue
+        shoaler = [j for j in nb if d1[j] < d1[i]]
+        if not shoaler:
+            continue  # a peak: every neighbour is deeper
+        t = min(shoaler, key=lambda j: (d1[j], -shapely.area(geoms[j])))
+        geoms[t] = shapely.union(geoms[t], geoms[i])
+        alive[i] = False
+        owner[i] = t
+    out = [[] for _ in bands]
+    for i, g in enumerate(geoms):
+        if alive[i]:
+            out[lvl[i]] += _polys(g)
+    return [shapely.multipolygons(ps) if ps else shapely.MultiPolygon() for ps in out]
+
+
+def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, levels_ft=None,
+                scale_z=None):
     """Partition any DEM covering the tile's buffered extent into depth-area / drying / nodata
     rows. Returns (final_path, count) inside ``tmp``, or None when there is no water."""
     import geopandas as gpd
@@ -786,6 +845,9 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0):
     # pixel (what drew the ribbon) — the two differ on the coarsened retry window.
     drying_legible_area = DRYING_LEGIBLE_MM2 * (stem_res / MM_PER_PX) ** 2
     drying_min_width = DRYING_MIN_WIDTH_PX * res
+    # Band/nodata legibility at the display scale a compiled tier serves; the native tier keeps
+    # every part, since it also serves the overzoom where they are legible.
+    legible_area = LEGIBLE_MM2 * (get_resolution(scale_z) / MM_PER_PX) ** 2 if scale_z else 0.0
     sink = _RowSink(f"{tmp}/depare-rows.geojsons")
 
     # ── depth bands + drying ── the metre + fathom partition ladders, each off one gdal_contour -p
@@ -808,8 +870,8 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0):
     drying_raw = []       # the bucket as contoured — the ft ladder's coverage member
     drying_geoms = []     # the same bucket simplified with the metre ladder — what ships
     _mark(None)
-    for sys_tag, levels in (("m", config.DEPARE_LEVELS + [config.DRYING_CAP]),
-                            ("ft", config.DEPARE_LEVELS_FT)):
+    for sys_tag, levels in (("m", (levels_m or config.DEPARE_LEVELS) + [config.DRYING_CAP]),
+                            ("ft", levels_ft or config.DEPARE_LEVELS_FT)):
         raw = partitions(dem, levels, f"{tmp}/depare-raw-{sys_tag}.fgb", timeout=timeout)
         drvals, bands = [], []
         for lvl in [l for l in levels if l <= 0]:
@@ -829,6 +891,9 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0):
         if sys_tag == "m":
             drying_geoms = simplified[len(drvals):]
         _mark(f"bands-simplify-{sys_tag}")
+        if legible_area > 0:
+            bands = _dissolve_sublegible(bands, drvals, legible_area)
+            _mark(f"bands-dissolve-{sys_tag}")
         for (drval1, drval2), geom in zip(drvals, bands):
             if sys_tag == "m":
                 coverage_parts += [piece for p in _polys(geom) for piece in _subdivide(p)]
@@ -939,7 +1004,7 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0):
                     geom = shapely.difference(geom, u, grid_size=GRID)
             kind = getattr(r, "kind", None)
             for full in _polys(geom):  # gate the PRE-clip polygon (buffered window) so a seam sliver survives both sides
-                if full.area >= min_area:
+                if full.area >= max(min_area, legible_area):
                     for p in _polys(full.intersection(clip)):  # then clip to the seam; no re-filter on the piece
                         # Simplify POST-clip, per-piece: kept vertices are a subset inside the clip
                         # box, so the ring can never cross the seam outward — at worst it recedes
@@ -967,11 +1032,73 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0):
     return final, n
 
 
+def tier_path(stem, tier):
+    return f"store/depare/{stem}-{tier.name}.fgb"
+
+
+def _tier_surface(stem, tier, out):
+    """A coarse tier's cut surface: the stem's halo-buffered window read off the mosaic tiles'
+    class-aware shoal pyramid at the tier zoom, then the shared depth-gated smooth at that
+    resolution — the same level and smooth the raster render serves at the zoom, so band tints
+    and relief agree by construction. Nearest at an exact power-of-two ratio is a grid-aligned
+    copy of the level; a tile's pyramid stops at res(8), so tiers below z8 reduce from there with
+    the same operator."""
+    import mosaic
+    import smooth
+    z, x, y, _cz = (int(a) for a in stem.split("-"))
+    res = get_resolution(tier.surface)
+    read_z = max(tier.surface, 8)
+    read_res = get_resolution(read_z)
+    halo_m = smooth.halo_px() * res
+    b = mercantile.xy_bounds(mercantile.Tile(x=x, y=y, z=z))
+    l, bt, r, t = b.left - halo_m, b.bottom - halo_m, b.right + halo_m, b.top + halo_m
+    tiles = " ".join(mosaic.tile_artifact(s) for s in mosaic.intersecting_tiles(stem, halo_m))
+    vrt = out + ".vrt"
+    utils.run_command(f"gdalbuildvrt -overwrite -te {l} {bt} {r} {t} -tr {read_res} {read_res} "
+                      f"-r nearest {vrt} {tiles}")
+    raw = out if read_z == tier.surface else out + ".z8.tif"
+    utils.run_command(f"gdal_translate -q -ot Float32 -a_nodata {smooth.NODATA} "
+                      "-co TILED=YES -co BLOCKSIZE=512 -co COMPRESS=ZSTD -co PREDICTOR=3 "
+                      f"-co BIGTIFF=IF_SAFER {vrt} {raw}")
+    os.remove(vrt)
+    if raw != out:
+        _uniform_coarsen(raw, 2 ** (read_z - tier.surface), out)
+        os.remove(raw)
+    if not os.environ.get("SKIP_SMOOTH"):
+        with rasterio.env.Env(GDAL_CACHEMAX=256):
+            smooth.smooth_tiff(out)
+    return out
+
+
+def _shoal_clamp(surface, finer, factor, tmp):
+    """Raise `surface` in place to at least the class-aware shoal reduction of `finer` (a
+    finer-tier surface) by `factor`, over the extent they share. Nodata on either side leaves
+    the surface pixel as read."""
+    import numpy as np
+    from rasterio.windows import from_bounds
+    reduced = _uniform_coarsen(finer, factor, tmp)
+    with rasterio.open(reduced) as r, rasterio.open(surface, "r+") as s:
+        left, bottom = max(r.bounds.left, s.bounds.left), max(r.bounds.bottom, s.bounds.bottom)
+        right, top = min(r.bounds.right, s.bounds.right), min(r.bounds.top, s.bounds.top)
+        if right <= left or top <= bottom:
+            return
+        rw = from_bounds(left, bottom, right, top, r.transform).round_offsets().round_lengths()
+        sw = from_bounds(left, bottom, right, top, s.transform).round_offsets().round_lengths()
+        a, b = s.read(1, window=sw), r.read(1, window=rw)
+        h, w = min(a.shape[0], b.shape[0]), min(a.shape[1], b.shape[1])
+        a, b = a[:h, :w], b[:h, :w]
+        valid = (a != s.nodata) & (b != r.nodata)
+        a = np.where(valid, np.maximum(a, b), a)
+        s.write(a, 1, window=rasterio.windows.Window(sw.col_off, sw.row_off, w, h))
+
+
 def tile(stem):
-    """The per-stem Snakemake job: partition one stem from a BUFFERED mosaic window, smoothed at
-    read with the one shared f(depth, zoom), output at store/depare/<stem>.fgb (depare also reads
-    the land + water masks). A waterless tile writes a 0-byte sentinel; bundling filters empties by
-    size."""
+    """The per-stem Snakemake job: one partition per tier (config.depare_tiers) — the coarse
+    tiers cut from the mosaic pyramid level at the tier zoom, the final tier from the BUFFERED
+    native window, smoothed at read with the one shared f(depth, zoom) — output at
+    store/depare/<stem>-t<z>.fgb per tier (depare also reads the land + water masks). A waterless
+    tier writes a 0-byte sentinel, as does a tier the stem does not hold; bundling filters
+    empties by size."""
     import shutil
     import signal
     import tempfile
@@ -991,51 +1118,79 @@ def tile(stem):
     if os.environ.get("DEPARE_TIMING"):
         _heartbeat(stem)
     z, x, y, child_z = (int(a) for a in stem.split("-"))
-    out = f"store/depare/{stem}.fgb"
     tmp = tempfile.mkdtemp(prefix=f"depare-{stem}-")  # local scratch; publish crosses to the store
+    os.makedirs("store/depare", exist_ok=True)
+    tiers = config.depare_tiers(child_z)
     try:
-        _mark(None)
         # The shared smoothed window is read-only; the timeout fallback derives its
         # coarsened copy in tmp rather than touching it.
-        dem = f"store/window/{stem}.tif"
-        _mark("window-dem")
+        window = f"store/window/{stem}.tif"
         tile_obj = mercantile.Tile(x=x, y=y, z=z)
-        try:
-            res = _depare_dem(dem, tile_obj, child_z, tmp, stem, timeout=timeout)
-        except ContourTimeout as e:
-            print(f"depare tile {stem}: {e} — retrying on a uniform 4x shoal-biased window",
-                  file=sys.stderr, flush=True)
-            dem = _uniform_coarsen(dem, 4, f"{tmp}/dem-4x.tiff")
-            res = _depare_dem(dem, tile_obj, child_z, tmp, stem, timeout=timeout)
-        except MemoryError:
-            # An allocation the kernel refused (overcommit says no when a single request
-            # exceeds free RAM+swap) — no OOM kill, and formatting a traceback at that point
-            # can itself fail, so a bare MemoryError otherwise exits 1 with an EMPTY log.
-            # Report the phase and footprint from a preallocated string: this path must not
-            # allocate. Marsh stems are the ones that get here (see the perf backlog).
-            os.write(2, _OOM_NOTE % (stem.encode(), _rss_kb()))
-            _save_traceback(stem)
-            raise
-        except BaseException:
-            # The rule redirects stderr with `2> {log}`, which TRUNCATES when snakemake starts the
-            # retry, so a failed attempt's traceback is destroyed within a second of being written
-            # and the job looks like it failed silently. Keep a copy beside the output, where a
-            # retry cannot erase it. (Changing the redirect to `2>>` would edit the rule's
-            # shellcmd, which snakemake hashes as rule CODE — that re-runs every depare tile.)
-            _save_traceback(stem)
-            raise
-        os.makedirs(os.path.dirname(out), exist_ok=True)
-        if res:
-            final, n = res
-            utils.publish(final, out)  # scratch and store are separate filesystems
-            # Window bytes alongside the polygon count: a COMPRESSED window's size tracks its
-            # geometric detail, which is what drives this rule's peak RSS (marsh coastlines
-            # compress worst and cost most). Pairs with the benchmark row so DEPARE_GB can be
-            # fitted against it instead of child_z alone — see the backlog.
-            print(f"depare tile {stem}: {n} polygons, window {os.path.getsize(dem) / 1e9:.2f} GB")
-        else:
-            open(out, "w").close()
-            print(f"depare tile {stem}: empty")
+        # Finest first: each coarser surface is clamped shoal-ward against the reduction of the
+        # finer one, so the compiled zooms cascade from the native cut out and a coarser tier can
+        # never read deeper than a finer — the served raster pyramid cascades the same way.
+        finer, finer_z = window, child_z
+        for tier in reversed(tiers):
+            _mark(None)
+            out = tier_path(stem, tier)
+            label = f"{stem}-{tier.name}"
+            tier_tmp = f"{tmp}/{tier.name}"
+            os.makedirs(tier_tmp)
+            if tier.surface == child_z:
+                dem = window
+            else:
+                dem = _tier_surface(stem, tier, f"{tier_tmp}/surface.tif")
+                _shoal_clamp(dem, finer, 2 ** (finer_z - tier.surface), f"{tier_tmp}/finer.tif")
+                finer, finer_z = dem, tier.surface
+            _mark(f"{tier.name}-surface")
+            scale_z = tier.first if tier.last is not None else None
+            try:
+                res = _depare_dem(dem, tile_obj, tier.surface, tier_tmp, label, timeout=timeout,
+                                  levels_m=tier.levels_m, levels_ft=tier.levels_ft, scale_z=scale_z)
+            except ContourTimeout as e:
+                print(f"depare tile {label}: {e} — retrying on a uniform 4x shoal-biased window",
+                      file=sys.stderr, flush=True)
+                dem = _uniform_coarsen(dem, 4, f"{tier_tmp}/dem-4x.tiff")
+                res = _depare_dem(dem, tile_obj, tier.surface, tier_tmp, label, timeout=timeout,
+                                  levels_m=tier.levels_m, levels_ft=tier.levels_ft, scale_z=scale_z)
+            except MemoryError:
+                # An allocation the kernel refused (overcommit says no when a single request
+                # exceeds free RAM+swap) — no OOM kill, and formatting a traceback at that point
+                # can itself fail, so a bare MemoryError otherwise exits 1 with an EMPTY log.
+                # Report the phase and footprint from a preallocated string: this path must not
+                # allocate. Marsh stems are the ones that get here (see the perf backlog).
+                os.write(2, _OOM_NOTE % (stem.encode(), _rss_kb()))
+                _save_traceback(stem)
+                raise
+            except BaseException:
+                # The rule redirects stderr with `2> {log}`, which TRUNCATES when snakemake starts
+                # the retry, so a failed attempt's traceback is destroyed within a second of being
+                # written and the job looks like it failed silently. Keep a copy beside the output,
+                # where a retry cannot erase it. (Changing the redirect to `2>>` would edit the
+                # rule's shellcmd, which snakemake hashes as rule CODE — that re-runs every tile.)
+                _save_traceback(stem)
+                raise
+            if res:
+                final, n = res
+                utils.publish(final, out)  # scratch and store are separate filesystems
+                # Window bytes alongside the polygon count: a COMPRESSED window's size tracks its
+                # geometric detail, which is what drives this rule's peak RSS (marsh coastlines
+                # compress worst and cost most). Pairs with the benchmark row so DEPARE_GB can be
+                # fitted against it instead of child_z alone — see the backlog.
+                print(f"depare tile {label}: {n} polygons, window {os.path.getsize(dem) / 1e9:.2f} GB")
+            else:
+                open(out, "w").close()
+                print(f"depare tile {label}: empty")
+            # the surface stays: the next coarser tier clamps against it
+            for f in os.listdir(tier_tmp):
+                if f != "surface.tif":
+                    fp = f"{tier_tmp}/{f}"
+                    shutil.rmtree(fp, ignore_errors=True) if os.path.isdir(fp) else os.remove(fp)
+        # Tiers past the stem's final one do not exist for it: a sentinel keeps the outputs fixed.
+        held = {t.first for t in tiers}
+        for first in config.DEPARE_TIER_STARTS:
+            if first not in held:
+                open(f"store/depare/{stem}-t{first}.fgb", "w").close()
     finally:
         # Always disarm + clean up: a body exception with the alarm still armed could fire during
         # unwinding and mask the real error as exit 124, and would leak the tmp dir.
@@ -1683,6 +1838,44 @@ def _check():
     nodata_rows = rows[rows["drval1"].isna()]
     assert nodata_rows.covers(lake.intersection(cell_box(0, 20, 60, 40)).centroid).any(), \
         "the lake's [0, cap] shore ribbon stays part of its nodata polygon"
+    # ── the tier operators ──
+    # Dissolve: a sub-legible part with a shallower neighbour merges into it (area conserved,
+    # partition disjoint); a sub-legible island with no band neighbour drops; a sub-legible part
+    # whose every neighbour is deeper is a peak and stays; legible parts are untouched.
+    import shapely
+    from shapely.geometry import box as _bx
+    shoal, deep = _bx(0, 0, 100, 100), _bx(100, 0, 200, 100)          # 2-5 m beside 5-10 m
+    pit = _bx(100, 45, 103, 55)                                         # a 5-10 m crumb on the shoal edge
+    shoal, deep = shoal.difference(pit), deep.difference(pit)
+    island = _bx(300, 300, 302, 302)                                    # 5-10 m with nothing around
+    peak = _bx(150, 45, 153, 48)                                        # a 2-5 m crumb inside 5-10 m
+    deep = deep.difference(peak)
+    bands = [shapely.multipolygons([shoal, peak]), shapely.multipolygons([deep, pit, island])]
+    total = sum(g.area for g in bands)
+    out = _dissolve_sublegible(bands, [(2.0, 5.0), (5.0, 10.0)], 50.0)
+    assert out[0].contains(pit.buffer(-0.1)) and not out[1].intersects(pit.buffer(-0.1)), \
+        "a sub-legible pit must dissolve into its shallower neighbour"
+    assert out[0].contains(peak.buffer(-0.1)), "a sub-legible peak must stay"
+    assert not out[1].intersects(island), "a sub-legible island must drop"
+    assert abs(sum(g.area for g in out) - (total - island.area)) < 1e-6 and \
+        out[0].intersection(out[1]).area < 1e-9, "the dissolve must conserve area and disjointness"
+    assert out[1].contains(_bx(120, 20, 180, 40)), "a legible part must be untouched"
+    # Shoal clamp: a coarse surface is raised to the reduction of the finer one, never lowered.
+    import tempfile as _tf
+    from rasterio.transform import from_origin as _fo
+    from smooth import NODATA as _ND
+    _d = _tf.mkdtemp()
+    fine = np.full((8, 8), -10.0, np.float32); fine[2:4, 2:4] = -3.0     # a shoal the coarse read missed
+    coarse = np.full((4, 4), -12.0, np.float32); coarse[0, 0] = _ND
+    for name, arr, r in (("fine", fine, 10.0), ("coarse", coarse, 20.0)):
+        with rasterio.open(f"{_d}/{name}.tif", "w", driver="GTiff", height=arr.shape[0], width=arr.shape[1],
+                           count=1, dtype="float32", nodata=_ND, crs="EPSG:3857",
+                           transform=_fo(0, 80, r, r)) as dst:
+            dst.write(arr, 1)
+    _shoal_clamp(f"{_d}/coarse.tif", f"{_d}/fine.tif", 2, f"{_d}/reduced.tif")
+    with rasterio.open(f"{_d}/coarse.tif") as src:
+        got = src.read(1)
+    assert got[1, 1] == -3.0 and got[2, 2] == -10.0 and got[0, 0] == _ND, got
     print(f"depare_run self-check ok ({len(bands)} m-bands, {len(drying)} drying, "
           f"{len(gft_bands)} ft-bands)")
 

@@ -17,8 +17,14 @@ Gate 3 is deliberately scoped to connected water. Unscoped ("drying area must no
 would reject filling an enclosed sub-legible pond, which is the licensed behaviour — USGS NHD
 breaks marsh for clearings >= 0.05in and charts the rest as one area.
 
+Tier gates (a stem's compiled partitions, one per zoom tier — see tiers()):
+  7. never deeper   a coarser tier reads <= the native drval1 at every sampled point
+  8. legibility     sub-legible parts per tier, split into pits and peaks
+  9. Töpfer         part count retained per tier step
+
     gates.py raster <before.tif> <after.tif>
     gates.py vector <before.fgb> <after.fgb> [--tol-m 2.23] [--routes routes.geojson]
+    gates.py tiers <stem>            (PERF_ROOT selects the store, as bench.py)
     gates.py --check
 """
 import json
@@ -28,6 +34,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 NODATA = -9999.0
 DRYING_CAP = 16.0
@@ -259,6 +266,101 @@ def vector(before, after, tol_m=DEFAULT_TOL_M, routes=None):
     return _vector_frames(ga, gb, tol_m, rr)
 
 
+# ── tier gates: one stem's compiled partitions against each other ────────────────────────────
+
+# 4 mm² at the 0.28 mm rendering pixel — Galanda's minimum area for a solid-fill polygon.
+LEGIBLE_MM2 = 4.0
+MM_PER_PX = 0.28
+
+
+def _bands(path):
+    import geopandas as gpd
+    g = gpd.read_file(path)
+    if not len(g):
+        return g
+    g = g.to_crs("EPSG:3857")
+    g = g[(g["sys"] == "m") & g["drval1"].notna() & (g["drval1"] >= 0)]
+    return g.explode(index_parts=False).reset_index(drop=True)
+
+
+def tiers(stem, root="."):
+    """The per-tier gates on one stem (config.depare_tiers), each tier's metre bands against the
+    native cut and against its own scale:
+
+      never deeper   at every native-band sample point the coarser tier's drval1 is <= the
+                     native drval1 — a compiled zoom may shoal, never deepen (S-4 B-411.5).
+                     A deeper reading within the tier's S-58 simplification tolerance of a
+                     shallower band is edge displacement, counted apart (`displaced`)
+      legibility     parts under LEGIBLE_MM2 at the tier's first zoom, split into pits (a
+                     shallower neighbour exists: dissolvable) and peaks (every neighbour deeper:
+                     a shoal that must stay)
+      Töpfer         part count per tier step, reported as the retained fraction
+
+    Returns {tier: {...}}; prints a table. Violations are reported, not asserted — the caller
+    decides the thresholds against the measurement."""
+    import config
+    import depare_run
+    import shapely
+    from shapely.strtree import STRtree
+    from aggregation_reproject import get_resolution
+    child_z = int(stem.split("-")[3])
+    plan = config.depare_tiers(child_z)
+    frames = {t.name: _bands(f"{root}/store/depare/{stem}-{t.name}.fgb") for t in plan
+              if os.path.getsize(f"{root}/store/depare/{stem}-{t.name}.fgb") > 0}
+    native_t = plan[-1]
+    native = frames.get(native_t.name)
+    out = {}
+    prev_parts = None
+    print(f"{'tier':5s} {'zooms':7s} {'parts':>7s} {'kept':>6s} {'sub-legible':>11s} {'pits':>6s} "
+          f"{'peaks':>6s} {'deeper':>7s} {'displaced':>9s}")
+    for t in plan:
+        g = frames.get(t.name)
+        if g is None or not len(g):
+            print(f"{t.name:5s} {'':7s} {'-':>7s}")
+            continue
+        geoms = g.geometry.values
+        n = len(geoms)
+        # legibility at the tier's own display zoom
+        px = get_resolution(t.first)
+        legible_m2 = LEGIBLE_MM2 / MM_PER_PX ** 2 * px * px
+        area = shapely.area(geoms)
+        small = np.flatnonzero(area < legible_m2)
+        tree = STRtree(geoms)
+        pits = peaks = 0
+        d1 = g["drval1"].values
+        for i in small:
+            nb = [j for j in tree.query(geoms[i], predicate="touches") if j != i]
+            # No band neighbour means land or drying all round, which is shallower than any
+            # band: dissolving the part into it removes a pit. A peak has neighbours, all deeper.
+            if not nb or any(d1[j] < d1[i] for j in nb):
+                pits += 1
+            else:
+                peaks += 1
+        # never deeper: sample the native parts' interiors
+        deeper = displaced = 0
+        if native is not None and t is not native_t and len(native):
+            tol = depare_run.SIMPLIFY_MM / depare_run.MM_PER_PX * px
+            pts = shapely.point_on_surface(native.geometry.values)
+            hits = tree.query(pts, predicate="within")  # (point idx, band idx)
+            nd = native["drval1"].values[hits[0]]
+            td = g["drval1"].values[hits[1]]
+            for k in np.flatnonzero(td > nd + 1e-6):
+                p = pts[hits[0][k]]
+                near = tree.query(p.buffer(tol), predicate="intersects")
+                if any(d1[j] < td[k] for j in near):
+                    displaced += 1
+                else:
+                    deeper += 1
+        kept = "" if prev_parts is None else f"{n / prev_parts:6.2f}"
+        zooms = f"{t.first}-{t.last}" if t.last else f"{t.first}+"
+        print(f"{t.name:5s} {zooms:7s} {n:7d} {kept:>6s} {len(small):11d} {pits:6d} {peaks:6d} {deeper:7d} {displaced:9d}")
+        out[t.name] = {"parts": n, "sub_legible": int(len(small)), "pits": pits, "peaks": peaks,
+                       "deeper": deeper, "displaced": displaced,
+                       "kept": None if prev_parts is None else n / prev_parts}
+        prev_parts = n
+    return out
+
+
 def _check():
     """Each gate fires on the failure it exists to catch, and passes the licensed change."""
     from metrics import water_stats
@@ -344,6 +446,10 @@ if __name__ == "__main__":
         r = raster(a[1], a[2])
         print(json.dumps(r, indent=2))
         sys.exit(0 if r["pass"] else 1)
+    elif a[:1] == ["tiers"] and len(a) == 2:
+        root = os.environ.get("PERF_ROOT", os.path.join(os.path.dirname(os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__)))), "pipelines", "store", "profile", "root"))
+        print(json.dumps(tiers(a[1], root), indent=1))
     elif a[:1] == ["vector"] and len(a) >= 3:
         tol = float(a[a.index("--tol-m") + 1]) if "--tol-m" in a else DEFAULT_TOL_M
         rt = a[a.index("--routes") + 1] if "--routes" in a else None

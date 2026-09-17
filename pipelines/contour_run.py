@@ -1,6 +1,6 @@
 """Contour lines derived from the depare depth-area partition.
 
-Isobaths are the shared edges of store/depare/<stem>.fgb's band polygons: a segment
+Isobaths are the shared edges of store/depare/<stem>-t<z>.fgb's band polygons (one file per zoom tier): a segment
 two bands of one ladder share is a contour at every ladder level between the shallow
 band's drval2 and the deep band's drval1 (a pinched-out band puts two coincident
 levels on one edge), while a segment with a single owner is an outer edge — land,
@@ -159,19 +159,32 @@ def _drop_small_rings(geom, min_area):
 
 
 def tile(stem):
-    """The per-stem Snakemake job: derive one stem's isobaths from store/depare/<stem>.fgb,
-    output at store/contour/<stem>.fgb (4326, one MultiLineString per sys × level). A featureless
-    tile writes a 0-byte sentinel so the engine sees a complete output; bundling filters empties
-    by size."""
+    """The per-stem Snakemake job: derive one stem's isobaths per zoom tier from
+    store/depare/<stem>-t<z>.fgb, output at store/contour/<stem>-t<z>.fgb (4326, one
+    MultiLineString per sys × level) — a tier's lines are the edges of that tier's partition, so
+    bands and lines at a zoom are one geometry. A featureless tier writes a 0-byte sentinel so
+    the engine sees a complete output; bundling filters empties by size."""
+    child_z = int(stem.split("-")[3])
+    os.makedirs("store/contour", exist_ok=True)
+    held = {t.first: t for t in config.depare_tiers(child_z)}
+    for first in config.DEPARE_TIER_STARTS:
+        tier = held.get(first)
+        out = f"store/contour/{stem}-t{first}.fgb"
+        if tier is None:
+            open(out, "w").close()
+            continue
+        _tile_tier(stem, tier, f"store/depare/{stem}-{tier.name}.fgb", out)
+
+
+def _tile_tier(stem, tier, src, out):
     import geopandas as gpd
     from shapely.geometry import MultiLineString
 
-    src = f"store/depare/{stem}.fgb"
-    out = f"store/contour/{stem}.fgb"
-    os.makedirs(os.path.dirname(out), exist_ok=True)
     rows = []
     if os.path.getsize(src) > 0:
-        for sys_tag, cfg_levels in (("m", config.CONTOUR_LEVELS), ("ft", config.CONTOUR_LEVELS_FT)):
+        # 0 rides the metre pass only (the sys-less drying line), so the fathom ladder drops it.
+        for sys_tag, cfg_levels in (("m", tier.levels_m),
+                                    ("ft", [l for l in tier.levels_ft if l != 0])):
             # The metre pass also reads the drying rows (sys-less, drval1 < 0): their seaward
             # edge against the shoalest band is the 0 m drying line, which ships once with NO
             # sys — where no drying polygon survives its gates, no 0 m line ships either, so
@@ -207,47 +220,30 @@ def tile(stem):
             utils.publish(final, out)  # scratch and store are separate filesystems
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
-        print(f"contour tile {stem}: {len(rows)} features")
+        print(f"contour tile {stem}-{tier.name}: {len(rows)} features")
     else:
         open(out, "w").close()
-        print(f"contour tile {stem}: empty")
+        print(f"contour tile {stem}-{tier.name}: empty")
 
 
 # ── bundle ───────────────────────────────────────────────────────────────────
 
-# Scale-dependent contour interval: coarse isobaths zoomed out, finer zoomed in
-# (charts thin the deep, not the shelf — abyssal contours stipple into noise at
-# small scale). (zoom_ceiling, depths_m shown below it); at/above the last ceiling
-# every level shows. Each list must be a subset of config.CONTOUR_LEVELS.
-CONTOUR_TIERS = [
-    (5, [-200, -1000, -2000, -4000]),
-    (7, [-200, -500, -1000, -2000, -3000, -4000]),
-    (9, [-50, -100, -200, -300, -500, -1000, -2000, -3000, -4000, -5000, -6000, -8000, -10000]),
-    (11, [-10, -20, -30, -50, -100, -200, -300, -500, -1000, -2000, -3000, -4000, -5000, -6000, -8000, -10000]),
-]
+# The per-zoom ladders live in config (CONTOUR_TIERS, depare_tiers): depth areas and isobaths are
+# compiled per zoom tier, and a tier's rows carry the zoom range they serve.
+CONTOUR_TIERS = config.CONTOUR_TIERS
+# The deepest zoom any tier starts at — a cell run's -z must reach it or the tier is never written.
+CONTOUR_MINZOOM_CEIL = config.DEPARE_TIER_STARTS[-1]
+_LADDERS = {t.first: t for t in config.depare_tiers(1 << 8)}
 
 
-# The deepest display minzoom any curve can carry (the native+ band floor).
-CONTOUR_MINZOOM_CEIL = CONTOUR_TIERS[-1][0]
-
-
-def contour_minzoom(sys_tag, depth_m):
-    """Per-curve tippecanoe.minzoom: the first CONTOUR_TIERS band that shows the curve (native+ if
-    none). The leaf-safe replacement for the old -j $zoom PER_ZOOM_FILTER — a variable-depth leaf
-    freezes at its own zoom, so zoom gating must ride each feature, not the $zoom expression. Metre
-    isobaths — and the sys-less 0 m drying line, which is in no tier, so it shows at native+ with
-    the other shoal curves — match a tier's hand-picked levels; feet/fathom curves mirror by depth
-    (shown once at least as deep as the shallowest metre curve the band shows)."""
-    lo = 0
-    for hi, depths in CONTOUR_TIERS:
-        if sys_tag != "ft":
-            shown = round(depth_m) in depths
-        else:  # ft: at least as deep as the shallowest metre curve shown in this band
-            shown = depth_m <= -min(-d for d in depths)
-        if shown:
-            return lo
-        lo = hi
-    return lo  # native+ band ([lo, inf)); lo is the last tier ceiling
+def tier_shows(sys_tag, depth_m, z):
+    """Whether a curve or band edge at depth_m (≤ 0) is part of the ladder drawn at zoom z. The
+    sys-less 0 m drying line rides every tier."""
+    start = config.depare_tier_at(z)
+    if start is None:
+        return False
+    lv = _LADDERS[start].levels_ft if sys_tag == "ft" else _LADDERS[start].levels_m
+    return any(abs(depth_m - l) < 0.01 for l in lv)
 
 
 def _stems_maxz(stems):
@@ -400,8 +396,8 @@ def require_stable_complete(layer, stems, files):
 # each cell exactly its own subtree), so the join is `pmtiles merge` (go-pmtiles) — a pure concat that
 # refuses overlapping inputs, replacing tile-join's boundary-tile MERGE (slow at planet scale + the
 # PMTiles-writer corruption felt/tippecanoe#278). All zoom gating rides as per-feature
-# tippecanoe.minzoom: contour tiers via contour_minzoom, depare's z6 floor as a uniform minzoom,
-# soundings' pyramid levels unchanged. The archive is SPARSE — the Worker overzooms ancestors
+# tippecanoe.minzoom/maxzoom: depth areas and contours carry their tier's zoom range (a stem's
+# final tier has no ceiling), soundings their pyramid levels. The archive is SPARSE — the Worker overzooms ancestors
 # (Part 1); manifest.vector.max_zoom is what turns that on.
 
 # Union of the three layers' MVT attributes; the FlatGeobuf/GeoJSON Integer64 columns need :int so
@@ -416,7 +412,7 @@ def require_stable_complete(layer, stems, files):
 VECTOR_ATTRS = ["depth_m", "depth_abs_m", "sys", "depth_ft", "depth_fm",
                 "drval1", "drval2", "rank", "prime"]
 VECTOR_TYPES = ["depth_abs_m:int", "depth_ft:int", "depth_fm:int", "rank:int", "prime:int"]
-DEPARE_MINZOOM = 6  # depare's zoom floor, now per-feature (was depare_run's run-level -Z)
+DEPARE_MINZOOM = config.DEPARE_TIER_STARTS[0]  # depare's zoom floor: the first tier's zoom
 # Geometric self-check thresholds, calibrated on the NY-harbor archive (2026-07-29). Decoded tiles
 # include their buffer ring, and a parent's ring spans 2× its children's in shared-map units, so
 # band content living only in the parent's ring (the next-deeper band just past the tile edge)
@@ -497,7 +493,7 @@ def _survives_leaf(geom, min_deg):
 
 
 def _fgb_to_seq(fgbs, cols, minzoom_fn, out_path, layer, identity_fn, id0, maxz, max_minzoom=None,
-                min_minzoom=None, leaf_detail=LEAF_DETAIL):
+                min_minzoom=None, leaf_detail=LEAF_DETAIL, maxzoom=None):
     """Stream per-tile FGBs → one GeoJSONSeq (newline-delimited features) carrying a per-feature
     tippecanoe.minzoom — FGB can't hold the tippecanoe extension, so the run reads GeoJSON like
     soundings already do. One tile in memory at a time (macrotile-sized). Every WRITTEN feature gets
@@ -505,14 +501,16 @@ def _fgb_to_seq(fgbs, cols, minzoom_fn, out_path, layer, identity_fn, id0, maxz,
     the self-check proves each input survived. When max_minzoom is set (the shallow run's -z), a
     feature whose minzoom exceeds it is dropped at write time — it belongs to a deeper cell, never a
     shallow tile; the explicit filter is what makes this our contract, not tippecanoe's clamp.
-    Returns (next_id, {id: identity} for the completeness set) — only above-leaf-pixel features enter
-    it (sub-pixel slivers are exempt, since tippecanoe drops them legitimately)."""
+    `maxzoom` (a tier's last zoom) is written as tippecanoe.maxzoom; None persists through overzoom.
+    Appends, so one seq can gather several tiers. Returns (next_id, {id: identity} for the
+    completeness set) — only above-leaf-pixel features enter it (sub-pixel slivers are exempt,
+    since tippecanoe drops them legitimately)."""
     import geopandas as gpd
     from shapely.geometry import mapping
     min_deg = COMPLETENESS_MIN_PX * _leaf_pixel_deg(maxz, leaf_detail)
     fid = id0
     ids = {}
-    with open(out_path, "w") as fh:
+    with open(out_path, "a") as fh:
         for fgb in fgbs:
             g = gpd.read_file(fgb)
             for r in g.itertuples():
@@ -524,14 +522,18 @@ def _fgb_to_seq(fgbs, cols, minzoom_fn, out_path, layer, identity_fn, id0, maxz,
                 mz = minzoom_fn(props)
                 if max_minzoom is not None and mz > max_minzoom:
                     continue
+                if min_minzoom is not None and maxzoom is not None and maxzoom < min_minzoom:
+                    continue  # the tier ends below this run's floor: it is the shallow run's alone
                 if min_minzoom is not None and mz < min_minzoom:
                     # A cell run's zoom floor: a variable-depth pyramid can decide to LEAF above the
                     # run's -Z and silently drop the frozen content — clamping every feature's minzoom
                     # to the floor makes the #397 leaf guard force subdivision down to it instead.
                     # The sub-floor zooms these features would have shown at belong to the shallow run.
                     mz = min_minzoom
-                feat = {"type": "Feature", "id": fid,
-                        "tippecanoe": {"minzoom": mz},
+                tc = {"minzoom": mz}
+                if maxzoom is not None and maxzoom >= mz:
+                    tc["maxzoom"] = maxzoom
+                feat = {"type": "Feature", "id": fid, "tippecanoe": tc,
                         "properties": props, "geometry": mapping(r.geometry)}
                 fh.write(json.dumps(feat))
                 fh.write("\n")
@@ -643,30 +645,40 @@ def _build_seqs_and_run(stems, minz, maxz, id_base, variable_depth, out, max_min
     above-leaf-pixel features. An all-empty input writes a 0-byte `out` and returns empty maps.
     require_stable_complete gates the caller; here 0-byte per-tile files are legitimately empty."""
     depare_on = not os.environ.get("SKIP_DEPARE")
-    # Contours derive from depare, so both layers ride (or skip) together.
-    cfiles = [f"store/contour/{s}.fgb" for s in stems] if depare_on else []
+    # Contours derive from depare, so both layers ride (or skip) together. Both are compiled per
+    # zoom tier: a tier file's rows carry the tier's zoom range, and a stem's final tier (cut
+    # from its native window) has no ceiling. Files group by that range.
+    groups = collections.defaultdict(list)  # (minzoom, maxzoom) -> stems
+    if depare_on:
+        for s in stems:
+            for t in config.depare_tiers(int(s.split("-")[3])):
+                groups[(t.first, t.last)].append(f"{s}-{t.name}")
     sfiles = [f"store/soundings/{s}.geojsons" for s in stems]
-    dfiles = [f"store/depare/{s}.fgb" for s in stems] if depare_on else []
-    cfgbs = [f for f in cfiles if os.path.getsize(f) > 0]
     sgjs = [f for f in sfiles if os.path.getsize(f) > 0]
-    dfgbs = [f for f in dfiles if os.path.getsize(f) > 0]
 
     cseq = utils.vector_scratch("contours.geojsons")
     sseq = utils.vector_scratch("soundings.geojsons")
     dseq = utils.vector_scratch("depare.geojsons")
     nid = id_base
-    cids = sids = dids = {}
+    cids, sids, dids = {}, {}, {}
     detail = LEAF_DETAIL if variable_depth else VECTOR_SHALLOW_DETAIL
     try:
-        nid, cids = _fgb_to_seq(cfgbs, ("depth_m", "depth_abs_m", "sys", "depth_ft", "depth_fm"),
-                                lambda p: contour_minzoom(p.get("sys"), float(p["depth_m"])), cseq,
-                                "contour", lambda p: f"sys={p.get('sys')} depth_m={p.get('depth_m')}",
-                                nid, maxz, max_minzoom, min_minzoom, detail)
+        for seq in (cseq, dseq):
+            open(seq, "w").close()
+        for (minz_t, maxz_t), names in sorted(groups.items(), key=lambda kv: (kv[0][0], kv[0][1] or 99)):
+            cfgbs = [f for f in (f"store/contour/{n}.fgb" for n in names) if os.path.getsize(f) > 0]
+            dfgbs = [f for f in (f"store/depare/{n}.fgb" for n in names) if os.path.getsize(f) > 0]
+            nid, ids = _fgb_to_seq(cfgbs, ("depth_m", "depth_abs_m", "sys", "depth_ft", "depth_fm"),
+                                   lambda p: minz_t, cseq, "contour",
+                                   lambda p: f"sys={p.get('sys')} depth_m={p.get('depth_m')}",
+                                   nid, maxz, max_minzoom, min_minzoom, detail, maxzoom=maxz_t)
+            cids.update(ids)
+            nid, ids = _fgb_to_seq(dfgbs, ("drval1", "drval2", "sys", "rank"),
+                                   lambda p: minz_t, dseq, "depare",
+                                   lambda p: f"drval1={p.get('drval1')} sys={p.get('sys')}",
+                                   nid, maxz, max_minzoom, min_minzoom, detail, maxzoom=maxz_t)
+            dids.update(ids)
         nid, sids = _soundings_to_seq(sgjs, sseq, nid, max_minzoom, min_minzoom)
-        nid, dids = _fgb_to_seq(dfgbs, ("drval1", "drval2", "sys", "rank"),
-                                lambda p: DEPARE_MINZOOM, dseq,
-                                "depare", lambda p: f"drval1={p.get('drval1')} sys={p.get('sys')}",
-                                nid, maxz, max_minzoom, min_minzoom, detail)
         layers = [(name, seq) for name, seq, ids in
                   (("contours", cseq, cids), ("soundings", sseq, sids), ("depare", dseq, dids)) if ids]
         if layers:
@@ -792,6 +804,20 @@ def _cell_sidecar(cell):
     return f"store/bundle/vector-cell-{cell}.ids.json"
 
 
+def _tier_names(stems):
+    return [f"{s}-t{z}" for s in stems for z in config.DEPARE_TIER_STARTS]
+
+
+def _require_tiers_complete(stems):
+    """Every per-tile file the bundles read must exist (a 0-byte one is an empty tile or a tier
+    the stem does not hold; a MISSING one is an interrupted build)."""
+    names = _tier_names(stems)
+    require_stable_complete("contour", names, [f"store/contour/{n}.fgb" for n in names])
+    require_stable_complete("soundings", stems, [f"store/soundings/{s}.geojsons" for s in stems])
+    if not os.environ.get("SKIP_DEPARE"):
+        require_stable_complete("depare", names, [f"store/depare/{n}.fgb" for n in names])
+
+
 def bundle_shallow_stable():
     """The global shallow vector run: plain dense -Z0 -z(VECTOR_SPLIT_Z-1) over all three layers, filtered
     to features whose tippecanoe.minzoom <= VECTOR_SPLIT_Z-1 → store/bundle/vector-shallow.pmtiles. Owns
@@ -802,10 +828,7 @@ def bundle_shallow_stable():
     import bundle
     import mosaic
     stems = mosaic.covering_stems()
-    require_stable_complete("contour", stems, [f"store/contour/{s}.fgb" for s in stems])
-    require_stable_complete("soundings", stems, [f"store/soundings/{s}.geojsons" for s in stems])
-    if not os.environ.get("SKIP_DEPARE"):
-        require_stable_complete("depare", stems, [f"store/depare/{s}.fgb" for s in stems])
+    _require_tiers_complete(stems)
     utils.create_folder("store/bundle")
     maxz = VECTOR_SPLIT_Z - 1
     ids = _build_seqs_and_run(stems, 0, maxz, 0, False, SHALLOW, max_minzoom=maxz)
@@ -827,10 +850,7 @@ def bundle_cell_stable(cell):
     if cell not in cells:
         raise SystemExit(f"vector cell {cell}: not a populated cell of the covering")
     stems = cells[cell]
-    require_stable_complete("contour", stems, [f"store/contour/{s}.fgb" for s in stems])
-    require_stable_complete("soundings", stems, [f"store/soundings/{s}.geojsons" for s in stems])
-    if not os.environ.get("SKIP_DEPARE"):
-        require_stable_complete("depare", stems, [f"store/depare/{s}.fgb" for s in stems])
+    _require_tiers_complete(stems)
     utils.create_folder("store/bundle")
     id_base = (sorted(cells).index(cell) + 1) * ID_STRIDE
     cell_maxz = _stems_maxz(stems)
@@ -1054,12 +1074,19 @@ def _vector_selfcheck(vec, maxz, expected=None, per_zoom=6):
             n_soundings += len(L.get("soundings", []))
             if z < DEPARE_MINZOOM and L.get("depare"):
                 problems.append(f"z{z} {x}/{y}: {len(L['depare'])} depare below z{DEPARE_MINZOOM}")
+            # Every curve and metre band edge in a tile belongs to the ladder its zoom's tier draws.
             for feat in L.get("contours", []):
                 p = feat["properties"]
                 d, s = p.get("depth_m"), p.get("sys")
-                if d is not None and contour_minzoom(s, float(d)) > z:
-                    problems.append(f"z{z} {x}/{y}: contour depth_m={d} sys={s} below minzoom "
-                                    f"{contour_minzoom(s, float(d))}")
+                if d is not None and not tier_shows(s, float(d), z):
+                    problems.append(f"z{z} {x}/{y}: contour depth_m={d} sys={s} is not in the "
+                                    f"tier ladder at z{z}")
+                    break
+            for feat in _mbands(L.get("depare", [])):
+                d1 = feat["properties"].get("drval1")
+                if d1 is not None and float(d1) >= 0 and not tier_shows("m", -float(d1), z):
+                    problems.append(f"z{z} {x}/{y}: depare band drval1={d1} is not in the tier "
+                                    f"ladder at z{z}")
                     break
             mbands = _mbands(L.get("depare", []))
             if mbands:
@@ -1148,16 +1175,20 @@ def _check():
     order = sorted(vector_covering_cells([a_stem, b_stem]))
     bases = [0] + [(i + 1) * ID_STRIDE for i in range(len(order))]
     assert all(b2 - b1 >= ID_STRIDE for b1, b2 in zip(bases, bases[1:])), bases
-    # per-feature minzoom reproduces the CONTOUR_TIERS thinning (the leaf-safe replacement for -j).
-    # A shallow metre curve only shows at native+ (last ceiling); a deep one from the first tier
-    # shows at z0; a fathom curve is gated by depth like the deep metre ones.
-    ceilings = [hi for hi, _ in CONTOUR_TIERS]
-    assert contour_minzoom("m", -2) == ceilings[-1]              # -2 in no tier -> native+
-    assert contour_minzoom("m", -4000) == 0                      # -4000 in the first tier -> z0
-    assert contour_minzoom("m", -50) == 7 and contour_minzoom("m", -10) == 9
-    assert contour_minzoom("ft", -0.5) == ceilings[-1]          # shallower than any band's floor
-    assert contour_minzoom("ft", -4000) == 0                     # deeper than the first band's floor
-    assert contour_minzoom(None, 0) == ceilings[-1]              # the sys-less drying line: native+
+    # The tier ladders reproduce the CONTOUR_TIERS thinning: a shallow metre curve draws only from
+    # the full-ladder tiers, a deep one from the first; a fathom curve is gated by depth like the
+    # deep metre ones; the sys-less drying line rides every tier.
+    assert tier_shows("m", -2, 11) and tier_shows("m", -2, 15) and not tier_shows("m", -2, 10)
+    assert tier_shows("m", -4000, 6) and tier_shows("m", -50, 7) and not tier_shows("m", -50, 6)
+    assert tier_shows("m", -10, 9) and not tier_shows("m", -10, 8)
+    assert not tier_shows("ft", -1.8288, 9) and tier_shows("ft", -1.8288, 11)   # one fathom
+    assert tier_shows("ft", -36.576, 9) and not tier_shows("ft", -36.576, 7)    # 20 fathoms
+    assert tier_shows("ft", -3657.6, 6)                                          # 2000 fathoms
+    assert all(tier_shows(None, 0, z) for z in (6, 8, 12)) and not tier_shows("m", 0, 5)
+    for cz in (8, 12, 15):
+        tiers = config.depare_tiers(cz)
+        assert tiers[-1].surface == cz and tiers[-1].last is None
+        assert all(a.last == b.first - 1 for a, b in zip(tiers, tiers[1:]))
     assert 0 in config.CONTOUR_LEVELS, "the 0 m drying line must be a contoured level"
     # every tier level must exist in the generated contour set (else it gates nothing)
     assert all(d in config.CONTOUR_LEVELS for _, depths in CONTOUR_TIERS for d in depths)

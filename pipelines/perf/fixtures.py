@@ -127,9 +127,13 @@ def build(sites=None, z=12):
         # The same two commands mosaic.window_dem uses, against the remote COG.
         _run("gdalbuildvrt", "-q", "-overwrite", "-te", l, b, r, t,
              "-tr", res, res, "-r", "bilinear", vrt, src)
-        _run("gdal_translate", "-q", "-ot", "Float32", "-a_nodata", mosaic.NODATA,
-             "-co", "TILED=YES", "-co", "BLOCKSIZE=512", "-co", "COMPRESS=ZSTD",
-             "-co", "PREDICTOR=3", "-co", "BIGTIFF=IF_SAFER", vrt, out)
+        # A mosaic tile carries the class-aware shoal pyramid down to res(8), and the coarse
+        # depth-area tiers are cut from those levels — the crop must carry them too.
+        import utils
+        with utils.shoal_cog_source(vrt, f"-ot Float32 -a_nodata {mosaic.NODATA}") as cog_src:
+            _run("gdal_translate", "-q", "-of", "COG", "-a_nodata", mosaic.NODATA,
+                 "-co", "BLOCKSIZE=512", "-co", "COMPRESS=ZSTD", "-co", "PREDICTOR=3",
+                 "-co", "BIGTIFF=IF_SAFER", "-co", "OVERVIEWS=FORCE_USE_EXISTING", cog_src, out)
         os.remove(vrt)
         print(f"  {out} ({os.path.getsize(out)/1e6:.1f} MB)")
     # covering.txt in the fixture root only — the real covering stays untouched.

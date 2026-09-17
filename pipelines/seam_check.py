@@ -339,21 +339,24 @@ def check_depare(fgbA, fgbB, edge, coarser_cz):
 
 # ── CLI drivers ───────────────────────────────────────────────────────────────
 
-def _run_pair(mode, stemA, stemB):
-    """Run one check on one adjacent pair; print a per-pair verdict + report. Returns True on PASS
-    (an antimeridian pair prints a note and counts as PASS — it's skipped, not failed)."""
+def _run_pair(mode, stemA, stemB, tier=None):
+    """Run one check on one adjacent pair (one zoom tier's files when `tier` is given); print a
+    per-pair verdict + report. Returns True on PASS (an antimeridian pair prints a note and
+    counts as PASS — it's skipped, not failed)."""
     A, B = parse_stem(stemA), parse_stem(stemB)
     edge = shared_edge(A, B)
+    what = f"{mode} {stemA} | {stemB}" + (f" @{tier}" if tier else "")
     if edge == "antimeridian":
-        print(f"SKIP {mode} {stemA} | {stemB}: antimeridian seam")
+        print(f"SKIP {what}: antimeridian seam")
         return True
     if edge is None:
         raise SystemExit(f"seam_check: {stemA} and {stemB} are not edge-adjacent")
     coarser_cz = min(A[3], B[3])   # coarser resolution (smaller child_z) sets the tolerance
     folder = "contour" if mode == "contours" else "depare"
-    fa, fb = f"store/{folder}/{stemA}.fgb", f"store/{folder}/{stemB}.fgb"
+    suffix = f"-{tier}" if tier else ""
+    fa, fb = f"store/{folder}/{stemA}{suffix}.fgb", f"store/{folder}/{stemB}{suffix}.fgb"
     ok, report = (check_contours if mode == "contours" else check_depare)(fa, fb, edge, coarser_cz)
-    print(f"{'PASS' if ok else 'FAIL'} {mode} {stemA} | {stemB}")
+    print(f"{'PASS' if ok else 'FAIL'} {what}")
     for line in report:
         print(line)
     return ok
@@ -370,7 +373,10 @@ def auto():
         stems = f.read().split()
     # A 0-byte sentinel counts as built-and-empty: an empty tile beside a neighbor whose
     # features cross their shared edge is exactly the discontinuity this gate exists to catch.
-    built = [s for s in stems if os.path.exists(f"store/contour/{s}.fgb")]
+    # Each zoom tier is an independent cut, so every tier both sides hold is a pair.
+    import config
+    tiers = [f"t{z}" for z in config.DEPARE_TIER_STARTS]
+    built = [s for s in stems if os.path.exists(f"store/contour/{s}-{tiers[0]}.fgb")]
     index = {}
     for s in built:
         z, x, y, _cz = parse_stem(s)
@@ -401,17 +407,20 @@ def auto():
 
     results, failures = [], 0
     for a, b in pairs:
-        ok = _run_pair("contours", a, b)
-        results.append((ok, "contours", a, b))
-        failures += 0 if ok else 1
-        # depare only where both tiles have a depare output (a partially built store) — a
-        # missing depare file is noted, not a failure.
-        if os.path.exists(f"store/depare/{a}.fgb") and os.path.exists(f"store/depare/{b}.fgb"):
-            ok = _run_pair("depare", a, b)
-            results.append((ok, "depare", a, b))
+        for t in tiers:
+            if not (os.path.exists(f"store/contour/{a}-{t}.fgb") and os.path.exists(f"store/contour/{b}-{t}.fgb")):
+                continue
+            ok = _run_pair("contours", a, b, t)
+            results.append((ok, f"contours@{t}", a, b))
             failures += 0 if ok else 1
-        else:
-            print(f"SKIP depare {a} | {b}: depare output missing for one side")
+            # depare only where both tiles have a depare output (a partially built store) — a
+            # missing depare file is noted, not a failure.
+            if os.path.exists(f"store/depare/{a}-{t}.fgb") and os.path.exists(f"store/depare/{b}-{t}.fgb"):
+                ok = _run_pair("depare", a, b, t)
+                results.append((ok, f"depare@{t}", a, b))
+                failures += 0 if ok else 1
+            else:
+                print(f"SKIP depare {a} | {b} @{t}: depare output missing for one side")
 
     print(f"\nseam_check auto summary ({len(pairs)} pair(s){note}):")
     for ok, mode, a, b in results:

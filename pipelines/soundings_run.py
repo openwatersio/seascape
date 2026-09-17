@@ -94,7 +94,7 @@ SHOAL_RING_LEVELS = sorted(-l for l in config.CONTOUR_LEVELS
 
 
 def _ring_minzoom(level_pos):
-    """The zoom a charted level's isobath first draws at (contour_run.CONTOUR_TIERS holds
+    """The zoom a charted level's isobath first draws at (config.CONTOUR_TIERS holds
     cumulative level sets per zoom band, so a level's minzoom is the floor of the first band
     listing it; a level in no band draws only at/above the last ceiling).
 
@@ -103,9 +103,8 @@ def _ring_minzoom(level_pos):
     generalization drops the ring at a scale, the chart makes no claim there for the sounding to
     complete. Promoting primes past their rings is what put decimetre least depths over the
     generalized coastline of a 1:500k view."""
-    from contour_run import CONTOUR_TIERS   # lazy: sibling stage, imported for its display table
     prev = 0
-    for ceil_z, lvls in CONTOUR_TIERS:
+    for ceil_z, lvls in config.CONTOUR_TIERS:
         if -level_pos in lvls:
             return prev
         prev = ceil_z
