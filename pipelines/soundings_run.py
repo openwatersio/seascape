@@ -154,6 +154,11 @@ KIND_PRIME = 1     # least depth in a closed isobath: uncapped, carries prime=1
 KIND_REPAIR = 2    # B-410a/B-403.1a insertion: uncapped from the zoom that needed it
 
 
+# Written coordinate precision: ~0.11 m of longitude at the equator, well under a sounding's
+# positional meaning and what keeps a million-point tile's GeoJSON from doubling in size.
+COORD_DECIMALS = 6
+
+
 def _owns(bbox, x, y):
     """Whether a stem owns the point — half-open, so adjacent stems partition the plane.
 
@@ -575,14 +580,30 @@ def _sound_dem(dem, tile_obj, z, child_z, tmp, label):
         return None
 
     to4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
+    # _owns decides in 3857, but the tiler reads the ROUNDED 4326 coordinate: half a unit is ~5 cm,
+    # enough to carry a point the stem owns across the seam into a neighbour's tile, where the
+    # cell's fringe filter drops it. Clamp the written value into the owned span — a shift of one
+    # unit is far below a sounding's positional meaning, where losing it is not.
+    west, north = to4326.transform(bbox.left, bbox.top)
+    east, south = to4326.transform(bbox.right, bbox.bottom)
+    step = 10.0 ** -COORD_DECIMALS
     feats = []
     for d, x3857, y3857, minz, kind in pts:
         lon, lat = to4326.transform(x3857, y3857)
+        lon, lat = round(lon, COORD_DECIMALS), round(lat, COORD_DECIMALS)
+        if lon < west:
+            lon = round(west + step, COORD_DECIMALS)
+        elif lon >= east:
+            lon = round(east - step, COORD_DECIMALS)
+        if lat <= south:
+            lat = round(south + step, COORD_DECIMALS)
+        elif lat > north:
+            lat = round(north - step, COORD_DECIMALS)
         # Each level shows at exactly one zoom (one field per zoom);
         # the finest level, primes and repair insertions ride uncapped — see _tc.
         feats.append({"type": "Feature", "tippecanoe": _tc(minz, child_z, kind),
                       "properties": _props(d, kind),
-                      "geometry": {"type": "Point", "coordinates": [round(lon, 6), round(lat, 6)]}})
+                      "geometry": {"type": "Point", "coordinates": [lon, lat]}})
 
     final = f"{tmp}/soundings.geojsons"
     with open(final, "w") as f:  # line-delimited features — see module docstring
@@ -833,6 +854,15 @@ def _check():
     for _x, _y in ((100.0, 50.0), (0.0, 0.0), (100.0, 0.0), (50.0, 0.0)):
         _owners = sum(bool(_owns(b, _x, _y)) for b in (_west, _east, _south, _se))
         assert _owners == 1, f"({_x}, {_y}) claimed by {_owners} stems, not exactly 1"
+    # The WRITTEN coordinate is what the tiler reads, so rounding must not carry a point out of
+    # the span _owns admitted it to. A stem's east seam is a dyadic 4326 value needing far more
+    # than COORD_DECIMALS digits, so a point just inside it rounds up and out without the clamp.
+    _seam = 360.0 / (1 << 15)
+    assert round(_seam + 1e-9, COORD_DECIMALS) < _seam, \
+        "the fixture must round a point just EAST of the seam back across it"
+    assert round(_seam + 10.0 ** -COORD_DECIMALS, COORD_DECIMALS) > _seam, \
+        "one unit past the seam must round to a value the eastern stem still owns"
+
     assert bool(_owns(_west, 0.0, 100.0)), "a stem owns its own west/north corner"
     assert not _owns(_west, 100.0, 50.0), "a stem cedes its east edge"
     assert not _owns(_west, 50.0, 0.0), "a stem cedes its south edge"
