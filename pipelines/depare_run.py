@@ -773,8 +773,9 @@ def _dissolve_sublegible(bands, drvals, min_area):
     (m²), smallest first: with a shallower neighbour (smaller drval1) the part merges into the
     shallowest of them — the area now reads shoaler, a pit removed; with no band neighbour at
     all (land, drying or nodata all round) it drops, which reads as not-water; with every
-    neighbour deeper it is a shoal and stays. Merges are exact unions along shared edges, so
-    the partition stays disjoint and no area is invented. Returns the bands in place."""
+    neighbour deeper it is a shoal and stays. A neighbour shares an edge, never just a corner.
+    Merges are exact unions along shared edges, so the partition stays disjoint and no area is
+    invented. Returns the bands in place."""
     import numpy as np
     import shapely
     from shapely.strtree import STRtree
@@ -800,7 +801,8 @@ def _dissolve_sublegible(bands, drvals, min_area):
     for i in np.argsort(shapely.area(parts)):
         if shapely.area(geoms[i]) >= min_area or not alive[i]:
             continue
-        nb = {find(j) for j in tree.query(parts[i], predicate="touches") if j != i}
+        nb = {find(j) for j in tree.query(parts[i], predicate="touches")
+              if j != i and shapely.intersection(parts[i], parts[j]).length > 0}
         nb.discard(i)
         nb = [j for j in nb if alive[j]]
         if not nb:
@@ -1036,6 +1038,15 @@ def tier_path(stem, tier):
     return f"store/depare/{stem}-{tier.name}.fgb"
 
 
+def tier_read_tiles(stem, tier):
+    """The mosaic tiles a coarse tier's surface reads: the stem's window buffered by the smooth
+    halo at the tier's resolution — a z6 halo reaches tens of kilometres past the stem."""
+    import mosaic
+    import smooth
+    halo_m = smooth.halo_px() * get_resolution(tier.surface)
+    return [mosaic.tile_artifact(s) for s in mosaic.intersecting_tiles(stem, halo_m)]
+
+
 def _tier_surface(stem, tier, out):
     """A coarse tier's cut surface: the stem's halo-buffered window read off the mosaic tiles'
     class-aware shoal pyramid at the tier zoom, then the shared depth-gated smooth at that
@@ -1052,7 +1063,7 @@ def _tier_surface(stem, tier, out):
     halo_m = smooth.halo_px() * res
     b = mercantile.xy_bounds(mercantile.Tile(x=x, y=y, z=z))
     l, bt, r, t = b.left - halo_m, b.bottom - halo_m, b.right + halo_m, b.top + halo_m
-    tiles = " ".join(mosaic.tile_artifact(s) for s in mosaic.intersecting_tiles(stem, halo_m))
+    tiles = " ".join(tier_read_tiles(stem, tier))
     vrt = out + ".vrt"
     utils.run_command(f"gdalbuildvrt -overwrite -te {l} {bt} {r} {t} -tr {read_res} {read_res} "
                       f"-r nearest {vrt} {tiles}")
@@ -1070,26 +1081,59 @@ def _tier_surface(stem, tier, out):
     return out
 
 
-def _shoal_clamp(surface, finer, factor, tmp):
-    """Raise `surface` in place to at least the class-aware shoal reduction of `finer` (a
-    finer-tier surface) by `factor`, over the extent they share. Nodata on either side leaves
-    the surface pixel as read."""
+def _shoal_reduce(arr, nodata, factor):
+    """utils._block_reduce's rule on an in-memory block whose sides are multiples of `factor`:
+    per 2x2, the max over water-domain children when any exist, else over valid ones, nodata
+    only when none is valid — `factor` halvings of it."""
     import numpy as np
-    from rasterio.windows import from_bounds
-    reduced = _uniform_coarsen(finer, factor, tmp)
-    with rasterio.open(reduced) as r, rasterio.open(surface, "r+") as s:
-        left, bottom = max(r.bounds.left, s.bounds.left), max(r.bounds.bottom, s.bounds.bottom)
-        right, top = min(r.bounds.right, s.bounds.right), min(r.bounds.top, s.bounds.top)
-        if right <= left or top <= bottom:
+    cap = config.DRYING_CAP
+    while factor > 1:
+        q = [arr[i::2, j::2] for i in (0, 1) for j in (0, 1)]
+        good = [(x != nodata) & (x == x) for x in q]
+        wet = [g & (x <= cap) for g, x in zip(good, q)]
+        floor = np.array(-np.inf, dtype=arr.dtype)
+        anywet = wet[0] | wet[1] | wet[2] | wet[3]
+        anygood = good[0] | good[1] | good[2] | good[3]
+        wmax = np.maximum.reduce([np.where(k, x, floor) for k, x in zip(wet, q)])
+        gmax = np.maximum.reduce([np.where(k, x, floor) for k, x in zip(good, q)])
+        arr = np.where(anygood, np.where(anywet, wmax, gmax), nodata).astype(arr.dtype)
+        factor //= 2
+    return arr
+
+
+def _shoal_clamp(surface, finer, factor, tmp=None):
+    """Raise `surface` in place to at least the class-aware shoal reduction of `finer` (a
+    finer-tier surface) by `factor`, over the extent they share. The reduction is taken on the
+    coarse grid: the shared extent is snapped inward to coarse pixel edges — which lie on the
+    finer lattice, since both grids anchor on the tile edge — and the finer raster is read over
+    exactly that extent, so every coarse pixel meets the reduction of its own block. Nodata on
+    either side leaves the pixel as read."""
+    import math
+    import numpy as np
+    from rasterio.windows import Window
+    with rasterio.open(finer) as f, rasterio.open(surface, "r+") as s:
+        cres, fres = s.transform.a, f.transform.a
+        if abs(cres - fres * factor) > 1e-6 * cres:
+            raise ValueError(f"shoal clamp: {surface} is not {factor}x coarser than {finer}")
+        left, right = max(f.bounds.left, s.bounds.left), min(f.bounds.right, s.bounds.right)
+        bottom, top = max(f.bounds.bottom, s.bounds.bottom), min(f.bounds.top, s.bounds.top)
+        c0 = math.ceil((left - s.transform.c) / cres - 1e-9)
+        c1 = math.floor((right - s.transform.c) / cres + 1e-9)
+        r0 = math.ceil((s.transform.f - top) / cres - 1e-9)
+        r1 = math.floor((s.transform.f - bottom) / cres + 1e-9)
+        w, h = c1 - c0, r1 - r0
+        if w <= 0 or h <= 0:
             return
-        rw = from_bounds(left, bottom, right, top, r.transform).round_offsets().round_lengths()
-        sw = from_bounds(left, bottom, right, top, s.transform).round_offsets().round_lengths()
-        a, b = s.read(1, window=sw), r.read(1, window=rw)
-        h, w = min(a.shape[0], b.shape[0]), min(a.shape[1], b.shape[1])
-        a, b = a[:h, :w], b[:h, :w]
-        valid = (a != s.nodata) & (b != r.nodata)
-        a = np.where(valid, np.maximum(a, b), a)
-        s.write(a, 1, window=rasterio.windows.Window(sw.col_off, sw.row_off, w, h))
+        sl, st = s.transform.c + c0 * cres, s.transform.f - r0 * cres
+        fc, fr = (sl - f.transform.c) / fres, (f.transform.f - st) / fres
+        if abs(fc - round(fc)) > 1e-6 or abs(fr - round(fr)) > 1e-6:
+            raise ValueError(f"shoal clamp: {finer} is not on {surface}'s lattice")
+        a = s.read(1, window=Window(c0, r0, w, h))
+        b = f.read(1, window=Window(round(fc), round(fr), w * factor, h * factor))
+        red = _shoal_reduce(b, f.nodata, factor)
+        valid = (a != s.nodata) & (red != f.nodata)
+        s.write(np.where(valid, np.maximum(a, red), a).astype(a.dtype), 1,
+                window=Window(c0, r0, w, h))
 
 
 def tile(stem):
@@ -1140,7 +1184,7 @@ def tile(stem):
                 dem = window
             else:
                 dem = _tier_surface(stem, tier, f"{tier_tmp}/surface.tif")
-                _shoal_clamp(dem, finer, 2 ** (finer_z - tier.surface), f"{tier_tmp}/finer.tif")
+                _shoal_clamp(dem, finer, 2 ** (finer_z - tier.surface))
                 finer, finer_z = dem, tier.surface
             _mark(f"{tier.name}-surface")
             scale_z = tier.first if tier.last is not None else None
@@ -1849,15 +1893,18 @@ def _check():
     shoal, deep = shoal.difference(pit), deep.difference(pit)
     island = _bx(300, 300, 302, 302)                                    # 5-10 m with nothing around
     peak = _bx(150, 45, 153, 48)                                        # a 2-5 m crumb inside 5-10 m
+    corner = _bx(200, 100, 203, 103)                                    # 5-10 m, meets the shoal at one corner only
     deep = deep.difference(peak)
-    bands = [shapely.multipolygons([shoal, peak]), shapely.multipolygons([deep, pit, island])]
+    bands = [shapely.multipolygons([shoal, peak]), shapely.multipolygons([deep, pit, island, corner])]
     total = sum(g.area for g in bands)
     out = _dissolve_sublegible(bands, [(2.0, 5.0), (5.0, 10.0)], 50.0)
     assert out[0].contains(pit.buffer(-0.1)) and not out[1].intersects(pit.buffer(-0.1)), \
         "a sub-legible pit must dissolve into its shallower neighbour"
     assert out[0].contains(peak.buffer(-0.1)), "a sub-legible peak must stay"
     assert not out[1].intersects(island), "a sub-legible island must drop"
-    assert abs(sum(g.area for g in out) - (total - island.area)) < 1e-6 and \
+    assert not out[0].intersects(corner.buffer(-0.1)), \
+        "a corner-only contact is no neighbour: the crumb must not dissolve into the shoal band"
+    assert abs(sum(g.area for g in out) - (total - island.area - corner.area)) < 1e-6 and \
         out[0].intersection(out[1]).area < 1e-9, "the dissolve must conserve area and disjointness"
     assert out[1].contains(_bx(120, 20, 180, 40)), "a legible part must be untouched"
     # Shoal clamp: a coarse surface is raised to the reduction of the finer one, never lowered.
@@ -1865,14 +1912,16 @@ def _check():
     from rasterio.transform import from_origin as _fo
     from smooth import NODATA as _ND
     _d = _tf.mkdtemp()
-    fine = np.full((8, 8), -10.0, np.float32); fine[2:4, 2:4] = -3.0     # a shoal the coarse read missed
+    # The finer raster carries a one-pixel halo the coarse one lacks, so their origins differ
+    # by half a coarse pixel: the reduction must still land on the coarse lattice.
+    fine = np.full((10, 10), -10.0, np.float32); fine[3:5, 3:5] = -3.0   # a shoal the coarse read missed
     coarse = np.full((4, 4), -12.0, np.float32); coarse[0, 0] = _ND
-    for name, arr, r in (("fine", fine, 10.0), ("coarse", coarse, 20.0)):
+    for name, arr, r, org in (("fine", fine, 10.0, (-10, 90)), ("coarse", coarse, 20.0, (0, 80))):
         with rasterio.open(f"{_d}/{name}.tif", "w", driver="GTiff", height=arr.shape[0], width=arr.shape[1],
                            count=1, dtype="float32", nodata=_ND, crs="EPSG:3857",
-                           transform=_fo(0, 80, r, r)) as dst:
+                           transform=_fo(org[0], org[1], r, r)) as dst:
             dst.write(arr, 1)
-    _shoal_clamp(f"{_d}/coarse.tif", f"{_d}/fine.tif", 2, f"{_d}/reduced.tif")
+    _shoal_clamp(f"{_d}/coarse.tif", f"{_d}/fine.tif", 2)
     with rasterio.open(f"{_d}/coarse.tif") as src:
         got = src.read(1)
     assert got[1, 1] == -3.0 and got[2, 2] == -10.0 and got[0, 0] == _ND, got

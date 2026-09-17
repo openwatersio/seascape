@@ -329,7 +329,9 @@ def tiers(stem, root="."):
         pits = peaks = 0
         d1 = g["drval1"].values
         for i in small:
-            nb = [j for j in tree.query(geoms[i], predicate="touches") if j != i]
+            # an edge neighbour, never a corner-only contact — the dissolve's own rule
+            nb = [j for j in tree.query(geoms[i], predicate="touches")
+                  if j != i and shapely.intersection(geoms[i], geoms[j]).length > 0]
             # No band neighbour means land or drying all round, which is shallower than any
             # band: dissolving the part into it removes a pit. A peak has neighbours, all deeper.
             if not nb or any(d1[j] < d1[i] for j in nb):

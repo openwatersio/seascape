@@ -740,10 +740,10 @@ def main():
         import mercantile
         inwin_set = set(inwin)
 
-        def _neighbors(stem, pool):
+        def _neighbors(stem, pool, buffer=None):
             z, x, y, _cz = (int(a) for a in stem.split("-"))
             l, b, r, t = aggregation_reproject.buffered_bounds(
-                mercantile.Tile(x=x, y=y, z=z), mosaic.window_buffer_3857(stem))
+                mercantile.Tile(x=x, y=y, z=z), buffer or mosaic.window_buffer_3857(stem))
             hit = []
             for s in pool:
                 sz, sx, sy, _c = (int(a) for a in s.split("-"))
@@ -754,6 +754,15 @@ def main():
 
         n_heal = sum(1 for s in inwin if any(n not in inwin_set for n in _neighbors(s, stems)))
         assert 0 < n_heal < n_inwin, f"heal set must be a nonempty strict subset: {n_heal}/{n_inwin}"
+        # depth areas read further: a coarse tier's surface carries the smooth halo at the tier's
+        # own resolution, so its heal set is the stems whose widest tier halo leaves the window
+        # (contours derive from depare and heal with it; soundings read the native window only).
+        import config
+        import smooth
+        widest = smooth.halo_px() * aggregation_reproject.get_resolution(config.DEPARE_TIER_STARTS[0])
+        n_heal_depare = sum(1 for s in inwin
+                            if any(n not in inwin_set for n in _neighbors(s, stems, widest)))
+        assert n_heal <= n_heal_depare <= n_inwin, f"depare heal set: {n_heal_depare}/{n_inwin}"
 
         snake(tmp, "-c", "4", "bundles", env={"BBOX": bbox})   # real regional build
 
@@ -763,9 +772,12 @@ def main():
         assert counts.get("mosaic_tile", 0) == 0, f"scope change must never re-merge: {counts}"
         # the bbox run re-forked its in-window stems with TRUNCATED neighborhoods (input set is
         # bbox-scoped); the planet build heals exactly the boundary stems via the input-set trigger.
-        assert counts.get("contour_tile", 0) == n_heal, f"planet must re-fork the {n_heal} bbox-truncated stems: {counts}"
-        assert counts.get("soundings_tile", 0) == n_heal, f"soundings heal too: {counts}"
-        assert counts.get("depare_tile", 0) == n_heal, f"depare heals too: {counts}"
+        assert counts.get("contour_tile", 0) == n_heal_depare, \
+            f"planet must re-fork the {n_heal_depare} stems whose tier halo was bbox-truncated: {counts}"
+        # soundings read the native window only, but that window is a temp() the depare rerun
+        # regenerates, and a regenerated temp() reruns every consumer: they heal with depare.
+        assert counts.get("soundings_tile", 0) == n_heal_depare, f"soundings heal too: {counts}"
+        assert counts.get("depare_tile", 0) == n_heal_depare, f"depare heals too: {counts}"
         for agg in ("mosaic_index", "vector_shallow", "vector_join", "terrain_planet_bundle"):
             assert counts.get(agg, 0) == 1, f"{agg} must rebuild after a scope change: {counts}"
         # one bbox-stamped vector cell per in-window stem (stem-grid split); the rest kept planet stamps

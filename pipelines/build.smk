@@ -382,6 +382,17 @@ def fork_inputs(wc):
     return [f"store/mosaic/tiles/{s}.tif" for s in mosaic_mod.intersecting_tiles(wc.stem)]
 
 
+def depare_inputs(wc):
+    """The mosaic tiles every depth-area tier reads: the native window's set plus each coarse
+    tier's halo at its own resolution (a z6 halo reaches tens of kilometres past the stem)."""
+    cz = int(wc.stem.split("-")[3])
+    tiles = set(fork_inputs(wc))
+    for t in pipeline_config.depare_tiers(cz):
+        if t.surface != cz:
+            tiles |= set(depare_run.tier_read_tiles(wc.stem, t))
+    return sorted(tiles)
+
+
 # The forks' shared read surface, built once per stem instead of three times: the buffered
 # window materialized, smoothed, and pond-filled. temp() — a z15 window is 4.3 GB and
 # only in-flight stems need theirs on disk. Consumers treat it as read-only.
@@ -468,7 +479,7 @@ rule soundings_tile:
 rule depare_tile:
     input:
         window="store/window/{stem}.tif",
-        tiles=fork_inputs,  # the coarse tiers read the mosaic pyramid levels directly
+        tiles=depare_inputs,  # the coarse tiers read the mosaic pyramid levels directly
         masks=MASKS,
     output:
         tier_files("depare", ["{stem}"])
