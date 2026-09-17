@@ -561,6 +561,17 @@ class _RowSink:
     # Furthest a snapped vertex can travel: half the cell DIAGONAL, not half its side — the vertex
     # goes to the nearest lattice point, and the worst case is the cell's centre.
     SNAP_MAX_SHIFT = GRID * 2 ** 0.5 / 2
+
+    @classmethod
+    def snap_budget(cls, geoms):
+        """How far a row's area may move when snapped to the write grid.
+
+        Perimeter times the max vertex shift, floored at one grid cell: a crumb whose perimeter is
+        shorter than a cell budgets below the grid's own quantum, where snapping can only
+        annihilate it or round it out to a fraction of a cell."""
+        import numpy as np
+        import shapely
+        return np.maximum(shapely.length(geoms) * cls.SNAP_MAX_SHIFT, cls.GRID ** 2)
     # When a reprojection fold has to be repaired before it can be snapped, the ring's pre-repair
     # shoelace area is ill-defined — which is why this gate is two-term rather than a floor. Fatal
     # only when the loss is BOTH real-part sized (SLIVER_MIN_PX ~ 1.1e-8 deg^2) AND more than 1%
@@ -669,7 +680,7 @@ class _RowSink:
         # batch total that growth pays for another row collapsing (measured on one real batch, 819
         # of 1658 rows grew and 837 shrank, and the net hid 92% of the movement). No real row came
         # within half of this bound — the worst measured sat at 0.42 of it.
-        budget = shapely.length(raw) * self.SNAP_MAX_SHIFT
+        budget = self.snap_budget(raw)
         try:
             snapped = shapely.set_precision(raw, self.GRID, mode="valid_output")
         except shapely.errors.GEOSException:
@@ -1248,6 +1259,19 @@ def _check():
         f"the folded row moved past its snap budget: {_wrote!r} vs {_want!r} deg^2"
     assert _want > 0.99 * shapely.area(_folded4326), \
         "resolving the fold must not eat the ring"
+
+    # A crumb smaller than the write grid: its perimeter-derived budget lands below one grid
+    # cell, so snapping can only annihilate it or round it out to a fraction of a cell — and the
+    # write must survive either. Planet run 35149243490 lost depare stems 4-1-8-8 and 4-14-5-8 to
+    # rows of ~2e-20 deg^2 rounding out to ~5e-19.
+    _crumb = _box(4.0, 50.0, 4.0 + _RowSink.GRID / 4, 50.0 + _RowSink.GRID / 4)
+    assert shapely.length(_crumb) * _RowSink.SNAP_MAX_SHIFT < _RowSink.GRID ** 2, \
+        "the fixture must be small enough that its perimeter alone budgets under one cell"
+    assert _RowSink.snap_budget(_crumb) >= _RowSink.GRID ** 2, _RowSink.snap_budget(_crumb)
+    # …and a row big enough to draw is nowhere near the floor, so the bound still bites there.
+    _drawable = _box(4.0, 50.0, 4.001, 50.001)
+    assert _RowSink.snap_budget(_drawable) > 1e3 * _RowSink.GRID ** 2, \
+        "the floor must not become the budget for drawable geometry"
 
     # A nodata row dilated past the world's east edge, as NODATA_OVERLAP_PX does on the
     # easternmost stem, whose clip box ends exactly there. Untrimmed, the inverse transform puts

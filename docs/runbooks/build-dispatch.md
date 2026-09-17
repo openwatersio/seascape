@@ -12,8 +12,19 @@ Snakemake job identity is **params + inputs + code**, and the planner is the onl
 - **A banked output is only banked if its whole input closure is stable.** "contour/depare don't rerun" requires that nothing upstream of them runs either.
 - **bbox ↔ planet flips re-key `cover`.** The bbox is a param of the covering checkpoint; switching between a regional and planet dispatch replans the covering.
 - **Every smoothing dial must live in `SMOOTH_CFG`.** A dial missing from that hash leaves windows fresh and silently re-measures the old surface.
+- **A datum builder script IS a rule input, and the gate cannot see what it costs.** `datum_surface` takes `pipelines/<builder>.py` as an `input:`, so editing one — even a comment or a self-check — restages its surface, and the cascade runs `datum_surface` → `prep_source` → that source's `catalog.json` → the `cover` checkpoint → every aggregate that expands over the covering. Two consequences: the build box does **source-prep work it is not meant to do** (`datum_surface` carries `retries: 2` for a 3.2 GB upstream fetch), and because `cover` is a checkpoint the dry run plans only ~10 jobs, so `max_jobs` gates nothing and the real DAG appears after `cover` runs. The remedy is to converge the surface **before** dispatching a build: run `sources.yml` first (it owns datum surfaces, source prep and the covering), then dispatch. Reverting the script instead only flips the staleness back the other way and re-fires the cascade on the next run. Blast radius is the sources that name the surface in `offset_surface` — for `ign69_zh` that is `litto3d_bretagne` alone, a handful of Brittany stems. The fork scripts (`soundings_run.py`, `depare_run.py`, `contour_run.py`) are shell-invoked, never inputs, so editing those is free.
 
-**The gate:** every dispatch states its expected DAG size in the `max_jobs` workflow input. The build then dry-runs the exact invocation first and aborts — printing the job-stats table and a reason census — if the planner disagrees. Rough sizes for calibration: full planet rebuild ≈ 16,400; one stage across the covering ≈ 3,300; vector tail (cells + shallow + join + bundles + stage) ≈ 3,300; incremental after a code-only change ≈ single digits.
+**The gate:** every dispatch states its expected DAG size in the `max_jobs` workflow input. The build then dry-runs the exact invocation first and aborts — printing the job-stats table and a reason census — if the planner disagrees. Size the gate from the covering, not from a remembered number — the covering grows as sources register, so any absolute figure here rots. Let `N` be the covering's stem count (`wc -l < store/aggregation/covering.txt`, 4,459 as of run 35124735536):
+
+| Dispatch | Expected jobs |
+| --- | --- |
+| One stage across the covering (depare, soundings, contours, windows — each) | ≈ `N` |
+| Vector tail (cells + shallow + join + bundles + stage) | ≈ `N` + `C` + 5, where `C` is the populated overlay-cell count (one `overlay_bundle` each) |
+| Terrain renders | ≈ `2.4 x N` (one per output zoom per anchor, so it scales with the pyramid, not the covering alone) |
+| A vector-wide rebuild (the four fork stages + vector tail + terrain cascade) | ≈ `7 x N` |
+| Incremental after a code-only change | single digits |
+
+Worked example: run 35124735536 planned **33,150** against a 4,459-stem covering — four fork stages (17,836), terrain (10,557), vector cells (4,459), the re-keyed merges (267) and the bundle tail (31, of which 23 are overlay cells).
 
 To predict scope before dispatching, dry-run locally against a representative store (the bbox root in `pipelines/`, with the same `BBOX` its provenance records) and read the job stats **and** the `reason:` lines per rule — the reasons, not the counts, tell you whether the plan matches your intent.
 
@@ -36,5 +47,9 @@ Arm all of this at dispatch time, not when something looks wrong:
 - **The `build` commit status** is the heartbeat: `root@<ip> · N of M steps (P%), ~R running`, updated every minute. `M` is the live check that the planned DAG matches `max_jobs` intent. A status that stops updating means the run died or the heartbeat did — either way, look.
 - The status may briefly show the **previous run's last heartbeat** (same commit, same context) — trust it only once it has changed after your dispatch.
 - Watch for the run's terminal states, not just successes: a watcher that only matches the happy path is silent through a crash.
+
+**A build stops at its first failure.** `build.yml` runs without `--keep-going`, so the run ends once a job exhausts its `retries` — which means it has already proven deterministic, since every transient-prone rule retries with `mem_gb x attempt` first. That is deliberate: a dead soundings, depare or vector cell blocks `vector_shallow` or `vector_join` for the whole covering, so carrying on cannot produce a releasable build, and it burns the run's parallelism on work that leaves the serial tail to a follow-up run with an idle box. Finished artifacts are banked on the volume either way, so a re-dispatch resumes.
+
+To find **every** failure in one pass — worth it on the first run after a wide pipeline change, where fixing one deterministic bug at a time costs a dispatch each — pass `--keep-going` through the `snakemake_args` input.
 
 When a run fails or must be canceled: **pull evidence first** — the job-stats table, the `reason:` census, per-rule logs and benchmarks from `/var/tmp/seascape-tmp` (they ship as the `snakemake-bench-<run-id>` artifact, but the box copy dies with the box), and whatever the failing rule wrote — the box teardown destroys everything not on the store volume.

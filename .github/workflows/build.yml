@@ -493,8 +493,10 @@ jobs:
           # No --prioritize: it flattens the index's whole merge chain to one priority, which
           # lets the scheduler pack small merges ahead of the heavy ones. build.smk's explicit
           # priority bands (index > merges > vector > terrain) order the chain instead.
+          # No --keep-going: a dead fork tile blocks vector_shallow and vector_join for the whole
+          # covering, so nothing after the first exhausted-retries failure can stage a build.
           ./docker.sh snakemake "${targets[@]}" "${extra[@]}" "${force[@]}" \
-            --keep-going --rerun-incomplete \
+            --rerun-incomplete \
             --logger seascape --logger-seascape-events /app/tmp/logs/events.jsonl \
             --cores "$cores" --resources mem_gb="$budget_gb" disk_mb="$disk_budget_mb" \
             --config workdir=/app/state tmp=/app/tmp 2>&1 | tee "$buildlog"
