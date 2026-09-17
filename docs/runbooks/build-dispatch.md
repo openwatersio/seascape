@@ -48,4 +48,8 @@ Arm all of this at dispatch time, not when something looks wrong:
 - The status may briefly show the **previous run's last heartbeat** (same commit, same context) — trust it only once it has changed after your dispatch.
 - Watch for the run's terminal states, not just successes: a watcher that only matches the happy path is silent through a crash.
 
+**A build stops at its first failure.** `build.yml` runs without `--keep-going`, so the run ends once a job exhausts its `retries` — which means it has already proven deterministic, since every transient-prone rule retries with `mem_gb x attempt` first. That is deliberate: a dead soundings, depare or vector cell blocks `vector_shallow` or `vector_join` for the whole covering, so carrying on cannot produce a releasable build, and it burns the run's parallelism on work that leaves the serial tail to a follow-up run with an idle box. Finished artifacts are banked on the volume either way, so a re-dispatch resumes.
+
+To find **every** failure in one pass — worth it on the first run after a wide pipeline change, where fixing one deterministic bug at a time costs a dispatch each — pass `--keep-going` through the `snakemake_args` input.
+
 When a run fails or must be canceled: **pull evidence first** — the job-stats table, the `reason:` census, per-rule logs and benchmarks from `/var/tmp/seascape-tmp` (they ship as the `snakemake-bench-<run-id>` artifact, but the box copy dies with the box), and whatever the failing rule wrote — the box teardown destroys everything not on the store volume.

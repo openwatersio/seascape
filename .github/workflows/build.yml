@@ -493,8 +493,19 @@ jobs:
           # No --prioritize: it flattens the index's whole merge chain to one priority, which
           # lets the scheduler pack small merges ahead of the heavy ones. build.smk's explicit
           # priority bands (index > merges > vector > terrain) order the chain instead.
+          #
+          # No --keep-going either: every rule that can fail transiently carries `retries`, and a
+          # retry reserves mem_gb x attempt, so a failure that reaches the scheduler has already
+          # proven itself deterministic. Carrying on past one cannot produce a releasable build —
+          # a dead soundings, depare or vector cell blocks vector_shallow or vector_join for the
+          # whole covering — and it spends the run's parallelism on work that then leaves the
+          # expensive serial tail (vector_shallow, the join, stage_build) to a follow-up run with
+          # an idle box. Run 35149243490 carried on for 6h20m after its first dead cell and still
+          # staged nothing. Stopping banks every finished artifact on the volume exactly the same,
+          # so a re-dispatch resumes. For a deliberate survey run — find every failure in one pass
+          # after a wide pipeline change — pass --keep-going through the snakemake_args input.
           ./docker.sh snakemake "${targets[@]}" "${extra[@]}" "${force[@]}" \
-            --keep-going --rerun-incomplete \
+            --rerun-incomplete \
             --logger seascape --logger-seascape-events /app/tmp/logs/events.jsonl \
             --cores "$cores" --resources mem_gb="$budget_gb" disk_mb="$disk_budget_mb" \
             --config workdir=/app/state tmp=/app/tmp 2>&1 | tee "$buildlog"
