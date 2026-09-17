@@ -669,7 +669,12 @@ class _RowSink:
         # batch total that growth pays for another row collapsing (measured on one real batch, 819
         # of 1658 rows grew and 837 shrank, and the net hid 92% of the movement). No real row came
         # within half of this bound — the worst measured sat at 0.42 of it.
-        budget = shapely.length(raw) * self.SNAP_MAX_SHIFT
+        # Floored at one grid cell's area: a crumb whose whole perimeter is shorter than a cell
+        # gets a perimeter-derived budget below the grid's own quantum, and snapping such a row
+        # can only annihilate it or round it out to a fraction of a cell — movement the formula
+        # calls a violation while the grid calls it the smallest step it has. Real rows are orders
+        # of magnitude above this floor, so the bound keeps its teeth where geometry is drawable.
+        budget = np.maximum(shapely.length(raw) * self.SNAP_MAX_SHIFT, self.GRID ** 2)
         try:
             snapped = shapely.set_precision(raw, self.GRID, mode="valid_output")
         except shapely.errors.GEOSException:
@@ -1248,6 +1253,20 @@ def _check():
         f"the folded row moved past its snap budget: {_wrote!r} vs {_want!r} deg^2"
     assert _want > 0.99 * shapely.area(_folded4326), \
         "resolving the fold must not eat the ring"
+
+    # A crumb smaller than the write grid: its perimeter-derived budget lands below one grid
+    # cell, so snapping can only annihilate it or round it out to a fraction of a cell — and the
+    # write must survive either. Planet run 35149243490 lost depare stems 4-1-8-8 and 4-14-5-8 to
+    # rows of ~2e-20 deg^2 rounding out to ~5e-19.
+    _crumb = _box(4.0, 50.0, 4.0 + _RowSink.GRID / 4, 50.0 + _RowSink.GRID / 4)
+    _crumb_budget = max(shapely.length(_crumb) * _RowSink.SNAP_MAX_SHIFT, _RowSink.GRID ** 2)
+    assert shapely.length(_crumb) * _RowSink.SNAP_MAX_SHIFT < _RowSink.GRID ** 2, \
+        "the fixture must be small enough that its perimeter alone budgets under one cell"
+    assert _crumb_budget >= _RowSink.GRID ** 2, _crumb_budget
+    # …and a row big enough to draw is nowhere near the floor, so the bound still bites there.
+    _drawable = _box(4.0, 50.0, 4.001, 50.001)
+    assert shapely.length(_drawable) * _RowSink.SNAP_MAX_SHIFT > 1e3 * _RowSink.GRID ** 2, \
+        "the floor must not become the budget for drawable geometry"
 
     # A nodata row dilated past the world's east edge, as NODATA_OVERLAP_PX does on the
     # easternmost stem, whose clip box ends exactly there. Untrimmed, the inverse transform puts
