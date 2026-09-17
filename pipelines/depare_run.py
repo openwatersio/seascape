@@ -669,11 +669,9 @@ class _RowSink:
         # batch total that growth pays for another row collapsing (measured on one real batch, 819
         # of 1658 rows grew and 837 shrank, and the net hid 92% of the movement). No real row came
         # within half of this bound — the worst measured sat at 0.42 of it.
-        # Floored at one grid cell's area: a crumb whose whole perimeter is shorter than a cell
-        # gets a perimeter-derived budget below the grid's own quantum, and snapping such a row
-        # can only annihilate it or round it out to a fraction of a cell — movement the formula
-        # calls a violation while the grid calls it the smallest step it has. Real rows are orders
-        # of magnitude above this floor, so the bound keeps its teeth where geometry is drawable.
+        # Floored at one grid cell's area: a crumb whose perimeter is shorter than a cell budgets
+        # below the grid's own quantum, where snapping can only annihilate it or round it out to a
+        # fraction of a cell. Drawable rows sit orders of magnitude above the floor.
         budget = np.maximum(shapely.length(raw) * self.SNAP_MAX_SHIFT, self.GRID ** 2)
         try:
             snapped = shapely.set_precision(raw, self.GRID, mode="valid_output")

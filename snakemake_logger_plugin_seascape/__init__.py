@@ -324,11 +324,9 @@ class LogHandler(LogHandlerBase):
 
     def _job_error(self, record: LogRecord) -> None:
         jobid = getattr(record, "jobid", None)
-        # Clear the in-flight entry BEFORE the dedup below. A retry re-enters the same jobid, so
-        # returning early there would leave that attempt in `running` for the rest of the run —
-        # inflating the counter and pinning `oldest` on a job that already failed (run
-        # 35149243490 reported a depare stem as the oldest running job for hours after it had
-        # exhausted its retries). The duplicate report finds nothing left to pop, which is fine.
+        # Clear the in-flight entry before the dedup: a retry re-enters the same jobid, so an early
+        # return there strands that attempt in `running`, inflating the counter and pinning
+        # `oldest` on a job that already failed.
         job = self.running.pop(jobid, None)
         # Snakemake reports each failure twice — once when it happens, once in the exit
         # summary (which no longer carries the wildcards). Keep the first, richer report.

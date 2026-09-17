@@ -157,15 +157,12 @@ KIND_REPAIR = 2    # B-410a/B-403.1a insertion: uncapped from the zoom that need
 def _owns(bbox, x, y):
     """Whether a stem owns the point — half-open, so adjacent stems partition the plane.
 
-    A stem owns its west and north edges and cedes its east and south. Closed intervals let both
-    neighbours claim a point on a shared edge, and the two disagree about where it lands: the
-    emitting stem's vector cell counts it, while the tiler puts a coordinate on the east/south
-    edge in the NEIGHBOUR's tile, which that cell's fringe filter drops as not its own. The
-    sounding then exists in no tile and fails the cell census. Working on extents hides this —
-    a polygon straddling the edge is clipped, but a point is dimensionless and simply lands on
-    one side. Planet run 35149243490 lost 7 cells this way, 1 sounding of 989,648 in the worst.
+    A stem owns its west and north edges and cedes its east and south, matching how the tiler
+    assigns a coordinate. Under closed intervals both neighbours claim a point on a shared edge,
+    and the tile it lands in belongs to the neighbour's vector cell — whose fringe filter drops
+    it, stranding a sounding the emitting cell's census still expects.
 
-    Vectorizes: `&` over numpy arrays, and over Python bools for the scalar callers."""
+    Vectorizes: `&` over numpy arrays and over Python bools for the scalar callers."""
     return (x >= bbox.left) & (x < bbox.right) & (y > bbox.bottom) & (y <= bbox.top)
 
 
