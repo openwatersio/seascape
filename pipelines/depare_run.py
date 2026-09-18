@@ -46,7 +46,7 @@ Per tile and per zoom tier (config.depare_tiers — each tier is a separately co
 the way an ENC compiles a cell per usage band: cut from the mosaic pyramid level at the tier's
 first zoom with the isobath ladder drawn there, the final tier from the native window): bands
 (gdal_contour -p at the tier's metre / fathom ladder, drop land, drval/sys) + drying (the metre
-ladder's [0, DRYING_CAP] bucket ∩ effective water, drval1 < 0) + nodata (inland-water polygons
+ladder's (0, DRYING_CAP] bucket ∩ effective water, drval1 < 0; exact datum is unknown, never foreshore) + nodata (inland-water polygons
 minus the DEM's water coverage and the drying) -> clip to the unbuffered tile bbox in shapely
 (polygon-only by construction, see _polys) -> 4326 -> store/depare/{stem}-t{z}.fgb. Same seam
 contract as contours for bands and drying: deterministic on the buffered grid, so neighbouring
@@ -148,6 +148,11 @@ DRYING_LEGIBLE_MM2 = float(os.environ.get("DRYING_LEGIBLE_MM2", "16"))
 # shallower neighbour or, with land or drying all round, drops — a pit removed, never a peak
 # (Guilbert & Zhang 2012); a nodata part under it drops. 0 disables.
 LEGIBLE_MM2 = float(os.environ.get("DEPARE_LEGIBLE_MM2", "4"))
+# Foreshore is strictly above datum, (0, DRYING_CAP]: exact 0 is the land sentinel and the
+# merge's fill for water a source holds no depth for, which the raster keeps as the unknown code
+# (terrain._encode_tile). A millimetre level splits that exact-datum bucket off the foreshore one
+# in the same gdal_contour pass; no real drying height sits under it.
+DRYING_EPS = 0.001
 DRYING_MIN_WIDTH_PX = float(os.environ.get("DRYING_MIN_WIDTH_PX", "1"))
 
 # S-58 Ed. 7.0.0 check 571 caps ENC vertex density at 0.3 mm at compilation scale — the only hard
@@ -872,7 +877,8 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, le
     drying_raw = []       # the bucket as contoured — the ft ladder's coverage member
     drying_geoms = []     # the same bucket simplified with the metre ladder — what ships
     _mark(None)
-    for sys_tag, levels in (("m", (levels_m or config.DEPARE_LEVELS) + [config.DRYING_CAP]),
+    datum_parts = []      # the exact-datum bucket, never foreshore
+    for sys_tag, levels in (("m", (levels_m or config.DEPARE_LEVELS) + [DRYING_EPS, config.DRYING_CAP]),
                             ("ft", levels_ft or config.DEPARE_LEVELS_FT)):
         raw = partitions(dem, levels, f"{tmp}/depare-raw-{sys_tag}.fgb", timeout=timeout)
         drvals, bands = [], []
@@ -881,12 +887,24 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, le
                 drvals.append((r.drval1, r.drval2))
                 bands.append(repaired_multi([r.geometry]))
         if sys_tag == "m":
-            # The [0, DRYING_CAP] bucket, keyed on amax alone: 0 and the cap are discrete levels
-            # and every other level is negative, so 0 < amax <= cap uniquely picks it regardless
-            # of the garbage amin. Land above the cap (amax > cap) is dropped.
-            bucket = repaired_multi(read_bucket(
-                raw, f"amax > 0 AND amax <= {config.DRYING_CAP}").geometry)
+            # The [0, DRYING_CAP] bucket — both the exact-datum [0, eps) and the foreshore
+            # [eps, cap] parts, keyed on amax alone: every other level is negative, so
+            # 0 < amax <= cap picks exactly these two regardless of the garbage amin. Kept whole
+            # as the coverage member so the shoalest band and the drying share their 0 m chain,
+            # which is the edge the 0 m line derives from. Land above the cap is dropped.
+            # Dissolved along the millimetre edge the two buckets share: the member must be one
+            # region, or the simplifier sees an invalid multipolygon and keeps raw geometry.
+            bucket = coverage_union(list(read_bucket(
+                raw, f"amax > 0 AND amax <= {config.DRYING_CAP}").geometry))
             drying_raw = [] if bucket.is_empty else [bucket]
+            # The exact-datum parts come out of the emitted drying below. Parts under the sliver
+            # floor are the interpolation hairline between a band and real foreshore and stay;
+            # the rest border land or unknown water, never a band chain, so they simplify at the
+            # same floor the bands did rather than stamp a raw staircase into the drying's edge.
+            datum_parts = [piece for poly in _polys(repaired_multi(
+                read_bucket(raw, f"amax = {DRYING_EPS}").geometry))
+                if poly.area >= min_area
+                for piece in _subdivide(poly.simplify(band_tol, preserve_topology=True))]
         _mark(f"bands-read-{sys_tag}")
         simplified = simplify_coverage(bands + drying_raw, band_tol)
         bands = simplified[:len(drvals)]
@@ -967,6 +985,16 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, le
                 _mark("drying-water-terms")
         effective = make_valid(effective)
         _mark("drying-make-valid")
+        if datum_parts and not effective.is_empty:
+            # Exact datum inside effective water — a clamp fill under a ditch a coarse source
+            # cannot resolve, a zeroed shoreline cell — is unknown, not foreshore: it leaves the
+            # drying here and falls to the nodata pass below.
+            near = STRtree(datum_parts).query(effective, predicate="intersects")
+            if len(near):
+                effective = make_valid(shapely.difference(
+                    effective, shapely.union_all([datum_parts[i] for i in near], grid_size=GRID),
+                    grid_size=GRID))
+            _mark("drying-diff-datum")
         if not effective.is_empty:
             drying_area = effective  # subtracted from nodata below (over the buffered extent)
             drying_rows = []
@@ -993,6 +1021,15 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, le
         _mark("nodata-tree")
         for r in water.itertuples():
             geom = make_valid(r.geometry).intersection(buffered)
+            # The differences below only shrink a part, so a part the gates would drop as it
+            # stands is dropped now, before any geometry work: on a polder that is the whole
+            # ditch grid, and the pass costs seconds instead of minutes.
+            keep = [poly for poly in _polys(geom)
+                    if poly.area >= max(min_area, legible_area)
+                    and not _illegible_drying(poly, drying_legible_area, drying_min_width)]
+            if not keep:
+                continue
+            geom = shapely.multipolygons(keep) if len(keep) > 1 else keep[0]
             if tree is not None and not geom.is_empty:
                 # predicate="intersects" (prepared), not bare envelope query: most inland lakes
                 # never truly touch coverage and skip the difference entirely. Parts are
@@ -1006,7 +1043,10 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, le
                     geom = shapely.difference(geom, u, grid_size=GRID)
             kind = getattr(r, "kind", None)
             for full in _polys(geom):  # gate the PRE-clip polygon (buffered window) so a seam sliver survives both sides
-                if full.area >= max(min_area, legible_area):
+                # Drying's two-instrument gate applies here too: a sub-pixel ribbon of unknown water
+                # (a ditch under a coarse source) is noise; a compact unknown pond is charted.
+                if full.area >= max(min_area, legible_area) and not _illegible_drying(
+                        full, drying_legible_area, drying_min_width):
                     for p in _polys(full.intersection(clip)):  # then clip to the seam; no re-filter on the piece
                         # Simplify POST-clip, per-piece: kept vertices are a subset inside the clip
                         # box, so the ring can never cross the seam outward — at worst it recedes
@@ -1807,19 +1847,20 @@ def _check():
     assert sorted(x.wkb for x in g.geometry) == sorted(x.wkb for x in g2.geometry), \
         "partitions not deterministic"
 
-    # A uniform-0 DEM (terrain exactly at datum) yields NO depth band — it falls in the
-    # [0, DRYING_CAP] drying bucket, so a merge-filled-0 area tints as drying foreshore, never a
-    # false shoal. (The cleared-lake NODATA path is separate: gdal_contour skips NODATA pixels, so
-    # a genuinely-unfilled lake interior carries no bucket and renders as nodata — see
-    # check_depare_water. Only a thin 0-filled rim at a cleared lake's edge lands in this bucket.)
+    # A uniform-0 DEM (terrain exactly at datum) yields NO depth band and lands in the
+    # exact-datum bucket, which the drying pass never emits: a merge-filled-0 area is unknown
+    # water, never a false shoal and never foreshore — the raster's rule for water-side 0.
     flat = np.zeros((h, w), dtype="float32")
     fp = f"{d}/flat.tif"
     with rasterio.open(fp, "w", driver="GTiff", height=h, width=w, count=1, dtype="float32",
                        nodata=-9999, crs="EPSG:3857", transform=tr) as dst:
         dst.write(flat, 1)
-    flat_g = read_bucket(partitions(fp, levels_m, f"{d}/flat-raw.fgb"), "amax <= 0")
-    assert len(flat_g) == 0, \
-        "a uniform-0 surface must produce no depth band (it's the drying bucket, not a shoal tint)"
+    flat_raw = partitions(fp, config.DEPARE_LEVELS + [DRYING_EPS, cap], f"{d}/flat-raw.fgb")
+    assert len(read_bucket(flat_raw, "amax <= 0")) == 0, \
+        "a uniform-0 surface must produce no depth band"
+    assert len(read_bucket(flat_raw, f"amax = {DRYING_EPS}")) == 1 and \
+        len(read_bucket(flat_raw, f"amax = {cap}")) == 0, \
+        "a uniform-0 surface is the exact-datum bucket alone, never foreshore"
 
     # The drying water term is tidal-only, end to end: one [0, cap] band crossing two water
     # polygons that both sit inside the land coverage (so the water term alone decides) ships as
@@ -1834,6 +1875,7 @@ def _check():
 
     kdem = np.full((60, 60), cap + 50, dtype="float32")
     kdem[20:40, :] = 2.0  # a [0, cap] foreshore band crossing both water polygons
+    kdem[25:35, 20:26] = 0.0  # exact datum inside the river: a clamp fill, not foreshore
     kp = f"{d}/kind-dem.tif"
     with rasterio.open(kp, "w", driver="GTiff", height=60, width=60, count=1, dtype="float32",
                        nodata=-9999, crs="EPSG:3857",
@@ -1866,6 +1908,9 @@ def _check():
     rows = gpd.read_file(out[0]).to_crs("EPSG:3857")
     dry = rows[rows["drval1"].notna() & (rows["drval1"] < 0)]
     assert dry.intersects(river).any(), "drying must survive inside a tidal (river) water polygon"
+    datum_patch = cell_box(20, 25, 26, 35)
+    assert not dry.covers(datum_patch.centroid).any(), \
+        "exact datum inside tidal water is unknown, never foreshore"
     assert not dry.intersects(lake).any(), \
         "a lake is off chart datum — its [0, cap] rim must emit no drying"
     assert dry.intersects(lagoon).any(), \
@@ -1882,6 +1927,8 @@ def _check():
     nodata_rows = rows[rows["drval1"].isna()]
     assert nodata_rows.covers(lake.intersection(cell_box(0, 20, 60, 40)).centroid).any(), \
         "the lake's [0, cap] shore ribbon stays part of its nodata polygon"
+    assert nodata_rows.covers(datum_patch.centroid).any(), \
+        "exact datum inside tidal water falls to the nodata pass"
     # ── the tier operators ──
     # Dissolve: a sub-legible part with a shallower neighbour merges into it (area conserved,
     # partition disjoint); a sub-legible island with no band neighbour drops; a sub-legible part
