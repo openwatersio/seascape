@@ -1019,6 +1019,7 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, le
             parts += [piece for p in _polys(drying_area) for piece in _subdivide(p)]
         tree = STRtree(parts) if parts else None
         _mark("nodata-tree")
+        nodata_by_kind = {}
         for r in water.itertuples():
             geom = make_valid(r.geometry).intersection(buffered)
             # The differences below only shrink a part, so a part the gates would drop as it
@@ -1059,10 +1060,16 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, le
                         # (the stem seam) and past the raw outline (the shoreline) — so the
                         # abutting fills overlap instead of opening hairlines (NODATA_OVERLAP_PX).
                         s = s.buffer(nodata_pad, join_style="mitre", mitre_limit=2.0)
-                        sink.write([{"geometry": sp, "drval1": None, "drval2": None,
-                                     "sys": None, "kind": kind, "rank": NODATA_RANK}
-                                    for sp in _polys(s)], flush=False)
+                        nodata_by_kind.setdefault(kind, []).extend(_polys(s))
         _mark("nodata-loop")
+        # One dissolved region per kind: two abutting water polygons dilate into each other, and
+        # the fill compounds where rows overlap — a dark lattice along every OSM outline inside
+        # a lake. Only the seam and shoreline overlaps survive, where they close hairlines.
+        for kind, parts in nodata_by_kind.items():
+            sink.write([{"geometry": sp, "drval1": None, "drval2": None,
+                         "sys": None, "kind": kind, "rank": NODATA_RANK}
+                        for sp in _polys(valid_union(parts))], flush=False)
+        _mark("nodata-dissolve")
 
     if not sink.count and not sink.pending:
         print(f"depare: no water in tile bbox for {label}")
@@ -1883,16 +1890,17 @@ def _check():
         dst.write(kdem, 1)
     lake, river, lagoon, tidal_lake = (cell_box(2, 15, 13, 45), cell_box(17, 15, 28, 45),
                                        cell_box(32, 15, 43, 45), cell_box(47, 15, 58, 45))
+    lake_b = cell_box(2, 45, 13, 55)  # abuts the lake along one edge
     gpd.GeoDataFrame(geometry=[_box(*bb)], crs="EPSG:3857").to_file(
         f"{d}/land.fgb", driver="FlatGeobuf")
     # Each rescue clause decides exactly one box: the lagoon by class ALONE, the tidal lake by
     # tidal=yes ALONE (is_salt deliberately all-null: the fillna path must run without deciding
     # the outcome).
-    gpd.GeoDataFrame({"kind": ["lake", "river", "lake", "lake"],
-                      "class": [None, None, "lagoon", None],
-                      "is_salt": [None, None, None, None],
-                      "tidal": [None, None, None, "yes"]},
-                     geometry=[lake, river, lagoon, tidal_lake],
+    gpd.GeoDataFrame({"kind": ["lake", "river", "lake", "lake", "lake"],
+                      "class": [None, None, "lagoon", None, None],
+                      "is_salt": [None, None, None, None, None],
+                      "tidal": [None, None, None, "yes", None]},
+                     geometry=[lake, river, lagoon, tidal_lake, lake_b],
                      crs="EPSG:3857").to_file(f"{d}/water.fgb", driver="FlatGeobuf")
     saved = {k: os.environ.get(k) for k in ("LANDMASK", "WATERMASK")}
     os.environ["LANDMASK"], os.environ["WATERMASK"] = f"{d}/land.fgb", f"{d}/water.fgb"
@@ -1929,6 +1937,14 @@ def _check():
         "the lake's [0, cap] shore ribbon stays part of its nodata polygon"
     assert nodata_rows.covers(datum_patch.centroid).any(), \
         "exact datum inside tidal water falls to the nodata pass"
+    # Two abutting lake polygons dissolve into one unknown-water region: no row overlaps another
+    # (the dilated seam would otherwise draw as a dark line), and the shared edge is covered.
+    nd = list(nodata_rows.geometry)
+    assert all(nd[i].intersection(nd[j]).area < 1e-6
+               for i in range(len(nd)) for j in range(i + 1, len(nd))), \
+        "nodata rows of one tile must not overlap each other"
+    assert nodata_rows.covers(lake.intersection(lake_b).centroid).any(), \
+        "abutting lakes share one unknown-water region across their common edge"
     # ── the tier operators ──
     # Dissolve: a sub-legible part with a shallower neighbour merges into it (area conserved,
     # partition disjoint); a sub-legible island with no band neighbour drops; a sub-legible part
