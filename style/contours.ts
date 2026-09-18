@@ -6,7 +6,7 @@ import type {
   LayerSpecification,
 } from "@maplibre/maplibre-gl-style-spec";
 import { labelSize, type Flavor, type Unit } from "./flavor.js";
-import { snapSafetyContour } from "./depth-areas.js";
+import { LADDER_TIER_ZOOMS, snapSafetyContour } from "./depth-areas.js";
 
 // Contours: metre isobaths (sys != "ft", also legacy no-sys tiles) vs the
 // fathom-curve set (sys == "ft"), which labels as feet or fathoms. Both
@@ -27,15 +27,24 @@ export function contourLinesLayer(
   flavor: Flavor,
   { vector, unit, safety }: { vector: string; unit: Unit; safety: number },
 ): LayerSpecification {
-  // The safety contour snaps UP the charted ladder to the next-deeper level, exactly
-  // as depthAreasColor recolours the bands, so the emphasized line always bounds the
-  // hazard tint. Contours carry integer depth props (depth_abs_m / depth_fm,
-  // contour_run.py), so the match is exact equality on the active system's prop.
-  const safetyContour = snapSafetyContour(unit, safety);
-  const isSafetyContour: ExpressionSpecification =
+  // The safety contour snaps UP the ladder drawn at each zoom tier to the next-deeper
+  // level, so the emphasized line is the one bounding the hazard tint at that zoom
+  // (depthAreasColor's whole-ladder snap agrees, see snapSafetyContour). Contours carry
+  // integer depth props (depth_abs_m / depth_fm, contour_run.py), so the match is exact
+  // equality on the active system's prop. ["zoom"] may only drive an outermost step, so
+  // the whole paint value steps by tier.
+  const isSafetyContour = (snap: number): ExpressionSpecification =>
     unit === "m"
-      ? ["==", ["get", "depth_abs_m"], safetyContour]
-      : ["==", ["get", "depth_fm"], Math.round(safetyContour / 1.8288)];
+      ? ["==", ["get", "depth_abs_m"], snap]
+      : ["==", ["get", "depth_fm"], Math.round(snap / 1.8288)];
+  const byTier = (f: (snap: number) => unknown): ExpressionSpecification => {
+    const expr: unknown[] = ["step", ["zoom"]];
+    LADDER_TIER_ZOOMS.forEach((z, i) => {
+      if (i > 0) expr.push(z);
+      expr.push(f(snapSafetyContour(unit, safety, z)));
+    });
+    return expr as unknown as ExpressionSpecification;
+  };
 
   return {
     id: "contour-lines",
@@ -52,10 +61,17 @@ export function contourLinesLayer(
       // colour, like S-52's DEPSC over DEPCN (IMO MSC.232 requires the emphasis);
       // every other contour stays uniform DEPCN weight (S-4 B-411.1 recommends
       // against emphasizing fixed standard contours).
-      "line-color": safetyContour
-        ? ["case", isSafetyContour, flavor.contourEmphasis, flavor.contour]
-        : flavor.contour,
-      "line-width": safetyContour ? ["case", isSafetyContour, 1.5, 0.8] : 0.8,
+      "line-color":
+        safety > 0
+          ? byTier((snap) => [
+              "case",
+              isSafetyContour(snap),
+              flavor.contourEmphasis,
+              flavor.contour,
+            ])
+          : flavor.contour,
+      "line-width":
+        safety > 0 ? byTier((snap) => ["case", isSafetyContour(snap), 1.5, 0.8]) : 0.8,
     },
   };
 }

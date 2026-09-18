@@ -25,6 +25,31 @@ const DEPARE_LADDER_FT = [
   1, 2, 3, 5, 10, 20, 30, 50, 100, 200, 300, 500, 1000, 2000, 3000, 5000,
 ].map((fm) => fm * 1.8288);
 
+// The ladder drawn per zoom tier — must mirror pipelines/config.py CONTOUR_TIERS
+// and DEPARE_TIER_STARTS: depth areas and isobaths are compiled per tier, and
+// the levels that bound a band at a zoom are a function of scale alone. The
+// fathom ladder at a tier is every curve at least as deep as the tier's
+// shallowest metre level; the whole ladder once the metre one is whole.
+const LADDER_TIERS_M: [number, number[]][] = [
+  [6, [200, 500, 1000, 2000, 3000, 4000]],
+  [7, [50, 100, 200, 300, 500, 1000, 2000, 3000, 4000, 5000, 6000, 8000, 10000]],
+  [
+    9,
+    [10, 20, 30, 50, 100, 200, 300, 500, 1000, 2000, 3000, 4000, 5000, 6000, 8000, 10000],
+  ],
+  [11, DEPARE_LADDER_M],
+];
+export const LADDER_TIER_ZOOMS = LADDER_TIERS_M.map(([z]) => z);
+
+export function ladderAt(unit: Unit, zoom: number): number[] {
+  const m =
+    [...LADDER_TIERS_M].reverse().find(([z]) => zoom >= z)?.[1] ??
+    LADDER_TIERS_M[0][1];
+  if (unit === "m") return m;
+  if (m === DEPARE_LADDER_M) return DEPARE_LADDER_FT;
+  return DEPARE_LADDER_FT.filter((l) => l >= m[0] - DRVAL_EPS);
+}
+
 // Comparisons against drval1 subtract this: tiles may carry the fathom-curve
 // drvals (1.8288, 5.4864, …) as 32-bit floats, which can land a hair below the
 // exact edge value. Ladder rungs are ≥ ~1.8 m apart, so 0.01 m is safely
@@ -32,11 +57,23 @@ const DEPARE_LADDER_FT = [
 export const DRVAL_EPS = 0.01;
 
 // The safety depth snapped UP the active ladder to the next-deeper charted
-// level; 0 when safety is off. Shared by the band recolour here and the
-// emphasized isobath in contours.ts, so tint and line always agree.
-export function snapSafetyContour(unit: Unit, safety: number): number {
+// level — the whole ladder, or the one drawn at `zoom` — 0 when safety is off.
+// The band recolour uses the whole ladder and still agrees with the per-zoom
+// emphasized isobath in contours.ts: every drval1 at a zoom is a rung of that
+// zoom's ladder, and no rung lies between the safety depth and the tier's
+// next-deeper one.
+export function snapSafetyContour(
+  unit: Unit,
+  safety: number,
+  zoom?: number,
+): number {
   if (!(safety > 0)) return 0;
-  const ladder = unit === "m" ? DEPARE_LADDER_M : DEPARE_LADDER_FT;
+  const ladder =
+    zoom === undefined
+      ? unit === "m"
+        ? DEPARE_LADDER_M
+        : DEPARE_LADDER_FT
+      : ladderAt(unit, zoom);
   return (
     ladder.find((l) => l >= safety - DRVAL_EPS) ?? ladder[ladder.length - 1]
   );
