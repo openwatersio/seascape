@@ -1153,8 +1153,9 @@ def _shoal_clamp(surface, finer, factor, tmp=None):
     finer-tier surface) by `factor`, over the extent they share. The reduction is taken on the
     coarse grid: the shared extent is snapped inward to coarse pixel edges — which lie on the
     finer lattice, since both grids anchor on the tile edge — and the finer raster is read over
-    exactly that extent, so every coarse pixel meets the reduction of its own block. Nodata on
-    either side leaves the pixel as read."""
+    exactly that extent, so every coarse pixel meets the reduction of its own block. Streamed in
+    stripes of whole coarse rows: the finer raster is a native window, 17 GB at cz15, and a
+    stripe holds ~32 MB of it. Nodata on either side leaves the pixel as read."""
     import math
     import numpy as np
     from rasterio.windows import Window
@@ -1175,12 +1176,17 @@ def _shoal_clamp(surface, finer, factor, tmp=None):
         fc, fr = (sl - f.transform.c) / fres, (f.transform.f - st) / fres
         if abs(fc - round(fc)) > 1e-6 or abs(fr - round(fr)) > 1e-6:
             raise ValueError(f"shoal clamp: {finer} is not on {surface}'s lattice")
-        a = s.read(1, window=Window(c0, r0, w, h))
-        b = f.read(1, window=Window(round(fc), round(fr), w * factor, h * factor))
-        red = _shoal_reduce(b, f.nodata, factor)
-        valid = (a != s.nodata) & (red != f.nodata)
-        s.write(np.where(valid, np.maximum(a, red), a).astype(a.dtype), 1,
-                window=Window(c0, r0, w, h))
+        fc, fr = round(fc), round(fr)
+        itemsize = np.dtype(f.dtypes[0]).itemsize
+        rows = max(1, utils._SHOAL_STRIPE_BYTES // (w * factor * factor * itemsize))
+        for oy in range(0, h, rows):
+            n = min(rows, h - oy)
+            a = s.read(1, window=Window(c0, r0 + oy, w, n))
+            b = f.read(1, window=Window(fc, fr + oy * factor, w * factor, n * factor))
+            red = _shoal_reduce(b, f.nodata, factor)
+            valid = (a != s.nodata) & (red != f.nodata)
+            s.write(np.where(valid, np.maximum(a, red), a).astype(a.dtype), 1,
+                    window=Window(c0, r0 + oy, w, n))
 
 
 def tile(stem):
