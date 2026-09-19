@@ -60,16 +60,24 @@ SITES = {
     "iberian-abyssal": ("8-110-91-10-db6827ae146c.tif", -24.61, 45.58,
                         "deep flat GEBCO-only ocean; the control every other site lacks — every "
                         "shoal-water measurement needs ground where it should trivially pass"),
+    "amsterdam": ("8-131-84-12-73d1984d9b32.tif", 4.7461, 52.1603,
+                  "IJmuiden, Haarlem and the Haarlemmermeer polder: the z10 tile that stopped the "
+                  "planet run at 993 KB. 17,913 sub-pixel ditch polygons over a below-datum land "
+                  "DEM — the clamp width-floor case, and the coarse-source lake case"),
+    "georgia": ("8-70-104-14-36e67555167d.tif", -81.30, 31.45,
+                "Sapelo–Altamaha sea-island marsh; 332 MB depare at cz14, the marsh class where "
+                "the z11–12 ladder question is decided"),
 }
 
 # A crop must carry its macrotile's OWN child_z or it is not the surface production contours:
 # the Delmarva macrotile is cz14, and reading it at CHILD_Z would invent detail the mosaic
 # does not hold.
-SITE_CHILD_Z = {"delmarva": 14, "iberian-abyssal": 10}
+SITE_CHILD_Z = {"delmarva": 14, "iberian-abyssal": 10, "amsterdam": 12, "georgia": 14}
 
 # Sites whose macrotile is coarse enough that a z12 stem would be a few hundred pixels. Build
 # these at a lower z so the crop is a comparable amount of ground: the core is 2^(cz-z)*512 px.
-SITE_Z = {"iberian-abyssal": 8}
+# amsterdam is built at z10 so the fixture stem IS the z10 tile whose bytes are the measurement.
+SITE_Z = {"iberian-abyssal": 8, "amsterdam": 10}
 
 # Published mask sizes, so a stale mask can never silently change a measurement. A stale or
 # absent water.fgb changes the nodata layer AND the drying cut, which is exactly the mechanism
@@ -119,9 +127,13 @@ def build(sites=None, z=12):
         # The same two commands mosaic.window_dem uses, against the remote COG.
         _run("gdalbuildvrt", "-q", "-overwrite", "-te", l, b, r, t,
              "-tr", res, res, "-r", "bilinear", vrt, src)
-        _run("gdal_translate", "-q", "-ot", "Float32", "-a_nodata", mosaic.NODATA,
-             "-co", "TILED=YES", "-co", "BLOCKSIZE=512", "-co", "COMPRESS=ZSTD",
-             "-co", "PREDICTOR=3", "-co", "BIGTIFF=IF_SAFER", vrt, out)
+        # A mosaic tile carries the class-aware shoal pyramid down to res(8), and the coarse
+        # depth-area tiers are cut from those levels — the crop must carry them too.
+        import utils
+        with utils.shoal_cog_source(vrt, f"-ot Float32 -a_nodata {mosaic.NODATA}") as cog_src:
+            _run("gdal_translate", "-q", "-of", "COG", "-a_nodata", mosaic.NODATA,
+                 "-co", "BLOCKSIZE=512", "-co", "COMPRESS=ZSTD", "-co", "PREDICTOR=3",
+                 "-co", "BIGTIFF=IF_SAFER", "-co", "OVERVIEWS=FORCE_USE_EXISTING", cog_src, out)
         os.remove(vrt)
         print(f"  {out} ({os.path.getsize(out)/1e6:.1f} MB)")
     # covering.txt in the fixture root only — the real covering stays untouched.

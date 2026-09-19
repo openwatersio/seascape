@@ -382,6 +382,17 @@ def fork_inputs(wc):
     return [f"store/mosaic/tiles/{s}.tif" for s in mosaic_mod.intersecting_tiles(wc.stem)]
 
 
+def depare_inputs(wc):
+    """The mosaic tiles every depth-area tier reads: the native window's set plus each coarse
+    tier's halo at its own resolution (a z6 halo reaches tens of kilometres past the stem)."""
+    cz = int(wc.stem.split("-")[3])
+    tiles = set(fork_inputs(wc))
+    for t in pipeline_config.depare_tiers(cz):
+        if t.surface != cz:
+            tiles |= set(depare_run.tier_read_tiles(wc.stem, t))
+    return sorted(tiles)
+
+
 # The forks' shared read surface, built once per stem instead of three times: the buffered
 # window materialized, smoothed, and pond-filled. temp() — a z15 window is 4.3 GB and
 # only in-flight stems need theirs on disk. Consumers treat it as read-only.
@@ -410,14 +421,21 @@ rule fork_window:
 
 # Isobaths derive from the depare partition (shared band edges — see contour_run), so the rule
 # consumes the depare FGB, not the DEM window, and rides only when DEPARE is on.
+# Depth areas and their isobaths are compiled per zoom tier (config.depare_tiers): one file per
+# tier, fixed across stems — a tier a stem does not hold is a 0-byte sentinel.
+def tier_files(kind, stems):
+    return [f"store/{kind}/{s}-t{z}.fgb" for s in stems for z in pipeline_config.DEPARE_TIER_STARTS]
+
+
 rule contour_tile:
     input:
-        depare="store/depare/{stem}.fgb",
+        depare=lambda wc: tier_files("depare", [wc.stem]),
     output:
-        "store/contour/{stem}.fgb"
+        tier_files("contour", ["{stem}"])
     params:
-        version=3, # increment to force a rebuild
+        version=4, # increment to force a rebuild
         levels=json.dumps({"m": pipeline_config.CONTOUR_LEVELS, "ft": pipeline_config.CONTOUR_LEVELS_FT}),
+        tiers=json.dumps(pipeline_config.CONTOUR_TIERS),
         deep=contour_run.DEEP_CUTOFF_M,
         ring=contour_run.MIN_RING_AREA_M2,
     priority: vector_tile_priority  # vector band: drain before terrain so the bundle overlaps it
@@ -461,15 +479,17 @@ rule soundings_tile:
 rule depare_tile:
     input:
         window="store/window/{stem}.tif",
+        tiles=depare_inputs,  # the coarse tiers read the mosaic pyramid levels directly
         masks=MASKS,
     output:
-        "store/depare/{stem}.fgb"
+        tier_files("depare", ["{stem}"])
     params:
-        version=4, # increment to force a rebuild
+        version=7, # increment to force a rebuild
         levels=json.dumps({"m": pipeline_config.DEPARE_LEVELS, "ft": pipeline_config.DEPARE_LEVELS_FT}),
+        tiers=json.dumps(pipeline_config.DEPARE_TIER_STARTS),
         drying=pipeline_config.DRYING_CAP, sliver=depare_run.SLIVER_MIN_PX,
         simplify_mm=depare_run.SIMPLIFY_MM,
-        nodata_simplify=depare_run.NODATA_SIMPLIFY_PX, nodata_overlap=depare_run.NODATA_OVERLAP_PX,
+        nodata_simplify=depare_run.NODATA_SIMPLIFY_PX,
     priority: vector_tile_priority  # vector band: drain before terrain so the bundle overlaps it
     retries: 2
     resources:
@@ -537,7 +557,7 @@ rule terrain_render:
 # set is checkpoint-derived, so the input is a function (not a parse-time expand()).
 rule contours:
     input:
-        lambda wc: expand("store/contour/{stem}.fgb", stem=depare_stems())
+        lambda wc: tier_files("contour", depare_stems())
 
 
 rule soundings:
@@ -547,7 +567,7 @@ rule soundings:
 
 rule depare:
     input:
-        lambda wc: expand("store/depare/{stem}.fgb", stem=depare_stems())
+        lambda wc: tier_files("depare", depare_stems())
 
 
 rule terrain:
@@ -558,9 +578,9 @@ rule terrain:
 def tile_inputs(wc):
     """Everything cartographic per stem — the union the `tiles` target gates on (DEPARE rides
     only when enabled)."""
-    return (expand("store/contour/{stem}.fgb", stem=depare_stems())
+    return (tier_files("contour", depare_stems())
             + expand("store/soundings/{stem}.geojsons", stem=covering_stems())
-            + expand("store/depare/{stem}.fgb", stem=depare_stems())
+            + tier_files("depare", depare_stems())
             + expand("store/pmtiles/{stem}.pmtiles", stem=render_stems()))
 
 
@@ -588,9 +608,9 @@ rule tiles:
 # (DEPARE). Always rebuilds — Snakemake owns freshness.
 rule vector_shallow:
     input:
-        contours=lambda wc: expand("store/contour/{stem}.fgb", stem=depare_stems()),
+        contours=lambda wc: tier_files("contour", depare_stems()),
         soundings=lambda wc: expand("store/soundings/{stem}.geojsons", stem=covering_stems()),
-        depare=lambda wc: expand("store/depare/{stem}.fgb", stem=depare_stems()),
+        depare=lambda wc: tier_files("depare", depare_stems()),
     output:
         "store/bundle/vector-shallow.pmtiles"
     priority: VECTOR_BAND  # above every terrain render, so the shallow run starts as the layers drain
@@ -610,11 +630,9 @@ rule vector_shallow:
 
 rule vector_cell:
     input:
-        contours=lambda wc: expand("store/contour/{stem}.fgb",
-                                   stem=(vector_cells().get(wc.cell, []) if DEPARE else [])),
+        contours=lambda wc: tier_files("contour", vector_cells().get(wc.cell, []) if DEPARE else []),
         soundings=lambda wc: expand("store/soundings/{stem}.geojsons", stem=vector_cells().get(wc.cell, [])),
-        depare=lambda wc: expand("store/depare/{stem}.fgb",
-                                 stem=(vector_cells().get(wc.cell, []) if DEPARE else [])),
+        depare=lambda wc: tier_files("depare", vector_cells().get(wc.cell, []) if DEPARE else []),
     output:
         archive="store/bundle/vector-cell-{cell}.pmtiles",
         # the completeness evidence the join consumes; declared so a lost sidecar reruns the cell

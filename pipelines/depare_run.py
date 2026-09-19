@@ -23,10 +23,9 @@ water compose without extra layers or archives:
 
 Bands and drying are pairwise disjoint by construction — bands are the DEM's water pixels
 (amax <= 0), drying is the disjoint [0, DRYING_CAP] bucket ∩ effective water. Nodata is the
-mapped water MINUS both, then dilated NODATA_OVERLAP_PX so every line it was cut on (stem
-seam, OSM shoreline, coverage edge) overlaps its neighbour instead of opening a background
-hairline between two opaque fills. The `rank` sort attribute resolves that overlap (nodata 0
-< bands 1 < drying 2: real depth over no-data, foreshore over the shoal band it abuts).
+mapped water MINUS both. The `rank` sort attribute orders the fills where simplification
+wobble lays one over another (nodata 0 < bands 1 < drying 2: real depth over no-data,
+foreshore over the shoal band it abuts).
 
 sys multiplexing: the bands duplicate per sys (the ladders differ), but drying and nodata
 are unit-independent, so they ship ONCE with NO `sys` — the style filters them by drval
@@ -42,16 +41,19 @@ each polygon, opening see-through cracks between bands. Generalization is COVERA
 simplification instead (simplify_coverage), which simplifies each shared edge once, for
 both its owners, at the S-58 vertex floor.
 
-Per tile: bands (gdal_contour -p at DEPARE_LEVELS / DEPARE_LEVELS_FT, drop land, drval/sys)
-+ drying (the metre ladder's [0, DRYING_CAP] bucket ∩ effective water, drval1 < 0) + nodata
-(inland-water polygons minus the DEM's water coverage and the drying) -> clip to the
-unbuffered tile bbox in shapely (polygon-only by construction, see _polys) -> 4326 ->
-store/depare/{stem}.fgb. Same seam contract as contours for bands and drying: deterministic
-on the buffered grid, so neighbouring tiles' features abut exactly at the clip line. Nodata
-rows instead ship dilated NODATA_OVERLAP_PX past the clip line, overlapping the neighbour
-tile's — abutment can't survive the per-piece nodata simplify, overlap can. The vector
-bundle folds these into the `depare` layer of the sharded variable-depth run (contour_run),
-gated at z6 by a per-feature tippecanoe.minzoom (contour_run.DEPARE_MINZOOM).
+Per tile and per zoom tier (config.depare_tiers — each tier is a separately compiled partition,
+the way an ENC compiles a cell per usage band: cut from the mosaic pyramid level at the tier's
+first zoom with the isobath ladder drawn there, the final tier from the native window): bands
+(gdal_contour -p at the tier's metre / fathom ladder, drop land, drval/sys) + drying (the metre
+ladder's (0, DRYING_CAP] bucket ∩ effective water, drval1 < 0; exact datum is unknown, never foreshore) + nodata (inland-water polygons
+minus the DEM's water coverage and the drying) -> clip to the unbuffered tile bbox in shapely
+(polygon-only by construction, see _polys) -> 4326 -> store/depare/{stem}-t{z}.fgb. Same seam
+contract as contours for bands and drying: deterministic on the buffered grid, so neighbouring
+tiles' features abut exactly at the clip line. Nodata rows are simplified per piece after the
+clip, so a ring recedes at most one stem pixel from the seam and never crosses it. The vector
+bundle folds these into the `depare`
+layer of the sharded variable-depth run (contour_run), each tier's rows carrying the tier's
+zoom range as tippecanoe.minzoom/maxzoom.
 """
 
 import os
@@ -65,10 +67,8 @@ import contour_run
 import utils
 from aggregation_reproject import get_resolution
 
-# The bands' zoom floor (z6, matching the style's depth-areas/contour-lines minzoom) is now applied
-# per feature by the vector bundle (contour_run.DEPARE_MINZOOM): partitions can't be level-thinned
-# per zoom like the lines' CONTOUR_TIERS (dropping one leaves a hole), so the floor is the low-zoom
-# cost control — the raster depth shading carries z<6.
+# Below the first tier's zoom (z6, matching the style's depth-areas/contour-lines minzoom) the
+# raster depth shading carries the water alone.
 
 # DEPARE_LEVELS derives from CONTOUR_LEVELS, which the style hand-mirrors (style/index.ts
 # DEPARE_LADDER_M/FT) — warn when an env override diverges the bands from the style. Upgrade
@@ -78,10 +78,9 @@ if config.CONTOUR_LEVELS != config.CONTOUR_LEVELS_DEFAULT:
           "hand-mirrored DEPARE_LADDER_M/FT (style/index.ts); update it to match.",
           file=sys.stderr)
 
-# Fill draw order for the `rank` sort attribute (a style fill-sort-key draws higher on top).
-# Load-bearing where the NODATA_OVERLAP_PX dilation slides nodata under its neighbours: real
-# depth (bands) over no-data (nodata), and drying over the shoal band it abuts along their
-# shared 0 m seam.
+# Fill draw order for the `rank` sort attribute (a style fill-sort-key draws higher on top):
+# real depth (bands) over no-data (nodata) wherever an OSM outline's simplify wobble lays one
+# over the other, and drying over the shoal band it abuts along their shared 0 m seam.
 NODATA_RANK = 0
 BAND_RANK = 1
 DRYING_RANK = 2
@@ -142,6 +141,14 @@ SLIVER_MIN_PX = float(os.environ.get("SLIVER_MIN_PX", "4"))
 # is 16 mm² at the STEM's own compilation scale (a rendering pixel is MM_PER_PX at scale, so a map
 # mm is res/MM_PER_PX projected metres), never a pinned zoom. Set either to 0 to disable the gate.
 DRYING_LEGIBLE_MM2 = float(os.environ.get("DRYING_LEGIBLE_MM2", "16"))
+# Band and nodata legibility at a tier's display scale: 4 mm² is the minimum area for a
+# solid-fill polygon in a subdivision (Galanda 2003). A band part under it dissolves into a
+# shallower neighbour or, with land or drying all round, drops — a pit removed, never a peak
+# (Guilbert & Zhang 2012); a nodata part under it drops. 0 disables.
+LEGIBLE_MM2 = float(os.environ.get("DEPARE_LEGIBLE_MM2", "4"))
+# Foreshore is strictly above datum, (0, DRYING_CAP]: exact 0 is the land sentinel and the
+# merge's fill for water a source holds no depth for, which the raster keeps as the unknown code
+# (terrain._encode_tile). The drying pass removes those pixels (_drop_datum).
 DRYING_MIN_WIDTH_PX = float(os.environ.get("DRYING_MIN_WIDTH_PX", "1"))
 
 # S-58 Ed. 7.0.0 check 571 caps ENC vertex density at 0.3 mm at compilation scale — the only hard
@@ -161,20 +168,10 @@ MM_PER_PX = 0.28
 # through coverage simplification instead, which is what keeps their shared edges bit-identical.
 NODATA_SIMPLIFY_PX = float(os.environ.get("NODATA_SIMPLIFY_PX", "1"))
 
-# Every line a nodata ring is cut on — the stem seam, the OSM shoreline, the coverage edge — abuts
-# a fill drawn from independently simplified geometry (the neighbour stem, the basemap's land, the
-# depth bands), and each side's simplification wobble opens background hairlines between the two
-# opaque fills. Dilating the finished rows by this many stem MVT pixels turns abutment into
-# overlap, which draws as nothing: bands and drying outrank nodata, land draws over water, and
-# nodata-on-nodata is one fill. 2 px covers the ≤1 px simplify recede plus tile-time wobble;
-# mitre join so a dense shoreline gains no arc vertices at its corners.
-NODATA_OVERLAP_PX = float(os.environ.get("NODATA_OVERLAP_PX", "2"))
-
 # Web Mercator's world half-width, in metres. 3857 -> 4326 normalizes longitude, so a vertex past
 # this edge lands on the FAR side of the antimeridian and its ring stretches around the globe as a
-# valid full-width bar at its latitude. The NODATA_OVERLAP_PX dilation is what reaches past, on the
-# edge stem whose clip box ends exactly here — and out there it has no neighbour to overlap, so the
-# write trims to this square first.
+# valid full-width bar at its latitude. The edge stem's clip box ends exactly here, so the write
+# trims to this square first rather than trust every overlay to stay inside it.
 WORLD_HALF_M = 20037508.342789244
 
 # Fixed-precision grid (metres) for overlays against multi-piece unions: GEOS 3.13's
@@ -762,7 +759,131 @@ def row_select(layer):
     return f'SELECT {cols} FROM "{layer}"'
 
 
-def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0):
+def _dissolve_sublegible(bands, drvals, min_area):
+    """Generalize one ladder's simplified partition at its display scale. Parts under min_area
+    (m²), smallest first: with a shallower neighbour (smaller drval1) the part merges into the
+    shallowest of them — the area now reads shoaler, a pit removed; with no band neighbour at
+    all (land, drying or nodata all round) it drops, which reads as not-water; with every
+    neighbour deeper it is a shoal and stays. A neighbour shares an edge, never just a corner.
+    Merges are exact unions along shared edges, so the partition stays disjoint and no area is
+    invented. Returns the bands in place."""
+    import numpy as np
+    import shapely
+    from shapely.strtree import STRtree
+    parts, lvl = [], []
+    for i, g in enumerate(bands):
+        for p in _polys(g):
+            parts.append(p)
+            lvl.append(i)
+    if not parts:
+        return bands
+    geoms = list(parts)
+    tree = STRtree(parts)
+    owner = list(range(len(parts)))  # a dissolved part resolves to what absorbed it
+
+    def find(i):
+        while owner[i] != i:
+            owner[i] = owner[owner[i]]
+            i = owner[i]
+        return i
+
+    alive = [True] * len(parts)
+    d1 = [drvals[l][0] for l in lvl]  # per part
+    for i in np.argsort(shapely.area(parts)):
+        if shapely.area(geoms[i]) >= min_area or not alive[i]:
+            continue
+        nb = {find(j) for j in tree.query(parts[i], predicate="touches")
+              if j != i and shapely.intersection(parts[i], parts[j]).length > 0}
+        nb.discard(i)
+        nb = [j for j in nb if alive[j]]
+        if not nb:
+            alive[i] = False
+            continue
+        shoaler = [j for j in nb if d1[j] < d1[i]]
+        if not shoaler:
+            continue  # a peak: every neighbour is deeper
+        t = min(shoaler, key=lambda j: (d1[j], -shapely.area(geoms[j])))
+        geoms[t] = shapely.union(geoms[t], geoms[i])
+        alive[i] = False
+        owner[i] = t
+    out = [[] for _ in bands]
+    for i, g in enumerate(geoms):
+        if alive[i]:
+            out[lvl[i]] += _polys(g)
+    return [shapely.multipolygons(ps) if ps else shapely.MultiPolygon() for ps in out]
+
+
+def _drop_datum(dem, geom, block=4096):
+    """`geom`'s parts (EPSG:3857 drying polygons) without their exact-datum pixels — the land
+    sentinel and the merge's fill for water a source holds no depth for, which the raster keeps
+    as the unknown code (terrain._encode_tile). A part at least half datum is dropped whole: a
+    ditch grid under a coarse source, a zeroed shoreline cell, a polder's ditches and dike tops
+    inside one water polygon — tens of thousands of ribbons that would otherwise each cost a
+    staircase difference. A real foreshore from a source that resolves it has no exact-0 pixel
+    and keeps its geometry whole, so the shared 0 m chain the contour derivation reads is
+    untouched; a foreshore holding a datum patch loses exactly those pixels. Every part is
+    burned into one index raster per block, so the whole pass is a few rasterizes and a
+    bincount, not a call each; blocks, so a window-spanning polygon never pulls the whole
+    window in."""
+    from collections import defaultdict
+
+    import numpy as np
+    import shapely
+    from rasterio import features
+    from rasterio.windows import Window, from_bounds
+    from shapely import make_valid
+    from shapely.geometry import shape
+    from shapely.strtree import STRtree
+    parts = _polys(geom)
+    if not parts:
+        return []
+    under = np.zeros(len(parts) + 1, dtype=np.int64)
+    zero = np.zeros(len(parts) + 1, dtype=np.int64)
+    holes = defaultdict(list)
+    # No GDAL_CACHEMAX cap here: rasterio hands the value to GDAL in BYTES, and a 256-byte block
+    # cache makes rasterize re-walk every shape per cache-sized slice — 20 minutes for 200 parts.
+    with rasterio.open(dem) as src:
+        win = from_bounds(*shapely.total_bounds(parts), transform=src.transform)
+        c0, r0 = max(0, int(win.col_off)), max(0, int(win.row_off))
+        c1 = min(src.width, int(win.col_off + win.width) + 1)
+        r1 = min(src.height, int(win.row_off + win.height) + 1)
+        tree = STRtree(parts)
+        for row in range(r0, r1, block):
+            for col in range(c0, c1, block):
+                w = Window(col, row, min(block, c1 - col), min(block, r1 - row))
+                hits = tree.query(shapely.box(*rasterio.windows.bounds(w, src.transform)),
+                                  predicate="intersects")
+                if not len(hits):
+                    continue
+                wt = src.window_transform(w)
+                # Python ints: a NumPy scalar burn value sends rasterio down a path that took
+                # 30 minutes on 565 parts where ints take under a second.
+                ids = features.rasterize(((parts[i], int(i) + 1) for i in hits),
+                                         out_shape=(w.height, w.width), transform=wt, fill=0,
+                                         dtype="int32")
+                hit = ids > 0
+                if not hit.any():
+                    continue
+                under += np.bincount(ids[hit], minlength=len(parts) + 1)
+                z = hit & (src.read(1, window=w) == 0)
+                if not z.any():
+                    continue
+                zero += np.bincount(ids[z], minlength=len(parts) + 1)
+                for shp, val in features.shapes(ids, mask=z, transform=wt):
+                    holes[int(val)].append(shape(shp))
+    out = []
+    for i, part in enumerate(parts, 1):
+        if under[i] and zero[i] * 2 >= under[i]:
+            continue
+        if holes[i]:  # a sub-pixel hairline has no pixel and stays whole
+            part = make_valid(shapely.difference(
+                part, shapely.union_all(holes[i], grid_size=GRID), grid_size=GRID))
+        out.extend(_polys(part))
+    return out
+
+
+def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, levels_ft=None,
+                scale_z=None):
     """Partition any DEM covering the tile's buffered extent into depth-area / drying / nodata
     rows. Returns (final_path, count) inside ``tmp``, or None when there is no water."""
     import geopandas as gpd
@@ -780,12 +901,14 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0):
     min_area = SLIVER_MIN_PX * res * res       # slivers where a vector edge meets the raster shore
     stem_res = get_resolution(child_z)          # the stem's own MVT pixel, EPSG:3857 metres
     nodata_tol = NODATA_SIMPLIFY_PX * stem_res  # generalize nodata to the stem's resolution
-    nodata_pad = NODATA_OVERLAP_PX * stem_res   # dilate finished nodata rows over every cut line
     band_tol = SIMPLIFY_MM / MM_PER_PX * stem_res  # the S-58 vertex floor at this stem's scale
     # Drying legibility: area at the STEM's scale (what a reader sees), width in the DEM's own
     # pixel (what drew the ribbon) — the two differ on the coarsened retry window.
     drying_legible_area = DRYING_LEGIBLE_MM2 * (stem_res / MM_PER_PX) ** 2
     drying_min_width = DRYING_MIN_WIDTH_PX * res
+    # Band/nodata legibility at the display scale a compiled tier serves; the native tier keeps
+    # every part, since it also serves the overzoom where they are legible.
+    legible_area = LEGIBLE_MM2 * (get_resolution(scale_z) / MM_PER_PX) ** 2 if scale_z else 0.0
     sink = _RowSink(f"{tmp}/depare-rows.geojsons")
 
     # ── depth bands + drying ── the metre + fathom partition ladders, each off one gdal_contour -p
@@ -808,8 +931,8 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0):
     drying_raw = []       # the bucket as contoured — the ft ladder's coverage member
     drying_geoms = []     # the same bucket simplified with the metre ladder — what ships
     _mark(None)
-    for sys_tag, levels in (("m", config.DEPARE_LEVELS + [config.DRYING_CAP]),
-                            ("ft", config.DEPARE_LEVELS_FT)):
+    for sys_tag, levels in (("m", (levels_m or config.DEPARE_LEVELS) + [config.DRYING_CAP]),
+                            ("ft", levels_ft or config.DEPARE_LEVELS_FT)):
         raw = partitions(dem, levels, f"{tmp}/depare-raw-{sys_tag}.fgb", timeout=timeout)
         drvals, bands = [], []
         for lvl in [l for l in levels if l <= 0]:
@@ -829,6 +952,9 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0):
         if sys_tag == "m":
             drying_geoms = simplified[len(drvals):]
         _mark(f"bands-simplify-{sys_tag}")
+        if legible_area > 0:
+            bands = _dissolve_sublegible(bands, drvals, legible_area)
+            _mark(f"bands-dissolve-{sys_tag}")
         for (drval1, drval2), geom in zip(drvals, bands):
             if sys_tag == "m":
                 coverage_parts += [piece for p in _polys(geom) for piece in _subdivide(p)]
@@ -901,6 +1027,12 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0):
         effective = make_valid(effective)
         _mark("drying-make-valid")
         if not effective.is_empty:
+            # Exact datum inside effective water is unknown, not foreshore: it leaves the drying
+            # here and falls to the nodata pass below (_drop_datum).
+            kept = _drop_datum(dem, effective)
+            effective = shapely.multipolygons(kept) if kept else shapely.MultiPolygon()
+            _mark("drying-diff-datum")
+        if not effective.is_empty:
             drying_area = effective  # subtracted from nodata below (over the buffered extent)
             drying_rows = []
             for full in _polys(effective):  # gate the PRE-clip polygon so a seam sliver of a big flat survives both sides
@@ -924,8 +1056,18 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0):
             parts += [piece for p in _polys(drying_area) for piece in _subdivide(p)]
         tree = STRtree(parts) if parts else None
         _mark("nodata-tree")
+        nodata_by_kind = {}
         for r in water.itertuples():
             geom = make_valid(r.geometry).intersection(buffered)
+            # The differences below only shrink a part, so a part the gates would drop as it
+            # stands is dropped now, before any geometry work: on a polder that is the whole
+            # ditch grid, and the pass costs seconds instead of minutes.
+            keep = [poly for poly in _polys(geom)
+                    if poly.area >= max(min_area, legible_area)
+                    and not _illegible_drying(poly, drying_legible_area, drying_min_width)]
+            if not keep:
+                continue
+            geom = shapely.multipolygons(keep) if len(keep) > 1 else keep[0]
             if tree is not None and not geom.is_empty:
                 # predicate="intersects" (prepared), not bare envelope query: most inland lakes
                 # never truly touch coverage and skip the difference entirely. Parts are
@@ -939,7 +1081,10 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0):
                     geom = shapely.difference(geom, u, grid_size=GRID)
             kind = getattr(r, "kind", None)
             for full in _polys(geom):  # gate the PRE-clip polygon (buffered window) so a seam sliver survives both sides
-                if full.area >= min_area:
+                # Drying's two-instrument gate applies here too: a sub-pixel ribbon of unknown water
+                # (a ditch under a coarse source) is noise; a compact unknown pond is charted.
+                if full.area >= max(min_area, legible_area) and not _illegible_drying(
+                        full, drying_legible_area, drying_min_width):
                     for p in _polys(full.intersection(clip)):  # then clip to the seam; no re-filter on the piece
                         # Simplify POST-clip, per-piece: kept vertices are a subset inside the clip
                         # box, so the ring can never cross the seam outward — at worst it recedes
@@ -948,14 +1093,21 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0):
                         s = p.simplify(nodata_tol, preserve_topology=True)
                         if s.is_empty:
                             continue
-                        # Dilate the survivor over every line it was cut on — past the clip line
-                        # (the stem seam) and past the raw outline (the shoreline) — so the
-                        # abutting fills overlap instead of opening hairlines (NODATA_OVERLAP_PX).
-                        s = s.buffer(nodata_pad, join_style="mitre", mitre_limit=2.0)
-                        sink.write([{"geometry": sp, "drval1": None, "drval2": None,
-                                     "sys": None, "kind": kind, "rank": NODATA_RANK}
-                                    for sp in _polys(s)], flush=False)
+                        nodata_by_kind.setdefault(kind, []).extend(_polys(s))
         _mark("nodata-loop")
+        # One dissolved region: OSM water polygons overlap each other (a riverbank inside a lake
+        # multipolygon), and a translucent fill compounds wherever rows overlap. A region keeps
+        # its kind when one kind made it.
+        pieces = [(k, sp) for k, sps in nodata_by_kind.items() for sp in sps]
+        if pieces:
+            region = valid_union([sp for _, sp in pieces])
+            ktree = STRtree([sp for _, sp in pieces])
+            for sp in _polys(region):
+                kinds = {pieces[i][0] for i in ktree.query(sp, predicate="intersects")}
+                sink.write([{"geometry": sp, "drval1": None, "drval2": None, "sys": None,
+                             "kind": kinds.pop() if len(kinds) == 1 else None,
+                             "rank": NODATA_RANK}], flush=False)
+        _mark("nodata-dissolve")
 
     if not sink.count and not sink.pending:
         print(f"depare: no water in tile bbox for {label}")
@@ -967,11 +1119,121 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0):
     return final, n
 
 
+def tier_path(stem, tier):
+    return f"store/depare/{stem}-{tier.name}.fgb"
+
+
+def tier_read_tiles(stem, tier):
+    """The mosaic tiles a coarse tier's surface reads: the stem's window buffered by the smooth
+    halo at the tier's resolution — a z6 halo reaches tens of kilometres past the stem."""
+    import mosaic
+    import smooth
+    halo_m = smooth.halo_px() * get_resolution(tier.surface)
+    return [mosaic.tile_artifact(s) for s in mosaic.intersecting_tiles(stem, halo_m)]
+
+
+def _tier_surface(stem, tier, out):
+    """A coarse tier's cut surface: the stem's halo-buffered window read off the mosaic tiles'
+    class-aware shoal pyramid at the tier zoom, then the shared depth-gated smooth at that
+    resolution — the same level and smooth the raster render serves at the zoom, so band tints
+    and relief agree by construction. Nearest at an exact power-of-two ratio is a grid-aligned
+    copy of the level; a tile's pyramid stops at res(8), so tiers below z8 reduce from there with
+    the same operator."""
+    import mosaic
+    import smooth
+    z, x, y, _cz = (int(a) for a in stem.split("-"))
+    res = get_resolution(tier.surface)
+    read_z = max(tier.surface, 8)
+    read_res = get_resolution(read_z)
+    halo_m = smooth.halo_px() * res
+    b = mercantile.xy_bounds(mercantile.Tile(x=x, y=y, z=z))
+    l, bt, r, t = b.left - halo_m, b.bottom - halo_m, b.right + halo_m, b.top + halo_m
+    tiles = " ".join(tier_read_tiles(stem, tier))
+    vrt = out + ".vrt"
+    utils.run_command(f"gdalbuildvrt -overwrite -te {l} {bt} {r} {t} -tr {read_res} {read_res} "
+                      f"-r nearest {vrt} {tiles}")
+    raw = out if read_z == tier.surface else out + ".z8.tif"
+    utils.run_command(f"gdal_translate -q -ot Float32 -a_nodata {smooth.NODATA} "
+                      "-co TILED=YES -co BLOCKSIZE=512 -co COMPRESS=ZSTD -co PREDICTOR=3 "
+                      f"-co BIGTIFF=IF_SAFER {vrt} {raw}")
+    os.remove(vrt)
+    if raw != out:
+        _uniform_coarsen(raw, 2 ** (read_z - tier.surface), out)
+        os.remove(raw)
+    if not os.environ.get("SKIP_SMOOTH"):
+        with rasterio.env.Env(GDAL_CACHEMAX=256):
+            smooth.smooth_tiff(out)
+    return out
+
+
+def _shoal_reduce(arr, nodata, factor):
+    """utils._block_reduce's rule on an in-memory block whose sides are multiples of `factor`:
+    per 2x2, the max over water-domain children when any exist, else over valid ones, nodata
+    only when none is valid — `factor` halvings of it."""
+    import numpy as np
+    cap = config.DRYING_CAP
+    while factor > 1:
+        q = [arr[i::2, j::2] for i in (0, 1) for j in (0, 1)]
+        good = [(x != nodata) & (x == x) for x in q]
+        wet = [g & (x <= cap) for g, x in zip(good, q)]
+        floor = np.array(-np.inf, dtype=arr.dtype)
+        anywet = wet[0] | wet[1] | wet[2] | wet[3]
+        anygood = good[0] | good[1] | good[2] | good[3]
+        wmax = np.maximum.reduce([np.where(k, x, floor) for k, x in zip(wet, q)])
+        gmax = np.maximum.reduce([np.where(k, x, floor) for k, x in zip(good, q)])
+        arr = np.where(anygood, np.where(anywet, wmax, gmax), nodata).astype(arr.dtype)
+        factor //= 2
+    return arr
+
+
+def _shoal_clamp(surface, finer, factor, tmp=None):
+    """Raise `surface` in place to at least the class-aware shoal reduction of `finer` (a
+    finer-tier surface) by `factor`, over the extent they share. The reduction is taken on the
+    coarse grid: the shared extent is snapped inward to coarse pixel edges — which lie on the
+    finer lattice, since both grids anchor on the tile edge — and the finer raster is read over
+    exactly that extent, so every coarse pixel meets the reduction of its own block. Streamed in
+    stripes of whole coarse rows: the finer raster is a native window, 17 GB at cz15, and a
+    stripe holds ~32 MB of it. Nodata on either side leaves the pixel as read."""
+    import math
+    import numpy as np
+    from rasterio.windows import Window
+    with rasterio.open(finer) as f, rasterio.open(surface, "r+") as s:
+        cres, fres = s.transform.a, f.transform.a
+        if abs(cres - fres * factor) > 1e-6 * cres:
+            raise ValueError(f"shoal clamp: {surface} is not {factor}x coarser than {finer}")
+        left, right = max(f.bounds.left, s.bounds.left), min(f.bounds.right, s.bounds.right)
+        bottom, top = max(f.bounds.bottom, s.bounds.bottom), min(f.bounds.top, s.bounds.top)
+        c0 = math.ceil((left - s.transform.c) / cres - 1e-9)
+        c1 = math.floor((right - s.transform.c) / cres + 1e-9)
+        r0 = math.ceil((s.transform.f - top) / cres - 1e-9)
+        r1 = math.floor((s.transform.f - bottom) / cres + 1e-9)
+        w, h = c1 - c0, r1 - r0
+        if w <= 0 or h <= 0:
+            return
+        sl, st = s.transform.c + c0 * cres, s.transform.f - r0 * cres
+        fc, fr = (sl - f.transform.c) / fres, (f.transform.f - st) / fres
+        if abs(fc - round(fc)) > 1e-6 or abs(fr - round(fr)) > 1e-6:
+            raise ValueError(f"shoal clamp: {finer} is not on {surface}'s lattice")
+        fc, fr = round(fc), round(fr)
+        itemsize = np.dtype(f.dtypes[0]).itemsize
+        rows = max(1, utils._SHOAL_STRIPE_BYTES // (w * factor * factor * itemsize))
+        for oy in range(0, h, rows):
+            n = min(rows, h - oy)
+            a = s.read(1, window=Window(c0, r0 + oy, w, n))
+            b = f.read(1, window=Window(fc, fr + oy * factor, w * factor, n * factor))
+            red = _shoal_reduce(b, f.nodata, factor)
+            valid = (a != s.nodata) & (red != f.nodata)
+            s.write(np.where(valid, np.maximum(a, red), a).astype(a.dtype), 1,
+                    window=Window(c0, r0 + oy, w, n))
+
+
 def tile(stem):
-    """The per-stem Snakemake job: partition one stem from a BUFFERED mosaic window, smoothed at
-    read with the one shared f(depth, zoom), output at store/depare/<stem>.fgb (depare also reads
-    the land + water masks). A waterless tile writes a 0-byte sentinel; bundling filters empties by
-    size."""
+    """The per-stem Snakemake job: one partition per tier (config.depare_tiers) — the coarse
+    tiers cut from the mosaic pyramid level at the tier zoom, the final tier from the BUFFERED
+    native window, smoothed at read with the one shared f(depth, zoom) — output at
+    store/depare/<stem>-t<z>.fgb per tier (depare also reads the land + water masks). A waterless
+    tier writes a 0-byte sentinel, as does a tier the stem does not hold; bundling filters
+    empties by size."""
     import shutil
     import signal
     import tempfile
@@ -991,51 +1253,79 @@ def tile(stem):
     if os.environ.get("DEPARE_TIMING"):
         _heartbeat(stem)
     z, x, y, child_z = (int(a) for a in stem.split("-"))
-    out = f"store/depare/{stem}.fgb"
     tmp = tempfile.mkdtemp(prefix=f"depare-{stem}-")  # local scratch; publish crosses to the store
+    os.makedirs("store/depare", exist_ok=True)
+    tiers = config.depare_tiers(child_z)
     try:
-        _mark(None)
         # The shared smoothed window is read-only; the timeout fallback derives its
         # coarsened copy in tmp rather than touching it.
-        dem = f"store/window/{stem}.tif"
-        _mark("window-dem")
+        window = f"store/window/{stem}.tif"
         tile_obj = mercantile.Tile(x=x, y=y, z=z)
-        try:
-            res = _depare_dem(dem, tile_obj, child_z, tmp, stem, timeout=timeout)
-        except ContourTimeout as e:
-            print(f"depare tile {stem}: {e} — retrying on a uniform 4x shoal-biased window",
-                  file=sys.stderr, flush=True)
-            dem = _uniform_coarsen(dem, 4, f"{tmp}/dem-4x.tiff")
-            res = _depare_dem(dem, tile_obj, child_z, tmp, stem, timeout=timeout)
-        except MemoryError:
-            # An allocation the kernel refused (overcommit says no when a single request
-            # exceeds free RAM+swap) — no OOM kill, and formatting a traceback at that point
-            # can itself fail, so a bare MemoryError otherwise exits 1 with an EMPTY log.
-            # Report the phase and footprint from a preallocated string: this path must not
-            # allocate. Marsh stems are the ones that get here (see the perf backlog).
-            os.write(2, _OOM_NOTE % (stem.encode(), _rss_kb()))
-            _save_traceback(stem)
-            raise
-        except BaseException:
-            # The rule redirects stderr with `2> {log}`, which TRUNCATES when snakemake starts the
-            # retry, so a failed attempt's traceback is destroyed within a second of being written
-            # and the job looks like it failed silently. Keep a copy beside the output, where a
-            # retry cannot erase it. (Changing the redirect to `2>>` would edit the rule's
-            # shellcmd, which snakemake hashes as rule CODE — that re-runs every depare tile.)
-            _save_traceback(stem)
-            raise
-        os.makedirs(os.path.dirname(out), exist_ok=True)
-        if res:
-            final, n = res
-            utils.publish(final, out)  # scratch and store are separate filesystems
-            # Window bytes alongside the polygon count: a COMPRESSED window's size tracks its
-            # geometric detail, which is what drives this rule's peak RSS (marsh coastlines
-            # compress worst and cost most). Pairs with the benchmark row so DEPARE_GB can be
-            # fitted against it instead of child_z alone — see the backlog.
-            print(f"depare tile {stem}: {n} polygons, window {os.path.getsize(dem) / 1e9:.2f} GB")
-        else:
-            open(out, "w").close()
-            print(f"depare tile {stem}: empty")
+        # Finest first: each coarser surface is clamped shoal-ward against the reduction of the
+        # finer one, so the compiled zooms cascade from the native cut out and a coarser tier can
+        # never read deeper than a finer — the served raster pyramid cascades the same way.
+        finer, finer_z = window, child_z
+        for tier in reversed(tiers):
+            _mark(None)
+            out = tier_path(stem, tier)
+            label = f"{stem}-{tier.name}"
+            tier_tmp = f"{tmp}/{tier.name}"
+            os.makedirs(tier_tmp)
+            if tier.surface == child_z:
+                dem = window
+            else:
+                dem = _tier_surface(stem, tier, f"{tier_tmp}/surface.tif")
+                _shoal_clamp(dem, finer, 2 ** (finer_z - tier.surface))
+                finer, finer_z = dem, tier.surface
+            _mark(f"{tier.name}-surface")
+            scale_z = tier.first if tier.last is not None else None
+            try:
+                res = _depare_dem(dem, tile_obj, tier.surface, tier_tmp, label, timeout=timeout,
+                                  levels_m=tier.levels_m, levels_ft=tier.levels_ft, scale_z=scale_z)
+            except ContourTimeout as e:
+                print(f"depare tile {label}: {e} — retrying on a uniform 4x shoal-biased window",
+                      file=sys.stderr, flush=True)
+                dem = _uniform_coarsen(dem, 4, f"{tier_tmp}/dem-4x.tiff")
+                res = _depare_dem(dem, tile_obj, tier.surface, tier_tmp, label, timeout=timeout,
+                                  levels_m=tier.levels_m, levels_ft=tier.levels_ft, scale_z=scale_z)
+            except MemoryError:
+                # An allocation the kernel refused (overcommit says no when a single request
+                # exceeds free RAM+swap) — no OOM kill, and formatting a traceback at that point
+                # can itself fail, so a bare MemoryError otherwise exits 1 with an EMPTY log.
+                # Report the phase and footprint from a preallocated string: this path must not
+                # allocate. Marsh stems are the ones that get here (see the perf backlog).
+                os.write(2, _OOM_NOTE % (stem.encode(), _rss_kb()))
+                _save_traceback(stem)
+                raise
+            except BaseException:
+                # The rule redirects stderr with `2> {log}`, which TRUNCATES when snakemake starts
+                # the retry, so a failed attempt's traceback is destroyed within a second of being
+                # written and the job looks like it failed silently. Keep a copy beside the output,
+                # where a retry cannot erase it. (Changing the redirect to `2>>` would edit the
+                # rule's shellcmd, which snakemake hashes as rule CODE — that re-runs every tile.)
+                _save_traceback(stem)
+                raise
+            if res:
+                final, n = res
+                utils.publish(final, out)  # scratch and store are separate filesystems
+                # Window bytes alongside the polygon count: a COMPRESSED window's size tracks its
+                # geometric detail, which is what drives this rule's peak RSS (marsh coastlines
+                # compress worst and cost most). Pairs with the benchmark row so DEPARE_GB can be
+                # fitted against it instead of child_z alone — see the backlog.
+                print(f"depare tile {label}: {n} polygons, window {os.path.getsize(dem) / 1e9:.2f} GB")
+            else:
+                open(out, "w").close()
+                print(f"depare tile {label}: empty")
+            # the surface stays: the next coarser tier clamps against it
+            for f in os.listdir(tier_tmp):
+                if f != "surface.tif":
+                    fp = f"{tier_tmp}/{f}"
+                    shutil.rmtree(fp, ignore_errors=True) if os.path.isdir(fp) else os.remove(fp)
+        # Tiers past the stem's final one do not exist for it: a sentinel keeps the outputs fixed.
+        held = {t.first for t in tiers}
+        for first in config.DEPARE_TIER_STARTS:
+            if first not in held:
+                open(f"store/depare/{stem}-t{first}.fgb", "w").close()
     finally:
         # Always disarm + clean up: a body exception with the alarm still armed could fire during
         # unwinding and mask the real error as exit 124, and would leak the tmp dir.
@@ -1273,11 +1563,10 @@ def _check():
     assert _RowSink.snap_budget(_drawable) > 1e3 * _RowSink.GRID ** 2, \
         "the floor must not become the budget for drawable geometry"
 
-    # A nodata row dilated past the world's east edge, as NODATA_OVERLAP_PX does on the
-    # easternmost stem, whose clip box ends exactly there. Untrimmed, the inverse transform puts
-    # the dilated vertices at -180 and the ring spans every longitude on Earth.
-    _edge = _box(WORLD_HALF_M - 500.0, 9.55e6, WORLD_HALF_M, 9.56e6).buffer(
-        NODATA_OVERLAP_PX * get_resolution(14), join_style="mitre", mitre_limit=2.0)
+    # A nodata row reaching past the world's east edge, as overlay wobble on the easternmost stem
+    # (whose clip box ends exactly there) can. Untrimmed, the inverse transform puts the vertices
+    # past the edge at -180 and the ring spans every longitude on Earth.
+    _edge = _box(WORLD_HALF_M - 500.0, 9.55e6, WORLD_HALF_M + 50.0, 9.56e6)
     _wrapped = gpd.GeoSeries([_edge], crs="EPSG:3857").to_crs("EPSG:4326").values[0].bounds
     assert _wrapped[2] - _wrapped[0] > 300, \
         "the fixture must wrap the antimeridian without the trim"
@@ -1503,14 +1792,11 @@ def _check():
     except ContourTimeout:
         pass
 
-    # nodata simplification + dilation: a dense OSM-style outline generalizes to the stem's
-    # resolution, shedding vertices while its area barely moves. The post-clip simplify recedes
-    # ≤ tol from every line the piece was cut on; the NODATA_OVERLAP_PX dilation must push the
-    # finished row back over all of them — across the clip line (the stem seam) and past the raw
-    # outline (the shoreline) — so the abutting fills overlap instead of opening hairlines.
+    # nodata simplification: a dense OSM-style outline generalizes to the stem's resolution,
+    # shedding vertices while its area barely moves, and the post-clip simplify keeps a piece's
+    # ring inside its clip line — it recedes ≤ tol from the seam and never crosses it.
     from shapely import get_num_coordinates
     tol = NODATA_SIMPLIFY_PX * get_resolution(14)
-    pad = NODATA_OVERLAP_PX * get_resolution(14)
     ring = [(1000.0 * np.cos(t) + 0.37 * tol * np.sin(60 * t),
              1000.0 * np.sin(t) + 0.37 * tol * np.cos(60 * t))
             for t in np.linspace(0, 2 * np.pi, 4000, endpoint=False)]  # dense, sub-tol wobble
@@ -1523,11 +1809,10 @@ def _check():
         s = piece.simplify(tol, preserve_topology=True)
         if s.is_empty:
             continue
-        s = s.buffer(pad, join_style="mitre", mitre_limit=2.0)
-        assert s.is_valid and s.covers(piece), \
-            "a dilated nodata row must cover its own cut piece (no shoreline sliver)"
-        assert s.bounds[0] < -pad / 2, \
-            "a dilated nodata row must cross the clip line (seam overlap, not abutment)"
+        assert s.is_valid and s.bounds[0] >= -1e-6, \
+            "a simplified nodata row must never cross its clip line"
+        assert shapely.hausdorff_distance(s, piece) <= tol + 1e-9, \
+            "a simplified nodata row must recede at most tol from its cut piece"
 
     d = tempfile.mkdtemp()
     h = w = 60
@@ -1608,19 +1893,17 @@ def _check():
     assert sorted(x.wkb for x in g.geometry) == sorted(x.wkb for x in g2.geometry), \
         "partitions not deterministic"
 
-    # A uniform-0 DEM (terrain exactly at datum) yields NO depth band — it falls in the
-    # [0, DRYING_CAP] drying bucket, so a merge-filled-0 area tints as drying foreshore, never a
-    # false shoal. (The cleared-lake NODATA path is separate: gdal_contour skips NODATA pixels, so
-    # a genuinely-unfilled lake interior carries no bucket and renders as nodata — see
-    # check_depare_water. Only a thin 0-filled rim at a cleared lake's edge lands in this bucket.)
+    # A uniform-0 DEM (terrain exactly at datum) yields NO depth band; its [0, cap] bucket is
+    # exact datum, which the drying pass removes pixel by pixel: a merge-filled-0 area is
+    # unknown water, never a false shoal and never foreshore — the raster's rule for water-side
+    # 0 (the kind fixture below proves it end to end).
     flat = np.zeros((h, w), dtype="float32")
     fp = f"{d}/flat.tif"
     with rasterio.open(fp, "w", driver="GTiff", height=h, width=w, count=1, dtype="float32",
                        nodata=-9999, crs="EPSG:3857", transform=tr) as dst:
         dst.write(flat, 1)
     flat_g = read_bucket(partitions(fp, levels_m, f"{d}/flat-raw.fgb"), "amax <= 0")
-    assert len(flat_g) == 0, \
-        "a uniform-0 surface must produce no depth band (it's the drying bucket, not a shoal tint)"
+    assert len(flat_g) == 0, "a uniform-0 surface must produce no depth band"
 
     # The drying water term is tidal-only, end to end: one [0, cap] band crossing two water
     # polygons that both sit inside the land coverage (so the water term alone decides) ships as
@@ -1635,6 +1918,7 @@ def _check():
 
     kdem = np.full((60, 60), cap + 50, dtype="float32")
     kdem[20:40, :] = 2.0  # a [0, cap] foreshore band crossing both water polygons
+    kdem[25:35, 20:26] = 0.0  # exact datum inside the river: a clamp fill, not foreshore
     kp = f"{d}/kind-dem.tif"
     with rasterio.open(kp, "w", driver="GTiff", height=60, width=60, count=1, dtype="float32",
                        nodata=-9999, crs="EPSG:3857",
@@ -1642,16 +1926,17 @@ def _check():
         dst.write(kdem, 1)
     lake, river, lagoon, tidal_lake = (cell_box(2, 15, 13, 45), cell_box(17, 15, 28, 45),
                                        cell_box(32, 15, 43, 45), cell_box(47, 15, 58, 45))
+    lake_b = cell_box(2, 45, 13, 55)  # abuts the lake along one edge
     gpd.GeoDataFrame(geometry=[_box(*bb)], crs="EPSG:3857").to_file(
         f"{d}/land.fgb", driver="FlatGeobuf")
     # Each rescue clause decides exactly one box: the lagoon by class ALONE, the tidal lake by
     # tidal=yes ALONE (is_salt deliberately all-null: the fillna path must run without deciding
     # the outcome).
-    gpd.GeoDataFrame({"kind": ["lake", "river", "lake", "lake"],
-                      "class": [None, None, "lagoon", None],
-                      "is_salt": [None, None, None, None],
-                      "tidal": [None, None, None, "yes"]},
-                     geometry=[lake, river, lagoon, tidal_lake],
+    gpd.GeoDataFrame({"kind": ["lake", "river", "lake", "lake", "lake"],
+                      "class": [None, None, "lagoon", None, None],
+                      "is_salt": [None, None, None, None, None],
+                      "tidal": [None, None, None, "yes", None]},
+                     geometry=[lake, river, lagoon, tidal_lake, lake_b],
                      crs="EPSG:3857").to_file(f"{d}/water.fgb", driver="FlatGeobuf")
     saved = {k: os.environ.get(k) for k in ("LANDMASK", "WATERMASK")}
     os.environ["LANDMASK"], os.environ["WATERMASK"] = f"{d}/land.fgb", f"{d}/water.fgb"
@@ -1667,6 +1952,9 @@ def _check():
     rows = gpd.read_file(out[0]).to_crs("EPSG:3857")
     dry = rows[rows["drval1"].notna() & (rows["drval1"] < 0)]
     assert dry.intersects(river).any(), "drying must survive inside a tidal (river) water polygon"
+    datum_patch = cell_box(20, 25, 26, 35)
+    assert not dry.covers(datum_patch.centroid).any(), \
+        "exact datum inside tidal water is unknown, never foreshore"
     assert not dry.intersects(lake).any(), \
         "a lake is off chart datum — its [0, cap] rim must emit no drying"
     assert dry.intersects(lagoon).any(), \
@@ -1683,6 +1971,59 @@ def _check():
     nodata_rows = rows[rows["drval1"].isna()]
     assert nodata_rows.covers(lake.intersection(cell_box(0, 20, 60, 40)).centroid).any(), \
         "the lake's [0, cap] shore ribbon stays part of its nodata polygon"
+    assert nodata_rows.covers(datum_patch.centroid).any(), \
+        "exact datum inside tidal water falls to the nodata pass"
+    # Two abutting lake polygons dissolve into one unknown-water region: no row overlaps another
+    # (the dilated seam would otherwise draw as a dark line), and the shared edge is covered.
+    nd = list(nodata_rows.geometry)
+    assert all(nd[i].intersection(nd[j]).area < 1e-6
+               for i in range(len(nd)) for j in range(i + 1, len(nd))), \
+        "nodata rows of one tile must not overlap each other"
+    assert nodata_rows.covers(lake.intersection(lake_b).centroid).any(), \
+        "abutting lakes share one unknown-water region across their common edge"
+    # ── the tier operators ──
+    # Dissolve: a sub-legible part with a shallower neighbour merges into it (area conserved,
+    # partition disjoint); a sub-legible island with no band neighbour drops; a sub-legible part
+    # whose every neighbour is deeper is a peak and stays; legible parts are untouched.
+    import shapely
+    from shapely.geometry import box as _bx
+    shoal, deep = _bx(0, 0, 100, 100), _bx(100, 0, 200, 100)          # 2-5 m beside 5-10 m
+    pit = _bx(100, 45, 103, 55)                                         # a 5-10 m crumb on the shoal edge
+    shoal, deep = shoal.difference(pit), deep.difference(pit)
+    island = _bx(300, 300, 302, 302)                                    # 5-10 m with nothing around
+    peak = _bx(150, 45, 153, 48)                                        # a 2-5 m crumb inside 5-10 m
+    corner = _bx(200, 100, 203, 103)                                    # 5-10 m, meets the shoal at one corner only
+    deep = deep.difference(peak)
+    bands = [shapely.multipolygons([shoal, peak]), shapely.multipolygons([deep, pit, island, corner])]
+    total = sum(g.area for g in bands)
+    out = _dissolve_sublegible(bands, [(2.0, 5.0), (5.0, 10.0)], 50.0)
+    assert out[0].contains(pit.buffer(-0.1)) and not out[1].intersects(pit.buffer(-0.1)), \
+        "a sub-legible pit must dissolve into its shallower neighbour"
+    assert out[0].contains(peak.buffer(-0.1)), "a sub-legible peak must stay"
+    assert not out[1].intersects(island), "a sub-legible island must drop"
+    assert not out[0].intersects(corner.buffer(-0.1)), \
+        "a corner-only contact is no neighbour: the crumb must not dissolve into the shoal band"
+    assert abs(sum(g.area for g in out) - (total - island.area - corner.area)) < 1e-6 and \
+        out[0].intersection(out[1]).area < 1e-9, "the dissolve must conserve area and disjointness"
+    assert out[1].contains(_bx(120, 20, 180, 40)), "a legible part must be untouched"
+    # Shoal clamp: a coarse surface is raised to the reduction of the finer one, never lowered.
+    import tempfile as _tf
+    from rasterio.transform import from_origin as _fo
+    from smooth import NODATA as _ND
+    _d = _tf.mkdtemp()
+    # The finer raster carries a one-pixel halo the coarse one lacks, so their origins differ
+    # by half a coarse pixel: the reduction must still land on the coarse lattice.
+    fine = np.full((10, 10), -10.0, np.float32); fine[3:5, 3:5] = -3.0   # a shoal the coarse read missed
+    coarse = np.full((4, 4), -12.0, np.float32); coarse[0, 0] = _ND
+    for name, arr, r, org in (("fine", fine, 10.0, (-10, 90)), ("coarse", coarse, 20.0, (0, 80))):
+        with rasterio.open(f"{_d}/{name}.tif", "w", driver="GTiff", height=arr.shape[0], width=arr.shape[1],
+                           count=1, dtype="float32", nodata=_ND, crs="EPSG:3857",
+                           transform=_fo(org[0], org[1], r, r)) as dst:
+            dst.write(arr, 1)
+    _shoal_clamp(f"{_d}/coarse.tif", f"{_d}/fine.tif", 2)
+    with rasterio.open(f"{_d}/coarse.tif") as src:
+        got = src.read(1)
+    assert got[1, 1] == -3.0 and got[2, 2] == -10.0 and got[0, 0] == _ND, got
     print(f"depare_run self-check ok ({len(bands)} m-bands, {len(drying)} drying, "
           f"{len(gft_bands)} ft-bands)")
 

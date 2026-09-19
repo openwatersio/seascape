@@ -23,6 +23,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import config  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # PERF_ROOT selects the store a run reads: the default fixture root, or a root holding real
@@ -35,8 +36,11 @@ SAMPLE_S = 0.25
 STAGES = {
     "window": ("smooth.py", lambda s: ["prepare-window", s, f"store/window/{s}.tif"],
                lambda s: f"store/window/{s}.tif", "raster"),
-    "depare": ("depare_run.py", lambda s: ["tile", s], lambda s: f"store/depare/{s}.fgb", "vector"),
-    "contour": ("contour_run.py", lambda s: ["tile", s], lambda s: f"store/contour/{s}.fgb",
+    # depare and contours are compiled per zoom tier (config.depare_tiers): one file per tier.
+    "depare": ("depare_run.py", lambda s: ["tile", s],
+               lambda s: [f"store/depare/{s}-t{z}.fgb" for z in config.DEPARE_TIER_STARTS], "vector"),
+    "contour": ("contour_run.py", lambda s: ["tile", s],
+                lambda s: [f"store/contour/{s}-t{z}.fgb" for z in config.DEPARE_TIER_STARTS],
                 "vector"),
     "soundings": ("soundings_run.py", lambda s: ["tile", s],
                   lambda s: f"store/soundings/{s}.geojsons", "vector"),
@@ -115,10 +119,19 @@ def run(stage, stem, label):
     rec = {"label": label, "stage": stage, "stem": stem, "wall_s": round(wall, 2),
            "rss_tree": box.get("rss_tree", 0), "phases": phases,
            "returncode": proc.returncode, **provenance()}
-    art = f"{ROOT}/{artifact(stem)}"
-    if os.path.exists(art):
+    arts = artifact(stem)
+    arts = [arts] if isinstance(arts, str) else arts
+    present = [a for a in arts if os.path.exists(f"{ROOT}/{a}") and os.path.getsize(f"{ROOT}/{a}") > 0]
+    if present:
         import metrics
-        rec["metrics"] = metrics.raster(art) if kind == "raster" else metrics.vector(art)
+        if kind == "raster":
+            rec["metrics"] = metrics.raster(f"{ROOT}/{present[0]}")
+        else:
+            per = {os.path.basename(a): metrics.vector(f"{ROOT}/{a}") for a in present}
+            rec["tiers"] = per
+            # totals across tiers: what the bundles read for this stem
+            rec["metrics"] = {k: sum(m[k] for m in per.values())
+                              for k in ("parts", "vertices", "fgb_bytes")}
     os.makedirs(os.path.dirname(RESULTS), exist_ok=True)
     with open(RESULTS, "a") as f:
         f.write(json.dumps(rec) + "\n")
@@ -128,6 +141,8 @@ def run(stage, stem, label):
         keys = ("parts", "vertices", "fgb_bytes") if kind == "vector" else (
             "crossings@0", "parts@0", "water_components", "largest_share")
         print("  " + "  ".join(f"{k}={m[k]}" for k in keys if k in m))
+    for name, m in rec.get("tiers", {}).items():
+        print(f"    {name}: parts={m['parts']} vertices={m['vertices']} fgb_bytes={m['fgb_bytes']}")
     if phases:
         top = sorted(phases.items(), key=lambda kv: -kv[1])[:4]
         print("  slowest phases: " + ", ".join(f"{k} {v}s" for k, v in top))
