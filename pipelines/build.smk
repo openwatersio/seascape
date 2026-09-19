@@ -484,12 +484,12 @@ rule depare_tile:
     output:
         tier_files("depare", ["{stem}"])
     params:
-        version=6, # increment to force a rebuild
+        version=7, # increment to force a rebuild
         levels=json.dumps({"m": pipeline_config.DEPARE_LEVELS, "ft": pipeline_config.DEPARE_LEVELS_FT}),
         tiers=json.dumps(pipeline_config.DEPARE_TIER_STARTS),
         drying=pipeline_config.DRYING_CAP, sliver=depare_run.SLIVER_MIN_PX,
         simplify_mm=depare_run.SIMPLIFY_MM,
-        nodata_simplify=depare_run.NODATA_SIMPLIFY_PX, nodata_overlap=depare_run.NODATA_OVERLAP_PX,
+        nodata_simplify=depare_run.NODATA_SIMPLIFY_PX,
     priority: vector_tile_priority  # vector band: drain before terrain so the bundle overlaps it
     retries: 2
     resources:

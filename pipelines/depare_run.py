@@ -23,10 +23,9 @@ water compose without extra layers or archives:
 
 Bands and drying are pairwise disjoint by construction — bands are the DEM's water pixels
 (amax <= 0), drying is the disjoint [0, DRYING_CAP] bucket ∩ effective water. Nodata is the
-mapped water MINUS both, then dilated NODATA_OVERLAP_PX so every line it was cut on (stem
-seam, OSM shoreline, coverage edge) overlaps its neighbour instead of opening a background
-hairline between two opaque fills. The `rank` sort attribute resolves that overlap (nodata 0
-< bands 1 < drying 2: real depth over no-data, foreshore over the shoal band it abuts).
+mapped water MINUS both. The `rank` sort attribute orders the fills where simplification
+wobble lays one over another (nodata 0 < bands 1 < drying 2: real depth over no-data,
+foreshore over the shoal band it abuts).
 
 sys multiplexing: the bands duplicate per sys (the ladders differ), but drying and nodata
 are unit-independent, so they ship ONCE with NO `sys` — the style filters them by drval
@@ -50,9 +49,9 @@ ladder's (0, DRYING_CAP] bucket ∩ effective water, drval1 < 0; exact datum is 
 minus the DEM's water coverage and the drying) -> clip to the unbuffered tile bbox in shapely
 (polygon-only by construction, see _polys) -> 4326 -> store/depare/{stem}-t{z}.fgb. Same seam
 contract as contours for bands and drying: deterministic on the buffered grid, so neighbouring
-tiles' features abut exactly at the clip line. Nodata rows instead ship dilated
-NODATA_OVERLAP_PX past the clip line, overlapping the neighbour tile's — abutment can't survive
-the per-piece nodata simplify, overlap can. The vector bundle folds these into the `depare`
+tiles' features abut exactly at the clip line. Nodata rows are simplified per piece after the
+clip, so a ring recedes at most one stem pixel from the seam and never crosses it. The vector
+bundle folds these into the `depare`
 layer of the sharded variable-depth run (contour_run), each tier's rows carrying the tier's
 zoom range as tippecanoe.minzoom/maxzoom.
 """
@@ -79,10 +78,9 @@ if config.CONTOUR_LEVELS != config.CONTOUR_LEVELS_DEFAULT:
           "hand-mirrored DEPARE_LADDER_M/FT (style/index.ts); update it to match.",
           file=sys.stderr)
 
-# Fill draw order for the `rank` sort attribute (a style fill-sort-key draws higher on top).
-# Load-bearing where the NODATA_OVERLAP_PX dilation slides nodata under its neighbours: real
-# depth (bands) over no-data (nodata), and drying over the shoal band it abuts along their
-# shared 0 m seam.
+# Fill draw order for the `rank` sort attribute (a style fill-sort-key draws higher on top):
+# real depth (bands) over no-data (nodata) wherever an OSM outline's simplify wobble lays one
+# over the other, and drying over the shoal band it abuts along their shared 0 m seam.
 NODATA_RANK = 0
 BAND_RANK = 1
 DRYING_RANK = 2
@@ -150,9 +148,7 @@ DRYING_LEGIBLE_MM2 = float(os.environ.get("DRYING_LEGIBLE_MM2", "16"))
 LEGIBLE_MM2 = float(os.environ.get("DEPARE_LEGIBLE_MM2", "4"))
 # Foreshore is strictly above datum, (0, DRYING_CAP]: exact 0 is the land sentinel and the
 # merge's fill for water a source holds no depth for, which the raster keeps as the unknown code
-# (terrain._encode_tile). A millimetre level splits that exact-datum bucket off the foreshore one
-# in the same gdal_contour pass; no real drying height sits under it.
-DRYING_EPS = 0.001
+# (terrain._encode_tile). The drying pass removes those pixels (_drop_datum).
 DRYING_MIN_WIDTH_PX = float(os.environ.get("DRYING_MIN_WIDTH_PX", "1"))
 
 # S-58 Ed. 7.0.0 check 571 caps ENC vertex density at 0.3 mm at compilation scale — the only hard
@@ -172,20 +168,10 @@ MM_PER_PX = 0.28
 # through coverage simplification instead, which is what keeps their shared edges bit-identical.
 NODATA_SIMPLIFY_PX = float(os.environ.get("NODATA_SIMPLIFY_PX", "1"))
 
-# Every line a nodata ring is cut on — the stem seam, the OSM shoreline, the coverage edge — abuts
-# a fill drawn from independently simplified geometry (the neighbour stem, the basemap's land, the
-# depth bands), and each side's simplification wobble opens background hairlines between the two
-# opaque fills. Dilating the finished rows by this many stem MVT pixels turns abutment into
-# overlap, which draws as nothing: bands and drying outrank nodata, land draws over water, and
-# nodata-on-nodata is one fill. 2 px covers the ≤1 px simplify recede plus tile-time wobble;
-# mitre join so a dense shoreline gains no arc vertices at its corners.
-NODATA_OVERLAP_PX = float(os.environ.get("NODATA_OVERLAP_PX", "2"))
-
 # Web Mercator's world half-width, in metres. 3857 -> 4326 normalizes longitude, so a vertex past
 # this edge lands on the FAR side of the antimeridian and its ring stretches around the globe as a
-# valid full-width bar at its latitude. The NODATA_OVERLAP_PX dilation is what reaches past, on the
-# edge stem whose clip box ends exactly here — and out there it has no neighbour to overlap, so the
-# write trims to this square first.
+# valid full-width bar at its latitude. The edge stem's clip box ends exactly here, so the write
+# trims to this square first rather than trust every overlay to stay inside it.
 WORLD_HALF_M = 20037508.342789244
 
 # Fixed-precision grid (metres) for overlays against multi-piece unions: GEOS 3.13's
@@ -827,6 +813,75 @@ def _dissolve_sublegible(bands, drvals, min_area):
     return [shapely.multipolygons(ps) if ps else shapely.MultiPolygon() for ps in out]
 
 
+def _drop_datum(dem, geom, block=4096):
+    """`geom`'s parts (EPSG:3857 drying polygons) without their exact-datum pixels — the land
+    sentinel and the merge's fill for water a source holds no depth for, which the raster keeps
+    as the unknown code (terrain._encode_tile). A part at least half datum is dropped whole: a
+    ditch grid under a coarse source, a zeroed shoreline cell, a polder's ditches and dike tops
+    inside one water polygon — tens of thousands of ribbons that would otherwise each cost a
+    staircase difference. A real foreshore from a source that resolves it has no exact-0 pixel
+    and keeps its geometry whole, so the shared 0 m chain the contour derivation reads is
+    untouched; a foreshore holding a datum patch loses exactly those pixels. Every part is
+    burned into one index raster per block, so the whole pass is a few rasterizes and a
+    bincount, not a call each; blocks, so a window-spanning polygon never pulls the whole
+    window in."""
+    from collections import defaultdict
+
+    import numpy as np
+    import shapely
+    from rasterio import features
+    from rasterio.windows import Window, from_bounds
+    from shapely import make_valid
+    from shapely.geometry import shape
+    from shapely.strtree import STRtree
+    parts = _polys(geom)
+    if not parts:
+        return []
+    under = np.zeros(len(parts) + 1, dtype=np.int64)
+    zero = np.zeros(len(parts) + 1, dtype=np.int64)
+    holes = defaultdict(list)
+    # No GDAL_CACHEMAX cap here: rasterio hands the value to GDAL in BYTES, and a 256-byte block
+    # cache makes rasterize re-walk every shape per cache-sized slice — 20 minutes for 200 parts.
+    with rasterio.open(dem) as src:
+        win = from_bounds(*shapely.total_bounds(parts), transform=src.transform)
+        c0, r0 = max(0, int(win.col_off)), max(0, int(win.row_off))
+        c1 = min(src.width, int(win.col_off + win.width) + 1)
+        r1 = min(src.height, int(win.row_off + win.height) + 1)
+        tree = STRtree(parts)
+        for row in range(r0, r1, block):
+            for col in range(c0, c1, block):
+                w = Window(col, row, min(block, c1 - col), min(block, r1 - row))
+                hits = tree.query(shapely.box(*rasterio.windows.bounds(w, src.transform)),
+                                  predicate="intersects")
+                if not len(hits):
+                    continue
+                wt = src.window_transform(w)
+                # Python ints: a NumPy scalar burn value sends rasterio down a path that took
+                # 30 minutes on 565 parts where ints take under a second.
+                ids = features.rasterize(((parts[i], int(i) + 1) for i in hits),
+                                         out_shape=(w.height, w.width), transform=wt, fill=0,
+                                         dtype="int32")
+                hit = ids > 0
+                if not hit.any():
+                    continue
+                under += np.bincount(ids[hit], minlength=len(parts) + 1)
+                z = hit & (src.read(1, window=w) == 0)
+                if not z.any():
+                    continue
+                zero += np.bincount(ids[z], minlength=len(parts) + 1)
+                for shp, val in features.shapes(ids, mask=z, transform=wt):
+                    holes[int(val)].append(shape(shp))
+    out = []
+    for i, part in enumerate(parts, 1):
+        if under[i] and zero[i] * 2 >= under[i]:
+            continue
+        if holes[i]:  # a sub-pixel hairline has no pixel and stays whole
+            part = make_valid(shapely.difference(
+                part, shapely.union_all(holes[i], grid_size=GRID), grid_size=GRID))
+        out.extend(_polys(part))
+    return out
+
+
 def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, levels_ft=None,
                 scale_z=None):
     """Partition any DEM covering the tile's buffered extent into depth-area / drying / nodata
@@ -846,7 +901,6 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, le
     min_area = SLIVER_MIN_PX * res * res       # slivers where a vector edge meets the raster shore
     stem_res = get_resolution(child_z)          # the stem's own MVT pixel, EPSG:3857 metres
     nodata_tol = NODATA_SIMPLIFY_PX * stem_res  # generalize nodata to the stem's resolution
-    nodata_pad = NODATA_OVERLAP_PX * stem_res   # dilate finished nodata rows over every cut line
     band_tol = SIMPLIFY_MM / MM_PER_PX * stem_res  # the S-58 vertex floor at this stem's scale
     # Drying legibility: area at the STEM's scale (what a reader sees), width in the DEM's own
     # pixel (what drew the ribbon) — the two differ on the coarsened retry window.
@@ -877,8 +931,7 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, le
     drying_raw = []       # the bucket as contoured — the ft ladder's coverage member
     drying_geoms = []     # the same bucket simplified with the metre ladder — what ships
     _mark(None)
-    datum_parts = []      # the exact-datum bucket, never foreshore
-    for sys_tag, levels in (("m", (levels_m or config.DEPARE_LEVELS) + [DRYING_EPS, config.DRYING_CAP]),
+    for sys_tag, levels in (("m", (levels_m or config.DEPARE_LEVELS) + [config.DRYING_CAP]),
                             ("ft", levels_ft or config.DEPARE_LEVELS_FT)):
         raw = partitions(dem, levels, f"{tmp}/depare-raw-{sys_tag}.fgb", timeout=timeout)
         drvals, bands = [], []
@@ -887,24 +940,12 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, le
                 drvals.append((r.drval1, r.drval2))
                 bands.append(repaired_multi([r.geometry]))
         if sys_tag == "m":
-            # The [0, DRYING_CAP] bucket — both the exact-datum [0, eps) and the foreshore
-            # [eps, cap] parts, keyed on amax alone: every other level is negative, so
-            # 0 < amax <= cap picks exactly these two regardless of the garbage amin. Kept whole
-            # as the coverage member so the shoalest band and the drying share their 0 m chain,
-            # which is the edge the 0 m line derives from. Land above the cap is dropped.
-            # Dissolved along the millimetre edge the two buckets share: the member must be one
-            # region, or the simplifier sees an invalid multipolygon and keeps raw geometry.
-            bucket = coverage_union(list(read_bucket(
-                raw, f"amax > 0 AND amax <= {config.DRYING_CAP}").geometry))
+            # The [0, DRYING_CAP] bucket, keyed on amax alone: 0 and the cap are discrete levels
+            # and every other level is negative, so 0 < amax <= cap uniquely picks it regardless
+            # of the garbage amin. Land above the cap (amax > cap) is dropped.
+            bucket = repaired_multi(read_bucket(
+                raw, f"amax > 0 AND amax <= {config.DRYING_CAP}").geometry)
             drying_raw = [] if bucket.is_empty else [bucket]
-            # The exact-datum parts come out of the emitted drying below. Parts under the sliver
-            # floor are the interpolation hairline between a band and real foreshore and stay;
-            # the rest border land or unknown water, never a band chain, so they simplify at the
-            # same floor the bands did rather than stamp a raw staircase into the drying's edge.
-            datum_parts = [piece for poly in _polys(repaired_multi(
-                read_bucket(raw, f"amax = {DRYING_EPS}").geometry))
-                if poly.area >= min_area
-                for piece in _subdivide(poly.simplify(band_tol, preserve_topology=True))]
         _mark(f"bands-read-{sys_tag}")
         simplified = simplify_coverage(bands + drying_raw, band_tol)
         bands = simplified[:len(drvals)]
@@ -985,15 +1026,11 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, le
                 _mark("drying-water-terms")
         effective = make_valid(effective)
         _mark("drying-make-valid")
-        if datum_parts and not effective.is_empty:
-            # Exact datum inside effective water — a clamp fill under a ditch a coarse source
-            # cannot resolve, a zeroed shoreline cell — is unknown, not foreshore: it leaves the
-            # drying here and falls to the nodata pass below.
-            near = STRtree(datum_parts).query(effective, predicate="intersects")
-            if len(near):
-                effective = make_valid(shapely.difference(
-                    effective, shapely.union_all([datum_parts[i] for i in near], grid_size=GRID),
-                    grid_size=GRID))
+        if not effective.is_empty:
+            # Exact datum inside effective water is unknown, not foreshore: it leaves the drying
+            # here and falls to the nodata pass below (_drop_datum).
+            kept = _drop_datum(dem, effective)
+            effective = shapely.multipolygons(kept) if kept else shapely.MultiPolygon()
             _mark("drying-diff-datum")
         if not effective.is_empty:
             drying_area = effective  # subtracted from nodata below (over the buffered extent)
@@ -1056,19 +1093,20 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, le
                         s = p.simplify(nodata_tol, preserve_topology=True)
                         if s.is_empty:
                             continue
-                        # Dilate the survivor over every line it was cut on — past the clip line
-                        # (the stem seam) and past the raw outline (the shoreline) — so the
-                        # abutting fills overlap instead of opening hairlines (NODATA_OVERLAP_PX).
-                        s = s.buffer(nodata_pad, join_style="mitre", mitre_limit=2.0)
                         nodata_by_kind.setdefault(kind, []).extend(_polys(s))
         _mark("nodata-loop")
-        # One dissolved region per kind: two abutting water polygons dilate into each other, and
-        # the fill compounds where rows overlap — a dark lattice along every OSM outline inside
-        # a lake. Only the seam and shoreline overlaps survive, where they close hairlines.
-        for kind, parts in nodata_by_kind.items():
-            sink.write([{"geometry": sp, "drval1": None, "drval2": None,
-                         "sys": None, "kind": kind, "rank": NODATA_RANK}
-                        for sp in _polys(valid_union(parts))], flush=False)
+        # One dissolved region: OSM water polygons overlap each other (a riverbank inside a lake
+        # multipolygon), and a translucent fill compounds wherever rows overlap. A region keeps
+        # its kind when one kind made it.
+        pieces = [(k, sp) for k, sps in nodata_by_kind.items() for sp in sps]
+        if pieces:
+            region = valid_union([sp for _, sp in pieces])
+            ktree = STRtree([sp for _, sp in pieces])
+            for sp in _polys(region):
+                kinds = {pieces[i][0] for i in ktree.query(sp, predicate="intersects")}
+                sink.write([{"geometry": sp, "drval1": None, "drval2": None, "sys": None,
+                             "kind": kinds.pop() if len(kinds) == 1 else None,
+                             "rank": NODATA_RANK}], flush=False)
         _mark("nodata-dissolve")
 
     if not sink.count and not sink.pending:
@@ -1525,11 +1563,10 @@ def _check():
     assert _RowSink.snap_budget(_drawable) > 1e3 * _RowSink.GRID ** 2, \
         "the floor must not become the budget for drawable geometry"
 
-    # A nodata row dilated past the world's east edge, as NODATA_OVERLAP_PX does on the
-    # easternmost stem, whose clip box ends exactly there. Untrimmed, the inverse transform puts
-    # the dilated vertices at -180 and the ring spans every longitude on Earth.
-    _edge = _box(WORLD_HALF_M - 500.0, 9.55e6, WORLD_HALF_M, 9.56e6).buffer(
-        NODATA_OVERLAP_PX * get_resolution(14), join_style="mitre", mitre_limit=2.0)
+    # A nodata row reaching past the world's east edge, as overlay wobble on the easternmost stem
+    # (whose clip box ends exactly there) can. Untrimmed, the inverse transform puts the vertices
+    # past the edge at -180 and the ring spans every longitude on Earth.
+    _edge = _box(WORLD_HALF_M - 500.0, 9.55e6, WORLD_HALF_M + 50.0, 9.56e6)
     _wrapped = gpd.GeoSeries([_edge], crs="EPSG:3857").to_crs("EPSG:4326").values[0].bounds
     assert _wrapped[2] - _wrapped[0] > 300, \
         "the fixture must wrap the antimeridian without the trim"
@@ -1755,14 +1792,11 @@ def _check():
     except ContourTimeout:
         pass
 
-    # nodata simplification + dilation: a dense OSM-style outline generalizes to the stem's
-    # resolution, shedding vertices while its area barely moves. The post-clip simplify recedes
-    # ≤ tol from every line the piece was cut on; the NODATA_OVERLAP_PX dilation must push the
-    # finished row back over all of them — across the clip line (the stem seam) and past the raw
-    # outline (the shoreline) — so the abutting fills overlap instead of opening hairlines.
+    # nodata simplification: a dense OSM-style outline generalizes to the stem's resolution,
+    # shedding vertices while its area barely moves, and the post-clip simplify keeps a piece's
+    # ring inside its clip line — it recedes ≤ tol from the seam and never crosses it.
     from shapely import get_num_coordinates
     tol = NODATA_SIMPLIFY_PX * get_resolution(14)
-    pad = NODATA_OVERLAP_PX * get_resolution(14)
     ring = [(1000.0 * np.cos(t) + 0.37 * tol * np.sin(60 * t),
              1000.0 * np.sin(t) + 0.37 * tol * np.cos(60 * t))
             for t in np.linspace(0, 2 * np.pi, 4000, endpoint=False)]  # dense, sub-tol wobble
@@ -1775,11 +1809,10 @@ def _check():
         s = piece.simplify(tol, preserve_topology=True)
         if s.is_empty:
             continue
-        s = s.buffer(pad, join_style="mitre", mitre_limit=2.0)
-        assert s.is_valid and s.covers(piece), \
-            "a dilated nodata row must cover its own cut piece (no shoreline sliver)"
-        assert s.bounds[0] < -pad / 2, \
-            "a dilated nodata row must cross the clip line (seam overlap, not abutment)"
+        assert s.is_valid and s.bounds[0] >= -1e-6, \
+            "a simplified nodata row must never cross its clip line"
+        assert shapely.hausdorff_distance(s, piece) <= tol + 1e-9, \
+            "a simplified nodata row must recede at most tol from its cut piece"
 
     d = tempfile.mkdtemp()
     h = w = 60
@@ -1860,20 +1893,17 @@ def _check():
     assert sorted(x.wkb for x in g.geometry) == sorted(x.wkb for x in g2.geometry), \
         "partitions not deterministic"
 
-    # A uniform-0 DEM (terrain exactly at datum) yields NO depth band and lands in the
-    # exact-datum bucket, which the drying pass never emits: a merge-filled-0 area is unknown
-    # water, never a false shoal and never foreshore — the raster's rule for water-side 0.
+    # A uniform-0 DEM (terrain exactly at datum) yields NO depth band; its [0, cap] bucket is
+    # exact datum, which the drying pass removes pixel by pixel: a merge-filled-0 area is
+    # unknown water, never a false shoal and never foreshore — the raster's rule for water-side
+    # 0 (the kind fixture below proves it end to end).
     flat = np.zeros((h, w), dtype="float32")
     fp = f"{d}/flat.tif"
     with rasterio.open(fp, "w", driver="GTiff", height=h, width=w, count=1, dtype="float32",
                        nodata=-9999, crs="EPSG:3857", transform=tr) as dst:
         dst.write(flat, 1)
-    flat_raw = partitions(fp, config.DEPARE_LEVELS + [DRYING_EPS, cap], f"{d}/flat-raw.fgb")
-    assert len(read_bucket(flat_raw, "amax <= 0")) == 0, \
-        "a uniform-0 surface must produce no depth band"
-    assert len(read_bucket(flat_raw, f"amax = {DRYING_EPS}")) == 1 and \
-        len(read_bucket(flat_raw, f"amax = {cap}")) == 0, \
-        "a uniform-0 surface is the exact-datum bucket alone, never foreshore"
+    flat_g = read_bucket(partitions(fp, levels_m, f"{d}/flat-raw.fgb"), "amax <= 0")
+    assert len(flat_g) == 0, "a uniform-0 surface must produce no depth band"
 
     # The drying water term is tidal-only, end to end: one [0, cap] band crossing two water
     # polygons that both sit inside the land coverage (so the water term alone decides) ships as

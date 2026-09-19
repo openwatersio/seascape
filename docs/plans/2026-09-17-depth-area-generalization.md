@@ -77,7 +77,7 @@ What the tier cut does not handle is a fragment that survives the coarse pixel a
 - If any neighbour is **shallower** (smaller `drval1`), dissolve the part into the shallowest neighbour. The area now reads shallower: a pit removed, safe.
 - If every neighbour is **deeper**, the part is a local shoal. It is kept as it is. A peak is never removed; exaggeration to the minimum drawable size is the fuller treatment and is listed under open questions, not built here.
 
-Adjacency comes from the partition's shared edges (the coverage is already noded), the candidates are a small minority of a tier partition that is itself small, and the dissolve is a union of two neighbours along a shared edge — bounded work, unlike anything run on the native partition. Drying parts go through `_illegible_drying` at tier scale as they do now; nodata rows are simplified to the tier pixel and dilated by `NODATA_OVERLAP_PX` at tier resolution, as they are now.
+Adjacency comes from the partition's shared edges (the coverage is already noded), the candidates are a small minority of a tier partition that is itself small, and the dissolve is a union of two neighbours along a shared edge — bounded work, unlike anything run on the native partition. Drying parts go through `_illegible_drying` at tier scale as they do now; nodata rows are simplified to the tier pixel, as they are now.
 
 ### 3d. Zoom placement and bundling
 
