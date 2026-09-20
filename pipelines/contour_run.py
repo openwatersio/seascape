@@ -481,9 +481,10 @@ def _tile_grid_deg(z):
 
 
 def _survives_leaf(geom, min_deg):
-    """Whether tippecanoe must keep this geometry at the leaf zoom (so completeness can require it).
-    Points always; lines by length; polygons by linear size sqrt(area) — all in degrees, min_deg being
-    COMPLETENESS_MIN_PX leaf pixels. Anisotropy (lon vs lat degrees) is inside the 4-px margin."""
+    """Whether tippecanoe must keep this geometry at the finest zoom it is written to (so completeness
+    can require it). Points always; lines by length; polygons by linear size sqrt(area) — all in
+    degrees, min_deg being COMPLETENESS_MIN_PX pixels of that zoom. Anisotropy (lon vs lat degrees)
+    is inside the 4-px margin."""
     t = geom.geom_type
     if "Point" in t:
         return True
@@ -503,11 +504,13 @@ def _fgb_to_seq(fgbs, cols, minzoom_fn, out_path, layer, identity_fn, id0, maxz,
     shallow tile; the explicit filter is what makes this our contract, not tippecanoe's clamp.
     `maxzoom` (a tier's last zoom) is written as tippecanoe.maxzoom; None persists through overzoom.
     Appends, so one seq can gather several tiers. Returns (next_id, {id: identity} for the
-    completeness set) — only above-leaf-pixel features enter it (sub-pixel slivers are exempt,
-    since tippecanoe drops them legitimately)."""
+    completeness set) — only features above the pixel of the finest zoom they are written to (the
+    tier's last, else the run's -z) enter it: tippecanoe drops a sub-pixel sliver legitimately,
+    and a coarse tier's sliver is measured against its own coarse pixel, not the leaf's."""
     import geopandas as gpd
     from shapely.geometry import mapping
-    min_deg = COMPLETENESS_MIN_PX * _leaf_pixel_deg(maxz, leaf_detail)
+    min_deg = COMPLETENESS_MIN_PX * _leaf_pixel_deg(maxz if maxzoom is None else min(maxzoom, maxz),
+                                                    leaf_detail)
     fid = id0
     ids = {}
     with open(out_path, "a") as fh:

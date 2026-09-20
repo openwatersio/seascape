@@ -883,7 +883,7 @@ def _drop_datum(dem, geom, block=4096):
 
 
 def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, levels_ft=None,
-                scale_z=None):
+                scale_z=None, fine_z=None):
     """Partition any DEM covering the tile's buffered extent into depth-area / drying / nodata
     rows. Returns (final_path, count) inside ``tmp``, or None when there is no water."""
     import geopandas as gpd
@@ -909,6 +909,11 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, le
     # Band/nodata legibility at the display scale a compiled tier serves; the native tier keeps
     # every part, since it also serves the overzoom where they are legible.
     legible_area = LEGIBLE_MM2 * (get_resolution(scale_z) / MM_PER_PX) ** 2 if scale_z else 0.0
+    # Unknown-water dust: a seam clip piece under half an MVT pixel square at the tier's finest
+    # display zoom is below what tippecanoe keeps, and no derivation reads these rows (bands and
+    # drying ship whole: the isobaths derive from their shared edges, and the census exempts
+    # their slivers instead).
+    dust_area = (get_resolution(fine_z) / 2) ** 2 if fine_z else 0.0
     sink = _RowSink(f"{tmp}/depare-rows.geojsons")
 
     # ── depth bands + drying ── the metre + fathom partition ladders, each off one gdal_contour -p
@@ -1085,7 +1090,9 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, le
                 # (a ditch under a coarse source) is noise; a compact unknown pond is charted.
                 if full.area >= max(min_area, legible_area) and not _illegible_drying(
                         full, drying_legible_area, drying_min_width):
-                    for p in _polys(full.intersection(clip)):  # then clip to the seam; no re-filter on the piece
+                    for p in _polys(full.intersection(clip)):  # then clip to the seam; only dust is re-filtered
+                        if p.area < dust_area:
+                            continue
                         # Simplify POST-clip, per-piece: kept vertices are a subset inside the clip
                         # box, so the ring can never cross the seam outward — at worst it recedes
                         # ≤ tol from the clip line (resolution-scale wobble, like the raster staircase).
@@ -1279,15 +1286,19 @@ def tile(stem):
                 finer, finer_z = dem, tier.surface
             _mark(f"{tier.name}-surface")
             scale_z = tier.first if tier.last is not None else None
+            # The native tier is written from its first zoom down to the cell's own depth.
+            fine_z = tier.last if tier.last is not None else max(child_z, tier.first)
             try:
                 res = _depare_dem(dem, tile_obj, tier.surface, tier_tmp, label, timeout=timeout,
-                                  levels_m=tier.levels_m, levels_ft=tier.levels_ft, scale_z=scale_z)
+                                  levels_m=tier.levels_m, levels_ft=tier.levels_ft, scale_z=scale_z,
+                                  fine_z=fine_z)
             except ContourTimeout as e:
                 print(f"depare tile {label}: {e} — retrying on a uniform 4x shoal-biased window",
                       file=sys.stderr, flush=True)
                 dem = _uniform_coarsen(dem, 4, f"{tier_tmp}/dem-4x.tiff")
                 res = _depare_dem(dem, tile_obj, tier.surface, tier_tmp, label, timeout=timeout,
-                                  levels_m=tier.levels_m, levels_ft=tier.levels_ft, scale_z=scale_z)
+                                  levels_m=tier.levels_m, levels_ft=tier.levels_ft, scale_z=scale_z,
+                                  fine_z=fine_z)
             except MemoryError:
                 # An allocation the kernel refused (overcommit says no when a single request
                 # exceeds free RAM+swap) — no OOM kill, and formatting a traceback at that point
@@ -1981,6 +1992,38 @@ def _check():
         "nodata rows of one tile must not overlap each other"
     assert nodata_rows.covers(lake.intersection(lake_b).centroid).any(), \
         "abutting lakes share one unknown-water region across their common edge"
+
+    # Dust: a clip piece too small for tippecanoe to keep at the tier's finest display zoom never
+    # ships, since a row in no tile fails the cell census. This DEM carries a 10-cell halo, so a
+    # lake in the halo reaches into the tile by a nub: a hair-sized one is dust, a strip is kept.
+    hp = f"{d}/halo-dem.tif"
+    with rasterio.open(hp, "w", driver="GTiff", height=80, width=80, count=1, dtype="float32",
+                       nodata=-9999, crs="EPSG:3857",
+                       transform=from_origin(bb.left - 10 * wres, bb.top + 10 * wres, wres, wres)) as dst:
+        dst.write(np.full((80, 80), -9999, dtype="float32"), 1)
+    dust_side = get_resolution(t.z) / 4   # a quarter MVT pixel square: under the floor
+    kept_side = get_resolution(t.z) * 4   # four MVT pixels square: well over it
+    halo_lake = _box(bb.left - 8 * wres, bb.top - 30 * wres, bb.left, bb.top - 20 * wres)
+    hair = halo_lake.union(_box(bb.left, bb.top - 25 * wres, bb.left + dust_side,
+                                bb.top - 25 * wres + dust_side))
+    halo_lake2 = _box(bb.left - 8 * wres, bb.top - 50 * wres, bb.left, bb.top - 40 * wres)
+    strip = halo_lake2.union(_box(bb.left, bb.top - 45 * wres, bb.left + kept_side,
+                                  bb.top - 45 * wres + kept_side))
+    gpd.GeoDataFrame({"kind": ["lake", "lake"]}, geometry=[hair, strip],
+                     crs="EPSG:3857").to_file(f"{d}/halo-water.fgb", driver="FlatGeobuf")
+    os.environ["LANDMASK"], os.environ["WATERMASK"] = f"{d}/land.fgb", f"{d}/halo-water.fgb"
+    try:
+        out = _depare_dem(hp, t, t.z, tempfile.mkdtemp(), "dust-check", fine_z=t.z)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    dust_rows = gpd.read_file(out[0]).to_crs("EPSG:3857")
+    assert len(dust_rows) == 1 and dust_rows["drval1"].isna().all() and \
+        dust_rows.geometry.iloc[0].intersects(strip) and not dust_rows.geometry.iloc[0].intersects(hair), \
+        f"the strip nub ships as unknown water and the hair nub is dust, got {len(dust_rows)} rows"
     # ── the tier operators ──
     # Dissolve: a sub-legible part with a shallower neighbour merges into it (area conserved,
     # partition disjoint); a sub-legible island with no band neighbour drops; a sub-legible part
