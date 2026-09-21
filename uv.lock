@@ -156,7 +156,7 @@ requires-dist = [
     { name = "requests", specifier = ">=2.32" },
     { name = "scipy", specifier = ">=1.10" },
     { name = "shapely", specifier = ">=2.1.2" },
-    { name = "snakemake", specifier = "==9.26.1" },
+    { name = "snakemake", specifier = "==9.27.0" },
     { name = "typing-extensions", specifier = ">=4.16.0" },
 ]
 
@@ -906,11 +906,11 @@ wheels = [
 
 [[package]]
 name = "pmtiles"
-version = "3.7.0"
+version = "3.8.1"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/16/3e/47e371add5ba09615c95c5ef72d8c3be471819d6dce07bae26c8e15d0687/pmtiles-3.7.0.tar.gz", hash = "sha256:ed8b04d550d104c81a759c9cc07bfc5743750f62e751f840425f4b9f4bb903df", size = 14582, upload-time = "2026-02-10T16:00:22Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/b9/b4/d1f0d62e37c885c441ef34360a72d9350ab87924ac5eb60b762ef9e14466/pmtiles-3.8.1.tar.gz", hash = "sha256:0f594a61b37fca039f06162428781f76a4233f5beea94444702f0dc41f20f007", size = 14931, upload-time = "2026-09-16T18:37:09.704Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d6/de/c0f177fd73818e0d671903ed986d4541674b0fad4365c7ecfd5a0af23a6d/pmtiles-3.7.0-py3-none-any.whl", hash = "sha256:d1a7a7a166ce3c5c8756cc2c8e4b0aa55e3d854fbd4517c963de16c39b631b14", size = 16848, upload-time = "2026-02-10T16:00:20.925Z" },
+    { url = "https://files.pythonhosted.org/packages/06/d4/1c451e0fb91caa3826a4ea34514ee6742802db3cbef3209976051e989d17/pmtiles-3.8.1-py3-none-any.whl", hash = "sha256:718561bb21f8c7dd5464fdcc3b9ad0e7b1c917be60ddfdf9a5ab56b8c67f7bde", size = 17058, upload-time = "2026-09-16T18:37:08.283Z" },
 ]
 
 [[package]]
@@ -1634,7 +1634,7 @@ wheels = [
 
 [[package]]
 name = "snakemake"
-version = "9.26.1"
+version = "9.27.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "conda-inject" },
@@ -1669,9 +1669,9 @@ dependencies = [
     { name = "wrapt" },
     { name = "yte" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/3e/37/f999e99357a9b30c6f36c92027ab3b6f64cade4ec54840197853297d2e04/snakemake-9.26.1.tar.gz", hash = "sha256:091b5d480c0c5eb2ef75b2568e9885091f3e2f11372de358da98ef66ef66e1e0", size = 6814489, upload-time = "2026-08-28T05:44:51.852Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a7/45/24d36c4f42c4e97d484110a8cd29a90ef2179951a0faa96900c29bdc99ee/snakemake-9.27.0.tar.gz", hash = "sha256:cd80a66dda92d274af02244a0c861d7de8851402b23caadbcbcc101f4c04a0d6", size = 6818358, upload-time = "2026-09-11T13:45:51.762Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/07/16/85def09087afe9b75b789d4dd75e4ed2bbaa0c03b86b96a96bb004074b92/snakemake-9.26.1-py3-none-any.whl", hash = "sha256:076384fd68f2cf8f5816aa53210566e8fb15fbb618e2f9449845db0556cc93b5", size = 1164575, upload-time = "2026-08-28T05:44:49.693Z" },
+    { url = "https://files.pythonhosted.org/packages/29/c1/eac97958cdf68eff9e2479a136817ed646c6d8c4fa835975a11daf02a648/snakemake-9.27.0-py3-none-any.whl", hash = "sha256:5e1bde6ef7c418f8b1734347bf143b05402419081bfe184715fe271cb1f26671", size = 1165618, upload-time = "2026-09-11T13:45:49.532Z" },
 ]
 
 [[package]]
