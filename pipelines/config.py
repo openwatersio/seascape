@@ -66,6 +66,80 @@ CONTOUR_LEVELS_FT = sorted(round(-fm * 1.8288, 4) for fm in FATHOM_CURVES)
 DEPARE_LEVELS = sorted({*CONTOUR_LEVELS, 0})
 DEPARE_LEVELS_FT = sorted({*CONTOUR_LEVELS_FT, 0})
 
+# Scale-dependent contour interval: coarse isobaths zoomed out, finer zoomed in (charts thin the
+# deep, not the shelf — abyssal contours stipple into noise at small scale). (zoom ceiling,
+# metre levels shown below it); at/above the last ceiling every level shows. Each list is a
+# subset of CONTOUR_LEVELS.
+CONTOUR_TIERS = [
+    (5, [-200, -1000, -2000, -4000]),
+    (7, [-200, -500, -1000, -2000, -3000, -4000]),
+    (9, [-50, -100, -200, -300, -500, -1000, -2000, -3000, -4000, -5000, -6000, -8000, -10000]),
+    (11, [-10, -20, -30, -50, -100, -200, -300, -500, -1000, -2000, -3000, -4000, -5000, -6000,
+          -8000, -10000]),
+]
+
+
+def contour_levels_at(z):
+    """The metre isobaths drawn at zoom z."""
+    for ceil_z, lvls in CONTOUR_TIERS:
+        if z < ceil_z:
+            return lvls
+    return CONTOUR_LEVELS
+
+
+# Depth areas are compiled per zoom tier, the way an ENC compiles a separate cell per usage band:
+# each tier is its own gapless partition, cut from the mosaic's pyramid level at the tier's first
+# zoom with the isobath ladder drawn there (bands and lines at a zoom share one surface and one
+# ladder), and it serves every zoom up to the next tier. The last tier a stem holds is cut from
+# its native window and serves every zoom above it — with its own zoom's ladder, not a finer one:
+# the band set is a function of scale (NOAA ENC Design Handbook Table 3), and a coarse source
+# viewed closer is an overscaled cell showing the same content (S-101 maximumDisplayScale), never
+# 2 m bands interpolated from cells that could not resolve them (S-4 B-412). z13 changes the
+# surface, not the ladder.
+DEPARE_TIER_STARTS = [6, 7, 9, 11, 13]
+
+
+class DepareTier(tuple):
+    """(first zoom, last zoom or None, surface zoom, metre levels, fathom-ladder levels)."""
+    __slots__ = ()
+    first = property(lambda t: t[0])
+    last = property(lambda t: t[1])
+    surface = property(lambda t: t[2])
+    levels_m = property(lambda t: t[3])
+    levels_ft = property(lambda t: t[4])
+    name = property(lambda t: f"t{t[0]}")
+
+
+def depare_tiers(child_z):
+    """The tiers a stem at child_z holds. A tier whose first zoom reaches the native resolution
+    — or the last tier of the list — is cut from the native window, serves every zoom above with
+    its own ladder, and ends the list; tiers after it do not exist for the stem."""
+    out = []
+    for i, z in enumerate(DEPARE_TIER_STARTS):
+        final = z >= child_z or i == len(DEPARE_TIER_STARTS) - 1
+        m = sorted({*contour_levels_at(z), 0})
+        # Fathom curves mirror by depth: a curve draws once it is at least as deep as the
+        # tier's shallowest metre isobath; the full ladder draws every curve.
+        if m == DEPARE_LEVELS:
+            ft = DEPARE_LEVELS_FT
+        else:
+            shoalest = max(l for l in m if l < 0)
+            ft = sorted({*(l for l in DEPARE_LEVELS_FT if l <= shoalest), 0})
+        if final:
+            out.append(DepareTier((z, None, child_z, m, ft)))
+            break
+        out.append(DepareTier((z, DEPARE_TIER_STARTS[i + 1] - 1, z, m, ft)))
+    return out
+
+
+def depare_tier_at(z):
+    """The tier serving display zoom z (None below the first tier's zoom)."""
+    tier = None
+    for start in DEPARE_TIER_STARTS:
+        if z >= start:
+            tier = start
+    return tier
+
 
 def sources():
     """All source ids (directory names under SOURCES_DIR)."""

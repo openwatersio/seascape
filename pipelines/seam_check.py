@@ -339,21 +339,24 @@ def check_depare(fgbA, fgbB, edge, coarser_cz):
 
 # ── CLI drivers ───────────────────────────────────────────────────────────────
 
-def _run_pair(mode, stemA, stemB):
-    """Run one check on one adjacent pair; print a per-pair verdict + report. Returns True on PASS
-    (an antimeridian pair prints a note and counts as PASS — it's skipped, not failed)."""
+def _run_pair(mode, stemA, stemB, tiers=None):
+    """Run one check on one adjacent pair (each side's tier file when `tiers` names them); print
+    a per-pair verdict + report. Returns True on PASS (an antimeridian pair prints a note and
+    counts as PASS — it's skipped, not failed)."""
     A, B = parse_stem(stemA), parse_stem(stemB)
     edge = shared_edge(A, B)
+    what = f"{mode} {stemA} | {stemB}" + (f" @{tiers[0]}|{tiers[1]}" if tiers else "")
     if edge == "antimeridian":
-        print(f"SKIP {mode} {stemA} | {stemB}: antimeridian seam")
+        print(f"SKIP {what}: antimeridian seam")
         return True
     if edge is None:
         raise SystemExit(f"seam_check: {stemA} and {stemB} are not edge-adjacent")
     coarser_cz = min(A[3], B[3])   # coarser resolution (smaller child_z) sets the tolerance
     folder = "contour" if mode == "contours" else "depare"
-    fa, fb = f"store/{folder}/{stemA}.fgb", f"store/{folder}/{stemB}.fgb"
+    sa, sb = (f"-{tiers[0]}", f"-{tiers[1]}") if tiers else ("", "")
+    fa, fb = f"store/{folder}/{stemA}{sa}.fgb", f"store/{folder}/{stemB}{sb}.fgb"
     ok, report = (check_contours if mode == "contours" else check_depare)(fa, fb, edge, coarser_cz)
-    print(f"{'PASS' if ok else 'FAIL'} {mode} {stemA} | {stemB}")
+    print(f"{'PASS' if ok else 'FAIL'} {what}")
     for line in report:
         print(line)
     return ok
@@ -370,7 +373,17 @@ def auto():
         stems = f.read().split()
     # A 0-byte sentinel counts as built-and-empty: an empty tile beside a neighbor whose
     # features cross their shared edge is exactly the discontinuity this gate exists to catch.
-    built = [s for s in stems if os.path.exists(f"store/contour/{s}.fgb")]
+    # Each zoom tier is an independent cut, so the pair at a zoom is the tier SERVING that zoom
+    # on each side — at a coarse/fine boundary that is the coarse stem's final tier against the
+    # fine stem's tier, the seam a viewer sees. A tier past a stem's final one is a sentinel by
+    # design and never a side of a pair.
+    import config
+
+    def serving(stem, z):
+        tiers = config.depare_tiers(parse_stem(stem)[3])
+        return next(t for t in reversed(tiers) if t.first <= z).name
+
+    built = [s for s in stems if os.path.exists(f"store/contour/{s}-t{config.DEPARE_TIER_STARTS[0]}.fgb")]
     index = {}
     for s in built:
         z, x, y, _cz = parse_stem(s)
@@ -401,17 +414,25 @@ def auto():
 
     results, failures = [], 0
     for a, b in pairs:
-        ok = _run_pair("contours", a, b)
-        results.append((ok, "contours", a, b))
-        failures += 0 if ok else 1
-        # depare only where both tiles have a depare output (a partially built store) — a
-        # missing depare file is noted, not a failure.
-        if os.path.exists(f"store/depare/{a}.fgb") and os.path.exists(f"store/depare/{b}.fgb"):
-            ok = _run_pair("depare", a, b)
-            results.append((ok, "depare", a, b))
+        done = set()
+        for z in config.DEPARE_TIER_STARTS:
+            t = (serving(a, z), serving(b, z))
+            if t in done:
+                continue
+            done.add(t)
+            if not (os.path.exists(f"store/contour/{a}-{t[0]}.fgb") and os.path.exists(f"store/contour/{b}-{t[1]}.fgb")):
+                continue
+            ok = _run_pair("contours", a, b, t)
+            results.append((ok, f"contours@{t[0]}|{t[1]}", a, b))
             failures += 0 if ok else 1
-        else:
-            print(f"SKIP depare {a} | {b}: depare output missing for one side")
+            # depare only where both tiles have a depare output (a partially built store) — a
+            # missing depare file is noted, not a failure.
+            if os.path.exists(f"store/depare/{a}-{t[0]}.fgb") and os.path.exists(f"store/depare/{b}-{t[1]}.fgb"):
+                ok = _run_pair("depare", a, b, t)
+                results.append((ok, f"depare@{t[0]}|{t[1]}", a, b))
+                failures += 0 if ok else 1
+            else:
+                print(f"SKIP depare {a} | {b} @{t[0]}|{t[1]}: depare output missing for one side")
 
     print(f"\nseam_check auto summary ({len(pairs)} pair(s){note}):")
     for ok, mode, a, b in results:

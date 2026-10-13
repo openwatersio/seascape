@@ -304,16 +304,16 @@ def check_vector_selfcheck():
 
     try:
         # ── base 3-layer archive: big features well above the leaf-pixel floor, all present ──
-        contours = [feat(1, line([[0.0, 0.0], [0.1, 0.05]]), {"depth_m": -4000, "sys": "m"}),
-                    feat(2, line([[0.0, 0.1], [0.1, 0.15]]), {"depth_m": -4000, "sys": "m"})]
+        contours = [feat(1, line([[0.0, 0.0], [0.1, 0.05]]), {"depth_m": -4000, "sys": "m"}, mn=6),
+                    feat(2, line([[0.0, 0.1], [0.1, 0.15]]), {"depth_m": -4000, "sys": "m"}, mn=6)]
         soundings = [feat(3, pt([0.02, 0.02]), {"depth_m": 5}),
                      feat(4, pt([0.05, 0.12]), {"depth_m": 9})]
-        depare = [feat(5, square(0.0, 0.0, 0.05), {"sys": "m", "drval1": 5}, mn=6),
-                  feat(6, square(0.2, 0.2, 0.05), {"sys": "m", "drval1": 10}, mn=6)]
+        depare = [feat(5, square(0.0, 0.0, 0.05), {"sys": "m", "drval1": 200}, mn=6),
+                  feat(6, square(0.2, 0.2, 0.05), {"sys": "m", "drval1": 500}, mn=6)]
         vec = build([("contours", contours), ("soundings", soundings), ("depare", depare)], 8)
         expected = {"contours": {1: "contour sys=m depth_m=-4000", 2: "contour sys=m depth_m=-4000"},
                     "soundings": {3: "sounding depth=5", 4: "sounding depth=9"},
-                    "depare": {5: "depare drval1=5", 6: "depare drval1=10"}}
+                    "depare": {5: "depare drval1=200", 6: "depare drval1=500"}}
         cr._vector_selfcheck(vec, 8, expected)  # POSITIVE: a correct archive must pass
         print("  positive: correct 3-layer archive passes")
 
@@ -327,14 +327,14 @@ def check_vector_selfcheck():
 
         # (d) overlapping depare pair (two m-bands, ~50% overlap in one tile)
         snd = [feat(3, pt([0.5, 0.5]), {"depth_m": 5})]
-        over = [feat(1, square(0.4, 0.4, 0.1), {"sys": "m", "drval1": 5}, mn=6),
-                feat(2, square(0.45, 0.45, 0.1), {"sys": "m", "drval1": 10}, mn=6)]
+        over = [feat(1, square(0.4, 0.4, 0.1), {"sys": "m", "drval1": 200}, mn=6),
+                feat(2, square(0.45, 0.45, 0.1), {"sys": "m", "drval1": 500}, mn=6)]
         vov = build([("soundings", snd), ("depare", over)], 8)
         must_raise(vov, 8, None, "overlap", "overlapping depare pair")
         # (e) dropped drval1==0 band — the 0-band must participate in the partition check
         # (with the `drval1 or -1` bug it was excluded, so this overlap went undetected → no raise)
         zero = [feat(1, square(0.4, 0.4, 0.1), {"sys": "m", "drval1": 0}, mn=6),
-                feat(2, square(0.45, 0.45, 0.1), {"sys": "m", "drval1": 5}, mn=6)]
+                feat(2, square(0.45, 0.45, 0.1), {"sys": "m", "drval1": 200}, mn=6)]
         vz = build([("soundings", snd), ("depare", zero)], 8)
         must_raise(vz, 8, None, "overlap", "drval1==0 band in partition check")
         print("  (d) overlapping depare pair and (e) drval1==0 band both caught by the overlap check")
@@ -349,8 +349,8 @@ def check_vector_selfcheck():
         def half(x0, x1):
             return {"type": "Polygon", "coordinates": [[[x0 + eps, b.south + eps], [x1 - eps, b.south + eps],
                     [x1 - eps, b.north - eps], [x0 + eps, b.north - eps], [x0 + eps, b.south + eps]]]}
-        gdepare = [feat(1, half(b.west, midx), {"sys": "m", "drval1": 5}, mn=6),
-                   feat(2, half(midx, b.east), {"sys": "m", "drval1": 10}, mn=6, mx=6)]
+        gdepare = [feat(1, half(b.west, midx), {"sys": "m", "drval1": 200}, mn=6),
+                   feat(2, half(midx, b.east), {"sys": "m", "drval1": 500}, mn=6, mx=6)]
         gsnd = [feat(10 + i, pt([(mercantile.bounds(ch).west + mercantile.bounds(ch).east) / 2,
                                  (mercantile.bounds(ch).south + mercantile.bounds(ch).north) / 2]),
                      {"depth_m": 5})
@@ -373,16 +373,15 @@ def check_shallow_minzoom_filter():
     import contour_run as cr
     tmp = tempfile.mkdtemp()
     try:
-        deep, shoal, cut = -4000, -2, 3  # minzoom("m",-4000)==0 <= cut < native+ minzoom("m",-2)
-        assert cr.contour_minzoom("m", deep) <= cut < cr.contour_minzoom("m", shoal)
+        deep, shoal, cut = -4000, -2, 3  # the deep curve's tier fits under the cut, the shoal one's does not
+        zoom_of = {deep: 0, shoal: 10}
         fgb = f"{tmp}/c.fgb"
         gpd.GeoDataFrame(
             {"depth_m": [deep, shoal], "sys": ["m", "m"]},
             geometry=[LineString([(0, 0), (0.1, 0.1)]), LineString([(0, 0.2), (0.1, 0.3)])],
             crs="EPSG:4326").to_file(fgb, driver="FlatGeobuf")
         seq = f"{tmp}/c.geojsons"
-        cr._fgb_to_seq([fgb], ("depth_m", "sys"),
-                       lambda p: cr.contour_minzoom(p["sys"], float(p["depth_m"])),
+        cr._fgb_to_seq([fgb], ("depth_m", "sys"), lambda p: zoom_of[int(p["depth_m"])],
                        seq, "contour", lambda p: str(p.get("depth_m")), 0, 10, max_minzoom=cut)
         written = [json.loads(l) for l in open(seq)]
         assert len(written) == 1 and written[0]["properties"]["depth_m"] == deep, \
@@ -649,8 +648,8 @@ def main():
                         p = feat["properties"]
                         d, s = p.get("depth_m"), p.get("sys")
                         if d is not None and s:
-                            assert contour_run.contour_minzoom(s, float(d)) <= SPLIT_Z - 1, \
-                                f"contour depth_m={d} minzoom exceeds shallow -z at z{z}"
+                            assert contour_run.tier_shows(s, float(d), z), \
+                                f"contour depth_m={d} sys={s} is not in the tier ladder at z{z}"
 
         # ── the joined archive's safety invariants (Verification 3,4,5): one served archive, three
         # layers, all zoom gating per-feature. _vector_selfcheck asserts no depare below z6, no
@@ -741,10 +740,10 @@ def main():
         import mercantile
         inwin_set = set(inwin)
 
-        def _neighbors(stem, pool):
+        def _neighbors(stem, pool, buffer=None):
             z, x, y, _cz = (int(a) for a in stem.split("-"))
             l, b, r, t = aggregation_reproject.buffered_bounds(
-                mercantile.Tile(x=x, y=y, z=z), mosaic.window_buffer_3857(stem))
+                mercantile.Tile(x=x, y=y, z=z), buffer or mosaic.window_buffer_3857(stem))
             hit = []
             for s in pool:
                 sz, sx, sy, _c = (int(a) for a in s.split("-"))
@@ -755,6 +754,15 @@ def main():
 
         n_heal = sum(1 for s in inwin if any(n not in inwin_set for n in _neighbors(s, stems)))
         assert 0 < n_heal < n_inwin, f"heal set must be a nonempty strict subset: {n_heal}/{n_inwin}"
+        # depth areas read further: a coarse tier's surface carries the smooth halo at the tier's
+        # own resolution, so its heal set is the stems whose widest tier halo leaves the window
+        # (contours derive from depare and heal with it; soundings read the native window only).
+        import config
+        import smooth
+        widest = smooth.halo_px() * aggregation_reproject.get_resolution(config.DEPARE_TIER_STARTS[0])
+        n_heal_depare = sum(1 for s in inwin
+                            if any(n not in inwin_set for n in _neighbors(s, stems, widest)))
+        assert n_heal <= n_heal_depare <= n_inwin, f"depare heal set: {n_heal_depare}/{n_inwin}"
 
         snake(tmp, "-c", "4", "bundles", env={"BBOX": bbox})   # real regional build
 
@@ -764,9 +772,12 @@ def main():
         assert counts.get("mosaic_tile", 0) == 0, f"scope change must never re-merge: {counts}"
         # the bbox run re-forked its in-window stems with TRUNCATED neighborhoods (input set is
         # bbox-scoped); the planet build heals exactly the boundary stems via the input-set trigger.
-        assert counts.get("contour_tile", 0) == n_heal, f"planet must re-fork the {n_heal} bbox-truncated stems: {counts}"
-        assert counts.get("soundings_tile", 0) == n_heal, f"soundings heal too: {counts}"
-        assert counts.get("depare_tile", 0) == n_heal, f"depare heals too: {counts}"
+        assert counts.get("contour_tile", 0) == n_heal_depare, \
+            f"planet must re-fork the {n_heal_depare} stems whose tier halo was bbox-truncated: {counts}"
+        # soundings read the native window only, but that window is a temp() the depare rerun
+        # regenerates, and a regenerated temp() reruns every consumer: they heal with depare.
+        assert counts.get("soundings_tile", 0) == n_heal_depare, f"soundings heal too: {counts}"
+        assert counts.get("depare_tile", 0) == n_heal_depare, f"depare heals too: {counts}"
         for agg in ("mosaic_index", "vector_shallow", "vector_join", "terrain_planet_bundle"):
             assert counts.get(agg, 0) == 1, f"{agg} must rebuild after a scope change: {counts}"
         # one bbox-stamped vector cell per in-window stem (stem-grid split); the rest kept planet stamps

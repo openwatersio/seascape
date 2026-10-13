@@ -70,6 +70,8 @@ A partition of the water into polygons, three feature kinds keyed by attribute p
 
 The band edges follow the charted isobath ladders (the metric levels and the classic fathom curves), so a safety-contour tint can only flip at a charted level. Fathom-curve `drval` values are exact multiples of 1.8288 m stored as 32-bit floats; compare with a small epsilon rather than exact equality.
 
+Coarse zooms carry fewer bands. Like an ENC compiled per usage band, the partition at a zoom is cut from that zoom's surface with the isobath ladder drawn there, so a zoom-out merges bands rather than hiding polygons, and the partition stays gapless at every zoom. Which levels bound a band at a zoom is a display decision, not a schema guarantee; a safety depth between two levels snaps to the next-deeper level present at that zoom. Zooming out can only shoal: a coarser zoom's band never reads deeper than the finer zoom beneath it.
+
 ## Coverage tiles
 
 `coverage/{z}/{x}/{y}.pbf` — source-provenance footprints, published as its own small tileset (`coverage.json`) that renderers overzoom independently.
@@ -88,5 +90,5 @@ These hold everywhere and are part of the contract precisely because no field ad
 
 - **Zero is chart datum.** Every depth, drying height, and band edge is relative to it.
 - **Positive-down vs. negative-down.** `drval1`/`drval2`, `soundings.depth_m`, and the `depth_abs_m`/`depth_ft`/`depth_fm` trio are positive-down; `contours.depth_m` and raster elevations are negative-down. Each field's convention is fixed; a sign-convention change is a schema bump.
-- **Shoal bias.** Quantization rounds shallow, sounding unit conversions floor shallow, the raster pyramid is monotone shoal-ward, and the safety contour snaps to the next-deeper charted level. Where the data must err, it errs toward showing less water.
+- **Shoal bias.** Quantization rounds shallow, sounding unit conversions floor shallow, the raster pyramid and the depth-area zoom tiers are monotone shoal-ward, and the safety contour snaps to the next-deeper charted level. Where the data must err, it errs toward showing less water.
 - **Drying is bounded.** Drying classification stops at the drying cap (16 m above datum); higher ground is land.

@@ -149,6 +149,39 @@ test("contour lines floor at z6 — depth shading carries lower zooms", () => {
   expect((lines as { minzoom?: number }).minzoom).toBe(6);
 });
 
+test("the emphasized safety contour follows the ladder drawn at each zoom tier", () => {
+  // Isobaths are compiled per zoom tier with a scale-dependent ladder, so the next-deeper
+  // level for a 3 m safety depth is 200 m at z6, 50 m at z7-8, 10 m at z9-10 and 5 m from z11.
+  const emphasized = (unit: "m" | "fm") => {
+    const lines = layers(day, { unit, safety: 3 }).find(
+      (l) => l.id === "contour-lines",
+    ) as { paint: Record<string, unknown[]> };
+    const color = lines.paint["line-color"];
+    expect(color.slice(0, 2)).toEqual(["step", ["zoom"]]);
+    expect([color[3], color[5], color[7]]).toEqual([7, 9, 11]);
+    return [2, 4, 6, 8].map((i) => (color[i] as unknown[])[1]);
+  };
+  expect(emphasized("m")).toEqual(
+    [200, 50, 10, 5].map((d) => ["==", ["get", "depth_abs_m"], d]),
+  );
+  // Fathom curves: at least as deep as the tier's shallowest metre level, so
+  // 200 m -> 200 fm, 50 m -> 30 fm, 10 m -> 10 fm, and the whole ladder -> 2 fm.
+  expect(emphasized("fm")).toEqual(
+    [200, 30, 10, 2].map((d) => ["==", ["get", "depth_fm"], d]),
+  );
+  const width = (
+    layers(day, { unit: "m", safety: 3 }).find((l) => l.id === "contour-lines") as {
+      paint: Record<string, unknown[]>;
+    }
+  ).paint["line-width"];
+  expect(width[0]).toBe("step");
+  expect(
+    (layers(day, { unit: "m", safety: 0 }).find((l) => l.id === "contour-lines") as {
+      paint: Record<string, unknown>;
+    }).paint["line-width"],
+  ).toBe(0.8);
+});
+
 test("the 0 m drying line is unit-less — every isobath filter admits it", () => {
   // The chart-datum shoreline is the same curve in metres, feet and fathoms, so the pipeline
   // ships it once with no `sys` (like depare's drying/nodata) instead of once per ladder.
@@ -436,9 +469,10 @@ test("the safety contour is the one emphasized isobath", () => {
     layers(day, opts).find((l) => l.id === "contour-lines") as {
       paint: Record<string, unknown>;
     };
-  // 4 m snaps up to the charted 5 m level, matched by the integer depth prop.
+  // 4 m snaps up to the charted 5 m level, matched by the integer depth prop; the paint
+  // steps by zoom tier, and the last branch is the whole ladder's.
   const metric = lines({ safety: 4 });
-  expect(metric.paint["line-width"]).toEqual([
+  expect((metric.paint["line-width"] as unknown[]).at(-1)).toEqual([
     "case",
     ["==", ["get", "depth_abs_m"], 5],
     1.5,
@@ -448,12 +482,9 @@ test("the safety contour is the one emphasized isobath", () => {
     day.contourEmphasis,
   );
   // Fathom mode matches on the fathom prop: 4 m snaps to the 3 fm curve.
-  expect(lines({ safety: 4, unit: "fm" }).paint["line-width"]).toEqual([
-    "case",
-    ["==", ["get", "depth_fm"], 3],
-    1.5,
-    0.8,
-  ]);
+  expect(
+    (lines({ safety: 4, unit: "fm" }).paint["line-width"] as unknown[]).at(-1),
+  ).toEqual(["case", ["==", ["get", "depth_fm"], 3], 1.5, 0.8]);
   // safety 0 turns the emphasis off entirely.
   expect(lines({ safety: 0 }).paint["line-width"]).toBe(0.8);
 });
