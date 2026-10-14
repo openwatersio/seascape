@@ -343,6 +343,23 @@ def valid_union(geoms):
     return unary_union([make_valid(g) for g in geoms])
 
 
+def minus_union(geom, parts):
+    """`geom` minus the union of `parts`, by whichever GEOS overlay mode survives the inputs:
+    snap-rounded first (GRID: float OverlayNG empties some multi-piece unions, see GRID), float
+    next (the snap-rounder drops a ring edge on near-coincident pieces: planet stem 8-128-85-15,
+    "Ring edge missing"), and a made-valid float overlay last."""
+    import shapely
+    from shapely import make_valid
+    try:
+        return shapely.difference(geom, shapely.union_all(parts, grid_size=GRID), grid_size=GRID)
+    except shapely.errors.GEOSException:
+        pass
+    try:
+        return shapely.difference(geom, shapely.union_all(parts))
+    except shapely.errors.GEOSException:
+        return make_valid(shapely.difference(make_valid(geom), valid_union(parts)))
+
+
 def repaired_parts(geoms):
     """Every part of `geoms`, make_valid'd only where shapely.is_valid rejects it.
 
@@ -876,8 +893,7 @@ def _drop_datum(dem, geom, block=4096):
         if under[i] and zero[i] * 2 >= under[i]:
             continue
         if holes[i]:  # a sub-pixel hairline has no pixel and stays whole
-            part = make_valid(shapely.difference(
-                part, shapely.union_all(holes[i], grid_size=GRID), grid_size=GRID))
+            part = make_valid(minus_union(part, holes[i]))
         out.extend(_polys(part))
     return out
 
@@ -1082,8 +1098,7 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, le
                 # harbor stem). GRID makes the union-operand overlay robust (see GRID).
                 hits = tree.query(geom, predicate="intersects")
                 if len(hits):
-                    u = shapely.union_all([parts[i] for i in hits], grid_size=GRID)
-                    geom = shapely.difference(geom, u, grid_size=GRID)
+                    geom = minus_union(geom, [parts[i] for i in hits])
             kind = getattr(r, "kind", None)
             for full in _polys(geom):  # gate the PRE-clip polygon (buffered window) so a seam sliver survives both sides
                 # Drying's two-instrument gate applies here too: a sub-pixel ribbon of unknown water
