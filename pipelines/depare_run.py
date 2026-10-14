@@ -2039,6 +2039,29 @@ def _check():
     assert len(dust_rows) == 1 and dust_rows["drval1"].isna().all() and \
         dust_rows.geometry.iloc[0].intersects(strip) and not dust_rows.geometry.iloc[0].intersects(hair), \
         f"the strip nub ships as unknown water and the hair nub is dust, got {len(dust_rows)} rows"
+
+    # minus_union falls through the overlay modes: a snap-rounded failure (GEOS "Ring edge
+    # missing") lands on the float overlay, a float failure on the made-valid one, and each mode
+    # yields the same geometry on inputs every mode can handle.
+    _geom = _box(0, 0, 100, 100)
+    _parts = [_box(20, 20, 60, 60), _box(50, 50, 90, 90)]
+    _want = shapely.difference(_geom, shapely.union_all(_parts))
+    _real = shapely.difference
+    for fails in (0, 1, 2):
+        calls = [0]
+
+        def _flaky(*a, **k):
+            calls[0] += 1
+            if calls[0] <= fails:
+                raise shapely.errors.GEOSException("TopologyException: Ring edge missing (self-check)")
+            return _real(*a, **k)
+        shapely.difference = _flaky
+        try:
+            got = minus_union(_geom, _parts)
+        finally:
+            shapely.difference = _real
+        assert calls[0] == fails + 1 and got.is_valid and abs(got.area - _want.area) < 1e-6, \
+            f"minus_union must fall through {fails} failing overlay mode(s): {calls[0]} calls"
     # ── the tier operators ──
     # Dissolve: a sub-legible part with a shallower neighbour merges into it (area conserved,
     # partition disjoint); a sub-legible island with no band neighbour drops; a sub-legible part
