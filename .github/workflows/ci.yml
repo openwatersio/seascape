@@ -70,7 +70,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
-        with: { node-version: 22, cache: npm }
+        with: { node-version-file: mise.toml, cache: npm }
       - name: Build viewer
         run: |
           npm ci
@@ -80,7 +80,7 @@ jobs:
       - name: Worker self-checks
         run: |
           # The .mjs checks import .ts directly — needs Node >= 22.18 (default type
-          # stripping); "node-version: 22" above resolves the latest 22.x, which is past it.
+          # stripping); `mise.toml` resolves the latest 22.x, which is past it.
           node worker/src/terrarium.test.mjs
           node worker/src/overlay.test.mjs
           node worker/src/cache.test.mjs
