@@ -343,6 +343,23 @@ def valid_union(geoms):
     return unary_union([make_valid(g) for g in geoms])
 
 
+def minus_union(geom, parts):
+    """`geom` minus the union of `parts`, by whichever GEOS overlay mode survives the inputs:
+    snap-rounded first (GRID: float OverlayNG empties some multi-piece unions, see GRID), float
+    next (the snap-rounder drops a ring edge on near-coincident pieces: planet stem 8-128-85-15,
+    "Ring edge missing"), and a made-valid float overlay last."""
+    import shapely
+    from shapely import make_valid
+    try:
+        return shapely.difference(geom, shapely.union_all(parts, grid_size=GRID), grid_size=GRID)
+    except shapely.errors.GEOSException:
+        pass
+    try:
+        return shapely.difference(geom, shapely.union_all(parts))
+    except shapely.errors.GEOSException:
+        return make_valid(shapely.difference(make_valid(geom), valid_union(parts)))
+
+
 def repaired_parts(geoms):
     """Every part of `geoms`, make_valid'd only where shapely.is_valid rejects it.
 
@@ -876,8 +893,7 @@ def _drop_datum(dem, geom, block=4096):
         if under[i] and zero[i] * 2 >= under[i]:
             continue
         if holes[i]:  # a sub-pixel hairline has no pixel and stays whole
-            part = make_valid(shapely.difference(
-                part, shapely.union_all(holes[i], grid_size=GRID), grid_size=GRID))
+            part = make_valid(minus_union(part, holes[i]))
         out.extend(_polys(part))
     return out
 
@@ -1082,8 +1098,7 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, le
                 # harbor stem). GRID makes the union-operand overlay robust (see GRID).
                 hits = tree.query(geom, predicate="intersects")
                 if len(hits):
-                    u = shapely.union_all([parts[i] for i in hits], grid_size=GRID)
-                    geom = shapely.difference(geom, u, grid_size=GRID)
+                    geom = minus_union(geom, [parts[i] for i in hits])
             kind = getattr(r, "kind", None)
             for full in _polys(geom):  # gate the PRE-clip polygon (buffered window) so a seam sliver survives both sides
                 # Drying's two-instrument gate applies here too: a sub-pixel ribbon of unknown water
@@ -2024,6 +2039,29 @@ def _check():
     assert len(dust_rows) == 1 and dust_rows["drval1"].isna().all() and \
         dust_rows.geometry.iloc[0].intersects(strip) and not dust_rows.geometry.iloc[0].intersects(hair), \
         f"the strip nub ships as unknown water and the hair nub is dust, got {len(dust_rows)} rows"
+
+    # minus_union falls through the overlay modes: a snap-rounded failure (GEOS "Ring edge
+    # missing") lands on the float overlay, a float failure on the made-valid one, and each mode
+    # yields the same geometry on inputs every mode can handle.
+    _geom = _box(0, 0, 100, 100)
+    _parts = [_box(20, 20, 60, 60), _box(50, 50, 90, 90)]
+    _want = shapely.difference(_geom, shapely.union_all(_parts))
+    _real = shapely.difference
+    for fails in (0, 1, 2):
+        calls = [0]
+
+        def _flaky(*a, **k):
+            calls[0] += 1
+            if calls[0] <= fails:
+                raise shapely.errors.GEOSException("TopologyException: Ring edge missing (self-check)")
+            return _real(*a, **k)
+        shapely.difference = _flaky
+        try:
+            got = minus_union(_geom, _parts)
+        finally:
+            shapely.difference = _real
+        assert calls[0] == fails + 1 and got.is_valid and abs(got.area - _want.area) < 1e-6, \
+            f"minus_union must fall through {fails} failing overlay mode(s): {calls[0]} calls"
     # ── the tier operators ──
     # Dissolve: a sub-legible part with a shallower neighbour merges into it (area conserved,
     # partition disjoint); a sub-legible island with no band neighbour drops; a sub-legible part
