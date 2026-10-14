@@ -27,7 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
-        with: { node-version: 22 }
+        with: { node-version-file: mise.toml }
       - name: Install workspace (runs the style package's prepare — tsc → style/dist)
         run: npm ci
       - name: wrangler deploy --env preview

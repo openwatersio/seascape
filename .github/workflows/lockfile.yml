@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version-file: .github/mise.toml
       - name: Check the lockfile regenerates from package.json
         run: |
           git ls-files --error-unmatch package-lock.json
