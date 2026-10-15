@@ -384,7 +384,7 @@ def fork_inputs(wc):
 
 def depare_inputs(wc):
     """The mosaic tiles every depth-area tier reads: the native window's set plus each coarse
-    tier's halo at its own resolution (a z6 halo reaches tens of kilometres past the stem)."""
+    tier's halo at its own surface resolution (a z5 halo reaches 160 km past the stem)."""
     cz = int(wc.stem.split("-")[3])
     tiles = set(fork_inputs(wc))
     for t in pipeline_config.depare_tiers(cz):
@@ -462,6 +462,7 @@ rule soundings_tile:
         version=1, # increment to force a rebuild
         cell=soundings_run.SOUND_CELL_PX, min_depth=soundings_run.SOUND_MIN_DEPTH_M,
         thin=soundings_run.SOUND_THIN_TIERS,
+        ladders=json.dumps(pipeline_config.CONTOUR_TIERS),  # a prime sounding shows with its ring
     priority: vector_tile_priority  # vector band: drain before terrain so the bundle overlaps it
     retries: 2
     resources:
@@ -484,9 +485,10 @@ rule depare_tile:
     output:
         tier_files("depare", ["{stem}"])
     params:
-        version=8, # increment to force a rebuild
+        version=9, # increment to force a rebuild
         levels=json.dumps({"m": pipeline_config.DEPARE_LEVELS, "ft": pipeline_config.DEPARE_LEVELS_FT}),
         tiers=json.dumps(pipeline_config.DEPARE_TIER_STARTS),
+        ladders=json.dumps(pipeline_config.CONTOUR_TIERS),
         drying=pipeline_config.DRYING_CAP, sliver=depare_run.SLIVER_MIN_PX,
         simplify_mm=depare_run.SIMPLIFY_MM,
         nodata_simplify=depare_run.NODATA_SIMPLIFY_PX,
@@ -602,7 +604,7 @@ rule tiles:
 #     ownership is structurally disjoint after the fringe filter, so the merge is a pure concat
 #     (go-pmtiles refuses overlapping inputs).
 # Layers stay joint within every run (separately-tiled layers leaf at different depths and vanish the
-# shallower one). All zoom gating rides as per-feature tippecanoe.minzoom (contour tiers, depare's z6
+# shallower one). All zoom gating rides as per-feature tippecanoe.minzoom (contour tiers, depare's z4
 # floor, sounding pyramid levels). 0-byte per-tile inputs are empty tiles (kept by size); an
 # all-empty cell writes a 0-byte archive the join skips. depare rides only when SKIP_DEPARE is unset
 # (DEPARE). Always rebuilds — Snakemake owns freshness.

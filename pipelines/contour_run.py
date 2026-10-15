@@ -1052,7 +1052,7 @@ def _vector_selfcheck(vec, maxz, expected=None, per_zoom=6):
     prevents — because a dropped feature appears in no tile and its id is missing from the union.
     Robust to legitimate per-zoom minzoom thinning and to --coalesce-smallest-as-needed (a feature
     that only coalesces at a low zoom still appears at its full-detail native leaf; one present
-    nowhere is a real drop). Plus the sampled complementary checks: no depare below its z6 floor, no
+    nowhere is a real drop). Plus the sampled complementary checks: no depare below its z4 floor, no
     contour below its tier minzoom, soundings present, depare m-bands pairwise disjoint (coalesce
     displaced nothing), and the partition conserved down-zoom (no interior blob of a parent's m-band
     union uncovered by its 4 children — a hole opened deeper; whole missing polygons are already
@@ -1206,16 +1206,18 @@ def _check():
     # the full-ladder tiers, a deep one from the first; a fathom curve is gated by depth like the
     # deep metre ones; the sys-less drying line rides every tier.
     assert tier_shows("m", -2, 11) and tier_shows("m", -2, 15) and not tier_shows("m", -2, 10)
-    assert tier_shows("m", -4000, 6) and tier_shows("m", -50, 7) and not tier_shows("m", -50, 6)
-    assert tier_shows("m", -10, 9) and not tier_shows("m", -10, 8)
+    assert tier_shows("m", -4000, 6) and tier_shows("m", -10, 4) and not tier_shows("m", -500, 5)
+    assert tier_shows("m", -30, 9) and not tier_shows("m", -30, 8)
     assert not tier_shows("ft", -1.8288, 9) and tier_shows("ft", -1.8288, 11)   # one fathom
-    assert tier_shows("ft", -36.576, 9) and not tier_shows("ft", -36.576, 7)    # 20 fathoms
+    assert tier_shows("ft", -18.288, 4) and not tier_shows("ft", -9.144, 9)     # 10 / 5 fathoms
     assert tier_shows("ft", -3657.6, 6)                                          # 2000 fathoms
-    assert all(tier_shows(None, 0, z) for z in (6, 8, 12)) and not tier_shows("m", 0, 5)
+    assert all(tier_shows(None, 0, z) for z in (4, 6, 8, 12)) and not tier_shows("m", 0, 3)
     for cz in (8, 12, 15):
         tiers = config.depare_tiers(cz)
         assert tiers[-1].surface == cz and tiers[-1].last is None
         assert all(a.last == b.first - 1 for a, b in zip(tiers, tiers[1:]))
+        # a compiled tier is cut one zoom finer than it first serves, never from the native window
+        assert all(t.surface == min(t.first + 1, cz - 1) for t in tiers[:-1])
     assert 0 in config.CONTOUR_LEVELS, "the 0 m drying line must be a contoured level"
     # every tier level must exist in the generated contour set (else it gates nothing)
     assert all(d in config.CONTOUR_LEVELS for _, depths in CONTOUR_TIERS for d in depths)

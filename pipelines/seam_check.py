@@ -383,7 +383,7 @@ def auto():
         tiers = config.depare_tiers(parse_stem(stem)[3])
         return next(t for t in reversed(tiers) if t.first <= z).name
 
-    built = [s for s in stems if os.path.exists(f"store/contour/{s}-t{config.DEPARE_TIER_STARTS[0]}.fgb")]
+    built = [s for s in stems if os.path.exists(f"store/contour/{s}-t{config.DEPARE_TIER_STARTS[-1]}.fgb")]
     index = {}
     for s in built:
         z, x, y, _cz = parse_stem(s)

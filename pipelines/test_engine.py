@@ -21,7 +21,7 @@ checkpoint that gates stage 2/3 (``snakemake bundles``) — and asserts:
     `pmtiles merge`d into a single sparse vector.pmtiles (no separate soundings/depare
     archives); tile ownership is STRICTLY disjoint (shallow below SPLIT_Z, cells at/above
     it with zero cross-cell overlap), and the merged archive's self-check
-    invariants hold (no depare below z6, no contour below its tier minzoom, depare
+    invariants hold (no depare below its first tier, no contour below its tier minzoom, depare
     m-bands disjoint, soundings present, every input id survives); the manifest carries
     vector.max_zoom = the covering's max child_z (the Worker's serving depth);
   - scope transitions: a bbox build re-merges nothing, and the next planet build
@@ -652,17 +652,18 @@ def main():
                                 f"contour depth_m={d} sys={s} is not in the tier ladder at z{z}"
 
         # ── the joined archive's safety invariants (Verification 3,4,5): one served archive, three
-        # layers, all zoom gating per-feature. _vector_selfcheck asserts no depare below z6, no
+        # layers, all zoom gating per-feature. _vector_selfcheck asserts no depare below its floor, no
         # contour below its tier minzoom, depare m-bands disjoint, soundings present, every input id
         # survives — it ran in-build; re-run it here so the test OWNS the invariant, not just the
         # build. ──
         layers = set()
-        for z in (max(child_zs), 6, 5):  # leaf zoom, the depare floor, at SPLIT_Z
+        floor = contour_run.DEPARE_MINZOOM
+        for z in (max(child_zs), floor, floor - 1):  # leaf zoom, the depare floor, just under it
             for x, y in _pm_tiles(vec).get(z, [])[:4]:
                 layers |= set(contour_run._decode_tile(vec, z, x, y))
-                if z < 6:
+                if z < floor:
                     assert "depare" not in contour_run._decode_tile(vec, z, x, y), \
-                        f"depare must not appear below z6 (z{z} {x}/{y})"
+                        f"depare must not appear below z{floor} (z{z} {x}/{y})"
         assert {"contours", "soundings", "depare"} <= layers, \
             f"the joined archive must carry all three layers: {sorted(layers)}"
         contour_run._vector_selfcheck(vec, maxz)  # raises SystemExit on any invariant violation
@@ -755,11 +756,12 @@ def main():
         n_heal = sum(1 for s in inwin if any(n not in inwin_set for n in _neighbors(s, stems)))
         assert 0 < n_heal < n_inwin, f"heal set must be a nonempty strict subset: {n_heal}/{n_inwin}"
         # depth areas read further: a coarse tier's surface carries the smooth halo at the tier's
-        # own resolution, so its heal set is the stems whose widest tier halo leaves the window
+        # surface resolution, so its heal set is the stems whose widest tier halo leaves the window
         # (contours derive from depare and heal with it; soundings read the native window only).
         import config
         import smooth
-        widest = smooth.halo_px() * aggregation_reproject.get_resolution(config.DEPARE_TIER_STARTS[0])
+        widest = smooth.halo_px() * aggregation_reproject.get_resolution(
+            min(config.depare_tiers(int(s.rsplit("-", 1)[1]))[0].surface for s in inwin))
         n_heal_depare = sum(1 for s in inwin
                             if any(n not in inwin_set for n in _neighbors(s, stems, widest)))
         assert n_heal <= n_heal_depare <= n_inwin, f"depare heal set: {n_heal_depare}/{n_inwin}"

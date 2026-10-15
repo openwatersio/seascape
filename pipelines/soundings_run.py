@@ -729,13 +729,13 @@ def _check():
         found = _enclosed_shoals(src, NODATA, 1.0, [5.0, 20.0],
                                  (_small, (_small != NODATA) & (_small < 0), _k))
     # The -3 m pinnacle is enclosed by the 5 m and 20 m levels, and is reported at its OWN pixel
-    # (not a decimated approximation) with its deepest ring's display zoom (20 m -> z9).
-    assert any(f[:3] == (3.0, 200.5, 200.5) and f[3] == 9 for f in found), found
+    # (not a decimated approximation) with its deepest ring's display zoom (20 m -> the first tier).
+    assert any(f[:3] == (3.0, 200.5, 200.5) and f[3] == 0 for f in found), found
     # The <1 m patch fills cell (0,0) out to two window edges, so no isobath closes around it.
     assert not any(c < 128 and r < 128 for _d, c, r, _mz in found), found
 
     # Ring display zooms come straight off contour_run.CONTOUR_TIERS (cumulative bands).
-    assert [_ring_minzoom(l) for l in (200, 50, 10, 2)] == [0, 7, 9, 11]
+    assert [_ring_minzoom(l) for l in (200, 50, 30, 10, 2)] == [0, 0, 9, 0, 11]
 
 
     # depth-tiered thinning: the tier a depth falls in, at and just under each cutoff
@@ -802,7 +802,9 @@ def _check():
     # lies about the other; a trench pixel is hidden by shoalest-wins entirely. Shoal-side and
     # deep-side repair must chart both, at their measured pixels, uncapped from the failing zoom.
     global SOUND_REPAIR, REPAIR_SHOAL, REPAIR_SPACING_PX
-    rrr = np.full((512, 512), -40.0, "float32")
+    # 8 m ambient: the shoals' deepest ring is 5 m, which draws from z11, so no prime charts
+    # them in the z8 field and only repair can.
+    rrr = np.full((512, 512), -8.0, "float32")
     rrr[100, 100] = -1.0     # cell (0,0)'s shoalest — the lattice charts this one
     rrr[120, 119] = -1.2     # same cell, 2 km away: invisible to the lattice, in the field's hull
     rrr[240, 140] = -150.0   # deep trench pixel, in the navigational band and inside the z8

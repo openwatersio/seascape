@@ -341,7 +341,8 @@ def tiers(stem, root="."):
         # never deeper: sample the native parts' interiors
         deeper = displaced = 0
         if native is not None and t is not native_t and len(native):
-            tol = depare_run.SIMPLIFY_MM / depare_run.MM_PER_PX * px
+            # the cut's vertex floor (depare_run.tile's tol_z)
+            tol = depare_run.SIMPLIFY_MM / depare_run.MM_PER_PX * get_resolution(min(t.last, t.surface))
             pts = shapely.point_on_surface(native.geometry.values)
             hits = tree.query(pts, predicate="within")  # (point idx, band idx)
             nd = native["drval1"].values[hits[0]]

@@ -42,9 +42,9 @@ simplification instead (simplify_coverage), which simplifies each shared edge on
 both its owners, at the S-58 vertex floor.
 
 Per tile and per zoom tier (config.depare_tiers — each tier is a separately compiled partition,
-the way an ENC compiles a cell per usage band: cut from the mosaic pyramid level at the tier's
-first zoom with the isobath ladder drawn there, the final tier from the native window): bands
-(gdal_contour -p at the tier's metre / fathom ladder, drop land, drval/sys) + drying (the metre
+the way an ENC compiles a cell per usage band: cut from the mosaic pyramid level one zoom finer
+than the tier's first, with the isobath ladder drawn at its first, the final tier from the native
+window): bands (gdal_contour -p at the tier's metre / fathom ladder, drop land, drval/sys) + drying (the metre
 ladder's (0, DRYING_CAP] bucket ∩ effective water, drval1 < 0; exact datum is unknown, never foreshore) + nodata (inland-water polygons
 minus the DEM's water coverage and the drying) -> clip to the unbuffered tile bbox in shapely
 (polygon-only by construction, see _polys) -> 4326 -> store/depare/{stem}-t{z}.fgb. Same seam
@@ -67,8 +67,8 @@ import contour_run
 import utils
 from aggregation_reproject import get_resolution
 
-# Below the first tier's zoom (z6, matching the style's depth-areas/contour-lines minzoom) the
-# raster depth shading carries the water alone.
+# Below the first tier's zoom (z4, matching the style's depth-areas minzoom) the raster depth
+# shading carries the water alone.
 
 # DEPARE_LEVELS derives from CONTOUR_LEVELS, which the style hand-mirrors (style/index.ts
 # DEPARE_LADDER_M/FT) — warn when an env override diverges the bands from the style. Upgrade
@@ -899,7 +899,7 @@ def _drop_datum(dem, geom, block=4096):
 
 
 def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, levels_ft=None,
-                scale_z=None, fine_z=None):
+                scale_z=None, fine_z=None, tol_z=None):
     """Partition any DEM covering the tile's buffered extent into depth-area / drying / nodata
     rows. Returns (final_path, count) inside ``tmp``, or None when there is no water."""
     import geopandas as gpd
@@ -917,7 +917,8 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, le
     min_area = SLIVER_MIN_PX * res * res       # slivers where a vector edge meets the raster shore
     stem_res = get_resolution(child_z)          # the stem's own MVT pixel, EPSG:3857 metres
     nodata_tol = NODATA_SIMPLIFY_PX * stem_res  # generalize nodata to the stem's resolution
-    band_tol = SIMPLIFY_MM / MM_PER_PX * stem_res  # the S-58 vertex floor at this stem's scale
+    # The S-58 vertex floor at this stem's scale, or at tol_z for a compiled tier.
+    band_tol = SIMPLIFY_MM / MM_PER_PX * get_resolution(tol_z or child_z)
     # Drying legibility: area at the STEM's scale (what a reader sees), width in the DEM's own
     # pixel (what drew the ribbon) — the two differ on the coarsened retry window.
     drying_legible_area = DRYING_LEGIBLE_MM2 * (stem_res / MM_PER_PX) ** 2
@@ -1147,7 +1148,7 @@ def tier_path(stem, tier):
 
 def tier_read_tiles(stem, tier):
     """The mosaic tiles a coarse tier's surface reads: the stem's window buffered by the smooth
-    halo at the tier's resolution — a z6 halo reaches tens of kilometres past the stem."""
+    halo at the tier's surface resolution — a z5 halo reaches 160 km past the stem."""
     import mosaic
     import smooth
     halo_m = smooth.halo_px() * get_resolution(tier.surface)
@@ -1156,11 +1157,11 @@ def tier_read_tiles(stem, tier):
 
 def _tier_surface(stem, tier, out):
     """A coarse tier's cut surface: the stem's halo-buffered window read off the mosaic tiles'
-    class-aware shoal pyramid at the tier zoom, then the shared depth-gated smooth at that
-    resolution — the same level and smooth the raster render serves at the zoom, so band tints
-    and relief agree by construction. Nearest at an exact power-of-two ratio is a grid-aligned
-    copy of the level; a tile's pyramid stops at res(8), so tiers below z8 reduce from there with
-    the same operator."""
+    class-aware shoal pyramid at the tier's surface zoom, then the shared depth-gated smooth at
+    that resolution — the same level and smooth the raster render serves at that zoom, and the
+    smooth only shoals (smooth_array clamps it to its input). Nearest at an exact power-of-two
+    ratio is a grid-aligned copy of the level; a tile's pyramid stops at res(8), so tiers below z8
+    reduce from there with the same operator."""
     import mosaic
     import smooth
     z, x, y, _cz = (int(a) for a in stem.split("-"))
@@ -1251,8 +1252,8 @@ def _shoal_clamp(surface, finer, factor, tmp=None):
 
 def tile(stem):
     """The per-stem Snakemake job: one partition per tier (config.depare_tiers) — the coarse
-    tiers cut from the mosaic pyramid level at the tier zoom, the final tier from the BUFFERED
-    native window, smoothed at read with the one shared f(depth, zoom) — output at
+    tiers cut from the mosaic pyramid level at the tier's surface zoom, the final tier from the
+    BUFFERED native window, smoothed at read with the one shared f(depth, zoom) — output at
     store/depare/<stem>-t<z>.fgb per tier (depare also reads the land + water masks). A waterless
     tier writes a 0-byte sentinel, as does a tier the stem does not hold; bundling filters
     empties by size."""
@@ -1295,25 +1296,32 @@ def tile(stem):
             os.makedirs(tier_tmp)
             if tier.surface == child_z:
                 dem = window
+            elif tier.surface == finer_z:
+                dem = finer  # two tiers capped to one zoom share one surface
             else:
                 dem = _tier_surface(stem, tier, f"{tier_tmp}/surface.tif")
                 _shoal_clamp(dem, finer, 2 ** (finer_z - tier.surface))
                 finer, finer_z = dem, tier.surface
             _mark(f"{tier.name}-surface")
+            # A compiled tier's legibility and nodata generalization sit at its first zoom, the
+            # coarsest it serves, whatever its surface's resolution.
             scale_z = tier.first if tier.last is not None else None
             # The native tier is written from its first zoom down to the cell's own depth.
             fine_z = tier.last if tier.last is not None else max(child_z, tier.first)
+            # A compiled tier's vertex floor sits at its finest display zoom, so the last zoom it
+            # serves still has a vertex per pixel, but never finer than its surface's pixel.
+            tol_z = min(tier.last, tier.surface) if scale_z else None
             try:
-                res = _depare_dem(dem, tile_obj, tier.surface, tier_tmp, label, timeout=timeout,
+                res = _depare_dem(dem, tile_obj, scale_z or child_z, tier_tmp, label, timeout=timeout,
                                   levels_m=tier.levels_m, levels_ft=tier.levels_ft, scale_z=scale_z,
-                                  fine_z=fine_z)
+                                  fine_z=fine_z, tol_z=tol_z)
             except ContourTimeout as e:
                 print(f"depare tile {label}: {e} — retrying on a uniform 4x shoal-biased window",
                       file=sys.stderr, flush=True)
                 dem = _uniform_coarsen(dem, 4, f"{tier_tmp}/dem-4x.tiff")
-                res = _depare_dem(dem, tile_obj, tier.surface, tier_tmp, label, timeout=timeout,
+                res = _depare_dem(dem, tile_obj, scale_z or child_z, tier_tmp, label, timeout=timeout,
                                   levels_m=tier.levels_m, levels_ft=tier.levels_ft, scale_z=scale_z,
-                                  fine_z=fine_z)
+                                  fine_z=fine_z, tol_z=tol_z)
             except MemoryError:
                 # An allocation the kernel refused (overcommit says no when a single request
                 # exceeds free RAM+swap) — no OOM kill, and formatting a traceback at that point

@@ -70,7 +70,7 @@ A partition of the water into polygons, three feature kinds keyed by attribute p
 
 The band edges follow the charted isobath ladders (the metric levels and the classic fathom curves), so a safety-contour tint can only flip at a charted level. Fathom-curve `drval` values are exact multiples of 1.8288 m stored as 32-bit floats; compare with a small epsilon rather than exact equality.
 
-Coarse zooms carry fewer bands. Like an ENC compiled per usage band, the partition at a zoom is cut from that zoom's surface with the isobath ladder drawn there, so a zoom-out merges bands rather than hiding polygons, and the partition stays gapless at every zoom. Which levels bound a band at a zoom is a display decision, not a schema guarantee; a safety depth between two levels snaps to the next-deeper level present at that zoom. Zooming out can only shoal: a coarser zoom's band never reads deeper than the finer zoom beneath it.
+Coarse zooms carry fewer bands. Like an ENC compiled per usage band, the partition at a zoom is cut from a surface at least as fine as that zoom, with the isobath ladder drawn there, so a zoom-out merges bands rather than hiding polygons, and the partition stays gapless at every zoom. Which levels bound a band at a zoom is a display decision, not a schema guarantee; a safety depth between two levels snaps to the next-deeper level present at that zoom. Zooming out can only shoal: a coarser zoom's band never reads deeper than the finer zoom beneath it.
 
 ## Coverage tiles
 

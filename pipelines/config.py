@@ -69,11 +69,16 @@ DEPARE_LEVELS_FT = sorted({*CONTOUR_LEVELS_FT, 0})
 # Scale-dependent contour interval: coarse isobaths zoomed out, finer zoomed in (charts thin the
 # deep, not the shelf — abyssal contours stipple into noise at small scale). (zoom ceiling,
 # metre levels shown below it); at/above the last ceiling every level shows. Each list is a
-# subset of CONTOUR_LEVELS.
+# subset of CONTOUR_LEVELS. The shelf levels follow NOAA's ENC Design Handbook Table 3 at each
+# tier's scale — Overview (z4-6) 50/100/200, General (z7-8) 20/50/100/200, Coastal (z9-10)
+# 20/30/50/100 — plus the S-4 B-411 10 and 20 m wherever Table 3 lacks them: in a shallow sea the
+# shallow-water tint must still split the water (S-4 B-411.6 sets its limit by "the prevailing
+# depths in the area"), and on a steep coast those bands shrink to a coastal ribbon.
 CONTOUR_TIERS = [
-    (5, [-200, -1000, -2000, -4000]),
-    (7, [-200, -500, -1000, -2000, -3000, -4000]),
-    (9, [-50, -100, -200, -300, -500, -1000, -2000, -3000, -4000, -5000, -6000, -8000, -10000]),
+    (6, [-10, -20, -50, -100, -200, -1000, -2000, -4000]),
+    (7, [-10, -20, -50, -100, -200, -500, -1000, -2000, -3000, -4000]),
+    (9, [-10, -20, -50, -100, -200, -300, -500, -1000, -2000, -3000, -4000, -5000, -6000, -8000,
+         -10000]),
     (11, [-10, -20, -30, -50, -100, -200, -300, -500, -1000, -2000, -3000, -4000, -5000, -6000,
           -8000, -10000]),
 ]
@@ -88,15 +93,17 @@ def contour_levels_at(z):
 
 
 # Depth areas are compiled per zoom tier, the way an ENC compiles a separate cell per usage band:
-# each tier is its own gapless partition, cut from the mosaic's pyramid level at the tier's first
-# zoom with the isobath ladder drawn there (bands and lines at a zoom share one surface and one
-# ladder), and it serves every zoom up to the next tier. The last tier a stem holds is cut from
+# each tier is its own gapless partition, cut from the mosaic's pyramid level one zoom finer than
+# the tier's first with the isobath ladder drawn at its first (bands and lines at a zoom share one
+# surface and one ladder), and it serves every zoom up to the next tier. The finer cut holds the
+# zooms a tier serves to the three pixels per millimetre the AHO re-grids to at compilation scale
+# (Rustomji 2019), except where the stem's native zoom caps it. The last tier a stem holds is cut from
 # its native window and serves every zoom above it — with its own zoom's ladder, not a finer one:
 # the band set is a function of scale (NOAA ENC Design Handbook Table 3), and a coarse source
 # viewed closer is an overscaled cell showing the same content (S-101 maximumDisplayScale), never
 # 2 m bands interpolated from cells that could not resolve them (S-4 B-412). z13 changes the
 # surface, not the ladder.
-DEPARE_TIER_STARTS = [6, 7, 9, 11, 13]
+DEPARE_TIER_STARTS = [4, 6, 7, 9, 11, 13]
 
 
 class DepareTier(tuple):
@@ -128,7 +135,9 @@ def depare_tiers(child_z):
         if final:
             out.append(DepareTier((z, None, child_z, m, ft)))
             break
-        out.append(DepareTier((z, DEPARE_TIER_STARTS[i + 1] - 1, z, m, ft)))
+        # Never the native window: that is the final tier's cut, and contouring it twice doubles
+        # the stem's heaviest pass.
+        out.append(DepareTier((z, DEPARE_TIER_STARTS[i + 1] - 1, min(z + 1, child_z - 1), m, ft)))
     return out
 
 
@@ -375,6 +384,18 @@ def _check():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def ladders():
+    """The depth-area ladder drawn at each zoom, positive-down and without the 0 m drying line, for
+    the style's parity test (style/index.test.ts), which holds its hand-mirrored copy to it."""
+    tiers = {t.first: t for t in depare_tiers(MAX_CHILD_Z)}
+    return {"first": DEPARE_TIER_STARTS[0],
+            "zooms": {z: {"m": [-l for l in reversed(tiers[depare_tier_at(z)].levels_m) if l],
+                          "ft": [-l for l in reversed(tiers[depare_tier_at(z)].levels_ft) if l]}
+                      for z in range(DEPARE_TIER_STARTS[0], MAX_CHILD_Z + 1)}}
+
+
 if __name__ == "__main__":
     if sys.argv[1:2] == ["--check"]:
         _check()
+    elif sys.argv[1:2] == ["--ladders"]:
+        print(json.dumps(ladders()))
