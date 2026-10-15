@@ -122,6 +122,8 @@ def depare_tiers(child_z):
     — or the last tier of the list — is cut from the native window, serves every zoom above with
     its own ladder, and ends the list; tiers after it do not exist for the stem."""
     out = []
+    final_z = next((z for z in DEPARE_TIER_STARTS if z >= child_z), DEPARE_TIER_STARTS[-1])
+    final_m = sorted({*contour_levels_at(final_z), 0})
     for i, z in enumerate(DEPARE_TIER_STARTS):
         final = z >= child_z or i == len(DEPARE_TIER_STARTS) - 1
         m = sorted({*contour_levels_at(z), 0})
@@ -135,9 +137,10 @@ def depare_tiers(child_z):
         if final:
             out.append(DepareTier((z, None, child_z, m, ft)))
             break
-        # Never the native window: that is the final tier's cut, and contouring it twice doubles
-        # the stem's heaviest pass.
-        out.append(DepareTier((z, DEPARE_TIER_STARTS[i + 1] - 1, min(z + 1, child_z - 1), m, ft)))
+        # Not the native window with the final tier's own ladder: that pass would repeat the final
+        # cut, the stem's heaviest.
+        surface = z if z + 1 == child_z and m == final_m else z + 1
+        out.append(DepareTier((z, DEPARE_TIER_STARTS[i + 1] - 1, surface, m, ft)))
     return out
 
 

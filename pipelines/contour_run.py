@@ -1216,8 +1216,11 @@ def _check():
         tiers = config.depare_tiers(cz)
         assert tiers[-1].surface == cz and tiers[-1].last is None
         assert all(a.last == b.first - 1 for a, b in zip(tiers, tiers[1:]))
-        # a compiled tier is cut one zoom finer than it first serves, never from the native window
-        assert all(t.surface == min(t.first + 1, cz - 1) for t in tiers[:-1])
+        # a compiled tier is cut one zoom finer than it first serves
+        assert all(t.surface == t.first + 1 for t in tiers[:-1] if t.first + 1 < cz)
+    # …from the native window too, unless that repeats the final tier's cut (same ladder)
+    assert config.depare_tiers(8)[2].surface == 8 and config.depare_tiers(10)[3].surface == 10
+    assert config.depare_tiers(12)[4].surface == 11
     assert 0 in config.CONTOUR_LEVELS, "the 0 m drying line must be a contoured level"
     # every tier level must exist in the generated contour set (else it gates nothing)
     assert all(d in config.CONTOUR_LEVELS for _, depths in CONTOUR_TIERS for d in depths)
