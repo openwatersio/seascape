@@ -176,6 +176,8 @@ jobs:
             fi
           }
           check "raster tile"     200 "$BASE/seascape/0/0/0.webp"            image/webp
-          check "vector tile"     200 "$BASE/seascape/0/0/0.pbf"             protobuf
+          # Vector layers start at z6 (the first depth-area tier); a tile with no content is a
+          # 204 by the Worker's contract, so probe a coast that always carries bands.
+          check "vector tile"     200 "$BASE/seascape/6/32/21.pbf"           protobuf
           check "raster.json"     200 "$BASE/seascape/raster.json"           json
           exit $fail
