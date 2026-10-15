@@ -43,8 +43,8 @@ both its owners, at the S-58 vertex floor.
 
 Per tile and per zoom tier (config.depare_tiers — each tier is a separately compiled partition,
 the way an ENC compiles a cell per usage band: cut from the mosaic pyramid level one zoom finer
-than the tier's first, with the isobath ladder drawn at its first, the final tier from the native
-window): bands (gdal_contour -p at the tier's metre / fathom ladder, drop land, drval/sys) + drying (the metre
+than the tier's first (unless that repeats the final tier's native cut), with the isobath ladder
+drawn at its first, the final tier from the native window): bands (gdal_contour -p at the tier's metre / fathom ladder, drop land, drval/sys) + drying (the metre
 ladder's (0, DRYING_CAP] bucket ∩ effective water, drval1 < 0; exact datum is unknown, never foreshore) + nodata (inland-water polygons
 minus the DEM's water coverage and the drying) -> clip to the unbuffered tile bbox in shapely
 (polygon-only by construction, see _polys) -> 4326 -> store/depare/{stem}-t{z}.fgb. Same seam
@@ -1302,8 +1302,6 @@ def tile(stem):
             os.makedirs(tier_tmp)
             if tier.surface == child_z:
                 dem = window
-            elif tier.surface == finer_z:
-                dem = finer  # two tiers capped to one zoom share one surface
             else:
                 dem = _tier_surface(stem, tier, f"{tier_tmp}/surface.tif")
                 _shoal_clamp(dem, finer, 2 ** (finer_z - tier.surface))
@@ -1314,20 +1312,17 @@ def tile(stem):
             scale_z = tier.first if tier.last is not None else None
             # The native tier is written from its first zoom down to the cell's own depth.
             fine_z = tier.last if tier.last is not None else max(child_z, tier.first)
-            # A compiled tier's vertex floor sits at its finest display zoom, so the last zoom it
-            # serves still has a vertex per pixel, but never finer than its surface's pixel.
-            tol_z = min(tier.last, tier.surface) if scale_z else None
             try:
                 res = _depare_dem(dem, tile_obj, scale_z or child_z, tier_tmp, label, timeout=timeout,
                                   levels_m=tier.levels_m, levels_ft=tier.levels_ft, scale_z=scale_z,
-                                  fine_z=fine_z, tol_z=tol_z)
+                                  fine_z=fine_z, tol_z=tier.vertex_z)
             except ContourTimeout as e:
                 print(f"depare tile {label}: {e} — retrying on a uniform 4x shoal-biased window",
                       file=sys.stderr, flush=True)
                 dem = _uniform_coarsen(dem, 4, f"{tier_tmp}/dem-4x.tiff")
                 res = _depare_dem(dem, tile_obj, scale_z or child_z, tier_tmp, label, timeout=timeout,
                                   levels_m=tier.levels_m, levels_ft=tier.levels_ft, scale_z=scale_z,
-                                  fine_z=fine_z, tol_z=tol_z)
+                                  fine_z=fine_z, tol_z=tier.vertex_z)
             except MemoryError:
                 # An allocation the kernel refused (overcommit says no when a single request
                 # exceeds free RAM+swap) — no OOM kill, and formatting a traceback at that point

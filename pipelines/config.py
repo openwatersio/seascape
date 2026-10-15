@@ -97,7 +97,7 @@ def contour_levels_at(z):
 # the tier's first with the isobath ladder drawn at its first (bands and lines at a zoom share one
 # surface and one ladder), and it serves every zoom up to the next tier. The finer cut holds the
 # zooms a tier serves to the three pixels per millimetre the AHO re-grids to at compilation scale
-# (Rustomji 2019), except where the stem's native zoom caps it. The last tier a stem holds is cut from
+# (Rustomji 2019), except where that cut would repeat the final tier's. The last tier a stem holds is cut from
 # its native window and serves every zoom above it — with its own zoom's ladder, not a finer one:
 # the band set is a function of scale (NOAA ENC Design Handbook Table 3), and a coarse source
 # viewed closer is an overscaled cell showing the same content (S-101 maximumDisplayScale), never
@@ -115,6 +115,9 @@ class DepareTier(tuple):
     levels_m = property(lambda t: t[3])
     levels_ft = property(lambda t: t[4])
     name = property(lambda t: f"t{t[0]}")
+    # A compiled tier's vertex floor: its finest display zoom, so the last zoom it serves still
+    # has a vertex per pixel, but never finer than its surface's pixel.
+    vertex_z = property(lambda t: min(t[1], t[2]) if t[1] is not None else None)
 
 
 def depare_tiers(child_z):

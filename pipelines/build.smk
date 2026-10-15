@@ -459,7 +459,7 @@ rule soundings_tile:
     output:
         "store/soundings/{stem}.geojsons"
     params:
-        version=1, # increment to force a rebuild
+        version=2, # increment to force a rebuild
         cell=soundings_run.SOUND_CELL_PX, min_depth=soundings_run.SOUND_MIN_DEPTH_M,
         thin=soundings_run.SOUND_THIN_TIERS,
         ladders=json.dumps(pipeline_config.CONTOUR_TIERS),  # a prime sounding shows with its ring
