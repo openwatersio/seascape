@@ -518,6 +518,12 @@ def simplify_coverage(geoms, tol):
     return geoms
 
 
+# gdal_contour -p polygonizes only between levels, so water deeper than a ladder's deepest level
+# gets no band at all. A level below the deepest ocean (Challenger Deep, 10,935 m) closes the
+# deepest band; its drval2 is this floor.
+DEPTH_FLOOR = -12000
+
+
 def partitions(dem, levels, raw_fgb, timeout=0):
     """Water/foreshore partitions off `dem`: gdal_contour -p buckets the DEM between `levels`,
     tagging each bucket its range amin/amax -> drval1/drval2 (ENC: shallow/deep bound,
@@ -525,7 +531,7 @@ def partitions(dem, levels, raw_fgb, timeout=0):
     bucket-at-a-time with read_bucket, so nothing holds both ladders at once.
     Callers select depth bands (amax <= 0), the [0, DRYING_CAP] drying bucket
     (0 < amax <= cap), and drop land (amax above the shallowest positive level)."""
-    fl = " ".join(str(l) for l in levels)
+    fl = " ".join(str(l) for l in [DEPTH_FLOOR, *levels] if l >= DEPTH_FLOOR)
     cmd = f"gdal_contour -q -p -amin amin -amax amax -fl {fl} -f FlatGeobuf {dem} {raw_fgb}"
     _run_bounded(cmd, "gdal_contour -p", timeout)
     _mark(f"gdal_contour[{os.path.basename(raw_fgb)}]")
@@ -1914,6 +1920,21 @@ def _check():
     water = 40 * w * res * res
     assert abs(union.area - water) < 1.5 * w * res * res, \
         f"bands must tile the water ({union.area:.0f} vs {water:.0f})"
+
+    # Water deeper than a ladder's deepest level still gets a band: a coarse tier's ladder stops
+    # at 4000 m and the full ladders at 10,000 m and 5000 fm, while trenches run past all three.
+    deep = np.full((h, w), -3500.0, dtype="float32")
+    deep[:, w // 3:] = -4122.0
+    deep[:, 2 * w // 3:] = -10900.0
+    dp = f"{d}/deep.tif"
+    with rasterio.open(dp, "w", driver="GTiff", height=h, width=w, count=1, dtype="float32",
+                       nodata=-9999, crs="EPSG:3857", transform=tr) as dst:
+        dst.write(deep, 1)
+    for ladder in ([-4000, -3000, -2000, 0], config.DEPARE_LEVELS, config.DEPARE_LEVELS_FT):
+        db = read_bucket(partitions(dp, ladder, f"{d}/deep-raw.fgb"), "amax <= 0")
+        covered = unary_union(list(db.geometry)).area
+        assert abs(covered - h * w * res * res) < 1.5 * h * res * res, \
+            f"water below the ladder's deepest level {ladder[0]} must get a band"
 
     # Fathom-curve set (no cap — drying rides the metre ladder only): -7 m sits between 3 fm and 5 fm.
     gft_bands = read_bucket(partitions(p, config.DEPARE_LEVELS_FT, f"{d}/raw-ft.fgb"),

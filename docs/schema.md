@@ -62,7 +62,7 @@ A partition of the water into polygons, three feature kinds keyed by attribute p
 
 | Kind | Signature | Meaning |
 |---|---|---|
-| Depth band | `drval1 ≥ 0`, `sys` present | Water between two charted isobaths: `drval1`/`drval2` are the shallow/deep bounds in positive-down metres. `sys` (`"m"` or `"ft"`) tags which isobath ladder cut the band — render one ladder, never both. |
+| Depth band | `drval1 ≥ 0`, `sys` present | Water between two charted isobaths: `drval1`/`drval2` are the shallow/deep bounds in positive-down metres; the deepest band's `drval2` is 12000, below any ocean. `sys` (`"m"` or `"ft"`) tags which isobath ladder cut the band — render one ladder, never both. |
 | Drying | `drval1 < 0`, no `sys` | Drying foreshore. `drval1`/`drval2` are the drying bucket's fixed bounds (−drying cap and 0) on every feature, **not** a measured per-feature drying height — only the sign is information. |
 | Unknown water | no `drval1` | Water of unknown depth (the vector twin of raster code 0). |
 
