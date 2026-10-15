@@ -45,7 +45,7 @@ jobs:
           echo "released tiles: $tiles"
           # Everything that shapes what the tiles and the Worker serve.
           paths=(pipelines Snakefile profiles worker patches Dockerfile pyproject.toml uv.lock
-                 docker.sh .github/workflows/build.yml)
+                 package.json package-lock.json docker.sh .github/workflows/build.yml)
           if git merge-base --is-ancestor "$GITHUB_SHA" "$tiles"; then
             echo "the released tiles were built after this commit"
           elif git merge-base --is-ancestor "$tiles" "$GITHUB_SHA" &&

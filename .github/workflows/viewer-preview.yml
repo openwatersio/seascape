@@ -24,16 +24,12 @@ permissions:
   statuses: write
 
 jobs:
-  stage:
+  # The build runs the branch's code and its dependencies' install scripts, so it holds no
+  # secrets; only the upload, which runs nothing from the branch, holds the bucket keys.
+  build:
     # Dependabot pushes run without the repository secrets the upload needs.
     if: github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
-    env:
-      DATA_BUCKET: data
-      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: auto
-      AWS_ENDPOINT_URL: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -44,6 +40,21 @@ jobs:
         run: |
           npm ci
           npm run build -- --base=/bathymetry/viewer/${{ github.sha }}/
+      - uses: actions/upload-artifact@v7
+        with: { name: viewer, path: dist, retention-days: 1 }
+
+  stage:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      DATA_BUCKET: data
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      AWS_ENDPOINT_URL: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+    steps:
+      - uses: actions/download-artifact@v8
+        with: { name: viewer, path: dist }
       - name: Stage in the data bucket
         run: aws s3 sync dist "s3://$DATA_BUCKET/bathymetry/viewer/${{ github.sha }}/" --no-progress
       - name: Link the preview from the commit
