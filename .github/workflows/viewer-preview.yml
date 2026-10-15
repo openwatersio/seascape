@@ -1,0 +1,54 @@
+name: Viewer preview
+
+# Style previews, the way build.yml makes tile previews: every pushed commit that touches the
+# style or the viewer builds the viewer at that commit and stages it in the data bucket at
+# bathymetry/viewer/<sha>/, served as plain objects by data.openwaters.io. It defaults to the
+# released tiles; ?tiles= points it at any build preview, e.g.
+#   https://data.openwaters.io/bathymetry/viewer/<sha>/index.html?tiles=https://data.openwaters.io/bathymetry/build/<sha>
+# The link lands on the commit as the `viewer` status.
+on:
+  push:
+    paths:
+      - "style/**"
+      - "index.html"
+      - "index.js"
+      - "vite.config.js"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/viewer-preview.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  statuses: write
+
+jobs:
+  stage:
+    runs-on: ubuntu-latest
+    env:
+      DATA_BUCKET: data
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      AWS_ENDPOINT_URL: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with: { node-version-file: mise.toml, cache: npm }
+      - name: Build viewer
+        env:
+          VITE_TILES_BASE: https://tiles.openwaters.io/seascape
+        run: |
+          npm ci
+          npm run build -- --base=/bathymetry/viewer/${{ github.sha }}/
+      - name: Stage in the data bucket
+        run: aws s3 sync dist "s3://$DATA_BUCKET/bathymetry/viewer/${{ github.sha }}/" --no-progress
+      - name: Link the preview from the commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          URL: https://data.openwaters.io/bathymetry/viewer/${{ github.sha }}/index.html
+        run: |
+          gh api "repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -f state=success -f context=viewer -f target_url="$URL" \
+            -f description="Viewer preview at this commit (?tiles= to open a build)"
+          echo "Viewer preview: $URL" >> "$GITHUB_STEP_SUMMARY"

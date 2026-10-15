@@ -1,0 +1,63 @@
+name: Style release
+
+# Publishes @openwaters/seascape to npm from a GitHub release tagged style-v<version>, through
+# npm trusted publishing (OIDC — no token; npmjs.com lists this workflow as the package's
+# trusted publisher). Consumers of the package (Seamap) read the released tiles, so a style
+# only publishes once those tiles carry every pipeline change in the style's commit: the
+# released tiles' commit is in the style's history with no pipeline change after it, or the
+# style's commit is in the tiles' history. Otherwise build and release the tiles first.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    if: startsWith(github.event.release.tag_name, 'style-v')
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name }}
+      TILES_BUCKET: ${{ secrets.R2_BUCKET }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      AWS_ENDPOINT_URL: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+    steps:
+      - uses: actions/checkout@v7
+        with: { fetch-depth: 0 }
+      - name: Tag matches the package version
+        run: |
+          version=$(jq -r .version style/package.json)
+          [ "$TAG" = "style-v$version" ] || { echo "::error::tag $TAG but style/package.json is $version"; exit 1; }
+      - name: Released tiles carry this style's pipeline
+        run: |
+          set -euo pipefail
+          # The live release is the newest manifest in the serving bucket (release.yml's own rule).
+          tiles=$(aws s3 ls "s3://$TILES_BUCKET/seascape/" --recursive \
+            | grep '/manifest\.json$' | sort -r | awk '{print $4}' | cut -d/ -f2 | head -1)
+          [ -n "$tiles" ] || { echo "::error::no released tiles found"; exit 1; }
+          echo "released tiles: $tiles"
+          if git merge-base --is-ancestor "$GITHUB_SHA" "$tiles"; then
+            echo "the released tiles were built after this commit"
+          elif git merge-base --is-ancestor "$tiles" "$GITHUB_SHA" &&
+               git diff --quiet "$tiles" "$GITHUB_SHA" -- pipelines Snakefile profiles; then
+            echo "no pipeline change since the released tiles"
+          else
+            echo "::error::the released tiles ($tiles) lack pipeline changes in $GITHUB_SHA — build and release the tiles first"
+            git diff --stat "$tiles" "$GITHUB_SHA" -- pipelines Snakefile profiles || true
+            exit 1
+          fi
+      - uses: actions/setup-node@v7
+        with: { node-version-file: mise.toml, cache: npm, registry-url: "https://registry.npmjs.org" }
+      - name: Test
+        run: |
+          npm ci
+          npm test --workspace style
+      - name: Publish
+        # Trusted publishing needs npm 11.5.1 or later.
+        run: |
+          npm install -g npm@11.6.2
+          npm publish --workspace style --access public
