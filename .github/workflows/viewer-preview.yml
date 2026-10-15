@@ -8,6 +8,7 @@ name: Viewer preview
 # The link lands on the commit as the `viewer` status.
 on:
   push:
+    branches: ["**"] # not tags: they skip the paths filter, and their commits preview on their branch
     paths:
       - "style/**"
       - "index.html"
@@ -24,6 +25,8 @@ permissions:
 
 jobs:
   stage:
+    # Dependabot pushes run without the repository secrets the upload needs.
+    if: github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     env:
       DATA_BUCKET: data

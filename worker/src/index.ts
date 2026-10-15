@@ -538,7 +538,9 @@ export default {
     const tilesBase = `${url.origin}${mount}`;
 
     if (rel === "/manifest.json") {
-      return json(await manifest(renv));
+      // `release` names the bundle this Worker serves; style-release.yml checks the style
+      // against it.
+      return json({ ...(await manifest(renv)), release: renv.RELEASE_PREFIX ?? "" });
     }
     // Drop-in MapLibre style for these tiles — the same style the viewer
     // renders (assembled by @openwaters/seascape); the endpoint base is derived
