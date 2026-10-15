@@ -118,3 +118,14 @@ renders at the initial viewport.
   virtual-mosaic resolution (about z9) from one indexed tile and overzooms it for every finer terrain
   render, despite the Bay index row naming CUDEM + NOS Estuarine at 9.55 m. Fix the GTI resolution,
   re-render terrain, and repeat this checklist.
+
+## Run 38586204681
+
+- Result: success for commit `dc2deec1419057738a00bed4c5d6894425965a5a` (main after #196, #195 and #208). Resumed the store volume left by run 38487841311, which had completed every mosaic tile before stopping on the GEOS overlay failure #208 fixes.
+- Build job: 15:05:06–03:27:53 UTC (12h22m47s) on a ccx63; 36,198 jobs, zero failures, zero retries; runner teardown succeeded. Full log at `docs/perf/logs/build-38586204681-2026-10-14T15-05-06Z.log`.
+- Publication order: vector merge and staging (manifest last, 02:10 UTC) preceded the mosaic publish (03:24 UTC, 4,465 tiles staged, 1,380 uploaded new, candidate GTI `mosaic-candidate-ce7c232a0da5.gti`). The serving pointer flips only at release, so the order between staging and the candidate publish does not matter for the archival build.
+- R2 inventory: 245 objects, 49,508,316,914 bytes: 240 overlays (one per manifest cell, none unreferenced, none empty), planet 1,540,902,021, vector 9,495,842,425, coverage 5,611,087, manifest 5,940 (equal to its R2 size), plus the 5.15 GB land archive. The land archive is a fifth top-level object the "overlay count + 4" rule above predates.
+- Manifest: planet z0–8 with global bounds, vector max zoom 15, 34 source IDs, DEPARE present (per-zoom tiers from #195).
+- `pmtiles verify` passed for all three primary archives: planet z0–8 webp, 87,381 addressed tiles; vector z4–15 mvt, 19,971,519 addressed tiles; coverage z0–8.
+- Preview smoke test against the exact SHA: globe at z2 complete with no seams; IJmuiden z12 (soundings, isobaths, foreshore, bands); SF Bay z10.6, the baseline failure location, shows the full CUDEM/NOS estuary detail; Hamilton Harbour z11 (no false depths over the city); mid-Pacific z10 falls back to the planet archive with 4,000 m isobaths and soundings. Every tile request returned 200; the only console errors are the site favicon and Mapterhorn land-relief tiles that do not exist over open ocean. Aborted requests during zoom animation are client cancellations.
+- Known limitation, not a release blocker: isobaths and depth areas at z6–9 are drawn with long straight segments. The tier files carry vertices every pixel; the shallow bundle run's `--simplification 8` at detail 10 removes them (a 4.9 km tolerance at z6). #210 changes those settings; its re-bundle is the check.
