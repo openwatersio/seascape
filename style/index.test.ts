@@ -149,6 +149,13 @@ test("contour lines floor at z6 — depth shading carries lower zooms", () => {
   expect((lines as { minzoom?: number }).minzoom).toBe(6);
 });
 
+test("contour lines meet at round joins — a vertex per pixel still turns corners", () => {
+  const lines = layers().find((l) => l.id === "contour-lines") as {
+    layout?: Record<string, unknown>;
+  };
+  expect(lines.layout).toMatchObject({ "line-join": "round", "line-cap": "round" });
+});
+
 test("the emphasized safety contour follows the ladder drawn at each zoom tier", () => {
   // Isobaths are compiled per zoom tier with a scale-dependent ladder, so the next-deeper
   // level for a 3 m safety depth is 200 m at z6, 50 m at z7-8, 10 m at z9-10 and 5 m from z11.

@@ -460,12 +460,10 @@ COMPLETENESS_MIN_PX = 4
 LEAF_DETAIL = 12  # tippecanoe's default tile detail: 2**12 = 4096 grid units per tile
 
 # The shallow run's -z is an OVERVIEW zoom — z >= VECTOR_SPLIT_Z is served from the cell archives.
-# Detail is the byte lever for a depare coverage (-S saturates at ~1.4x under
-# --no-simplification-of-shared-nodes), and the ceiling it must respect is tippecanoe's 500 KB,
-# past which the overflow path (--coalesce-smallest-as-needed) merges a band's polygon onto a
-# deeper neighbour: a partition hole and a shoal-bias lie. The per-zoom depth-area tiers keep the
-# planet's largest shallow tile under 80 KB, so leaf detail fits; 1024 units (detail 10) is the
-# fallback dial if a tile ever nears the ceiling, at a quarter-pixel quantization at z7.
+# Every shallow tile must fit tippecanoe's 500 KB ceiling, past which the as-needed pass merges a
+# band's polygon onto a deeper neighbour: a partition hole and a shoal-bias lie, which is why
+# _tippecanoe_run fails the archive the moment that pass arms. Detail is the byte dial if a tile
+# ever nears the ceiling: 1024 units (detail 10) quantizes a quarter of a display pixel at z7.
 VECTOR_SHALLOW_DETAIL = int(os.environ.get("VECTOR_SHALLOW_DETAIL", "12"))
 
 
@@ -603,9 +601,9 @@ def _tippecanoe_run(layers, minz, maxz, out, variable_depth):
     cmd += ["-n", "Open Waters Bathymetry", "-A", utils.ATTRIBUTION,
             "-Z", str(minz), "-z", str(maxz), "-P",
             "--coalesce-smallest-as-needed", "--no-simplification-of-shared-nodes",
-            # 1 keeps the tier files' S-58 vertex floor (one vertex per display pixel); every
-            # unit above it is a Douglas-Peucker tolerance of that many tile units, which draws
-            # the low-zoom isobaths as long straight segments (8 is a 4.9 km tolerance at z6).
+            # A Douglas-Peucker tolerance in tile units: 1 is an eighth of a display pixel at
+            # detail 12 and keeps the tier files' S-58 vertex floor; 8 is a whole pixel, which
+            # straightens an isobath into segments many pixels long.
             "--simplification", os.environ.get("VECTOR_SIMPLIFICATION", "1")]
     if variable_depth:
         # -S alone ALSO applies at maxzoom (~76 m tolerance at z10), which cut isobaths across
@@ -636,6 +634,27 @@ def _tippecanoe_run(layers, minz, maxz, out, variable_depth):
     kind = "variable-depth" if variable_depth else "shallow"
     with utils.log_group(f"vector tippecanoe {kind} ({len(layers)} layers, z{minz}-{maxz})"):
         utils.run_monitored(cmd, f"vector tippecanoe {kind}", out)
+    armed = _overflow_armed(_archive_metadata(out).get("strategies", []))
+    if armed:
+        raise SystemExit(f"vector tippecanoe {kind}: a tile passed the size ceiling and tippecanoe "
+                         f"coalesced or dropped features to fit ({armed}) — a merged band is a "
+                         f"partition hole, so this archive must not ship; lower the detail dial")
+
+
+# tippecanoe's per-zoom `strategies` keys that only count when a tile exceeded the size ceiling
+# and the as-needed pass changed its content. tiny_polygons is its normal sub-pixel dust.
+_OVERFLOW_STRATEGIES = ("coalesced_as_needed", "dropped_as_needed", "detail_reduced")
+
+
+def _overflow_armed(strategies):
+    """{zoom: {strategy: count}} of the as-needed changes in a tippecanoe `strategies` block, empty
+    when every tile fit."""
+    armed = {}
+    for z, s in enumerate(strategies or []):
+        hit = {k: s[k] for k in _OVERFLOW_STRATEGIES if s and s.get(k)}
+        if hit:
+            armed[z] = hit
+    return armed
 
 
 def _empty_archive(out):
@@ -1200,6 +1219,11 @@ def _check():
     assert 0 in config.CONTOUR_LEVELS, "the 0 m drying line must be a contoured level"
     # every tier level must exist in the generated contour set (else it gates nothing)
     assert all(d in config.CONTOUR_LEVELS for _, depths in CONTOUR_TIERS for d in depths)
+    # The overflow gate reads only the as-needed strategies: dust thinning is normal, a coalesce or
+    # a drop at any zoom arms it.
+    assert _overflow_armed([None, {"tiny_polygons": 77048}, {}]) == {}
+    assert _overflow_armed([{"tiny_polygons": 3, "coalesced_as_needed": 2}, {"dropped_as_needed": 1}]) == \
+        {0: {"coalesced_as_needed": 2}, 1: {"dropped_as_needed": 1}}
     print("contour_run derivation + ring-drop + minzoom self-check ok")
 
 
