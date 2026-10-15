@@ -54,6 +54,9 @@ export function contourLinesLayer(
     filter: contourFilter(unit),
     // Presentation floor, not a data limit: below z6 isobaths read as clutter over depth shading.
     minzoom: 6,
+    // Round joins: an isobath vertex per display pixel still meets at angles, and miter joins
+    // spike them.
+    layout: { "line-join": "round", "line-cap": "round" },
     // Full-strength linework at DEPCN weight — translucent hairlines read as
     // shading artefacts rather than isobaths.
     paint: {

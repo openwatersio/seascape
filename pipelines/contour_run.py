@@ -459,12 +459,14 @@ COMPLETENESS_MIN_PX = 4
 
 LEAF_DETAIL = 12  # tippecanoe's default tile detail: 2**12 = 4096 grid units per tile
 
-# The shallow run's -z is an OVERVIEW zoom — z >= VECTOR_SPLIT_Z is served from the cell archives, so
-# no shallow tile is ever rendered at leaf scale. At LEAF_DETAIL a planet z6/z7 depare tile runs
-# 0.5–2 MB, past tippecanoe's 500 KB ceiling, and the overflow path (--coalesce-smallest-as-needed)
-# merges a band's polygon onto a deeper neighbour: a partition hole and a shoal-bias lie. 1024 units
-# still resolves a quarter of a screen pixel at z7 (~306 m against a ~1.2 km pixel).
-VECTOR_SHALLOW_DETAIL = int(os.environ.get("VECTOR_SHALLOW_DETAIL", "10"))
+# The shallow run's -z is an OVERVIEW zoom — z >= VECTOR_SPLIT_Z is served from the cell archives.
+# Detail is the byte lever for a depare coverage (-S saturates at ~1.4x under
+# --no-simplification-of-shared-nodes), and the ceiling it must respect is tippecanoe's 500 KB,
+# past which the overflow path (--coalesce-smallest-as-needed) merges a band's polygon onto a
+# deeper neighbour: a partition hole and a shoal-bias lie. The per-zoom depth-area tiers keep the
+# planet's largest shallow tile under 80 KB, so leaf detail fits; 1024 units (detail 10) is the
+# fallback dial if a tile ever nears the ceiling, at a quarter-pixel quantization at z7.
+VECTOR_SHALLOW_DETAIL = int(os.environ.get("VECTOR_SHALLOW_DETAIL", "12"))
 
 
 def _leaf_pixel_deg(maxz, detail=LEAF_DETAIL):
@@ -601,7 +603,10 @@ def _tippecanoe_run(layers, minz, maxz, out, variable_depth):
     cmd += ["-n", "Open Waters Bathymetry", "-A", utils.ATTRIBUTION,
             "-Z", str(minz), "-z", str(maxz), "-P",
             "--coalesce-smallest-as-needed", "--no-simplification-of-shared-nodes",
-            "--simplification", os.environ.get("VECTOR_SIMPLIFICATION", "8")]
+            # 1 keeps the tier files' S-58 vertex floor (one vertex per display pixel); every
+            # unit above it is a Douglas-Peucker tolerance of that many tile units, which draws
+            # the low-zoom isobaths as long straight segments (8 is a 4.9 km tolerance at z6).
+            "--simplification", os.environ.get("VECTOR_SIMPLIFICATION", "1")]
     if variable_depth:
         # -S alone ALSO applies at maxzoom (~76 m tolerance at z10), which cut isobaths across
         # islands the DEM-level land clamp had already routed around — pin maxzoom near-lossless

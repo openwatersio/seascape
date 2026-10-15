@@ -619,6 +619,7 @@ rule vector_shallow:
         # planet covering (run 31946612525), the largest single job in the build.
         mem_gb=20
     params:
+        version=2, # increment to force a rebuild
         bbox=os.environ.get("BBOX", ""),  # scope stamp — see mosaic_index
     benchmark:
         f"{TMP}/bench/vector-shallow.tsv"
@@ -645,7 +646,7 @@ rule vector_cell:
         # carries no `retries`, so the handful of dense coastal cells ride physical headroom.
         mem_gb=2
     params:
-        version=1, # increment to force a rebuild
+        version=2, # increment to force a rebuild
         bbox=os.environ.get("BBOX", ""),  # scope stamp — see mosaic_index
     benchmark:
         f"{TMP}/bench/vector-cell-{{cell}}.tsv"
