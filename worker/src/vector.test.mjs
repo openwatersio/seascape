@@ -246,6 +246,18 @@ console.log("vector.ts G ok — layer name, feature id, and property types survi
 }
 console.log("vector.ts G2 ok — non-default extent stays coherent through the wire");
 
+// ── G3: overzoom from a 2048-extent ancestor (the shallow run's low zooms) scales by the
+// source layer's own extent and re-encodes at 4096 ────────────────────────────────
+{
+  const strip = [[0, 0], [512, 0], [512, 2048], [0, 2048]]; // the parent's left quarter
+  const parent = srcTile(6, 0, 0, [layer("depare", [polyFeature(1, [strip], { drval1: 0, drval2: 5, sys: "m", rank: 1 })], 2048)]);
+  const out = synthesizeLayers([parent], 7, 0, 0);
+  assert.equal(out[0].extent, 4096, "the child re-encodes at the served extent");
+  const b = bbox(out[0].features[0]);
+  assert.equal(b.mxx, 2048, "a quarter of a 2048-extent parent is half of its 4096-extent child");
+}
+console.log("vector.ts G3 ok — a 2048-extent ancestor overzooms into a 4096-extent child");
+
 // ── H: line overzoom clips and scales ─────────────────────────────────────────
 {
   // horizontal line across the parent at y=1024 (top quarter band)

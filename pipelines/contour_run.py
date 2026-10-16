@@ -421,7 +421,7 @@ DEPARE_MINZOOM = config.DEPARE_TIER_STARTS[0]  # depare's zoom floor: the first 
 # and flags residual BLOBS rather than area ratios. Measured noise floor after clip+erode:
 # gap 8.1k child-px², overlap 103 px²; a real defect (a displaced or lost band polygon — the 50%
 # negative fixture is ~33M px²) sits orders of magnitude above these.
-DEPARE_ERODE_PX = 2.0          # erosion before differencing, in child-tile grid units
+DEPARE_ERODE_PX = 2.0          # erosion before differencing, in child-tile grid units at a 2x step
 DEPARE_GAP_MAX_PX2 = 32_768    # residual blob ≥ ~181×181 child px (0.2% of a tile) is a hole
 DEPARE_OVERLAP_MAX_PX2 = 512   # eroded pairwise band intersection ≥ this is a displacement
 
@@ -463,8 +463,17 @@ LEAF_DETAIL = 12  # tippecanoe's default tile detail: 2**12 = 4096 grid units pe
 # Every shallow tile must fit tippecanoe's 500 KB ceiling, past which the as-needed pass merges a
 # band's polygon onto a deeper neighbour: a partition hole and a shoal-bias lie, which is why
 # _tippecanoe_run fails the archive the moment that pass arms. Detail is the byte dial if a tile
-# ever nears the ceiling: 1024 units (detail 10) quantizes a quarter of a display pixel at z7.
+# ever nears the ceiling: VECTOR_SHALLOW_DETAIL sets the run's top zoom, VECTOR_SHALLOW_LOW_DETAIL
+# every zoom below it, never finer than the top. The z4 archipelago tile 4/13/7 (Philippines and
+# northern Borneo) reached 525 KB at detail 12; 2048 units (detail 11) are four per display pixel.
 VECTOR_SHALLOW_DETAIL = int(os.environ.get("VECTOR_SHALLOW_DETAIL", "12"))
+VECTOR_SHALLOW_LOW_DETAIL = min(int(os.environ.get("VECTOR_SHALLOW_LOW_DETAIL", "11")),
+                                VECTOR_SHALLOW_DETAIL)
+
+
+def _shallow_detail(z):
+    """The shallow run's detail at zoom z: full at its top zoom (-d), low below it (-D)."""
+    return VECTOR_SHALLOW_DETAIL if z >= VECTOR_SPLIT_Z - 1 else VECTOR_SHALLOW_LOW_DETAIL
 
 
 def _leaf_pixel_deg(maxz, detail=LEAF_DETAIL):
@@ -474,10 +483,10 @@ def _leaf_pixel_deg(maxz, detail=LEAF_DETAIL):
 
 def _tile_grid_deg(z):
     """One MVT grid unit of a tile of the JOINED archive, in degrees of longitude. z below the split
-    comes from the shallow run at VECTOR_SHALLOW_DETAIL, the rest from the per-cell runs at
+    comes from the shallow run at its per-zoom detail, the rest from the per-cell runs at
     LEAF_DETAIL. Every geometric tolerance below is expressed in grid units, so it has to follow the
     grid of the tile it measures — a coarser tile quantizes its band edges proportionally further."""
-    return 360.0 / 2 ** z / 2 ** (VECTOR_SHALLOW_DETAIL if z < VECTOR_SPLIT_Z else LEAF_DETAIL)
+    return 360.0 / 2 ** z / 2 ** (_shallow_detail(z) if z < VECTOR_SPLIT_Z else LEAF_DETAIL)
 
 
 def _survives_leaf(geom, min_deg):
@@ -494,7 +503,7 @@ def _survives_leaf(geom, min_deg):
 
 
 def _fgb_to_seq(fgbs, cols, minzoom_fn, out_path, layer, identity_fn, id0, maxz, max_minzoom=None,
-                min_minzoom=None, leaf_detail=LEAF_DETAIL, maxzoom=None):
+                min_minzoom=None, detail_at=lambda z: LEAF_DETAIL, maxzoom=None):
     """Stream per-tile FGBs → one GeoJSONSeq (newline-delimited features) carrying a per-feature
     tippecanoe.minzoom — FGB can't hold the tippecanoe extension, so the run reads GeoJSON like
     soundings already do. One tile in memory at a time (macrotile-sized). Every WRITTEN feature gets
@@ -509,8 +518,8 @@ def _fgb_to_seq(fgbs, cols, minzoom_fn, out_path, layer, identity_fn, id0, maxz,
     and a coarse tier's sliver is measured against its own coarse pixel, not the leaf's."""
     import geopandas as gpd
     from shapely.geometry import mapping
-    min_deg = COMPLETENESS_MIN_PX * _leaf_pixel_deg(maxz if maxzoom is None else min(maxzoom, maxz),
-                                                    leaf_detail)
+    finest = maxz if maxzoom is None else min(maxzoom, maxz)
+    min_deg = COMPLETENESS_MIN_PX * _leaf_pixel_deg(finest, detail_at(finest))
     fid = id0
     ids = {}
     with open(out_path, "a") as fh:
@@ -588,7 +597,7 @@ def _tippecanoe_run(layers, minz, maxz, out, variable_depth):
     """ONE tippecanoe run over the named layer seqs → out (pmtiles). `variable_depth` marks the
     per-cell runs, whose -z IS the display leaf: they add --generate-variable-depth-tile-pyramid and
     pin maxzoom near-lossless. The shallow run is a plain dense pyramid whose every zoom, -z
-    included, is an overview, so it drops that pin and writes at VECTOR_SHALLOW_DETAIL. The rest is
+    included, is an overview, so it drops that pin and writes at _shallow_detail. The rest is
     shared: --coalesce-smallest-as-needed (an as-needed strategy is invocation-wide; of the ones on
     offer it merges rather than drops, but a merge still displaces a depare band, so the run must
     stay under the tile ceiling on its own and never reach for it), and
@@ -602,7 +611,8 @@ def _tippecanoe_run(layers, minz, maxz, out, variable_depth):
             "-Z", str(minz), "-z", str(maxz), "-P",
             "--coalesce-smallest-as-needed", "--no-simplification-of-shared-nodes",
             # A Douglas-Peucker tolerance in tile units: 1 is an eighth of a display pixel at
-            # detail 12 and keeps the tier files' S-58 vertex floor; 8 is a whole pixel, which
+            # detail 12 (a quarter at the shallow run's detail 11) and keeps the tier files' S-58
+            # vertex floor; 8 is a whole pixel at detail 12, which
             # straightens an isobath into segments many pixels long.
             "--simplification", os.environ.get("VECTOR_SIMPLIFICATION", "1")]
     if variable_depth:
@@ -619,7 +629,7 @@ def _tippecanoe_run(layers, minz, maxz, out, variable_depth):
         # docs/plans/2026-07-31-post-build-followups.md.
         cmd += ["--maximum-tile-bytes", os.environ.get("VECTOR_CELL_TILE_BYTES", "800000")]
     else:
-        cmd += ["-d", str(VECTOR_SHALLOW_DETAIL), "-D", str(VECTOR_SHALLOW_DETAIL)]
+        cmd += ["-d", str(VECTOR_SHALLOW_DETAIL), "-D", str(VECTOR_SHALLOW_LOW_DETAIL)]
     # --detect-shared-borders drives tippecanoe's wagyu exit-106 hole-placement crash on dense
     # DEPARE geometry (mapbox/tippecanoe#761, unfixed in felt v2.80.0). Its documented successor
     # --no-simplification-of-shared-nodes (above) keeps shared edges crack-free without the crash;
@@ -638,7 +648,10 @@ def _tippecanoe_run(layers, minz, maxz, out, variable_depth):
     if armed:
         raise SystemExit(f"vector tippecanoe {kind}: a tile passed the size ceiling and tippecanoe "
                          f"coalesced or dropped features to fit ({armed}) — a merged band is a "
-                         f"partition hole, so this archive must not ship; lower the detail dial")
+                         f"partition hole, so this archive must not ship; lower the detail dial"
+                         + ("" if variable_depth else
+                            " (VECTOR_SHALLOW_LOW_DETAIL below the run's top zoom, "
+                            "VECTOR_SHALLOW_DETAIL at it)"))
 
 
 # tippecanoe's per-zoom `strategies` keys that only count when a tile exceeded the size ceiling
@@ -688,7 +701,7 @@ def _build_seqs_and_run(stems, minz, maxz, id_base, variable_depth, out, max_min
     dseq = utils.vector_scratch("depare.geojsons")
     nid = id_base
     cids, sids, dids = {}, {}, {}
-    detail = LEAF_DETAIL if variable_depth else VECTOR_SHALLOW_DETAIL
+    detail = (lambda z: LEAF_DETAIL) if variable_depth else _shallow_detail
     try:
         for seq in (cseq, dseq):
             open(seq, "w").close()
@@ -1134,7 +1147,10 @@ def _vector_selfcheck(vec, maxz, expected=None, per_zoom=6):
                 if z + 1 <= maxz and all(k in present.get(z + 1, ()) for k in kids):
                     childpx = _tile_grid_deg(z + 1)
                     pu = mband_union(mbands, clip)
-                    resid = pu.buffer(-DEPARE_ERODE_PX * childpx) if pu is not None else None
+                    # Scaled to the grid step: at the shallow run's detail change a parent's
+                    # grid is 4x its children's, and its edges wobble twice as far.
+                    erode = DEPARE_ERODE_PX * max(childpx, px / 2)
+                    resid = pu.buffer(-erode) if pu is not None else None
                     if resid is not None and not resid.is_empty:
                         ku = [g for g in (mband_union(_decode_tile(vec, z + 1, kx, ky).get("depare", []),
                                                       clip) for kx, ky in kids) if g is not None]
@@ -1221,6 +1237,12 @@ def _check():
     # …from the native window too, unless that repeats the final tier's cut (same ladder)
     assert config.depare_tiers(8)[2].surface == 8 and config.depare_tiers(10)[3].surface == 10
     assert config.depare_tiers(12)[4].surface == 11
+    # The shallow run writes its top zoom at full detail and every zoom below at the low detail,
+    # and the self-check's grid unit follows the same split.
+    top = VECTOR_SPLIT_Z - 1
+    assert _shallow_detail(top) == VECTOR_SHALLOW_DETAIL and _shallow_detail(top - 1) == VECTOR_SHALLOW_LOW_DETAIL
+    assert _tile_grid_deg(top - 1) == 360.0 / 2 ** (top - 1) / 2 ** VECTOR_SHALLOW_LOW_DETAIL
+    assert _tile_grid_deg(VECTOR_SPLIT_Z) == 360.0 / 2 ** VECTOR_SPLIT_Z / 2 ** LEAF_DETAIL
     assert 0 in config.CONTOUR_LEVELS, "the 0 m drying line must be a contoured level"
     # every tier level must exist in the generated contour set (else it gates nothing)
     assert all(d in config.CONTOUR_LEVELS for _, depths in CONTOUR_TIERS for d in depths)

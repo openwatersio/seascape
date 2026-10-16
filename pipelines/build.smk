@@ -621,8 +621,9 @@ rule vector_shallow:
         # planet covering (run 31946612525), the largest single job in the build.
         mem_gb=20
     params:
-        version=2, # increment to force a rebuild
+        version=3, # increment to force a rebuild
         bbox=os.environ.get("BBOX", ""),  # scope stamp — see mosaic_index
+        detail=[contour_run.VECTOR_SHALLOW_DETAIL, contour_run.VECTOR_SHALLOW_LOW_DETAIL],
     benchmark:
         f"{TMP}/bench/vector-shallow.tsv"
     log:
