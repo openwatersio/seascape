@@ -45,11 +45,15 @@ jobs:
           echo "released tiles: $tiles"
           # Everything that shapes what the tiles and the Worker serve.
           paths=(pipelines Snakefile profiles worker patches Dockerfile pyproject.toml uv.lock
-                 package.json package-lock.json docker.sh .github/workflows/build.yml)
+                 package.json docker.sh .github/workflows/build.yml)
+          # The lockfile pins the Worker's dependencies; the style package's own entry is the
+          # release's version bump, not a Worker change.
+          lock() { git show "$1:package-lock.json" | jq -S 'del(.packages.style)'; }
           if git merge-base --is-ancestor "$GITHUB_SHA" "$tiles"; then
             echo "the released tiles were built after this commit"
           elif git merge-base --is-ancestor "$tiles" "$GITHUB_SHA" &&
-               git diff --quiet "$tiles" "$GITHUB_SHA" -- "${paths[@]}"; then
+               git diff --quiet "$tiles" "$GITHUB_SHA" -- "${paths[@]}" &&
+               [ "$(lock "$tiles")" = "$(lock "$GITHUB_SHA")" ]; then
             echo "no tile or Worker change since the released tiles"
           else
             echo "::error::the released tiles ($tiles) lack changes in $GITHUB_SHA — build and release the tiles first"
