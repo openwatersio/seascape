@@ -905,9 +905,16 @@ def _drop_datum(dem, geom, block=4096):
 
 
 def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, levels_ft=None,
-                scale_z=None, fine_z=None, tol_z=None):
+                scale_z=None, fine_z=None, tol_z=None, carry=None):
     """Partition any DEM covering the tile's buffered extent into depth-area / drying / nodata
-    rows. Returns (final_path, count) inside ``tmp``, or None when there is no water."""
+    rows. Returns (final_path, count) inside ``tmp``, or None when there is no water.
+
+    ``carry`` shares the costly water work across a stem's tiers: an empty dict is filled with
+    this cut's repaired inland-water features and the union of the tidal ones its drying bucket
+    touches, and a filled one stands in for the inland-water feed. That union is the cost — 3.2 h
+    on the native Arctic stem 4-3-3-8 and still 48 min at z7, since it scales with OSM's water, not
+    the raster — so a coarse tier reuses it and unions only the tidal features its own, wider
+    bucket adds."""
     import geopandas as gpd
     import landmask
     import shapely
@@ -999,17 +1006,23 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, le
 
     # Inland-water feed, read once by bbox (the nodata pass iterates all its features for `kind`;
     # the drying cut unions the tidal ones). Optional: absent -> no water term (land-only gate).
+    reuse = carry is not None and "water" in carry
     water_src = landmask.water_path()
     water = None
-    if landmask._present(water_src):
+    if not reuse and landmask._present(water_src):
         w = gpd.read_file(water_src, bbox=bbox)
         if len(w):
             water = w.to_crs("EPSG:3857")
     _mark("water-read")
     # Parts, same reason as coverage: the union's one consumer (the drying water term) only
     # needs the parts near the bucket.
-    tidal_parts = [make_valid(g) for g in water.geometry[_may_dry(water)]] \
-        if water is not None else []
+    if reuse:
+        tidal_parts = carry["tidal_parts"]
+    else:
+        tidal_parts = [make_valid(g) for g in water.geometry[_may_dry(water)]] \
+            if water is not None else []
+        if carry is not None:
+            carry.update(tidal_parts=tidal_parts, tidal_union=None, tidal_idx=set())
     _mark("water-make-valid")
 
     # ── drying ── fold the [0, DRYING_CAP] foreshore in as DEPARE with a negative drval1. Cut the
@@ -1047,10 +1060,23 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, le
                 # against their union: the window-spanning BUCKET is the unbounded operand, so
                 # pairwise would be quadratic (912 s+ measured). No GRID here — this shape measured
                 # byte-exact on every profile stem, and snap-rounding traded that for nothing.
-                near = [tidal_parts[i]
-                        for i in STRtree(tidal_parts).query(bucket, predicate="intersects")]
-                if near:
-                    effective = valid_union([effective, bucket.intersection(shapely.union_all(near))])
+                idx = STRtree(tidal_parts).query(bucket, predicate="intersects").tolist()
+                terms = []
+                if reuse:
+                    # bucket ∩ (finer union ∪ the parts only this bucket touches): a part in the
+                    # finer union that misses this bucket adds nothing to the intersection.
+                    if carry["tidal_union"] is not None:
+                        terms.append(bucket.intersection(carry["tidal_union"]))
+                    extra = [tidal_parts[i] for i in idx if i not in carry["tidal_idx"]]
+                    if extra:
+                        terms.append(bucket.intersection(shapely.union_all(extra)))
+                elif idx:
+                    union = shapely.union_all([tidal_parts[i] for i in idx])
+                    terms.append(bucket.intersection(union))
+                    if carry is not None:
+                        carry.update(tidal_union=union, tidal_idx=set(idx))
+                if terms:
+                    effective = valid_union([effective, *terms])
                 _mark("drying-water-terms")
         effective = make_valid(effective)
         _mark("drying-make-valid")
@@ -1078,15 +1104,24 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, le
     # lake the merge left as nodata produces no band, so its whole polygon survives; a surveyed lake
     # nets to slivers the min-area filter drops. No drval (absence is the encoding) + a `kind`
     # passthrough. Ocean has no water polygon, so it gains nothing. Skipped when no water feed.
-    if water is not None:
+    # A reusing tier takes the finer cut's repaired water features instead of re-reading the feed.
+    sources = None
+    if reuse:
+        sources = carry["water"]
+    elif water is not None:
+        sources = [(getattr(r, "kind", None), make_valid(r.geometry).intersection(buffered))
+                   for r in water.itertuples()]
+    if carry is not None and not reuse:
+        carry["water"] = sources
+    if sources is not None:
         parts = list(coverage_parts)
         if drying_area is not None:
             parts += [piece for p in _polys(drying_area) for piece in _subdivide(p)]
         tree = STRtree(parts) if parts else None
         _mark("nodata-tree")
         nodata_by_kind = {}
-        for r in water.itertuples():
-            geom = make_valid(r.geometry).intersection(buffered)
+        for kind, src in sources:
+            geom = src.intersection(buffered) if reuse else src
             # The differences below only shrink a part, so a part the gates would drop as it
             # stands is dropped now, before any geometry work: on a polder that is the whole
             # ditch grid, and the pass costs seconds instead of minutes.
@@ -1106,7 +1141,6 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, le
                 hits = tree.query(geom, predicate="intersects")
                 if len(hits):
                     geom = minus_union(geom, [parts[i] for i in hits])
-            kind = getattr(r, "kind", None)
             for full in _polys(geom):  # gate the PRE-clip polygon (buffered window) so a seam sliver survives both sides
                 # Drying's two-instrument gate applies here too: a sub-pixel ribbon of unknown water
                 # (a ditch under a coarse source) is noise; a compact unknown pond is charted.
@@ -1294,6 +1328,7 @@ def tile(stem):
         # finer one, so the compiled zooms cascade from the native cut out and a coarser tier can
         # never read deeper than a finer — the served raster pyramid cascades the same way.
         finer, finer_z = window, child_z
+        carry = {}  # the native cut's drying and nodata, reused by the coarser tiers
         for tier in reversed(tiers):
             _mark(None)
             out = tier_path(stem, tier)
@@ -1315,14 +1350,14 @@ def tile(stem):
             try:
                 res = _depare_dem(dem, tile_obj, scale_z or child_z, tier_tmp, label, timeout=timeout,
                                   levels_m=tier.levels_m, levels_ft=tier.levels_ft, scale_z=scale_z,
-                                  fine_z=fine_z, tol_z=tier.vertex_z)
+                                  fine_z=fine_z, tol_z=tier.vertex_z, carry=carry)
             except ContourTimeout as e:
                 print(f"depare tile {label}: {e} — retrying on a uniform 4x shoal-biased window",
                       file=sys.stderr, flush=True)
                 dem = _uniform_coarsen(dem, 4, f"{tier_tmp}/dem-4x.tiff")
                 res = _depare_dem(dem, tile_obj, scale_z or child_z, tier_tmp, label, timeout=timeout,
                                   levels_m=tier.levels_m, levels_ft=tier.levels_ft, scale_z=scale_z,
-                                  fine_z=fine_z, tol_z=tier.vertex_z)
+                                  fine_z=fine_z, tol_z=tier.vertex_z, carry=carry)
             except MemoryError:
                 # An allocation the kernel refused (overcommit says no when a single request
                 # exceeds free RAM+swap) — no OOM kill, and formatting a traceback at that point
@@ -1991,7 +2026,12 @@ def _check():
     saved = {k: os.environ.get(k) for k in ("LANDMASK", "WATERMASK")}
     os.environ["LANDMASK"], os.environ["WATERMASK"] = f"{d}/land.fgb", f"{d}/water.fgb"
     try:
-        out = _depare_dem(kp, t, t.z, tempfile.mkdtemp(), "kind-check")
+        carry = {}
+        out = _depare_dem(kp, t, t.z, tempfile.mkdtemp(), "kind-check", carry=carry)
+        # A coarser tier reuses this cut's drying and nodata instead of the water feed: with the
+        # feed gone, the reusing pass must still draw the same drying and nodata.
+        os.environ["WATERMASK"] = f"{d}/absent.fgb"
+        again = _depare_dem(kp, t, t.z, tempfile.mkdtemp(), "kind-reuse", carry=carry)
     finally:
         for k, v in saved.items():
             if v is None:
@@ -2000,6 +2040,12 @@ def _check():
                 os.environ[k] = v
     assert out, "the kind fixture must produce rows"
     rows = gpd.read_file(out[0]).to_crs("EPSG:3857")
+    reused = gpd.read_file(again[0]).to_crs("EPSG:3857")
+    for what, sel in (("drying", lambda g: g[g["drval1"] < 0]), ("nodata", lambda g: g[g["drval1"].isna()])):
+        a_, b_ = sel(rows).geometry.union_all(), sel(reused).geometry.union_all()
+        assert a_.area > 0 and a_.symmetric_difference(b_).area < 1e-6 * a_.area, \
+            f"a tier reusing the finer cut's {what} must draw the same {what}"
+
     dry = rows[rows["drval1"].notna() & (rows["drval1"] < 0)]
     assert dry.intersects(river).any(), "drying must survive inside a tidal (river) water polygon"
     datum_patch = cell_box(20, 25, 26, 35)
