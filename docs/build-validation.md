@@ -129,3 +129,11 @@ renders at the initial viewport.
 - `pmtiles verify` passed for all three primary archives: planet z0–8 webp, 87,381 addressed tiles; vector z4–15 mvt, 19,971,519 addressed tiles; coverage z0–8.
 - Preview smoke test against the exact SHA: globe at z2 complete with no seams; IJmuiden z12 (soundings, isobaths, foreshore, bands); SF Bay z10.6, the baseline failure location, shows the full CUDEM/NOS estuary detail; Hamilton Harbour z11 (no false depths over the city); mid-Pacific z10 falls back to the planet archive with 4,000 m isobaths and soundings. Every tile request returned 200; the only console errors are the site favicon and Mapterhorn land-relief tiles that do not exist over open ocean. Aborted requests during zoom animation are client cancellations.
 - Known limitation, not a release blocker: isobaths and depth areas at z6–9 are drawn with long straight segments. The tier files carry vertices every pixel; the shallow bundle run's `--simplification 8` at detail 10 removes them (a 4.9 km tolerance at z6). #210 changes those settings; its re-bundle is the check.
+
+## Run 38765614255
+
+- Result: success for commit `a1bbdb8b38a22e782273840e18c4b6181d068f22` (main after #210). A re-bundle of run 38586204681's store: 4,471 jobs (the shallow run, 4,465 cells, join, self-check, bundles, staging), zero failures, 1h23m on a ccx63. The shallow run took 26 minutes at 6 GB; the overflow gate armed on no run.
+- R2 inventory: 245 objects, 50,274,293,846 bytes. Only `vector.pmtiles` (10,261,819,357 bytes, up 8% from 9,495,842,425) and `manifest.json` changed; planet, coverage, land and the 240 overlays carry over from run 38586204681.
+- `pmtiles verify` passed on the vector archive: z4–15, 19,971,521 addressed tiles. The in-build self-check passed: sampled invariants ok.
+- Served tiles, median segment length at the two example views: Kuril z6 12.1 → 3.9 px, z7 14.5 → 4.0 px; Southern California z6 9.0 → 2.6 px, z7 12.3 → 3.4 px; z8 unchanged in both (the tier cut's own floor). Tile bytes about doubled at z6–7, far under the ceilings.
+- Known limitations, not release blockers: at a compiled tier's last zoom the cut's own vertex floor leaves 6–7 px segments (z8 here); and in Bands mode the z5/z6 handoff changes the shelf tint, since the vector tier tints a 0–200 m band by `drval1` while the raster ramp below z6 tints by pixel depth.
