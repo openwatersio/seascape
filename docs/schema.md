@@ -62,15 +62,15 @@ A partition of the water into polygons, three feature kinds keyed by attribute p
 
 | Kind | Signature | Meaning |
 |---|---|---|
-| Depth band | `drval1 ≥ 0`, `sys` present | Water between two charted isobaths: `drval1`/`drval2` are the shallow/deep bounds in positive-down metres. `sys` (`"m"` or `"ft"`) tags which isobath ladder cut the band — render one ladder, never both. |
+| Depth band | `drval1 ≥ 0`, `sys` present | Water between two charted isobaths: `drval1`/`drval2` are the shallow/deep bounds in positive-down metres; the deepest band's `drval2` is 12000, below any ocean, in either ladder. `sys` (`"m"` or `"ft"`) tags which isobath ladder cut the band — render one ladder, never both. |
 | Drying | `drval1 < 0`, no `sys` | Drying foreshore. `drval1`/`drval2` are the drying bucket's fixed bounds (−drying cap and 0) on every feature, **not** a measured per-feature drying height — only the sign is information. |
 | Unknown water | no `drval1` | Water of unknown depth (the vector twin of raster code 0). |
 
 `rank` (Number) orders the features for painting within the fill.
 
-The band edges follow the charted isobath ladders (the metric levels and the classic fathom curves), so a safety-contour tint can only flip at a charted level. Fathom-curve `drval` values are exact multiples of 1.8288 m stored as 32-bit floats; compare with a small epsilon rather than exact equality.
+The band edges follow the charted isobath ladders (the metric levels and the classic fathom curves), so a safety-contour tint can only flip at a charted level. Fathom-curve `drval` values (except that 12000 floor) are exact multiples of 1.8288 m stored as 32-bit floats; compare with a small epsilon rather than exact equality.
 
-Coarse zooms carry fewer bands. Like an ENC compiled per usage band, the partition at a zoom is cut from that zoom's surface with the isobath ladder drawn there, so a zoom-out merges bands rather than hiding polygons, and the partition stays gapless at every zoom. Which levels bound a band at a zoom is a display decision, not a schema guarantee; a safety depth between two levels snaps to the next-deeper level present at that zoom. Zooming out can only shoal: a coarser zoom's band never reads deeper than the finer zoom beneath it.
+Coarse zooms carry fewer bands. Like an ENC compiled per usage band, the partition at a zoom is cut from its own tier's surface with the isobath ladder drawn there, so a zoom-out merges bands rather than hiding polygons, and the partition stays gapless at every zoom. Which levels bound a band at a zoom is a display decision, not a schema guarantee; a safety depth between two levels snaps to the next-deeper level present at that zoom. Zooming out can only shoal: a coarser zoom's band never reads deeper than the finer zoom beneath it.
 
 ## Coverage tiles
 

@@ -15,6 +15,10 @@ import {
   type ChartMap,
 } from "./index";
 
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { BANDS_MIN_ZOOM, DRVAL_EPS, ladderAt } from "./depth-areas";
+
 // Expressions are opaque tuple unions; tests poke at their raw stops.
 const raw = (e: unknown) => e as (number | string)[];
 
@@ -144,9 +148,9 @@ test("layers reference only the caller's source names", () => {
     expect((l as { source: string }).source).toBe("bathy-coverage");
 });
 
-test("contour lines floor at z6 — depth shading carries lower zooms", () => {
+test("contour lines floor at z4 — depth shading carries lower zooms", () => {
   const lines = layers().find((l) => l.id === "contour-lines");
-  expect((lines as { minzoom?: number }).minzoom).toBe(6);
+  expect((lines as { minzoom?: number }).minzoom).toBe(4);
 });
 
 test("contour lines meet at round joins — a vertex per pixel still turns corners", () => {
@@ -158,23 +162,23 @@ test("contour lines meet at round joins — a vertex per pixel still turns corne
 
 test("the emphasized safety contour follows the ladder drawn at each zoom tier", () => {
   // Isobaths are compiled per zoom tier with a scale-dependent ladder, so the next-deeper
-  // level for a 3 m safety depth is 200 m at z6, 50 m at z7-8, 10 m at z9-10 and 5 m from z11.
+  // level for a 3 m safety depth is 10 m below z11 and 5 m from z11.
   const emphasized = (unit: "m" | "fm") => {
     const lines = layers(day, { unit, safety: 3 }).find(
       (l) => l.id === "contour-lines",
     ) as { paint: Record<string, unknown[]> };
     const color = lines.paint["line-color"];
     expect(color.slice(0, 2)).toEqual(["step", ["zoom"]]);
-    expect([color[3], color[5], color[7]]).toEqual([7, 9, 11]);
-    return [2, 4, 6, 8].map((i) => (color[i] as unknown[])[1]);
+    expect([color[3], color[5], color[7], color[9]]).toEqual([6, 7, 9, 11]);
+    return [2, 4, 6, 8, 10].map((i) => (color[i] as unknown[])[1]);
   };
   expect(emphasized("m")).toEqual(
-    [200, 50, 10, 5].map((d) => ["==", ["get", "depth_abs_m"], d]),
+    [10, 10, 10, 10, 5].map((d) => ["==", ["get", "depth_abs_m"], d]),
   );
   // Fathom curves: at least as deep as the tier's shallowest metre level, so
-  // 200 m -> 200 fm, 50 m -> 30 fm, 10 m -> 10 fm, and the whole ladder -> 2 fm.
+  // 10 m -> 10 fm, and the whole ladder -> 2 fm.
   expect(emphasized("fm")).toEqual(
-    [200, 30, 10, 2].map((d) => ["==", ["get", "depth_fm"], d]),
+    [10, 10, 10, 10, 2].map((d) => ["==", ["get", "depth_fm"], d]),
   );
   const width = (
     layers(day, { unit: "m", safety: 3 }).find((l) => l.id === "contour-lines") as {
@@ -273,15 +277,15 @@ test("shading gates the depare bands via filter, never compounding with the reli
   expect(get(relief, "depth-areas").filter).toEqual(["!", ["has", "sys"]]);
   expect(get(relief, "depth-shading").maxzoom).toBeUndefined();
   // Bands mode: the fill adds the active-sys ladder to the unit-less features, and the raster
-  // hands off at the z6 floor (relief below, bands above).
+  // hands off at the z4 floor (relief below, bands above).
   const bands = layers(day, { shading: "bands", unit: "m" });
   expect(get(bands, "depth-areas").filter).toEqual([
     "any",
     ["!", ["has", "sys"]],
     ["==", ["get", "sys"], "m"],
   ]);
-  expect(get(bands, "depth-shading").maxzoom).toBe(6);
-  expect(get(bands, "depth-areas").minzoom).toBe(6);
+  expect(get(bands, "depth-shading").maxzoom).toBe(4);
+  expect(get(bands, "depth-areas").minzoom).toBe(4);
   // The fill is always visible in both modes — the filter, not visibility, gates the bands.
   expect(get(relief, "depth-areas").layout?.visibility).toBeUndefined();
   expect(get(bands, "depth-areas").layout?.visibility).toBeUndefined();
@@ -503,4 +507,19 @@ test("hillshade option controls the depth-hillshade visibility", () => {
     }).layout.visibility;
   expect(vis()).toBe("visible");
   expect(vis({ hillshade: false })).toBe("none");
+});
+
+test("the ladders mirror the pipeline's at every compiled zoom", () => {
+  // pipelines/config.py is stdlib-only, so its ladders print without the pipeline's env.
+  const config = fileURLToPath(new URL("../pipelines/config.py", import.meta.url));
+  const pipeline = JSON.parse(
+    execFileSync("python3", [config, "--ladders"], { encoding: "utf8" }),
+  ) as { first: number; zooms: Record<string, { m: number[]; ft: number[] }> };
+  expect(BANDS_MIN_ZOOM).toBe(pipeline.first);
+  for (const [z, { m, ft }] of Object.entries(pipeline.zooms)) {
+    expect(ladderAt("m", Number(z)), `metre ladder at z${z}`).toEqual(m);
+    const fm = ladderAt("ft", Number(z));
+    expect(fm.length, `fathom ladder at z${z}`).toBe(ft.length);
+    fm.forEach((d, i) => expect(Math.abs(d - ft[i])).toBeLessThan(DRVAL_EPS));
+  }
 });

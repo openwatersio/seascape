@@ -132,7 +132,7 @@ export function depthShadingLayer(
     id: "depth-shading",
     type: "color-relief",
     source: dem,
-    // Bands mode: the vector depth areas take over at their z6 data floor;
+    // Bands mode: the vector depth areas take over at their z4 data floor;
     // the relief carries lower zooms (same palette, so the handoff is a
     // sharpness change, not a colour change).
     ...(shading === "bands" ? { maxzoom: BANDS_MIN_ZOOM } : {}),

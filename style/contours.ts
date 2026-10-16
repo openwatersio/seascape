@@ -6,7 +6,11 @@ import type {
   LayerSpecification,
 } from "@maplibre/maplibre-gl-style-spec";
 import { labelSize, type Flavor, type Unit } from "./flavor.js";
-import { LADDER_TIER_ZOOMS, snapSafetyContour } from "./depth-areas.js";
+import {
+  BANDS_MIN_ZOOM,
+  LADDER_TIER_ZOOMS,
+  snapSafetyContour,
+} from "./depth-areas.js";
 
 // Contours: metre isobaths (sys != "ft", also legacy no-sys tiles) vs the
 // fathom-curve set (sys == "ft"), which labels as feet or fathoms. Both
@@ -52,8 +56,8 @@ export function contourLinesLayer(
     source: vector,
     "source-layer": "contours",
     filter: contourFilter(unit),
-    // Presentation floor, not a data limit: below z6 isobaths read as clutter over depth shading.
-    minzoom: 6,
+    // The first compiled tier: its isobaths bound the depth areas drawn there.
+    minzoom: BANDS_MIN_ZOOM,
     // Round joins: an isobath vertex per display pixel still meets at angles, and miter joins
     // spike them.
     layout: { "line-join": "round", "line-cap": "round" },

@@ -20,8 +20,8 @@
  * applyState() re-derives each layer's declared state-dependent properties and
  * sets them in place; or fetch a regenerated style
  * (`/style.json?unit=ft&safety=3`). `shading` ("relief" | "bands") picks the
- * water shading: the raster ramp, or the vector ENC depth-area bands above z6
- * (the relief keeps z<6 either way).
+ * water shading: the raster ramp, or the vector ENC depth-area bands above z4
+ * (the relief keeps z<4 either way).
  */
 import type {
   LayerSpecification,
@@ -51,7 +51,7 @@ import { coverageLayers } from "./coverage.js";
 
 export { day, type Flavor, type Shading, type Unit } from "./flavor.js";
 export { depthRelief } from "./depth-shading.js";
-export { depthAreasColor } from "./depth-areas.js";
+export { BANDS_MIN_ZOOM, depthAreasColor } from "./depth-areas.js";
 
 // The tile-contract version this package targets (docs/schema.md). Compare it
 // against the `schema` field of the endpoint's TileJSON: a mismatch means the

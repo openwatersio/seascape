@@ -1,6 +1,12 @@
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
-import { applyState, readDepth, style, SCHEMA } from "@openwaters/seascape";
+import {
+  applyState,
+  BANDS_MIN_ZOOM,
+  readDepth,
+  style,
+  SCHEMA,
+} from "@openwaters/seascape";
 
 // The style itself (sources, layers, depth ramp, unit/safety expressions) lives
 // in the @openwaters/seascape package (style/) — this file is the demo app:
@@ -130,8 +136,8 @@ map.on("load", () => {
   // values, so the controls just forward them. shading gates the depare fill's own
   // filter (it hides the depth bands but keeps drying/unknown-depth water), so it
   // rides through applyState too — the raster only needs its zoom range adjusted:
-  // bands data floors at z6, so relief keeps z<6, and never both at once (the 0.85
-  // opacities would compound).
+  // bands data floors at BANDS_MIN_ZOOM, so relief keeps the zooms below, and
+  // never both at once (the 0.85 opacities would compound).
   const apply = () => {
     const shading =
       document.getElementById("shading-select")?.value === "bands"
@@ -143,7 +149,11 @@ map.on("load", () => {
       shading,
     });
     if (map.getLayer("depth-shading"))
-      map.setLayerZoomRange("depth-shading", 0, shading === "bands" ? 6 : 24);
+      map.setLayerZoomRange(
+        "depth-shading",
+        0,
+        shading === "bands" ? BANDS_MIN_ZOOM : 24,
+      );
   };
   apply();
   document.getElementById("safety-depth")?.addEventListener("input", apply);

@@ -8,9 +8,9 @@ import type {
 } from "@maplibre/maplibre-gl-style-spec";
 import { day, type Flavor, type Shading, type Unit } from "./flavor.js";
 
-// The depare layer's data floor (tippecanoe -Z in the pipeline) and the contour
-// lines' presentation floor — depth shading carries lower zooms.
-export const BANDS_MIN_ZOOM = 6;
+// The depare and contour layers' data floor (the first compiled tier in the
+// pipeline) — depth shading carries lower zooms.
+export const BANDS_MIN_ZOOM = 4;
 
 // Charted isobath ladders, positive-down metres — must mirror pipelines/config.py
 // DEPARE_LEVELS / DEPARE_LEVELS_FT (the bucket edges baked into the depare
@@ -31,8 +31,15 @@ const DEPARE_LADDER_FT = [
 // fathom ladder at a tier is every curve at least as deep as the tier's
 // shallowest metre level; the whole ladder once the metre one is whole.
 const LADDER_TIERS_M: [number, number[]][] = [
-  [6, [200, 500, 1000, 2000, 3000, 4000]],
-  [7, [50, 100, 200, 300, 500, 1000, 2000, 3000, 4000, 5000, 6000, 8000, 10000]],
+  [4, [10, 20, 50, 100, 200, 1000, 2000, 4000]],
+  [6, [10, 20, 50, 100, 200, 500, 1000, 2000, 3000, 4000]],
+  [
+    7,
+    [
+      10, 20, 50, 100, 200, 300, 500, 1000, 2000, 3000, 4000, 5000, 6000, 8000,
+      10000,
+    ],
+  ],
   [
     9,
     [10, 20, 30, 50, 100, 200, 300, 500, 1000, 2000, 3000, 4000, 5000, 6000, 8000, 10000],
