@@ -59,7 +59,9 @@ const MOVETO = 1,
   LINETO = 2;
 
 // tippecanoe-overzoom CLI defaults (overzoom.cpp): extent == 1<<detail, buffer
-// in 1/256ths of the extent. The bundle emits 4096-extent tiles, so detail 12.
+// in 1/256ths of the extent. Every served tile is re-encoded at detail 12 (extent 4096);
+// a source layer can be 2048 (the shallow run's low zooms), and synthesizeLayers scales by
+// each layer's own extent.
 const DETAIL = 12;
 const BUFFER = 5;
 
