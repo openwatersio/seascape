@@ -1,0 +1,75 @@
+name: Style release
+
+# Publishes @openwaters/seascape to npm from a GitHub release tagged style-v<version>, through
+# npm trusted publishing (OIDC — no token; npmjs.com lists this workflow as the package's
+# trusted publisher). Consumers of the package (Seamap) read the released tiles, so a style
+# only publishes from main once the live tiles carry every tile and Worker change in the
+# style's commit, at the style's schema: the live tiles' commit is in the style's history with
+# no such change after it, or the style's commit is in the tiles' history. Otherwise build and
+# release the tiles first.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    if: startsWith(github.event.release.tag_name, 'style-v')
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with: { fetch-depth: 0 }
+      - name: Tag matches the package version
+        run: |
+          version=$(jq -r .version style/package.json)
+          [ "$TAG" = "style-v$version" ] || { echo "::error::tag $TAG but style/package.json is $version"; exit 1; }
+      - name: Released tiles carry this style's pipeline
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main ||
+            { echo "::error::$GITHUB_SHA is not on main — release the style from main"; exit 1; }
+          # The release the Worker serves, from its own manifest, so the commit and the schema
+          # checked below name the same live bundle.
+          live=$(curl -fsS https://tiles.openwaters.io/seascape/manifest.json)
+          prefix=$(jq -r '.release // empty' <<<"$live")
+          [ -n "$prefix" ] ||
+            { echo "::error::the live Worker does not report its release — release tiles from a commit that has it first"; exit 1; }
+          tiles=$(basename "$prefix")
+          git cat-file -e "$tiles^{commit}" ||
+            { echo "::error::released tiles $tiles are not a commit in this repository"; exit 1; }
+          echo "released tiles: $tiles"
+          # Everything that shapes what the tiles and the Worker serve.
+          paths=(pipelines Snakefile profiles worker patches Dockerfile pyproject.toml uv.lock
+                 package.json package-lock.json docker.sh .github/workflows/build.yml)
+          if git merge-base --is-ancestor "$GITHUB_SHA" "$tiles"; then
+            echo "the released tiles were built after this commit"
+          elif git merge-base --is-ancestor "$tiles" "$GITHUB_SHA" &&
+               git diff --quiet "$tiles" "$GITHUB_SHA" -- "${paths[@]}"; then
+            echo "no tile or Worker change since the released tiles"
+          else
+            echo "::error::the released tiles ($tiles) lack changes in $GITHUB_SHA — build and release the tiles first"
+            git diff --stat "$tiles" "$GITHUB_SHA" -- "${paths[@]}"
+            exit 1
+          fi
+          style=$(sed -n 's/^export const SCHEMA = \([0-9]*\);/\1/p' style/index.ts)
+          schema=$(jq -r '.schema // 1' <<<"$live")
+          [ "$style" = "$schema" ] ||
+            { echo "::error::the style is schema $style but the released tiles are schema $schema"; exit 1; }
+      - uses: actions/setup-node@v7
+        with: { node-version-file: mise.toml, cache: npm, registry-url: "https://registry.npmjs.org" }
+      - name: Test
+        run: |
+          npm ci
+          npm test --workspace style
+      - name: Publish
+        # Trusted publishing needs npm 11.5.1 or later.
+        run: |
+          npm install -g npm@11.6.2
+          # A prerelease (0.4.0-rc.1) goes to `next`, never `latest`.
+          case "${TAG#style-v}" in *-*) dist=next ;; *) dist=latest ;; esac
+          npm publish --workspace style --access public --tag "$dist"

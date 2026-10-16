@@ -4,7 +4,8 @@ name: Release
 # rebuild — and deploys the Worker + viewer. The build pipeline lives in build.yml.
 # A published release promotes the build for its tagged commit. Run manually
 # (workflow_dispatch from main, with a `sha`) to publish any other built commit
-# using the current workflow rather than the one at that commit.
+# using the current workflow rather than the one at that commit. A style-v* release publishes
+# the style package (style-release.yml) and promotes no tiles.
 on:
   release:
     types: [published]
@@ -32,6 +33,7 @@ jobs:
   # in the unserved <sha>/ dir — clients keep reading the old release until the new
   # Worker version rolls out.
   publish-r2:
+    if: ${{ !startsWith(github.event.release.tag_name, 'style-v') }}
     runs-on: ubuntu-latest
     env:
       SHA: ${{ github.event.inputs.sha || github.sha }}
@@ -84,11 +86,13 @@ jobs:
         run: |
           # Count-based retention (current + 2 rollback targets), ordered by each
           # release's manifest.json mtime — never age/cadence dependent, so the tiles
-          # bucket needs no lifecycle rule. The copy above runs first, so $SHA is always kept.
+          # bucket needs no lifecycle rule. $SHA is kept explicitly: a rollback to a release
+          # already published skips the copy, so its manifest is not among the newest.
           keep=$(aws s3 ls "s3://$TILES_BUCKET/seascape/" --recursive \
             | grep '/manifest\.json$' | sort -r | awk '{print $4}' | cut -d/ -f2 | head -3)
           [ -n "$keep" ] || { echo "::error::no releases found — refusing to prune"; exit 1; }
-          for sha in $(aws s3 ls "s3://$TILES_BUCKET/seascape/" | awk '{print $2}' | tr -d /); do
+          keep="$keep"$'\n'"$SHA"
+          for sha in $(aws s3 ls "s3://$TILES_BUCKET/seascape/" | awk '/ PRE /{print $2}' | tr -d /); do
             grep -qx "$sha" <<<"$keep" || {
               echo "pruning seascape/$sha"
               aws s3 rm "s3://$TILES_BUCKET/seascape/$sha" --recursive
@@ -123,6 +127,7 @@ jobs:
 
   # Build the viewer (pointed at the Worker) and deploy it to GitHub Pages.
   deploy-pages:
+    if: ${{ !startsWith(github.event.release.tag_name, 'style-v') }}
     runs-on: ubuntu-latest
     permissions: { pages: write, id-token: write, contents: read }
     environment:
