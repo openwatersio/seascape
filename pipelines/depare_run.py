@@ -17,7 +17,8 @@ water compose without extra layers or archives:
      water (seaward of the OSM land line, but kept inside mapped tidal inland water — the
      ICW/tidal-channel case; a lake has no chart datum to dry against), see generate().
   3. nodata — water OSM maps as a polygon but the DEM holds no depth for (a #24-cleared
-     lake, unsurveyed margins beside a fairway). NO drval1/drval2 — absence IS the encoding
+     lake, unsurveyed margins beside a fairway), plus the exact-datum water the drying pass
+     drops (a coarse source's shore clamped to 0, the raster's unknown code). NO drval1/drval2 — absence IS the encoding
      (MVT has no null; the fill's "no drval1" case renders S-52's NODATA fill) — plus a
      `kind` passthrough of the Overture subtype (river/lake/canal/reservoir).
 
@@ -46,7 +47,7 @@ the way an ENC compiles a cell per usage band: cut from the mosaic pyramid level
 than the tier's first (unless that repeats the final tier's native cut), with the isobath ladder
 drawn at its first, the final tier from the native window): bands (gdal_contour -p at the tier's metre / fathom ladder, drop land, drval/sys) + drying (the metre
 ladder's (0, DRYING_CAP] bucket ∩ effective water, drval1 < 0; exact datum is unknown, never foreshore) + nodata (inland-water polygons
-minus the DEM's water coverage and the drying) -> clip to the unbuffered tile bbox in shapely
+minus the DEM's water coverage and the drying, plus the drying's exact-datum water) -> clip to the unbuffered tile bbox in shapely
 (polygon-only by construction, see _polys) -> 4326 -> store/depare/{stem}-t{z}.fgb. Same seam
 contract as contours for bands and drying: deterministic on the buffered grid, so neighbouring
 tiles' features abut exactly at the clip line. Nodata rows are simplified per piece after the
@@ -82,6 +83,7 @@ if config.CONTOUR_LEVELS != config.CONTOUR_LEVELS_DEFAULT:
 # real depth (bands) over no-data (nodata) wherever an OSM outline's simplify wobble lays one
 # over the other, and drying over the shoal band it abuts along their shared 0 m seam.
 NODATA_RANK = 0
+DATUM_KIND = "datum"  # the nodata pass's key for exact-datum water; never written as a kind
 BAND_RANK = 1
 DRYING_RANK = 2
 
@@ -148,7 +150,7 @@ DRYING_LEGIBLE_MM2 = float(os.environ.get("DRYING_LEGIBLE_MM2", "16"))
 LEGIBLE_MM2 = float(os.environ.get("DEPARE_LEGIBLE_MM2", "4"))
 # Foreshore is strictly above datum, (0, DRYING_CAP]: exact 0 is the land sentinel and the
 # merge's fill for water a source holds no depth for, which the raster keeps as the unknown code
-# (terrain._encode_tile). The drying pass removes those pixels (_drop_datum).
+# (terrain._encode_tile). The drying pass hands those pixels to the nodata pass (_drop_datum).
 DRYING_MIN_WIDTH_PX = float(os.environ.get("DRYING_MIN_WIDTH_PX", "1"))
 
 # S-58 Ed. 7.0.0 check 571 caps ENC vertex density at 0.3 mm at compilation scale — the only hard
@@ -837,7 +839,8 @@ def _dissolve_sublegible(bands, drvals, min_area):
 
 
 def _drop_datum(dem, geom, block=4096):
-    """`geom`'s parts (EPSG:3857 drying polygons) without their exact-datum pixels — the land
+    """`geom`'s parts (EPSG:3857 drying polygons) split into (kept, datum): the parts without
+    their exact-datum pixels, and the datum water they lose. Exact datum is the land
     sentinel and the merge's fill for water a source holds no depth for, which the raster keeps
     as the unknown code (terrain._encode_tile). A part at least half datum is dropped whole: a
     ditch grid under a coarse source, a zeroed shoreline cell, a polder's ditches and dike tops
@@ -859,7 +862,7 @@ def _drop_datum(dem, geom, block=4096):
     from shapely.strtree import STRtree
     parts = _polys(geom)
     if not parts:
-        return []
+        return [], []
     under = np.zeros(len(parts) + 1, dtype=np.int64)
     zero = np.zeros(len(parts) + 1, dtype=np.int64)
     holes = defaultdict(list)
@@ -894,14 +897,19 @@ def _drop_datum(dem, geom, block=4096):
                 zero += np.bincount(ids[z], minlength=len(parts) + 1)
                 for shp, val in features.shapes(ids, mask=z, transform=wt):
                     holes[int(val)].append(shape(shp))
-    out = []
+    out, datum = [], []
     for i, part in enumerate(parts, 1):
         if under[i] and zero[i] * 2 >= under[i]:
+            # Only the datum pixels are unknown water; a minority of real foreshore stays out.
+            datum.extend([part] if zero[i] == under[i] else
+                         _polys(make_valid(part.intersection(shapely.union_all(holes[i])))))
             continue
         if holes[i]:  # a sub-pixel hairline has no pixel and stays whole
-            part = make_valid(minus_union(part, holes[i]))
+            kept = make_valid(minus_union(part, holes[i]))
+            datum.extend(_polys(make_valid(part.difference(kept))))
+            part = kept
         out.extend(_polys(part))
-    return out
+    return out, datum
 
 
 def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, levels_ft=None,
@@ -1039,6 +1047,7 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, le
     # which is what keeps the shared 0 m edge aligned; clip in shapely; the min-area filter drops
     # seam slivers and the legibility gate the hairlines the land cut leaves above them.
     drying_area = None
+    datum = []  # exact-datum sea the drying pass drops: unknown depth, emitted with nodata
     if drying_geoms:
         bucket = coverage_union(drying_geoms)
         _mark("drying-bucket-union")
@@ -1083,8 +1092,26 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, le
         if not effective.is_empty:
             # Exact datum inside effective water is unknown, not foreshore: it leaves the drying
             # here and falls to the nodata pass below (_drop_datum).
-            kept = _drop_datum(dem, effective)
+            kept, datum = _drop_datum(dem, effective)
             effective = shapely.multipolygons(kept) if kept else shapely.MultiPolygon()
+            # Inside the land coverage the datum is tidal inland water, which the nodata pass
+            # already draws from its OSM polygon; only the sea has no polygon to draw it from.
+            # Datum cut from bucket - land is off land already, so only the pieces the tidal
+            # term brought in pay a land overlay, one piece at a time (the GRID mode is the
+            # fallback, as in minus_union).
+            if datum and land_geom is not None:
+                shapely.prepare(land_geom)
+                sea = []
+                for p in datum:
+                    if not land_geom.intersects(p):
+                        sea.append(p)
+                    elif not land_geom.contains(p):
+                        try:
+                            sea.extend(_polys(make_valid(shapely.difference(p, land_geom))))
+                        except shapely.errors.GEOSException:
+                            sea.extend(_polys(make_valid(
+                                shapely.difference(p, land_geom, grid_size=GRID))))
+                datum = sea
             _mark("drying-diff-datum")
         if not effective.is_empty:
             drying_area = effective  # subtracted from nodata below (over the buffered extent)
@@ -1103,7 +1130,8 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, le
     # the buffered tile) MINUS the water-coverage footprint (depth bands ∪ drying) — a #24-cleared
     # lake the merge left as nodata produces no band, so its whole polygon survives; a surveyed lake
     # nets to slivers the min-area filter drops. No drval (absence is the encoding) + a `kind`
-    # passthrough. Ocean has no water polygon, so it gains nothing. Skipped when no water feed.
+    # passthrough. Skipped when no water feed. Ocean has no water polygon: its unknown water is the
+    # exact datum the drying pass dropped (a coarse source's clamped shore), added after the loop.
     # A reusing tier takes the finer cut's repaired water features instead of re-reading the feed.
     sources = None
     if reuse:
@@ -1113,13 +1141,13 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, le
                    for r in water.itertuples()]
     if carry is not None and not reuse:
         carry["water"] = sources
+    nodata_by_kind = {}
     if sources is not None:
         parts = list(coverage_parts)
         if drying_area is not None:
             parts += [piece for p in _polys(drying_area) for piece in _subdivide(p)]
         tree = STRtree(parts) if parts else None
         _mark("nodata-tree")
-        nodata_by_kind = {}
         for kind, src in sources:
             geom = src.intersection(buffered) if reuse else src
             # The differences below only shrink a part, so a part the gates would drop as it
@@ -1158,18 +1186,27 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, le
                             continue
                         nodata_by_kind.setdefault(kind, []).extend(_polys(s))
         _mark("nodata-loop")
-        # One dissolved region: OSM water polygons overlap each other (a riverbank inside a lake
-        # multipolygon), and a translucent fill compounds wherever rows overlap. A region keeps
-        # its kind when one kind made it.
-        pieces = [(k, sp) for k, sps in nodata_by_kind.items() for sp in sps]
-        if pieces:
-            region = valid_union([sp for _, sp in pieces])
-            ktree = STRtree([sp for _, sp in pieces])
-            for sp in _polys(region):
-                kinds = {pieces[i][0] for i in ktree.query(sp, predicate="intersects")}
-                sink.write([{"geometry": sp, "drval1": None, "drval2": None, "sys": None,
-                             "kind": kinds.pop() if len(kinds) == 1 else None,
-                             "rank": NODATA_RANK}], flush=False)
+    # Exact-datum water, which the raster serves as the unknown code: the same gates and clip as
+    # the pieces above, but no simplify, since its edges are the drying's and the bands'.
+    for full in datum:
+        if full.area >= max(min_area, legible_area) and not _illegible_drying(
+                full, drying_legible_area, drying_min_width):
+            nodata_by_kind.setdefault(DATUM_KIND, []).extend(
+                p for p in _polys(full.intersection(clip)) if p.area >= dust_area)
+    # One dissolved region: OSM water polygons overlap each other (a riverbank inside a lake
+    # multipolygon) and the datum water inside them, and a translucent fill compounds wherever rows
+    # overlap. A region keeps its kind when one kind made it, so one that takes in datum water has
+    # none.
+    pieces = [(k, sp) for k, sps in nodata_by_kind.items() for sp in sps]
+    if pieces:
+        region = valid_union([sp for _, sp in pieces])
+        ktree = STRtree([sp for _, sp in pieces])
+        for sp in _polys(region):
+            kinds = {pieces[i][0] for i in ktree.query(sp, predicate="intersects")}
+            kind = kinds.pop() if len(kinds) == 1 else None
+            sink.write([{"geometry": sp, "drval1": None, "drval2": None, "sys": None,
+                         "kind": None if kind == DATUM_KIND else kind,
+                         "rank": NODATA_RANK}], flush=False)
         _mark("nodata-dissolve")
 
     if not sink.count and not sink.pending:
@@ -2069,6 +2106,8 @@ def _check():
         "the lake's [0, cap] shore ribbon stays part of its nodata polygon"
     assert nodata_rows.covers(datum_patch.centroid).any(), \
         "exact datum inside tidal water falls to the nodata pass"
+    assert (nodata_rows[nodata_rows.covers(datum_patch.centroid)]["kind"] == "river").all(), \
+        "datum inside the land coverage is the water polygon's own, so the river keeps its kind"
     # Two abutting lake polygons dissolve into one unknown-water region: no row overlaps another
     # (the dilated seam would otherwise draw as a dark line), and the shared edge is covered.
     nd = list(nodata_rows.geometry)
@@ -2109,6 +2148,56 @@ def _check():
     assert len(dust_rows) == 1 and dust_rows["drval1"].isna().all() and \
         dust_rows.geometry.iloc[0].intersects(strip) and not dust_rows.geometry.iloc[0].intersects(hair), \
         f"the strip nub ships as unknown water and the hair nub is dust, got {len(dust_rows)} rows"
+
+    # A coarse source's shore, clamped: water, a real foreshore, then sea the clamp set to exact
+    # datum up to the OSM land line, and land behind it. The raster serves the datum strip as the
+    # unknown code, so with no water feed at all it must ship as unknown water, stopping at the
+    # land line and with no kind. A foreshore wider than the strip is cut, and the datum water must
+    # sit flush against it (no crack, no overlap); a narrower one is dropped whole with its datum,
+    # and the unknown water must still stay off its real foreshore pixels.
+    osm_land = cell_box(45, 0, 60, 60)
+    gpd.GeoDataFrame(geometry=[osm_land], crs="EPSG:3857").to_file(
+        f"{d}/coast-land.fgb", driver="FlatGeobuf")
+    for shore in (10, 25):
+        cdem = np.full((60, 60), cap + 50, dtype="float32")
+        cdem[:, :shore] = -10.0
+        cdem[:, shore:30] = 2.0
+        cdem[:, 30:45] = 0.0
+        cp = f"{d}/coast-dem-{shore}.tif"
+        with rasterio.open(cp, "w", driver="GTiff", height=60, width=60, count=1,
+                           dtype="float32", nodata=-9999, crs="EPSG:3857",
+                           transform=from_origin(bb.left, bb.top, wres, wres)) as dst:
+            dst.write(cdem, 1)
+        os.environ["LANDMASK"], os.environ["WATERMASK"] = f"{d}/coast-land.fgb", f"{d}/absent.fgb"
+        try:
+            out = _depare_dem(cp, t, t.z, tempfile.mkdtemp(), f"coast-check-{shore}")
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        crows = gpd.read_file(out[0]).to_crs("EPSG:3857")
+        coast = crows[crows["drval1"].isna()]
+        assert len(coast) and coast.covers(cell_box(35, 25, 40, 35).centroid).any(), \
+            f"exact-datum sea must ship as unknown water (foreshore from column {shore})"
+        assert coast["kind"].isna().all(), "datum water carries no kind"
+        assert coast.intersection(osm_land).area.sum() < 1e-6 * osm_land.area, \
+            "the datum water must stop at the OSM land line"
+        assert not coast.covers(cell_box(shore + 1, 25, 29, 35).centroid).any(), \
+            "unknown water must stay off the real foreshore"
+        if shore == 10:
+            charted = crows[crows["drval1"].notna()
+                            & ((crows["sys"] == "m") | (crows["drval1"] < 0))]
+            assert (charted["drval1"] < 0).any(), "the cut foreshore must still ship as drying"
+            sea = _box(*bb).difference(osm_land)
+            covered = unary_union(list(charted.geometry) + list(coast.geometry))
+            # Within a DEM pixel of the land line the surface interpolates up past the cap: land
+            # in the raster's pixel grid too, so it is no crack.
+            assert sea.difference(covered).difference(osm_land.buffer(wres)).area \
+                < 1e-6 * sea.area, "bands, drying and datum water must cover the sea with no crack"
+            assert coast.geometry.union_all().intersection(charted.geometry.union_all()).area \
+                < 1e-6 * sea.area, "datum water must not overlap the drying or the bands"
 
     # minus_union falls through the overlay modes: a snap-rounded failure (GEOS "Ring edge
     # missing") lands on the float overlay, a float failure on the made-valid one, and each mode
