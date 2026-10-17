@@ -6,6 +6,8 @@ Coverage is global through z8 (~15″) with regional detail to z14 (~0.25″) wh
 
 [![Seascape screenshot](https://github.com/user-attachments/assets/396e33f2-909c-4643-8486-df4e071f2201)](https://openwatersio.github.io/seascape/#8.41/65.382/-23.2)
 
+See the [Seascape documentation](https://openwaters.io/charts/seascape/) for tile endpoints, MapLibre integration, and data sources.
+
 > [!WARNING]
 > **Not for navigational use.** Do not use this bathymetry for navigation, or in any
 > situation where inaccuracies could result in harm to people or property. It is intended
