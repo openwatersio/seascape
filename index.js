@@ -1,5 +1,8 @@
-import maplibregl from "maplibre-gl";
+import * as maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
+// MapLibre v6 is ESM-only and can't find its worker inside a bundle on its own;
+// Vite's ?worker&url bundles it into one file and hands back the URL.
+import workerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url";
 import {
   applyState,
   BANDS_MIN_ZOOM,
@@ -37,6 +40,8 @@ const tilesBase = (
 const MAX_ZOOM = 13; // deepest zoom readDepth fetches (the Worker overzooms past it)
 
 // ─── Create map ───────────────────────────────────────────────────────────
+maplibregl.setWorkerUrl(workerUrl);
+
 // The style is self-contained: zooms/bounds/attribution come from the
 // endpoint's TileJSON, so there's nothing to fetch before creating the map.
 const map = new maplibregl.Map({
