@@ -1,3 +1,0 @@
-self-hosted-runner:
-  labels:
-    - ubuntu-26.04

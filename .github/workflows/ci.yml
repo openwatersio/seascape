@@ -19,7 +19,7 @@ jobs:
   # the files that define the deps (IMAGE_TAG, exported by ghcr-login). When that tag
   # already exists in GHCR the build is skipped entirely — code-only pushes reuse it.
   image:
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     permissions: { contents: read, packages: write }
     steps:
       - uses: actions/checkout@v7
@@ -47,7 +47,7 @@ jobs:
   # image toolchain produces correct results.
   check:
     needs: image
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     permissions: { contents: read, packages: read }
     steps:
       - uses: actions/checkout@v7
@@ -66,7 +66,7 @@ jobs:
   # Compile-check the viewer (it's built + deployed on release; see release.yml)
   # and run the Worker's dependency-free self-checks (plain node assert scripts).
   web:
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7

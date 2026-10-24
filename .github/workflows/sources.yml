@@ -53,7 +53,7 @@ jobs:
   # Ensure the deps-only toolchain image exists (keyed on IMAGE_TAG from ghcr-login; shared
   # with ci.yml/build.yml, so a push-built image is reused).
   image:
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     permissions: { contents: read, packages: write }
     steps:
       - uses: actions/checkout@v7
@@ -79,7 +79,7 @@ jobs:
 
   # Boot the Hetzner box and attach the persistent store volume.
   create-runner:
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     permissions: { contents: read }
     outputs:
       label: ${{ steps.runner.outputs.label }}
@@ -297,7 +297,7 @@ jobs:
   collect-metrics:
     needs: [create-runner, sources]
     if: ${{ always() && needs.create-runner.outputs.server_id != '' }}
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
@@ -322,7 +322,7 @@ jobs:
   delete-runner:
     needs: [create-runner, sources, collect-metrics]
     if: always()
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     permissions: { contents: read }
     steps:
       - name: Delete runner + server

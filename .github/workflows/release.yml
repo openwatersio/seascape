@@ -34,7 +34,7 @@ jobs:
   # Worker version rolls out.
   publish-r2:
     if: ${{ !startsWith(github.event.release.tag_name, 'style-v') }}
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     env:
       SHA: ${{ github.event.inputs.sha || github.sha }}
     steps:
@@ -104,7 +104,7 @@ jobs:
   # sees a mix of old/new bundles. Rollback = re-dispatch with a prior (kept) sha.
   deploy-worker:
     needs: publish-r2
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     env:
       SHA: ${{ github.event.inputs.sha || github.sha }}
     steps:
@@ -128,7 +128,7 @@ jobs:
   # Build the viewer (pointed at the Worker) and deploy it to GitHub Pages.
   deploy-pages:
     if: ${{ !startsWith(github.event.release.tag_name, 'style-v') }}
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     permissions: { pages: write, id-token: write, contents: read }
     environment:
       name: github-pages
@@ -159,7 +159,7 @@ jobs:
   # re-dispatch this workflow with a prior kept sha.
   smoke-test:
     needs: deploy-worker
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     env:
       BASE: https://tiles.openwaters.io
     steps:

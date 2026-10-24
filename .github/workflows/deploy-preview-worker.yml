@@ -23,7 +23,7 @@ concurrency:
 
 jobs:
   deploy:
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -48,7 +48,7 @@ jobs:
   # build proves the plumbing; no need to find the newest.
   smoke-test:
     needs: deploy
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     env:
       DATA_BUCKET: data
       AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}

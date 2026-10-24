@@ -77,7 +77,7 @@ concurrency:
 jobs:
   # Ensure the deps-only toolchain image exists (shared with ci.yml/sources.yml).
   image:
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     permissions: { contents: read, packages: write }
     steps:
       - uses: actions/checkout@v7
@@ -103,7 +103,7 @@ jobs:
 
   # Boot the Hetzner box, register it as a self-hosted runner, attach the store volume.
   create-runner:
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     permissions: { contents: read, statuses: write }
     outputs:
       label: ${{ steps.runner.outputs.label }}
@@ -557,7 +557,7 @@ jobs:
   collect-metrics:
     needs: [create-runner, build]
     if: ${{ always() && needs.create-runner.outputs.server_id != '' }}
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
@@ -580,7 +580,7 @@ jobs:
   delete-runner:
     needs: [create-runner, build, collect-metrics]
     if: always()
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     permissions: { contents: read }
     steps:
       - name: Delete runner + server
