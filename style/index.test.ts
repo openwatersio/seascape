@@ -12,7 +12,9 @@ import {
   layers,
   style,
   SCHEMA,
+  VIEWS,
   type ChartMap,
+  type View,
 } from "./index";
 
 import { execFileSync } from "node:child_process";
@@ -530,8 +532,31 @@ test("the ladders mirror the pipeline's at every compiled zoom", () => {
 
 test("relief views share no layer ids with the chart, so applyState leaves them alone", () => {
   const chartIds = new Set(layers().map((l) => l.id));
-  for (const view of ["relief", "globe", "hillshade", "topo"] as const) {
+  for (const view of VIEWS.filter((v) => v !== "chart")) {
     const s = style({ tilesBase: "https://t.example", view });
     for (const l of s.layers) expect(chartIds.has(l.id)).toBe(false);
   }
+});
+
+test("every view's layers reference only sources the style declares", () => {
+  for (const view of VIEWS) {
+    const s = style({ tilesBase: "https://t.example", view });
+    for (const l of s.layers)
+      if ("source" in l) expect(s.sources).toHaveProperty(l.source as string);
+  }
+});
+
+test("an unknown view throws rather than building a broken style", () => {
+  expect(() =>
+    style({ tilesBase: "https://t.example", view: "bogus" as View }),
+  ).toThrow(/unknown view/);
+});
+
+test("topo gives unknown-depth water its own knife-edge colour", () => {
+  const s = style({ tilesBase: "https://t.example", view: "topo" });
+  const tint = s.layers.find((l) => l.id === "topo-tint") as {
+    paint: Record<string, unknown>;
+  };
+  const ramp = raw(tint.paint["color-relief-color"]).slice(3);
+  expect(ramp[ramp.indexOf(0) + 1]).toBe("#ffffff");
 });

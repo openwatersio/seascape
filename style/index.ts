@@ -16,7 +16,7 @@
  * Runtime parameters: `unit` ("m" | "ft" | "fm") and `safety` (metres, 0 = off)
  * appear in the generated expressions as literals — every label, isobath
  * filter, and the depth-shading ramp. Literal expressions run on any GL JS
- * with color-relief (MapLibre >= 5.6). To change them on a live map,
+ * with color-relief resampling (MapLibre >= 5.20). To change them on a live map,
  * applyState() re-derives each layer's declared state-dependent properties and
  * sets them in place; or fetch a regenerated style
  * (`/style.json?unit=ft&safety=3`). `shading` ("relief" | "bands") picks the
@@ -57,13 +57,13 @@ import {
 } from "./relief.js";
 
 export { day, type Flavor, type Shading, type Unit } from "./flavor.js";
-export { hillshadeLayers, reliefLayers, topoLayers } from "./relief.js";
 
 // "chart" is the nautical chart; "relief" and "globe" are shaded-relief demo
 // views (relief.ts), globe adding the globe projection and atmosphere;
 // "hillshade" is plain grey seafloor shading on white; "topo" is a red-to-blue
 // depth tint with contours.
-export type View = "chart" | "relief" | "globe" | "hillshade" | "topo";
+export const VIEWS = ["chart", "relief", "globe", "hillshade", "topo"] as const;
+export type View = (typeof VIEWS)[number];
 export { depthRelief } from "./depth-shading.js";
 export { BANDS_MIN_ZOOM, depthAreasColor } from "./depth-areas.js";
 
@@ -193,10 +193,13 @@ export function style({
   shading?: Shading;
   hillshade?: boolean;
 }): StyleSpecification {
+  // Callers outside TypeScript (URL params) can pass anything; an unknown view
+  // would otherwise reach the relief branch without its land source.
+  if (!VIEWS.includes(view)) throw new Error(`unknown view: ${view}`);
   if (view !== "chart")
     return {
       version: 8,
-      name: "Open Waters Seascape Relief",
+      name: `Open Waters Seascape ${view}`,
       glyphs,
       sources: {
         ...(view === "relief" || view === "globe"

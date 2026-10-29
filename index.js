@@ -6,6 +6,7 @@ import {
   readDepth,
   style,
   SCHEMA,
+  VIEWS,
 } from "@openwaters/seascape";
 
 // The style itself (sources, layers, depth ramp, unit/safety expressions) lives
@@ -35,13 +36,21 @@ const tilesBase = (
   ""
 ).replace(/\/$/, "");
 const MAX_ZOOM = 13; // deepest zoom readDepth fetches (the Worker overzooms past it)
-// ?view=relief|globe swaps the chart for a shaded-relief demo view; picking one
-// reloads, so the chart-only setup below never runs against relief layers.
+// ?view= swaps the chart for one of the package's demo views (unknown values
+// fall back to the chart); picking one reloads, so the chart-only setup below
+// never runs against demo layers, and its controls hide.
 const params = new URLSearchParams(location.search);
-const view = params.get("view") || "chart";
+const view = VIEWS.includes(params.get("view")) ? params.get("view") : "chart";
+if (view !== "chart")
+  for (const el of document.querySelectorAll(".chart-only"))
+    el.style.display = "none";
 const viewSelect = document.getElementById("view-select");
 viewSelect.value = view;
 viewSelect.addEventListener("change", () => {
+  // Carry the position across the reload as the #W,S,E,N hash this viewer
+  // fits on load.
+  const bbox = map.getBounds().toArray().flat().join(",");
+  history.replaceState(null, "", `#${bbox}`);
   params.set("view", viewSelect.value);
   location.search = params.toString();
 });
@@ -56,7 +65,6 @@ const map = new maplibregl.Map({
   hash: true,
   dragRotate: false,
   pitchWithRotate: false,
-  dragRotate: false,
   attributionControl: { compact: true },
 });
 window.map = map; // exposed for debugging / verification
@@ -113,11 +121,11 @@ const toggles = {
 };
 
 map.on("load", () => {
-  if (view !== "chart") return; // relief views carry their own land relief
+  if (view !== "chart") return; // demo views carry their own land, if any
   // Mapterhorn (mapterhorn.com): open global terrain DEM, far finer on land
   // than the bathymetry mosaic. Ocean is flat 0 there, so a hillshade shades
-  // land only — attribution rides in via its TileJSON. Demo-only; the style
-  // package stays bathymetry.
+  // land only — attribution rides in via its TileJSON. The chart style stays
+  // bathymetry; only the package's demo views carry Mapterhorn.
   map.addSource("mapterhorn", {
     type: "raster-dem",
     url: "https://tiles.mapterhorn.com/tilejson.json",

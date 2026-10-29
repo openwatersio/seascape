@@ -150,7 +150,7 @@
     <details id="controls" class="maplibregl-ctrl">
       <summary title="Settings" aria-label="Settings" role="button">&#9881;</summary>
       <div id="controls-panel">
-        <section>
+        <section class="chart-only">
           <strong>Seascape Layers</strong>
           <label>
             <input type="checkbox" id="toggle-depth" checked /> Depth shading
@@ -174,6 +174,8 @@
           <label>
             <input type="checkbox" id="toggle-land" checked /> Land relief (Mapterhorn)
           </label>
+        </section>
+        <section>
           <label>
             <input type="checkbox" id="toggle-tiles" /> Tile grid
           </label>
@@ -190,7 +192,7 @@
               <option value="topo">Topo</option>
             </select>
           </label>
-          <label id="shading-control" class="row"
+          <label id="shading-control" class="row chart-only"
             title="Smooth raster relief, or vector ENC depth bands (crisp isobath edges, safety snapped to a charted level)">
             <span>Shading</span>
             <select id="shading-select">
@@ -198,14 +200,14 @@
               <option value="bands">Bands (vector)</option>
             </select>
           </label>
-          <label class="row">Units
+          <label class="row chart-only">Units
             <select id="unit-select">
               <option value="m">metres</option>
               <option value="ft">feet</option>
               <option value="fm">fathoms</option>
             </select>
           </label>
-          <label class="row" title="Draft + margin; water shallower than this is shaded as a hazard (0 = off)">
+          <label class="row chart-only" title="Draft + margin; water shallower than this is shaded as a hazard (0 = off)">
             Safety
             <div>
               <input type="number" id="safety-depth" min="0" step="1" value="2" style="width: 3.5em" /> m

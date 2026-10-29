@@ -161,7 +161,8 @@ export function hillshadeLayers({
 // Topo view: a science-style bathymetric tint with contours. The ramp spends
 // most of its colours in the shallows, as fishing and survey charts do — red at
 // the shore, yellow by ~35 m, cyan by ~90 m — then darkens slowly to the
-// abyss. Drying foreshore is pink; land is grey.
+// abyss. Unknown-depth water is white (a knife-edge stop at exact 0, so it never
+// blends into the shoal red), drying foreshore pink, land grey.
 const TOPO_RAMP = [
   -11000, "#0d1340",
   -6000, "#18246e",
@@ -174,6 +175,7 @@ const TOPO_RAMP = [
   -18, "#f59331",
   -5, "#e8402f",
   -LSB, "#d7263d",
+  0, "#ffffff",
   LSB, "#f4b6c8",
   LAND_CODE - LSB, "#f4b6c8",
   LAND_CODE, "#d4d4d4",
