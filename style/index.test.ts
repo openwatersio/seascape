@@ -37,6 +37,9 @@ test("generated style validates against the MapLibre style spec", () => {
       safety: 3,
     }),
     style({ tilesBase: "https://t.example", shading: "bands", safety: 5 }),
+    style({ tilesBase: "https://t.example", view: "relief" }),
+    style({ tilesBase: "https://t.example", view: "globe" }),
+    style({ tilesBase: "https://t.example", view: "hillshade" }),
   ];
   for (const s of variants) expect(validateStyleMin(s)).toEqual([]);
 });
@@ -521,5 +524,13 @@ test("the ladders mirror the pipeline's at every compiled zoom", () => {
     const fm = ladderAt("ft", Number(z));
     expect(fm.length, `fathom ladder at z${z}`).toBe(ft.length);
     fm.forEach((d, i) => expect(Math.abs(d - ft[i])).toBeLessThan(DRVAL_EPS));
+  }
+});
+
+test("relief views share no layer ids with the chart, so applyState leaves them alone", () => {
+  const chartIds = new Set(layers().map((l) => l.id));
+  for (const view of ["relief", "globe", "hillshade"] as const) {
+    const s = style({ tilesBase: "https://t.example", view });
+    for (const l of s.layers) expect(chartIds.has(l.id)).toBe(false);
   }
 });

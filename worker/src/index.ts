@@ -547,7 +547,8 @@ export default {
     // from the request. Point MapLibre's `style:` (or Maputnik) at this URL
     // directly. ?unit=m|ft|fm, ?safety=<metres>, and ?shading=relief|bands set
     // mariner defaults in the served style; on a live map the package's
-    // applyState changes unit/safety in place.
+    // applyState changes unit/safety in place. ?view=relief|globe|hillshade serves the
+    // shaded-relief demo views instead of the chart.
     if (rel === "/style.json") {
       // Uncacheable plain-text 400s: an intermediary must never cache an error
       // for a URL that would succeed once the param is fixed.
@@ -578,6 +579,13 @@ export default {
           : (["relief", "bands"] as const).find((s) => s === shadingParam);
       if (shadingParam !== null && shading === undefined)
         return bad("shading must be relief or bands");
+      const viewParam = url.searchParams.get("view");
+      const view =
+        viewParam === null
+          ? undefined
+          : (["chart", "relief", "globe", "hillshade"] as const).find((v) => v === viewParam);
+      if (viewParam !== null && view === undefined)
+        return bad("view must be chart, relief, globe, or hillshade");
       // Same guard as the viewer's: a Worker redeployed against an older or
       // newer tileset (release.yml republishes prior shas) must not serve a
       // style that decodes the tiles plausibly but wrongly (docs/schema.md).
@@ -603,6 +611,7 @@ export default {
           ...(unit !== undefined ? { unit } : {}),
           ...(safety !== undefined ? { safety } : {}),
           ...(shading !== undefined ? { shading } : {}),
+          ...(view !== undefined ? { view } : {}),
         }),
       );
     }

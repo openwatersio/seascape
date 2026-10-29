@@ -35,13 +35,23 @@ const tilesBase = (
   ""
 ).replace(/\/$/, "");
 const MAX_ZOOM = 13; // deepest zoom readDepth fetches (the Worker overzooms past it)
+// ?view=relief|globe swaps the chart for a shaded-relief demo view; picking one
+// reloads, so the chart-only setup below never runs against relief layers.
+const params = new URLSearchParams(location.search);
+const view = params.get("view") || "chart";
+const viewSelect = document.getElementById("view-select");
+viewSelect.value = view;
+viewSelect.addEventListener("change", () => {
+  params.set("view", viewSelect.value);
+  location.search = params.toString();
+});
 
 // ─── Create map ───────────────────────────────────────────────────────────
 // The style is self-contained: zooms/bounds/attribution come from the
 // endpoint's TileJSON, so there's nothing to fetch before creating the map.
 const map = new maplibregl.Map({
   container: "map",
-  style: style({ tilesBase }),
+  style: style({ tilesBase, view }),
   bounds: BBOX,
   hash: true,
   dragRotate: false,
@@ -103,6 +113,7 @@ const toggles = {
 };
 
 map.on("load", () => {
+  if (view !== "chart") return; // relief views carry their own land relief
   // Mapterhorn (mapterhorn.com): open global terrain DEM, far finer on land
   // than the bathymetry mosaic. Ocean is flat 0 there, so a hillshade shades
   // land only — attribution rides in via its TileJSON. Demo-only; the style
@@ -209,7 +220,10 @@ document
 // across tile boundaries hits once per fragment.
 // undefined → coverage layer hidden (skip the line); [] → no footprint = GEBCO.
 function sourcesAt(point) {
-  if (map.getLayoutProperty("source-fill", "visibility") === "none")
+  if (
+    !map.getLayer("source-fill") ||
+    map.getLayoutProperty("source-fill", "visibility") === "none"
+  )
     return undefined;
   const hits = map.queryRenderedFeatures(point, { layers: ["source-fill"] });
   const byId = new Map(hits.map((f) => [f.properties.source_id, f.properties]));

@@ -48,8 +48,20 @@ import {
 } from "./contours.js";
 import { soundingsLayer, soundingsState } from "./soundings.js";
 import { coverageLayers } from "./coverage.js";
+import {
+  hillshadeLayers,
+  MAPTERHORN,
+  mapterhornSource,
+  reliefLayers,
+} from "./relief.js";
 
 export { day, type Flavor, type Shading, type Unit } from "./flavor.js";
+export { hillshadeLayers, reliefLayers } from "./relief.js";
+
+// "chart" is the nautical chart; "relief" and "globe" are shaded-relief demo
+// views (relief.ts), globe adding the globe projection and atmosphere;
+// "hillshade" is plain grey seafloor shading on white.
+export type View = "chart" | "relief" | "globe" | "hillshade";
 export { depthRelief } from "./depth-shading.js";
 export { BANDS_MIN_ZOOM, depthAreasColor } from "./depth-areas.js";
 
@@ -156,9 +168,11 @@ export function layers(
 // A complete, drop-in StyleSpecification: OSM raster base (osm: false for
 // layers-only over your own basemap) + the bathymetry sources and layers.
 // `unit`/`safety` parameterize every layer, ramp included, so labels and tint
-// always agree.
+// always agree. `view` swaps the chart for the relief demo views (relief.ts),
+// which ignore every chart option.
 export function style({
   tilesBase,
+  view = "chart",
   flavor = day,
   glyphs = DEFAULT_GLYPHS,
   osm = true,
@@ -168,6 +182,7 @@ export function style({
   hillshade = true,
 }: {
   tilesBase: string;
+  view?: View;
   flavor?: Flavor;
   glyphs?: string;
   osm?: boolean;
@@ -176,6 +191,45 @@ export function style({
   shading?: Shading;
   hillshade?: boolean;
 }): StyleSpecification {
+  if (view !== "chart")
+    return {
+      version: 8,
+      name: "Open Waters Seascape Relief",
+      sources: {
+        ...(view === "hillshade" ? {} : { [MAPTERHORN]: mapterhornSource }),
+        "seascape-dem": sources({ tilesBase })["seascape-dem"],
+      },
+      layers: view === "hillshade" ? hillshadeLayers() : reliefLayers(),
+      ...(view === "globe"
+        ? {
+            // Globe while zoomed out, flat Mercator once zoomed in.
+            projection: {
+              type: [
+                "interpolate",
+                ["linear"],
+                ["zoom"],
+                10,
+                "vertical-perspective",
+                12,
+                "mercator",
+              ],
+            },
+            sky: {
+              "atmosphere-blend": [
+                "interpolate",
+                ["linear"],
+                ["zoom"],
+                0,
+                1,
+                5,
+                1,
+                7,
+                0,
+              ],
+            },
+          }
+        : {}),
+    } as StyleSpecification;
   const osmSource: Record<string, SourceSpecification> = osm
     ? {
         osm: {
