@@ -329,7 +329,9 @@ SMOOTH_CFG = json.dumps({} if os.environ.get("SKIP_SMOOTH") else {
     "pond_fill_min_child_z": smooth.POND_FILL_MIN_CHILD_Z,
     # Not a dial — smooth_array's shoal clamp carries no knob, and a surface property with no
     # dial would otherwise leave every window fresh across a change to it.
-    "shoal_clamped": True}, sort_keys=True)
+    "shoal_clamped": True,
+    # The effective-land cut (landmask.cut_to_land) and the value it writes.
+    "land_cut": landmask.CUT_LAND_M}, sort_keys=True)
 
 
 # Fork reservations by child_z: ceil(measured max RSS) over run 31946612525's benchmark
@@ -382,6 +384,12 @@ def fork_inputs(wc):
     return [f"store/mosaic/tiles/{s}.tif" for s in mosaic_mod.intersecting_tiles(wc.stem)]
 
 
+def cut_masks(z):
+    """The masks landmask.cut_to_land (window_mask) reads for a surface at zoom z: the vector
+    pair at z>=8, the prepped land-z8 raster below."""
+    return MASKS if z >= 8 else MASKS + RASTER_MASK
+
+
 def depare_inputs(wc):
     """The mosaic tiles every depth-area tier reads: the native window's set plus each coarse
     tier's halo at its own surface resolution (a z5 halo reaches 160 km past the stem)."""
@@ -394,11 +402,12 @@ def depare_inputs(wc):
 
 
 # The forks' shared read surface, built once per stem instead of three times: the buffered
-# window materialized, smoothed, and pond-filled. temp() — a z15 window is 4.3 GB and
-# only in-flight stems need theirs on disk. Consumers treat it as read-only.
+# window materialized, smoothed, cut to effective land, and pond-filled. temp() — a z15 window is
+# 4.3 GB and only in-flight stems need theirs on disk. Consumers treat it as read-only.
 rule fork_window:
     input:
-        fork_inputs,
+        tiles=fork_inputs,
+        masks=lambda wc: cut_masks(int(wc.stem.split("-")[3])),
     output:
         temp("store/window/{stem}.tif")
     params:
@@ -455,11 +464,10 @@ rule contour_tile:
 rule soundings_tile:
     input:
         window="store/window/{stem}.tif",
-        masks=MASKS,
     output:
         "store/soundings/{stem}.geojsons"
     params:
-        version=2, # increment to force a rebuild
+        version=3, # increment to force a rebuild
         cell=soundings_run.SOUND_CELL_PX, min_depth=soundings_run.SOUND_MIN_DEPTH_M,
         thin=soundings_run.SOUND_THIN_TIERS,
         ladders=json.dumps(pipeline_config.CONTOUR_TIERS),  # a prime sounding shows with its ring
@@ -481,11 +489,13 @@ rule depare_tile:
     input:
         window="store/window/{stem}.tif",
         tiles=depare_inputs,  # the coarse tiers read the mosaic pyramid levels directly
-        masks=MASKS,
+        # Drying's land cut, and each tier's cut_to_land at its own surface zoom.
+        masks=lambda wc: sorted({m for t in pipeline_config.depare_tiers(int(wc.stem.split("-")[3]))
+                                 for m in cut_masks(t.surface)}),
     output:
         tier_files("depare", ["{stem}"])
     params:
-        version=11, # increment to force a rebuild
+        version=12, # increment to force a rebuild
         levels=json.dumps({"m": pipeline_config.DEPARE_LEVELS, "ft": pipeline_config.DEPARE_LEVELS_FT}),
         tiers=json.dumps(pipeline_config.DEPARE_TIER_STARTS),
         ladders=json.dumps(pipeline_config.CONTOUR_TIERS),

@@ -45,7 +45,8 @@ both its owners, at the S-58 vertex floor.
 Per tile and per zoom tier (config.depare_tiers — each tier is a separately compiled partition,
 the way an ENC compiles a cell per usage band: cut from the mosaic pyramid level one zoom finer
 than the tier's first (unless that repeats the final tier's native cut), with the isobath ladder
-drawn at its first, the final tier from the native window): bands (gdal_contour -p at the tier's metre / fathom ladder, drop land, drval/sys) + drying (the metre
+drawn at its first, the final tier from the native window — every surface cut to effective land
+first, landmask.cut_to_land): bands (gdal_contour -p at the tier's metre / fathom ladder, drop land, drval/sys) + drying (the metre
 ladder's (0, DRYING_CAP] bucket ∩ effective water, drval1 < 0; exact datum is unknown, never foreshore) + nodata (inland-water polygons
 minus the DEM's water coverage and the drying, plus the drying's exact-datum water) -> clip to the unbuffered tile bbox in shapely
 (polygon-only by construction, see _polys) -> 4326 -> store/depare/{stem}-t{z}.fgb. Same seam
@@ -1338,6 +1339,8 @@ def tile(stem):
     import signal
     import tempfile
 
+    import landmask
+
     # DEPARE_TIMEOUT (seconds; unset = no bound): each gdal_contour -p pass runs under this
     # bound; on expiry the tile retries once on a uniform 4x shoal-biased window, then fails
     # honestly. The SIGALRM backstop (8x: 2 ladders x 2 attempts x contour + GEOS slack) still
@@ -1357,8 +1360,8 @@ def tile(stem):
     os.makedirs("store/depare", exist_ok=True)
     tiers = config.depare_tiers(child_z)
     try:
-        # The shared smoothed window is read-only; the timeout fallback derives its
-        # coarsened copy in tmp rather than touching it.
+        # The shared smoothed window (already cut to land) is read-only; the timeout fallback
+        # derives its coarsened copy in tmp rather than touching it.
         window = f"store/window/{stem}.tif"
         tile_obj = mercantile.Tile(x=x, y=y, z=z)
         # Finest first: each coarser surface is clamped shoal-ward against the reduction of the
@@ -1377,6 +1380,9 @@ def tile(stem):
             else:
                 dem = _tier_surface(stem, tier, f"{tier_tmp}/surface.tif")
                 _shoal_clamp(dem, finer, 2 ** (finer_z - tier.surface))
+                # The reduction hands a mixed block to its water, so the finer cut does not carry
+                # down: cut again at this grid, as the raster masks each zoom at its own.
+                landmask.cut_to_land(dem, tier.surface)
                 finer, finer_z = dem, tier.surface
             _mark(f"{tier.name}-surface")
             # A compiled tier's legibility and nodata generalization sit at its first zoom, the

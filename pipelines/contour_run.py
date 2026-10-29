@@ -491,14 +491,18 @@ def _tile_grid_deg(z):
 
 def _survives_leaf(geom, min_deg):
     """Whether tippecanoe must keep this geometry at the finest zoom it is written to (so completeness
-    can require it). Points always; lines by length; polygons by linear size sqrt(area) — all in
-    degrees, min_deg being COMPLETENESS_MIN_PX pixels of that zoom. Anisotropy (lon vs lat degrees)
-    is inside the 4-px margin."""
+    can require it). Points always; lines by length; polygons by linear size sqrt(area) AND by
+    4·area/perimeter (a square's side, twice a ribbon's width) — all in degrees, min_deg being
+    COMPLETENESS_MIN_PX pixels of that zoom.
+    Width, because area alone requires a ribbon: gdal_contour packs every level between a water
+    pixel and a wall beside it (the land cut's CUT_LAND_M, a cliff) into a band 200 m long and 1 cm
+    wide, which tippecanoe rightly collapses. Anisotropy (lon vs lat degrees) is inside the 4-px
+    margin."""
     t = geom.geom_type
     if "Point" in t:
         return True
     if "Polygon" in t:
-        return geom.area ** 0.5 >= min_deg
+        return geom.area ** 0.5 >= min_deg and 4 * geom.area >= min_deg * geom.length
     return geom.length >= min_deg
 
 
@@ -1175,6 +1179,11 @@ def _check():
     import geopandas as gpd
     import numpy as np
     from shapely.geometry import LineString, box as sbox
+
+    # The census requires a polygon only when tippecanoe can draw it: square enough AND wide enough.
+    # The ribbon is the Jacksonville hairline in z15 leaf units — 667 long, 1/30 wide, sqrt(area) 4.7.
+    assert _survives_leaf(sbox(0, 0, 5, 5), 4) and not _survives_leaf(sbox(0, 0, 3, 3), 4)
+    assert not _survives_leaf(sbox(0, 0, 667, 1 / 30), 4) and _survives_leaf(sbox(0, 0, 667, 5), 4)
 
     # The 5 m line is the shared inner-square edge, whole and merged; the outer boundary has one
     # owner and yields nothing. A pinched-out band puts both skipped levels on one edge,

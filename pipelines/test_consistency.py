@@ -5,9 +5,9 @@ asserts they still describe the same seabed:
 
   * raster shading   mosaic -> class-aware shoal pyramid (utils._block_reduce) -> read at the
                      target zoom -> smooth -> classify (terrain._encode_tile) -> Terrarium
-  * isobaths         mosaic -> fork window (smooth + pond_fill) -> land clamp ->
-                     gdal_contour -> Chaikin/simplify -> clip
-  * depth areas      the same fork window -> gdal_contour -p -> coverage simplify -> land cut
+  * depth areas      mosaic -> fork window (smooth + land cut + pond_fill) -> gdal_contour -p
+                     -> coverage simplify -> drying land cut
+  * isobaths         the depth areas' shared band edges (contour_run)
 
 One synthetic tile carries the structures where those paths have historically parted company —
 a channel through a land bar, a shoal inside a deeper basin, a drying flat with an enclosed
@@ -163,7 +163,7 @@ def _dem():
 
 def _write_masks(d):
     """OSM-shaped masks: the land bar with the channel notched out of it (a dredged cut is mapped
-    as water, so the contour land clamp must not close it), and a far-away water polygon — the
+    as water, so the land cut must not close it), and a far-away water polygon — the
     depare nodata pass needs a water feed present, and none of it may reach the fixture."""
     import geopandas as gpd
     from shapely.geometry import box

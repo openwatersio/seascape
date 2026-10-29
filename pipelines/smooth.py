@@ -126,9 +126,9 @@ def smooth_tiff(path, block=None):
     # sources but Int16 where GEBCO dominates, and PREDICTOR=3 is float-only.
     dt = profile["dtype"]
     predictor = 3 if dt in ("float32", "float64") else 2 if "int" in dt else 1
-    # BIGTIFF: a z15 window compresses under 4 GB, but the later in-place land clamp
+    # BIGTIFF: a z15 window compresses under 4 GB, but the later in-place land cut
     # appends rewritten blocks past the classic-TIFF offset limit; IF_SAFER sizes by
-    # the uncompressed estimate so the clamp always has room.
+    # the uncompressed estimate so the cut always has room.
     profile.update(driver="GTiff", count=1, tiled=True, blockxsize=512, blockysize=512,
                    compress="zstd", predictor=predictor, num_threads="all_cpus",
                    BIGTIFF="IF_SAFER")
@@ -348,9 +348,9 @@ def _check():
 
 def prepare_window(stem, out_tif):
     """The forks' shared read surface: the stem's buffered window materialized once,
-    smoothed and pond-filled. Consumers must treat it as read-only — contour and
-    soundings clamp a private copy; depare reads it directly. Every generalization lives here so
-    bands, contour lines and soundings stay coincident."""
+    smoothed, cut to effective land and pond-filled. Consumers must treat it as read-only.
+    Every generalization lives here so bands, contour lines and soundings stay coincident."""
+    import landmask
     import mosaic
     child_z = int(stem.split("-")[3])
     os.makedirs(os.path.dirname(out_tif), exist_ok=True)
@@ -361,6 +361,9 @@ def prepare_window(stem, out_tif):
     with rasterio.env.Env(GDAL_CACHEMAX=256):
         if not os.environ.get("SKIP_SMOOTH"):
             smooth_tiff(tmp)
+        # After the smooth, as the raster masks after its own; before the pond fill, so water
+        # the cut strands inside land (a dock slip, a dry dock) is sized and filled like any pond.
+        landmask.cut_to_land(tmp, child_z)
         ponds = pond_fill(tmp, child_z)
     with open(tmp, "rb") as f:
         os.fsync(f.fileno())  # teardown is a power cut; a rename must not outlive its data
