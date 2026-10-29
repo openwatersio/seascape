@@ -318,18 +318,19 @@ rule publish_mosaic:
 # The one shared f(depth, zoom) — a knob change reruns stage 3 only, never a merge. Every dial
 # prepare_window applies must appear here: a dial missing from this hash
 # leaves the window artifact fresh, so a sweep silently re-measures the previous surface.
-SMOOTH_CFG = json.dumps({} if os.environ.get("SKIP_SMOOTH") else {
+# SKIP_SMOOTH skips only the smooth, so the cut and the pond fill stay keyed in both modes.
+SMOOTH_CFG = json.dumps({**({} if os.environ.get("SKIP_SMOOTH") else {
     "sigma": smooth.DEM_SIGMA, "sigma_deep": smooth.DEM_SIGMA_DEEP,
     "mask_sigma": smooth.MASK_SIGMA, "slope_low": smooth.SLOPE_LOW,
     "slope_high": smooth.SLOPE_HIGH, "depth_full": smooth.DEPTH_FULL,
     "depth_smooth": smooth.DEPTH_SMOOTH, "block": smooth.BLOCK,
+    # Not a dial — smooth_array's shoal clamp carries no knob, and a surface property with no
+    # dial would otherwise leave every window fresh across a change to it.
+    "shoal_clamped": True}),
     "pond_fill_mm2": smooth.POND_FILL_MM2,
     "pond_fill_extent_m": smooth.POND_FILL_EXTENT_M,
     "pond_fill_max_depth_m": smooth.POND_FILL_MAX_DEPTH_M,
     "pond_fill_min_child_z": smooth.POND_FILL_MIN_CHILD_Z,
-    # Not a dial — smooth_array's shoal clamp carries no knob, and a surface property with no
-    # dial would otherwise leave every window fresh across a change to it.
-    "shoal_clamped": True,
     # The effective-land cut (landmask.cut_to_land) and the value it writes.
     "land_cut": landmask.CUT_LAND_M}, sort_keys=True)
 
