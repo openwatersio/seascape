@@ -1235,8 +1235,8 @@ def _check():
         # a compiled tier is cut one zoom finer than it first serves
         assert all(t.surface == t.first + 1 for t in tiers[:-1] if t.first + 1 < cz)
     # …from the native window too, unless that repeats the final tier's cut (same ladder)
-    assert config.depare_tiers(8)[2].surface == 8 and config.depare_tiers(10)[3].surface == 10
-    assert config.depare_tiers(12)[4].surface == 11
+    assert config.depare_tiers(8)[3].surface == 8 and config.depare_tiers(10)[4].surface == 10
+    assert config.depare_tiers(12)[5].surface == 11
     # The shallow run writes its top zoom at full detail and every zoom below at the low detail,
     # and the self-check's grid unit follows the same split.
     top = VECTOR_SPLIT_Z - 1

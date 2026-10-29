@@ -143,9 +143,14 @@ SLIVER_MIN_PX = float(os.environ.get("SLIVER_MIN_PX", "4"))
 DRYING_LEGIBLE_MM2 = float(os.environ.get("DRYING_LEGIBLE_MM2", "16"))
 # Band and nodata legibility at a tier's display scale: 4 mm² is the minimum area for a
 # solid-fill polygon in a subdivision (Galanda 2003). A band part under it dissolves into a
-# shallower neighbour or, with land or drying all round, drops — a pit removed, never a peak
-# (Guilbert & Zhang 2012); a nodata part under it drops. 0 disables.
+# shallower neighbour or, with land or drying all round, drops — a pit removed; a peak stays
+# (Guilbert & Zhang 2012) unless SHOAL_MIN_PX dissolves it; a nodata part under it drops. 0 disables.
 LEGIBLE_MM2 = float(os.environ.get("DEPARE_LEGIBLE_MM2", "4"))
+# Overview tiers (first zoom <= SHOAL_DISSOLVE_MAX_Z) also dissolve a peak under SHOAL_MIN_PX
+# display pixels square into its nearest-depth deeper neighbour: at that size it is invisible,
+# and the overview zooms hold thousands of them. 0 disables.
+SHOAL_MIN_PX = float(os.environ.get("DEPARE_SHOAL_MIN_PX", "4"))
+SHOAL_DISSOLVE_MAX_Z = int(os.environ.get("DEPARE_SHOAL_DISSOLVE_MAX_Z", "6"))
 # Foreshore is strictly above datum, (0, DRYING_CAP]: exact 0 is the land sentinel and the
 # merge's fill for water a source holds no depth for, which the raster keeps as the unknown code
 # (terrain._encode_tile). The drying pass removes those pixels (_drop_datum).
@@ -782,12 +787,13 @@ def row_select(layer):
     return f'SELECT {cols} FROM "{layer}"'
 
 
-def _dissolve_sublegible(bands, drvals, min_area):
+def _dissolve_sublegible(bands, drvals, min_area, shoal_area=0.0):
     """Generalize one ladder's simplified partition at its display scale. Parts under min_area
     (m²), smallest first: with a shallower neighbour (smaller drval1) the part merges into the
     shallowest of them — the area now reads shoaler, a pit removed; with no band neighbour at
     all (land, drying or nodata all round) it drops, which reads as not-water; with every
-    neighbour deeper it is a shoal and stays. A neighbour shares an edge, never just a corner.
+    neighbour deeper it is a shoal and stays, unless it is under shoal_area, when it merges into
+    the shallowest of those deeper neighbours. A neighbour shares an edge, never just a corner.
     Merges are exact unions along shared edges, so the partition stays disjoint and no area is
     invented. Returns the bands in place."""
     import numpy as np
@@ -823,9 +829,12 @@ def _dissolve_sublegible(bands, drvals, min_area):
             alive[i] = False
             continue
         shoaler = [j for j in nb if d1[j] < d1[i]]
-        if not shoaler:
+        if shoaler:
+            t = min(shoaler, key=lambda j: (d1[j], -shapely.area(geoms[j])))
+        elif shapely.area(geoms[i]) < shoal_area:
+            t = min(nb, key=lambda j: (d1[j], -shapely.area(geoms[j])))
+        else:
             continue  # a peak: every neighbour is deeper
-        t = min(shoaler, key=lambda j: (d1[j], -shapely.area(geoms[j])))
         geoms[t] = shapely.union(geoms[t], geoms[i])
         alive[i] = False
         owner[i] = t
@@ -939,6 +948,8 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, le
     # Band/nodata legibility at the display scale a compiled tier serves; the native tier keeps
     # every part, since it also serves the overzoom where they are legible.
     legible_area = LEGIBLE_MM2 * (get_resolution(scale_z) / MM_PER_PX) ** 2 if scale_z else 0.0
+    shoal_area = (SHOAL_MIN_PX * get_resolution(scale_z) ** 2
+                  if scale_z and scale_z <= SHOAL_DISSOLVE_MAX_Z else 0.0)
     # Unknown-water dust: a seam clip piece under half an MVT pixel square at the tier's finest
     # display zoom is below what tippecanoe keeps, and no derivation reads these rows (bands and
     # drying ship whole: the isobaths derive from their shared edges, and the census exempts
@@ -988,7 +999,7 @@ def _depare_dem(dem, tile_obj, child_z, tmp, label, timeout=0, levels_m=None, le
             drying_geoms = simplified[len(drvals):]
         _mark(f"bands-simplify-{sys_tag}")
         if legible_area > 0:
-            bands = _dissolve_sublegible(bands, drvals, legible_area)
+            bands = _dissolve_sublegible(bands, drvals, legible_area, shoal_area)
             _mark(f"bands-dissolve-{sys_tag}")
         for (drval1, drval2), geom in zip(drvals, bands):
             if sys_tag == "m":
@@ -2157,6 +2168,11 @@ def _check():
     assert abs(sum(g.area for g in out) - (total - island.area - corner.area)) < 1e-6 and \
         out[0].intersection(out[1]).area < 1e-9, "the dissolve must conserve area and disjointness"
     assert out[1].contains(_bx(120, 20, 180, 40)), "a legible part must be untouched"
+    # Under shoal_area the same peak merges into its deeper neighbour, nearest depth first.
+    out = _dissolve_sublegible(bands, [(2.0, 5.0), (5.0, 10.0)], 50.0, shoal_area=10.0)
+    assert out[1].contains(peak.buffer(-0.1)) and not out[0].intersects(peak.buffer(-0.1)), \
+        "a peak under shoal_area must dissolve into its deeper neighbour"
+    assert out[0].contains(pit.buffer(-0.1)), "the pit still dissolves shoalward"
     # Shoal clamp: a coarse surface is raised to the reduction of the finer one, never lowered.
     import tempfile as _tf
     from rasterio.transform import from_origin as _fo

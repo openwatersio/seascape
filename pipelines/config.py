@@ -103,7 +103,7 @@ def contour_levels_at(z):
 # viewed closer is an overscaled cell showing the same content (S-101 maximumDisplayScale), never
 # 2 m bands interpolated from cells that could not resolve them (S-4 B-412). z13 changes the
 # surface, not the ladder.
-DEPARE_TIER_STARTS = [4, 6, 7, 9, 11, 13]
+DEPARE_TIER_STARTS = [4, 5, 6, 7, 9, 11, 13]
 
 
 class DepareTier(tuple):
