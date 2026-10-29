@@ -12,6 +12,13 @@ error. That immunity is now structural, not a promise: the merge seam feather gu
 its own sign flips (aggregation_merge), so no second, source-blind clamp runs after
 the merge to re-flatten trusted data by geography.
 
+Output cut: the products are a different matter. Every chart layer cuts EVERY source by
+effective land at its own resolution (cut_to_land on the forks' shared window and depare's
+coarse tier surfaces; terrain._encode_tile on the raster), from one mask (window_mask), so
+bands, isobaths, soundings and the raster agree pixel for pixel. That cut lives downstream of
+the stored DEM, so a mask fix re-runs the forks and never a merge, and the DEM keeps what
+S-102 measured over reclaimed land or under a wharf for the day the mask is wrong.
+
 Inland water: the mask subtracts an OSM-derived inland-water polygon layer (rivers,
 lakes, canals, reservoirs — not the ocean, which the land polygons already bound, and not
 Overture's marine 'physical' polygons: bays/straits are drawn without island holes, so
@@ -624,9 +631,9 @@ def rasterize(bounds_3857, res, out_tif, src=None, water_src=None, all_touched=F
 
     all_touched burns both passes with -at: every pixel a polygon touches, not just pixel
     centres. At a coarse grid a narrow island rim slips through centre sampling and keeps
-    its false negative depths — the contour/soundings clamp uses -at so the whole rim
-    clamps (over-clamping errs bias-shallow, the chart-safe direction; -at on the water
-    burn symmetrically keeps narrow river channels open).
+    its false negative depths (over-clamping errs bias-shallow, the chart-safe direction; -at
+    on the water burn symmetrically keeps narrow river channels open). The product cut
+    (window_mask) samples centres instead, so the vectors and the raster share one grid.
 
     Pass the SAME -te/-tr gdalwarp uses for the tile, so the mask aligns pixel-for-pixel
     with the warped raster and neighbouring tiles rasterize their shared halo identically
@@ -791,9 +798,10 @@ def extract_raster(bounds_3857, res, out_tif):
 _SCAN_BLOCK = 2048
 
 
-def _clamp_negative_land(dem_path, mask_tif, valid):
-    """Shared windowed clamp: where land (mask==1) AND valid(ds, win, a) AND value<0, set 0.
-    Mask-first — read the cheap Byte mask window and skip landless blocks before decoding the
+def _clamp_negative_land(dem_path, mask_tif, valid, to=0.0):
+    """Shared windowed clamp: where land (mask==1) AND valid(ds, win, a) AND value<0, set 0 —
+    or, with a positive `to`, where value<=0, set `to` (land-side exact 0 included). Mask-first
+    — read the cheap Byte mask window and skip landless blocks before decoding the
     DEM/alpha, so a mostly-water tile is a mask-only scan. GDAL_CACHEMAX-bounded like
     contains_nodata_pixels (the block cache these windowed reads accumulate, per worker)."""
     with rasterio.open(mask_tif) as m:
@@ -814,28 +822,50 @@ def _clamp_negative_land(dem_path, mask_tif, valid):
                     if not land.any():
                         continue
                     a = ds.read(1, window=win)
-                    hit = land & valid(ds, win, a) & (a < 0)
+                    hit = land & valid(ds, win, a) & ((a <= 0) if to else (a < 0))
                     if hit.any():
-                        a[hit] = 0
+                        a[hit] = to
                         ds.write(a, 1, window=win)
 
 
-def clamp_dem_to_land(dem_path):
-    """Post-smooth land clamp for a derived stage-3 DEM (contours/soundings): re-cut
-    negative-under-land to 0 on the DEM's OWN grid before isolines/minima are extracted.
-    The warp-time clamp runs at source resolution with centre sampling, so narrow island
-    rims keep false negatives, and the pre-contour smoothing smears them back across
-    clamped interiors — isobaths and soundings then land on islands. all_touched here so
-    the whole rim clamps (bias-shallow). No-op without a land mask, like everything else."""
-    if not _present(path()):
-        return
+def window_mask(bounds_3857, res, z, out_tif):
+    """Effective land (1) on a stage-3 window's exact grid, the one mask every product cuts with;
+    returns out_tif, or None when no mask is available (the cut then degrades to none). z>=8
+    rasterizes the vector mask by pixel centre; coarser windows window the prepped land-z8
+    raster instead — a continental -spat clip selects most of the planet's polygons, re-reading
+    the whole multi-GB FGB per stem."""
+    if z >= 8 and _present(path()):
+        rasterize(bounds_3857, res, out_tif)
+        return out_tif
+    if z < 8 and raster_available():
+        extract_raster(bounds_3857, res, out_tif)
+        return out_tif
+    return None
+
+
+# What cut_to_land writes: above DRYING_CAP, so every fork reads it as land (depare's partition
+# drops it, soundings gate on < 0, the class-aware reductions never hand it a mixed block), and
+# far above it, so gdal_contour's interpolated 0 m and DRYING_CAP crossings both fall on the
+# neighbouring water pixel's centre. Never 0: a bucket holds its upper level, so exact datum
+# polygonizes into the shoalest band — measured at Helsingør (#225), a 0 cut left 79% of the band
+# over land in place — and a value near the cap threads a foreshore ribbon through every cut pixel.
+CUT_LAND_M = 1000.0
+
+
+def cut_to_land(dem_path, z):
+    """Cut effective land out of a smoothed stage-3 surface in place: water-signed (<= 0) pixels
+    whose centre the mask calls land become CUT_LAND_M. Source-blind, as terrain._encode_tile's
+    `(data <= 0) & land` is on the same grid, so the vector products end where the raster's land
+    code starts — coarse-cell overshoot, stale surveys of reclaimed land, water under a wharf,
+    and smeared island rims all go. Run after the smooth (the raster masks after its smooth too),
+    so the cut never bleeds into the water beside it. z picks the mask path (window_mask)."""
     with rasterio.open(dem_path) as ds:
-        b = ds.bounds
-        res = ds.res[0]
+        b, res, nd = ds.bounds, ds.res[0], ds.nodata
     mask_tif = dem_path + ".landmask.tif"
     try:
-        rasterize((b.left, b.bottom, b.right, b.top), res, mask_tif, all_touched=True)
-        clamp(dem_path, mask_tif)
+        if window_mask((b.left, b.bottom, b.right, b.top), res, z, mask_tif) is None:
+            return
+        _clamp_negative_land(dem_path, mask_tif, lambda ds, win, a: a != nd, to=CUT_LAND_M)
     finally:
         if os.path.isfile(mask_tif):
             os.remove(mask_tif)
@@ -1144,6 +1174,42 @@ def _check():
     with rasterio.open(mask_b) as m:
         lw_b = m.read(1)
     assert np.array_equal(lw[:, shift:], lw_b[:, :w - shift]), "seam not deterministic across extents"
+
+    # The product cut is source-blind and keyed on effective land (land ∖ inland water): water-
+    # signed pixels under it, exact 0 included, become CUT_LAND_M; positive land, inland water,
+    # the sea and nodata are untouched. It must burn the same mask terrain encodes with.
+    ly, lx = np.where(lw == 1)
+    iy, ix = np.where((land == 1) & (lw == 0))
+    dem3 = np.full((h, w), -5.0, dtype="float32")
+    dem3[ly[1], lx[1]] = 0.0
+    dem3[ly[2], lx[2]] = 3.0
+    dem3[ly[3], lx[3]] = NODATA
+    cut_tif = f"{d}/cut.tif"
+    with rasterio.open(cut_tif, "w", driver="GTiff", height=h, width=w, count=1, dtype="float32",
+                       nodata=NODATA, crs="EPSG:3857", transform=tr) as dst:
+        dst.write(dem3, 1)
+    saved = {k: os.environ.get(k) for k in ("LANDMASK", "WATERMASK")}
+    os.environ["LANDMASK"], os.environ["WATERMASK"] = land_fgb, water_fgb
+    try:
+        cut_to_land(cut_tif, 12)
+        assert window_mask(te, res, 12, f"{d}/window_mask.tif") is not None
+        with rasterio.open(f"{d}/window_mask.tif") as m:
+            assert np.array_equal(m.read(1), lw), "the cut must burn rasterize()'s composite"
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    with rasterio.open(cut_tif) as r:
+        out3 = r.read(1)
+    assert out3[ly[0], lx[0]] == CUT_LAND_M, "negative under land must cut to land"
+    assert out3[ly[1], lx[1]] == CUT_LAND_M, "land-side exact datum must cut to land"
+    assert out3[ly[2], lx[2]] == 3.0, "positive under land must survive"
+    assert out3[ly[3], lx[3]] == NODATA, "nodata under land must stay nodata"
+    assert out3[iy[0], ix[0]] == -5.0, "inland water must keep its depth"
+    assert out3[wy[0], wx[0]] == -5.0, "the sea must keep its depth"
+    assert ((out3 == CUT_LAND_M) == ((lw == 1) & (dem3 <= 0) & (dem3 != NODATA))).all()
 
     # Open-ocean tile: -spat selects zero land AND zero water polygons → an all-water mask, no
     # error (an empty FlatGeobuf clip would raise, sinking every ocean tile — hence the GPKG

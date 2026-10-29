@@ -251,8 +251,8 @@ def _encode_tile(i, j, src_path, halo, out_webp, cz, mask_path=None, finer=None,
         # <=0, not ==0: the class-aware reduction hands a mixed block to its water, so a
         # land feature narrower than a block (sea stack, cliff toe) reads negative at coarse
         # zooms and would chart as depth. OSM land is authoritative here exactly as it is for
-        # the vector layers (clamp_dem_to_land, the depare land cut); a genuine below-datum
-        # bed is on the water side of the mask and untouched.
+        # the vector layers, which cut the same mask out of their surfaces (landmask.cut_to_land);
+        # a genuine below-datum bed is on the water side of the mask and untouched.
         data[(data <= 0) & land] = LAND
     else:
         data[pos] = LAND  # maskless (coarse stems / no feed): drying is sub-pixel there anyway
@@ -290,21 +290,14 @@ def _render(stem, out_pmtiles):
     if not os.environ.get("SKIP_SMOOTH"):
         smooth.smooth_tiff(window)  # the ONE f(depth,zoom); halo makes interior identical to whole
 
-    # Land mask on the window's exact grid so _encode_tile can nudge land-side exact-0 pixels
-    # (clamped polders, the below-sea-level Caspian Depression, beyond-build land fringe) to
-    # land, keeping decoded 0 unambiguously water. Same #24 machinery, degrades to no-nudge
-    # when no mask is published. cz>=8 rasterizes the vector mask per window (indexed -spat
-    # reads); coarser stems window the prepped planet-z8 raster instead — a continental -spat
-    # clip selects most of the planet's polygons, re-reading the whole multi-GB FGB per stem.
-    mask = None
+    # Land mask on the window's exact grid — the one the vector products cut with — so
+    # _encode_tile can nudge land-side exact-0 pixels (clamped polders, the below-sea-level
+    # Caspian Depression, beyond-build land fringe) to land, keeping decoded 0 unambiguously
+    # water. Same #24 machinery, degrades to no-nudge when no mask is published.
     with rasterio.open(window) as w:
         b, wres = w.bounds, w.res[0]
-    if cz >= 8 and landmask._present(landmask.path()):
-        mask = f"{tmp}/landmask.tif"
-        landmask.rasterize((b.left, b.bottom, b.right, b.top), wres, mask)
-    elif cz < 8 and landmask.raster_available():
-        mask = f"{tmp}/landmask.tif"
-        landmask.extract_raster((b.left, b.bottom, b.right, b.top), wres, mask)
+    mask = landmask.window_mask((b.left, b.bottom, b.right, b.top), wres, cz,
+                                f"{tmp}/landmask.tif")
 
     x_min, y_min = x * span, y * span
     planned = finer_stems(stem)
