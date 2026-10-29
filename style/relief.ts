@@ -12,7 +12,9 @@ import type {
   LayerSpecification,
   SourceSpecification,
 } from "@maplibre/maplibre-gl-style-spec";
+import { contourLabelsLayer, contourLinesLayer } from "./contours.js";
 import { LAND_CODE, LSB } from "./depth-shading.js";
+import { day } from "./flavor.js";
 
 export const MAPTERHORN = "mapterhorn";
 
@@ -152,6 +154,65 @@ export function hillshadeLayers({
       type: "hillshade",
       source: dem,
       paint: { "hillshade-method": "igor" },
+    },
+  ] as unknown as LayerSpecification[];
+}
+
+// Topo view: a science-style bathymetric tint with contours. The ramp spends
+// most of its colours in the shallows, as fishing and survey charts do — red at
+// the shore, yellow by ~35 m, cyan by ~90 m — then darkens slowly to the
+// abyss. Drying foreshore is pink; land is grey.
+const TOPO_RAMP = [
+  -11000, "#0d1340",
+  -6000, "#18246e",
+  -3000, "#1f3fb0",
+  -1000, "#1f6fd6",
+  -200, "#1aa0d8",
+  -90, "#33c9b8",
+  -55, "#7fd04a",
+  -35, "#f2e33a",
+  -18, "#f59331",
+  -5, "#e8402f",
+  -LSB, "#d7263d",
+  LSB, "#f4b6c8",
+  LAND_CODE - LSB, "#f4b6c8",
+  LAND_CODE, "#d4d4d4",
+];
+
+// Chart contours, inked dark grey, metric, no safety emphasis. Renamed so
+// applyState() leaves them alone.
+const topoFlavor = { ...day, contour: "#3a3a3a", label: "#222222" };
+
+export function topoLayers({
+  dem = "seascape-dem",
+  vector = "seascape-vector",
+}: { dem?: string; vector?: string } = {}): LayerSpecification[] {
+  return [
+    {
+      id: "topo-tint",
+      type: "color-relief",
+      source: dem,
+      paint: {
+        "color-relief-color": relief(TOPO_RAMP),
+        resampling: "nearest",
+      },
+    },
+    {
+      id: "topo-hillshade",
+      type: "hillshade",
+      source: dem,
+      paint: {
+        "hillshade-method": "igor",
+        "hillshade-exaggeration": 0.3,
+      },
+    },
+    {
+      ...contourLinesLayer(topoFlavor, { vector, unit: "m", safety: 0 }),
+      id: "topo-contours",
+    },
+    {
+      ...contourLabelsLayer(topoFlavor, { vector, unit: "m" }),
+      id: "topo-contour-labels",
     },
   ] as unknown as LayerSpecification[];
 }

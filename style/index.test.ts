@@ -40,6 +40,7 @@ test("generated style validates against the MapLibre style spec", () => {
     style({ tilesBase: "https://t.example", view: "relief" }),
     style({ tilesBase: "https://t.example", view: "globe" }),
     style({ tilesBase: "https://t.example", view: "hillshade" }),
+    style({ tilesBase: "https://t.example", view: "topo" }),
   ];
   for (const s of variants) expect(validateStyleMin(s)).toEqual([]);
 });
@@ -529,7 +530,7 @@ test("the ladders mirror the pipeline's at every compiled zoom", () => {
 
 test("relief views share no layer ids with the chart, so applyState leaves them alone", () => {
   const chartIds = new Set(layers().map((l) => l.id));
-  for (const view of ["relief", "globe", "hillshade"] as const) {
+  for (const view of ["relief", "globe", "hillshade", "topo"] as const) {
     const s = style({ tilesBase: "https://t.example", view });
     for (const l of s.layers) expect(chartIds.has(l.id)).toBe(false);
   }

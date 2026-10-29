@@ -53,15 +53,17 @@ import {
   MAPTERHORN,
   mapterhornSource,
   reliefLayers,
+  topoLayers,
 } from "./relief.js";
 
 export { day, type Flavor, type Shading, type Unit } from "./flavor.js";
-export { hillshadeLayers, reliefLayers } from "./relief.js";
+export { hillshadeLayers, reliefLayers, topoLayers } from "./relief.js";
 
 // "chart" is the nautical chart; "relief" and "globe" are shaded-relief demo
 // views (relief.ts), globe adding the globe projection and atmosphere;
-// "hillshade" is plain grey seafloor shading on white.
-export type View = "chart" | "relief" | "globe" | "hillshade";
+// "hillshade" is plain grey seafloor shading on white; "topo" is a red-to-blue
+// depth tint with contours.
+export type View = "chart" | "relief" | "globe" | "hillshade" | "topo";
 export { depthRelief } from "./depth-shading.js";
 export { BANDS_MIN_ZOOM, depthAreasColor } from "./depth-areas.js";
 
@@ -195,11 +197,22 @@ export function style({
     return {
       version: 8,
       name: "Open Waters Seascape Relief",
+      glyphs,
       sources: {
-        ...(view === "hillshade" ? {} : { [MAPTERHORN]: mapterhornSource }),
+        ...(view === "relief" || view === "globe"
+          ? { [MAPTERHORN]: mapterhornSource }
+          : {}),
         "seascape-dem": sources({ tilesBase })["seascape-dem"],
+        ...(view === "topo"
+          ? { "seascape-vector": sources({ tilesBase })["seascape-vector"] }
+          : {}),
       },
-      layers: view === "hillshade" ? hillshadeLayers() : reliefLayers(),
+      layers:
+        view === "hillshade"
+          ? hillshadeLayers()
+          : view === "topo"
+            ? topoLayers()
+            : reliefLayers(),
       ...(view === "globe"
         ? {
             // Globe while zoomed out, flat Mercator once zoomed in.
