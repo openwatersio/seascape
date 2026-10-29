@@ -16,23 +16,47 @@ const map = new maplibregl.Map({
 });
 ```
 
-Or skip the package entirely and point MapLibre at the served style: `https://tiles.openwaters.io/seascape/style.json` (parameterizable with `?unit=ft&safety=3&shading=bands`).
+Or skip the package entirely and point MapLibre at the served style: `https://tiles.openwaters.io/seascape/style.json` (parameterizable with `?unit=ft&safety=3&shading=bands`, and `?osm=false` to leave out the OSM raster base; see [Composing with your own basemap](#composing-with-your-own-basemap)).
 
 Requires MapLibre GL JS ≥ 5.20 (the depth shading uses `color-relief` with `resampling`).
 
 ## Composing with your own basemap
 
-The package follows the protomaps-basemaps split: layer structure lives in functions, appearance in a plain `Flavor` object, and you own the style. `style()` assembles a complete style (OSM base by default, `osm: false` for bathymetry-only); `sources()` + `layers()` let you graft the bathymetry into an existing style:
+The package follows the protomaps-basemaps split: layer structure lives in functions, appearance in a plain `Flavor` object, and you own the style. `style()` assembles a complete style (OSM base by default, `osm: false` for bathymetry-only); `sources()` + `layers()` let you graft the bathymetry into an existing style.
+
+Where the layers go decides what covers what. Appending them on top of the basemap paints the depth fills over its piers, breakwaters, bridges, buildings and labels. Instead, put the fills and lines just above the basemap's water fill, and the chart's labels on top:
 
 ```js
-import { sources, layers } from "@openwaters/seascape";
+import { day, sources, layers } from "@openwaters/seascape";
 
+const base = await (await fetch(myBasemapStyleUrl)).json();
+const chart = layers(day, { shading: "bands" });
+// The last fill that paints the sea and lakes: "water" in OpenMapTiles and
+// Protomaps, "water_polygons" in VersaTiles.
+const water = base.layers.findLastIndex(
+  (l) =>
+    l.type === "fill" && ["water", "water_polygons"].includes(l["source-layer"]),
+);
+if (water < 0) throw new Error("basemap has no water fill to sit above");
 const myStyle = {
-  version: 8,
-  sources: { ...myBasemapSources, ...sources({ tilesBase }) },
-  layers: [...myBaseLayers, ...layers()],
+  ...base,
+  sources: { ...base.sources, ...sources({ tilesBase }) },
+  layers: [
+    ...base.layers.slice(0, water + 1),
+    ...chart.filter((l) => l.type !== "symbol"),
+    ...base.layers.slice(water + 1),
+    ...chart.filter((l) => l.type === "symbol"),
+  ],
 };
 ```
+
+- **Fills and lines above the water fill.** The basemap's land cover and land use stay below the chart, and everything it draws on the water (piers, breakwaters, dams, bridges, houseboats, roads) stays above it.
+- **Labels on top.** MapLibre places the last symbol layer first, so the chart's soundings and isobath labels win collisions with the basemap's place and POI labels. Spliced in under them, soundings near the shore are dropped.
+- **Check what else sits above the water fill.** An area fill there that can cover water hides the chart on it. In [OpenFreeMap Liberty](https://openfreemap.org/), `aeroway_fill` paints every aerodrome polygon, including seaplane bases such as Lake Spenard in Anchorage. Move such layers below the chart.
+- **Glyphs.** A style has one `glyphs` URL, and it must serve the chart's fonts: Noto Sans Medium and Noto Sans Medium Italic, including the subscript digits soundings use for decimetres. `https://tiles.openwaters.io/fonts/{fontstack}/{range}.pbf` serves both.
+- **Relief shading** washes land in `flavor.land` so a raster base reads through it. Over a vector basemap that already draws its own land, pass a flavor with `land: "rgba(0,0,0,0)"`, or use `shading: "bands"`.
+
+The served style works the same way without the package. `https://tiles.openwaters.io/seascape/style.json?osm=false` leaves out the OSM raster base, so its `sources` and `layers` can be merged into your basemap's style JSON as above. For MapLibre Native, merge the two documents in your app before loading the result as the map's style: `Style.Builder().fromJson(json)` on Android, or a file URL as `styleURL` on iOS.
 
 Zooms, bounds, and attribution come from the endpoint's TileJSON documents (`raster.json`, `vector.json`, `coverage.json`) — the style never hardcodes them.
 
