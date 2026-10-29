@@ -30,7 +30,15 @@ Where the layers go decides what covers what. Appending them on top of the basem
 import { day, sources, layers } from "@openwaters/seascape";
 
 const base = await (await fetch(myBasemapStyleUrl)).json();
-const chart = layers(day, { shading: "bands" });
+// The merged style keeps the basemap's glyphs URL, so the chart's labels must
+// use fonts that server has (see Glyphs below). OpenFreeMap has Noto Sans
+// Regular and Italic, but not the chart's default Medium weights.
+const flavor = {
+  ...day,
+  font: ["Noto Sans Regular"],
+  soundingFont: ["Noto Sans Italic"],
+};
+const chart = layers(flavor, { shading: "bands" });
 // The last fill that paints the sea and lakes: "water" in OpenMapTiles and
 // Protomaps, "water_polygons" in VersaTiles.
 const water = base.layers.findLastIndex(
@@ -53,10 +61,10 @@ const myStyle = {
 - **Fills and lines above the water fill.** The basemap's land cover and land use stay below the chart, and everything it draws on the water (piers, breakwaters, dams, bridges, houseboats, roads) stays above it.
 - **Labels on top.** MapLibre places the last symbol layer first, so the chart's soundings and isobath labels win collisions with the basemap's place and POI labels. Spliced in under them, soundings near the shore are dropped.
 - **Check what else sits above the water fill.** An area fill there that can cover water hides the chart on it. In [OpenFreeMap Liberty](https://openfreemap.org/), `aeroway_fill` paints every aerodrome polygon, including seaplane bases such as Lake Spenard in Anchorage. Move such layers below the chart.
-- **Glyphs.** A style has one `glyphs` URL, and it must serve the chart's fonts: Noto Sans Medium and Noto Sans Medium Italic, including the subscript digits soundings use for decimetres. `https://tiles.openwaters.io/fonts/{fontstack}/{range}.pbf` serves both.
+- **Glyphs.** A style has one `glyphs` URL, and every chart label needs a font stack it serves, including the subscript digits soundings use for decimetres. When a stack is missing, MapLibre GL JS falls back to a local system font; don't count on that in other renderers. The chart defaults to Noto Sans Medium and Medium Italic, which `https://tiles.openwaters.io/fonts/{fontstack}/{range}.pbf` serves along with Noto Sans Regular and Italic. Either give the chart fonts the basemap's server has, as the snippet does for OpenFreeMap, or point `glyphs` at a server that has both styles' fonts.
 - **Relief shading** washes land in `flavor.land` so a raster base reads through it. Over a vector basemap that already draws its own land, pass a flavor with `land: "rgba(0,0,0,0)"`, or use `shading: "bands"`.
 
-The served style works the same way without the package. `https://tiles.openwaters.io/seascape/style.json?osm=false` leaves out the OSM raster base, so its `sources` and `layers` can be merged into your basemap's style JSON as above. For MapLibre Native, merge the two documents in your app before loading the result as the map's style: `Style.Builder().fromJson(json)` on Android, or a file URL as `styleURL` on iOS.
+The served style works the same way without the package. `https://tiles.openwaters.io/seascape/style.json?osm=false` leaves out the OSM raster base, so its `sources` and `layers` can be merged into your basemap's style JSON as above. To change the chart's fonts there, rewrite `text-font` on its symbol layers. For MapLibre Native, merge the two documents in your app before loading the result as the map's style: `Style.Builder().fromJson(json)` on Android, or a file URL as `styleURL` on iOS.
 
 Zooms, bounds, and attribution come from the endpoint's TileJSON documents (`raster.json`, `vector.json`, `coverage.json`) — the style never hardcodes them.
 
