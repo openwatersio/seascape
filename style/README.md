@@ -18,7 +18,7 @@ const map = new maplibregl.Map({
 
 Or skip the package entirely and point MapLibre at the served style: `https://tiles.openwaters.io/seascape/style.json` (parameterizable with `?unit=ft&safety=3&shading=bands`).
 
-Requires MapLibre GL JS ≥ 5.6 (the depth shading uses `color-relief`).
+Requires MapLibre GL JS ≥ 5.20 (the depth shading uses `color-relief` with `resampling`).
 
 ## Composing with your own basemap
 

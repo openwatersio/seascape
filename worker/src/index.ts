@@ -27,7 +27,7 @@
  */
 
 import { PMTiles, Source, RangeResponse } from "pmtiles";
-import { style as seascapeStyle, SCHEMA } from "@openwaters/seascape";
+import { style as seascapeStyle, SCHEMA, VIEWS } from "@openwaters/seascape";
 import {
   CachedSource,
   contentEtag,
@@ -547,7 +547,8 @@ export default {
     // from the request. Point MapLibre's `style:` (or Maputnik) at this URL
     // directly. ?unit=m|ft|fm, ?safety=<metres>, and ?shading=relief|bands set
     // mariner defaults in the served style; on a live map the package's
-    // applyState changes unit/safety in place.
+    // applyState changes unit/safety in place. ?view=relief|globe|hillshade|topo
+    // serves a demo view instead of the chart; those take no chart settings.
     if (rel === "/style.json") {
       // Uncacheable plain-text 400s: an intermediary must never cache an error
       // for a URL that would succeed once the param is fixed.
@@ -578,6 +579,21 @@ export default {
           : (["relief", "bands"] as const).find((s) => s === shadingParam);
       if (shadingParam !== null && shading === undefined)
         return bad("shading must be relief or bands");
+      const viewParam = url.searchParams.get("view");
+      const view =
+        viewParam === null
+          ? undefined
+          : VIEWS.find((v) => v === viewParam);
+      if (viewParam !== null && view === undefined)
+        return bad(`view must be one of ${VIEWS.join(", ")}`);
+      // The demo views carry no chart settings; accepting them would serve,
+      // say, metre contour labels to a caller that asked for fathoms.
+      if (
+        view !== undefined &&
+        view !== "chart" &&
+        (unit !== undefined || safety !== undefined || shading !== undefined)
+      )
+        return bad("unit, safety, and shading apply only to the chart view");
       // Same guard as the viewer's: a Worker redeployed against an older or
       // newer tileset (release.yml republishes prior shas) must not serve a
       // style that decodes the tiles plausibly but wrongly (docs/schema.md).
@@ -603,6 +619,7 @@ export default {
           ...(unit !== undefined ? { unit } : {}),
           ...(safety !== undefined ? { safety } : {}),
           ...(shading !== undefined ? { shading } : {}),
+          ...(view !== undefined ? { view } : {}),
         }),
       );
     }
