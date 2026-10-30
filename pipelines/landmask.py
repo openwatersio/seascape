@@ -90,9 +90,11 @@ LAND_POLYGONS_URL = "https://osmdata.openstreetmap.de/download/land-polygons-spl
 # the public S3 mirror — one dataset read beats an osmium filter over a planet PBF. Water
 # lives under theme=base (there is no theme=water). The release string is a dated
 # snapshot; bump it to the current Overture release when re-preparing (listing:
-# https://docs.overturemaps.org/release/). GDAL opens the partition directory as one
-# dataset (~65M features); the bucket is anonymous, so no credentials in the read path.
-OVERTURE_RELEASE = "2026-06-17.0"
+# https://docs.overturemaps.org/release/), then dispatch the sources lane with rebuild_water
+# — code is not a rerun trigger, so the pin alone rebuilds nothing.
+# GDAL opens the partition directory as one dataset (~65M features); the bucket is anonymous,
+# so no credentials in the read path.
+OVERTURE_RELEASE = "2026-10-21.0"
 OVERTURE_BUCKET_URL = "https://overturemaps-us-west-2.s3.us-west-2.amazonaws.com"
 OVERTURE_PREFIX = f"release/{OVERTURE_RELEASE}/theme=base/type=water/"
 # Where the release's parquet parts are staged (26 GB / 32 files). Kept per release so a
@@ -220,8 +222,10 @@ def prep_water(processes=8):
     # Converted windows are CHECKPOINTS, kept beside the output rather than in scratch: the
     # planet read is ~9 h, and a failure in the last window used to throw away every earlier
     # one. A re-run skips what's already converted, so an interrupted build resumes in minutes.
-    # Removed only once the mask is published.
-    tmp = out + ".windows"
+    # Removed only once the mask is published. Keyed by release and window layout so neither a
+    # bump nor a BBOX/WATER_TILE_DEG change resumes windows converted for something else.
+    layout = hashlib.md5(repr(windows).encode()).hexdigest()[:8]
+    tmp = f"{out}.windows-{OVERTURE_RELEASE}-{layout}"
     utils.create_folder(tmp)
     try:
         done = sum(1 for i in range(len(windows)) if os.path.isfile(f"{tmp}/tile_{i}.gpkg"))

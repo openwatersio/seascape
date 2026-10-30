@@ -294,7 +294,9 @@ rule datum_surface_dgm_w:
         "{PY}/../sources/dgm_w/build_reference.py --out {output} 2> {log}"
 
 
-# Masks rebuild only when forced (-R landmask): pinned snapshot/release ⇒ no data drift.
+# Masks rebuild only when forced (-R landmask, or the sources lane's rebuild_water for the
+# water mask): pinned snapshot/release ⇒ no data drift. A params version= bump reaches only a
+# mask with a Snakemake record, which one hydrated from R2 lacks.
 rule landmask:
     output:
         "store/landmask/land.fgb"
