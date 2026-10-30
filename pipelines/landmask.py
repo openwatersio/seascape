@@ -90,8 +90,8 @@ LAND_POLYGONS_URL = "https://osmdata.openstreetmap.de/download/land-polygons-spl
 # the public S3 mirror — one dataset read beats an osmium filter over a planet PBF. Water
 # lives under theme=base (there is no theme=water). The release string is a dated
 # snapshot; bump it to the current Overture release when re-preparing (listing:
-# https://docs.overturemaps.org/release/) together with the watermask rule's params
-# version= in the Snakefile — code is not a rerun trigger, so the pin alone rebuilds nothing.
+# https://docs.overturemaps.org/release/), then dispatch the sources lane with rebuild_water
+# — code is not a rerun trigger, so the pin alone rebuilds nothing.
 # GDAL opens the partition directory as one dataset (~65M features); the bucket is anonymous,
 # so no credentials in the read path.
 OVERTURE_RELEASE = "2026-10-21.0"

@@ -19,6 +19,10 @@ on:
         description: "Force re-registration (re-run prep + catalog, refetching raws on demand) + ignore the raw-collection shrink guard. Pair with a source id — unscoped it refetches every source."
         type: boolean
         default: false
+      rebuild_water:
+        description: "Rebuild the inland-water mask from the pinned Overture release (a ~9 h planet read). Dispatch once after moving OVERTURE_RELEASE."
+        type: boolean
+        default: false
       snakemake_args:
         description: "Extra snakemake args, e.g. -R cover (aggregation-code changes) or -F (true cold rebuild)"
         required: false
@@ -173,8 +177,8 @@ jobs:
           # Self-heal the pinned masks from R2. Rebuilding water.fgb scans the ENTIRE planet's
           # Overture water (hours, 28 GB+ intermediate), so a crashed/forced rebuild that strands
           # the volume without it makes every later run re-pay that scan. publish_masks makes the
-          # R2 copy canonical — restore it (minutes). A deliberate Overture refresh must clear the
-          # R2 copy first, else this re-seeds the old mask.
+          # R2 copy canonical — restore it (minutes). A restored mask has no Snakemake record, so a
+          # params bump can't see it: an Overture refresh dispatches rebuild_water to replace it.
           mkdir -p "$STATE/store/landmask"
           for m in land water; do
             f="$STATE/store/landmask/$m.fgb"
@@ -215,6 +219,7 @@ jobs:
         env:
           INPUT_SOURCE: ${{ github.event.inputs.source }}
           INPUT_FORCE: ${{ github.event.inputs.force }}
+          INPUT_REBUILD_WATER: ${{ github.event.inputs.rebuild_water }}
           INPUT_ARGS: ${{ github.event.inputs.snakemake_args }}
           # LOCAL-disk per-run scratch (docker.sh mounts it at /app/tmp): logs + benchmarks land
           # here, off the network store volume. Step-scoped to avoid redirecting other steps'
@@ -259,6 +264,12 @@ jobs:
           # --cores 16 > vCPUs: width for IO-bound fetches; mem_gb caps the heavy jobs
           # (28 = 32 GB - 4 reserved). Box-only — laptops keep cores:all as their cap.
           rc=0
+          # Its own invocation: a repeated -R replaces the one before it, so -R watermask through
+          # snakemake_args would drop -R enumerate and rebuild the mask in two invocations.
+          if [ "$INPUT_REBUILD_WATER" = "true" ]; then
+            ./docker.sh snakemake store/landmask/water.fgb --keep-going --rerun-incomplete \
+              --cores 16 --resources mem_gb=28 -R watermask "${extra[@]}" || rc=$?
+          fi
           if [ "$INPUT_FORCE" = "true" ]; then
             # Re-register: prep_source and register are the two catalog.json producers (disjoint
             # wildcard constraints: local vs raw sources). Raws are temp() — a forced prep
