@@ -29,7 +29,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@maplibre/maplibre-gl-style-spec": "^26.2.1"
+    "@maplibre/maplibre-gl-style-spec": "^26.4.4"
   },
   "devDependencies": {
     "typescript": "^7.0.2",
