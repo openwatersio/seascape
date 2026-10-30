@@ -1,7 +1,7 @@
 /**
  * source-fill / source-highlight / source-outline / source-labels — source
  * coverage (provenance): footprint polygons with props source_id / source_name /
- * source_maxzoom, from the standalone coverage tileset. Hidden by default; a
+ * source_maxzoom / source_priority, from the standalone coverage tileset. Hidden by default; a
  * viewer can toggle them on for click-to-identify.
  */
 import type { LayerSpecification } from "@maplibre/maplibre-gl-style-spec";

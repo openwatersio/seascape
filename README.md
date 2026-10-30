@@ -159,6 +159,16 @@ The build pipeline, local development, container usage, and CI/deploy live in
 
 The underlying data remains under each source's own open terms. The full attribution list is available in the `attribution` field of the TileJSON endpoints ([raster.json](https://tiles.openwaters.io/seascape/raster.json), [vector.json](https://tiles.openwaters.io/seascape/vector.json)). It is displayed by MapLibre's attribution control automatically, which satisfies each source's terms.
 
+Canadian bathymetry from the Canadian Hydrographic Service NONNA products carries this notice, as the CHS NONNA Licence requires:
+
+> This product was made by Open Waters and contains intellectual property of the Canadian Hydrographic Service (CHS) of the Department of Fisheries and Oceans.
+>
+> This product does not meet the requirements of the *Navigation Safety Regulations, 2020* under the *Canada Shipping Act, 2001*. Charts and publications issued by or on the authority of CHS must be used to meet the requirements of those regulations.
+>
+> The copyright in the data are and remain the property of His Majesty the King in Right of Canada and shall not be sold, licensed, leased, assigned or given to a third party.
+>
+> The incorporation of CHS data in this product does not constitute an endorsement or an approval of this product by the Canadian Hydrographic Service, the Department of Fisheries and Oceans or His Majesty the King in Right of Canada.
+
 ## Prior art
 
 - https://github.com/versatiles-org/opendem-gebco-bathymetry/

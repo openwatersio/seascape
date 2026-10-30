@@ -313,7 +313,7 @@ def _source_maxzooms():
 
 def _coverage_geojson():
     """Combine every regional source's simplified footprint into one GeoJSON FC with
-    {source_id, source_name, source_maxzoom}; write it and return the path. None if no
+    {source_id, source_name, source_maxzoom, source_priority}; write it and return the path. None if no
     polygons are present locally (coverage_bundle turns that into a hard failure).
 
     BBOX (W,S,E,N lon/lat, the same regional-build env the covering uses) pushes a -spat
@@ -336,10 +336,11 @@ def _coverage_geojson():
              "-simplify", "0.001", "-lco", "COORDINATE_PRECISION=5"],
             capture_output=True, text=True, check=True).stdout
         for f in json.loads(out).get("features", []):
-            # source_maxzoom drives the viewer's deepest-wins pick on overlap (priority isn't
-            # folded in — a higher-priority shallower source would mis-attribute; rare today).
+            # source_priority then source_maxzoom drive the viewer's pick on overlap — the
+            # merge order (utils.get_grouped_source_items).
             f["properties"] = {"source_id": sid, "source_name": meta.get("name", sid),
-                               "source_maxzoom": zmax.get(sid) or meta.get("max_zoom") or 0}
+                               "source_maxzoom": zmax.get(sid) or meta.get("max_zoom") or 0,
+                               "source_priority": config.source_property(sid, "priority", 0)}
             feats.append(f)
     if not feats:
         return None
