@@ -294,7 +294,8 @@ rule datum_surface_dgm_w:
         "{PY}/../sources/dgm_w/build_reference.py --out {output} 2> {log}"
 
 
-# Masks rebuild only when forced (-R landmask): pinned snapshot/release ⇒ no data drift.
+# Masks rebuild only when forced (-R landmask), or for watermask when its params version= is
+# bumped: pinned snapshot/release ⇒ no data drift.
 rule landmask:
     output:
         "store/landmask/land.fgb"
@@ -334,7 +335,7 @@ rule watermask:
     output:
         "store/landmask/water.fgb"
     params:
-        version=2, # increment to force a rebuild
+        version=3, # increment to force a rebuild
     priority: 10_000_000  # see landmask
     # No retries: the planet read is ~9 h, and every failure seen here has been deterministic
     retries: 0
