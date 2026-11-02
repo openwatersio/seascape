@@ -547,7 +547,8 @@ export default {
     // from the request. Point MapLibre's `style:` (or Maputnik) at this URL
     // directly. ?unit=m|ft|fm, ?safety=<metres>, and ?shading=relief|bands set
     // mariner defaults in the served style; on a live map the package's
-    // applyState changes unit/safety in place. ?view=relief|globe|hillshade|topo
+    // applyState changes unit/safety in place. ?osm=false leaves out the OSM
+    // raster base. ?view=relief|globe|hillshade|topo
     // serves a demo view instead of the chart; those take no chart settings.
     if (rel === "/style.json") {
       // Uncacheable plain-text 400s: an intermediary must never cache an error
@@ -579,6 +580,19 @@ export default {
           : (["relief", "bands"] as const).find((s) => s === shadingParam);
       if (shadingParam !== null && shading === undefined)
         return bad("shading must be relief or bands");
+      // osm=false drops the OSM raster base: the layers-only style an app splices
+      // into its own basemap, above the water fill and under its land structures.
+      const osmParam = url.searchParams.get("osm");
+      const osm =
+        osmParam === null
+          ? undefined
+          : osmParam === "true"
+            ? true
+            : osmParam === "false"
+              ? false
+              : undefined;
+      if (osmParam !== null && osm === undefined)
+        return bad("osm must be true or false");
       const viewParam = url.searchParams.get("view");
       const view =
         viewParam === null
@@ -591,9 +605,12 @@ export default {
       if (
         view !== undefined &&
         view !== "chart" &&
-        (unit !== undefined || safety !== undefined || shading !== undefined)
+        (unit !== undefined ||
+          safety !== undefined ||
+          shading !== undefined ||
+          osm !== undefined)
       )
-        return bad("unit, safety, and shading apply only to the chart view");
+        return bad("unit, safety, shading, and osm apply only to the chart view");
       // Same guard as the viewer's: a Worker redeployed against an older or
       // newer tileset (release.yml republishes prior shas) must not serve a
       // style that decodes the tiles plausibly but wrongly (docs/schema.md).
@@ -619,6 +636,7 @@ export default {
           ...(unit !== undefined ? { unit } : {}),
           ...(safety !== undefined ? { safety } : {}),
           ...(shading !== undefined ? { shading } : {}),
+          ...(osm !== undefined ? { osm } : {}),
           ...(view !== undefined ? { view } : {}),
         }),
       );

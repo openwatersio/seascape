@@ -45,7 +45,8 @@ both its owners, at the S-58 vertex floor.
 Per tile and per zoom tier (config.depare_tiers — each tier is a separately compiled partition,
 the way an ENC compiles a cell per usage band: cut from the mosaic pyramid level one zoom finer
 than the tier's first (unless that repeats the final tier's native cut), with the isobath ladder
-drawn at its first, the final tier from the native window): bands (gdal_contour -p at the tier's metre / fathom ladder, drop land, drval/sys) + drying (the metre
+drawn at its first, the final tier from the native window — every surface cut to effective land
+first, landmask.cut_to_land): bands (gdal_contour -p at the tier's metre / fathom ladder, drop land, drval/sys) + drying (the metre
 ladder's (0, DRYING_CAP] bucket ∩ effective water, drval1 < 0; exact datum is unknown, never foreshore) + nodata (inland-water polygons
 minus the DEM's water coverage and the drying, plus the drying's exact-datum water) -> clip to the unbuffered tile bbox in shapely
 (polygon-only by construction, see _polys) -> 4326 -> store/depare/{stem}-t{z}.fgb. Same seam
@@ -255,6 +256,16 @@ def _uniform_coarsen(dem, factor, out):
         halved = out if 2 ** (level + 1) == factor else f"{root}-{2 ** (level + 1)}x.tiff"
         utils._block_reduce(step, halved, nodata)
         step = halved
+    return out
+
+
+def _retry_surface(dem, z, out):
+    """The timeout rescue's surface: the uniform 4x coarsen, cut to effective land again. The
+    coarsen hands a mixed block to its water, so the cut `dem` carries does not survive it; z is
+    the tier surface's zoom, so the mask comes from the same source at the coarser pixel."""
+    import landmask
+    _uniform_coarsen(dem, 4, out)
+    landmask.cut_to_land(out, z)
     return out
 
 
@@ -1338,6 +1349,8 @@ def tile(stem):
     import signal
     import tempfile
 
+    import landmask
+
     # DEPARE_TIMEOUT (seconds; unset = no bound): each gdal_contour -p pass runs under this
     # bound; on expiry the tile retries once on a uniform 4x shoal-biased window, then fails
     # honestly. The SIGALRM backstop (8x: 2 ladders x 2 attempts x contour + GEOS slack) still
@@ -1357,8 +1370,8 @@ def tile(stem):
     os.makedirs("store/depare", exist_ok=True)
     tiers = config.depare_tiers(child_z)
     try:
-        # The shared smoothed window is read-only; the timeout fallback derives its
-        # coarsened copy in tmp rather than touching it.
+        # The shared smoothed window (already cut to land) is read-only; the timeout fallback
+        # derives its coarsened copy in tmp rather than touching it.
         window = f"store/window/{stem}.tif"
         tile_obj = mercantile.Tile(x=x, y=y, z=z)
         # Finest first: each coarser surface is clamped shoal-ward against the reduction of the
@@ -1377,6 +1390,9 @@ def tile(stem):
             else:
                 dem = _tier_surface(stem, tier, f"{tier_tmp}/surface.tif")
                 _shoal_clamp(dem, finer, 2 ** (finer_z - tier.surface))
+                # The reduction hands a mixed block to its water, so the finer cut does not carry
+                # down: cut again at this grid, as the raster masks each zoom at its own.
+                landmask.cut_to_land(dem, tier.surface)
                 finer, finer_z = dem, tier.surface
             _mark(f"{tier.name}-surface")
             # A compiled tier's legibility and nodata generalization sit at its first zoom, the
@@ -1391,7 +1407,7 @@ def tile(stem):
             except ContourTimeout as e:
                 print(f"depare tile {label}: {e} — retrying on a uniform 4x shoal-biased window",
                       file=sys.stderr, flush=True)
-                dem = _uniform_coarsen(dem, 4, f"{tier_tmp}/dem-4x.tiff")
+                dem = _retry_surface(dem, tier.surface, f"{tier_tmp}/dem-4x.tiff")
                 res = _depare_dem(dem, tile_obj, scale_z or child_z, tier_tmp, label, timeout=timeout,
                                   levels_m=tier.levels_m, levels_ft=tier.levels_ft, scale_z=scale_z,
                                   fine_z=fine_z, tol_z=tier.vertex_z, carry=carry)
@@ -1954,6 +1970,36 @@ def _check():
     assert (coarse[:2, 6] == -7.0).all(), ("the coarsen closed a channel", coarse[:2, 6])
     assert (coarse[:2, :6] > cap).all(), ("land must stay land in the coarsen", coarse[0, :6])
     assert (ctr.a, ctr.c, ctr.f) == (tr.a * 4, tr.c, tr.f), "the coarsen moved the grid"
+
+    # The rescue cuts its coarse surface to land again. Fine columns 0-26 are cut land (centres
+    # west of the land edge at x = 2700 m); coarse column 6 holds three of them and one water
+    # pixel, so the coarsen alone hands it the water, though its centre (2600 m) is on land.
+    import geopandas as gpd
+    import landmask
+    from shapely.geometry import box as _box
+    rdem = np.full((h, w), -7.0, dtype="float32")
+    rdem[:, :27] = landmask.CUT_LAND_M
+    rp = f"{d}/retry.tif"
+    with rasterio.open(rp, "w", driver="GTiff", height=h, width=w, count=1, dtype="float32",
+                       nodata=-9999, crs="EPSG:3857", transform=tr) as dst:
+        dst.write(rdem, 1)
+    gpd.GeoDataFrame(geometry=[_box(0, 0, 2700, h * res)], crs="EPSG:3857").to_file(
+        f"{d}/retry-land.fgb", driver="FlatGeobuf")
+    with rasterio.open(_uniform_coarsen(rp, 4, f"{d}/retry-plain.tiff")) as small:
+        assert (small.read(1)[:, 6] == -7.0).all(), "fixture: the coarsen alone must reopen column 6"
+    saved = {k: os.environ.get(k) for k in ("LANDMASK", "WATERMASK")}
+    os.environ["LANDMASK"], os.environ["WATERMASK"] = f"{d}/retry-land.fgb", f"{d}/absent.fgb"
+    try:
+        with rasterio.open(_retry_surface(rp, 12, f"{d}/retry-4x.tiff")) as small:
+            rc = small.read(1)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    assert (rc[:, :7] == landmask.CUT_LAND_M).all(), ("the rescue must cut land again", rc[0, :8])
+    assert (rc[:, 7:] == -7.0).all(), ("the rescue must leave the water", rc[0, 6:9])
 
     raw = partitions(p, levels_m, f"{d}/raw.fgb")
     bands = read_bucket(raw, "amax <= 0")

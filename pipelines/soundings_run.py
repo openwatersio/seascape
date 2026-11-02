@@ -43,7 +43,6 @@ import sys
 import mercantile
 
 import config
-import landmask
 import utils
 
 NODATA = -9999
@@ -623,11 +622,9 @@ def tile(stem):
     z, x, y, child_z = (int(a) for a in stem.split("-"))
     out = f"store/soundings/{stem}.geojsons"
     tmp = tempfile.mkdtemp(prefix=f"soundings-{stem}-")  # local scratch; publish crosses to the store
-    # Private copy of the shared smoothed window; the land clamp mutates in place, and
-    # without it smeared/rim negatives under the land mask mint soundings on islands.
-    dem = f"{tmp}/dem.tiff"
-    shutil.copyfile(f"store/window/{stem}.tif", dem)
-    landmask.clamp_dem_to_land(dem)
+    # The shared window is already cut to effective land (smooth.prepare_window), so a smeared
+    # rim negative under the mask cannot mint a sounding on an island.
+    dem = f"store/window/{stem}.tif"
     res = _sound_dem(dem, mercantile.Tile(x=x, y=y, z=z), z, child_z, tmp, stem)
     os.makedirs(os.path.dirname(out), exist_ok=True)
     if res:
