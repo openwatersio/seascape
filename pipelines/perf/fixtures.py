@@ -60,7 +60,7 @@ SITES = {
     "iberian-abyssal": ("8-110-91-10-db6827ae146c.tif", -24.61, 45.58,
                         "deep flat GEBCO-only ocean; the control every other site lacks — every "
                         "shoal-water measurement needs ground where it should trivially pass"),
-    "amsterdam": ("8-131-84-12-73d1984d9b32.tif", 4.7461, 52.1603,
+    "amsterdam": ("8-131-84-12-41891712eb7b.tif", 4.7461, 52.1603,
                   "IJmuiden, Haarlem and the Haarlemmermeer polder: the z10 tile that stopped the "
                   "planet run at 993 KB. 17,913 sub-pixel ditch polygons over a below-datum land "
                   "DEM — the clamp width-floor case, and the coarse-source lake case"),

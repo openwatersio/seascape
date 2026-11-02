@@ -414,7 +414,7 @@ def coverage_union(geoms):
 
     coverage_union_all is silently wrong on input that is not a coverage, so the RESULT is what
     gets checked; the input cannot be, since coverage_is_valid does not finish in 33 min on that
-    bucket. Both failure modes surface in the result anyway: parts that overlap or share only
+    bucket's exploded parts. Both failure modes surface in the result anyway: parts that overlap or share only
     part of an edge come back unmerged, and members that overlap or touch along a line make the
     output MultiPolygon invalid, while geometry dropped outright breaks the area identity. That
     identity alone proves nothing — .area sums a MultiPolygon's members, so unmerged overlaps
@@ -457,11 +457,6 @@ def coverage_union(geoms):
 # so dropping a representable one would open an overlap.
 MIN_RING_M = 1e-3
 
-# How much of a ladder's area coverage simplification may move before the result is rejected —
-# see simplify_coverage for why an exact identity is not on offer.
-AREA_GUARD = 1e-3
-
-
 def _drop_subgrid_rings(geom):
     """`geom` with any hole shorter than MIN_RING_M removed. Vectorized over parts, and returns
     the input untouched when nothing qualifies, so the marsh's hole-free parts cost one C call."""
@@ -490,8 +485,9 @@ def simplify_coverage(geoms, tol):
     whole ladder at once, decomposes it into the edges between its polygons, and simplifies each
     edge ONCE — so adjacent bands come back sharing the identical polyline (measured: every vertex
     of a shared chain is present in both members, no pair overlaps, and the coverage's total area
-    holds to 5e-15). It also never invents a vertex, which is what keeps the drawn contour lines
-    pinned to the band edges they trace: every surviving band vertex is still a vertex of the line.
+    moves only across the outer boundary). It also never invents a vertex, which is what keeps the
+    drawn contour lines pinned to the band edges they trace: every surviving band vertex is still a
+    vertex of the line.
 
     The algorithm is Visvalingam-Whyatt, so `tol` bounds the area of what it removes rather than
     the displacement; measure the displacement, don't assert it (perf/gates.py gate 5). It is also
@@ -502,25 +498,25 @@ def simplify_coverage(geoms, tol):
     Silently wrong on input that is not a coverage, like every coverage_* entry point. The input
     IS one by construction — one gdal_contour -p pass, verified offline with
     coverage_invalid_edges (0 invalid edges on all four fixtures and on 8-63-105-15's 52.5 M-vertex
-    metre ladder, 173 s), which is too expensive to spend per tile. What runs here is the cheap
-    result gate: every member still valid, and no geometry gone. AREA_GUARD is what "gone" means —
-    an exact identity is not available, because simplifying the coverage's outer boundary trades
-    area across it; the theoretical bound, tol x boundary length, is ~1% of a marsh coverage's area
-    and so is no gate at all, while the measured drift is 1.5e-6 (30,375 m2 over 90,464 km of
-    boundary — 0.3 mm of mean displacement). This sits between: tighter than the bound, and loose
-    enough that only a member that VANISHED trips it."""
+    metre ladder, 173 s). The result gate runs the same validator on the simplified ladder (2.3 s
+    on 1.2 M vertices, 73 s on 20 M with 200,000 holes): still a coverage, every member valid, no
+    part lost. Total area is no gate: simplifying the outer boundary trades area across it in
+    proportion to tol (median 0.6% where an overview tier exceeded 0.1%, 45% on a ladder of a few
+    pixels), while a broken coverage can come back overlapping with no drift at all."""
     import shapely
     geoms = list(geoms)
     if not geoms or tol <= 0:
         return geoms
-    before = float(shapely.area(geoms).sum())
     try:
-        out = [_drop_subgrid_rings(g)
-               for g in shapely.coverage_simplify(geoms, tol, simplify_boundary=True)]
-        after = float(shapely.area(out).sum())
-        if abs(after - before) <= AREA_GUARD * before and bool(shapely.is_valid(out).all()):
+        simplified = shapely.coverage_simplify(geoms, tol, simplify_boundary=True)
+        coverage = bool(shapely.coverage_is_valid(simplified))
+        out = [_drop_subgrid_rings(g) for g in simplified]
+        valid = bool(shapely.is_valid(out).all())
+        parts = shapely.get_num_geometries(simplified) < shapely.get_num_geometries(geoms)
+        lost = int(parts.sum())
+        if coverage and valid and not lost:
             return out
-        why = f"area {after!r} vs {before!r}, valid {bool(shapely.is_valid(out).all())}"
+        why = f"coverage {coverage}, valid {valid}, {lost} members lost parts"
     except MemoryError:
         raise                      # the tile's own MemoryError path reports the footprint
     except Exception as e:
@@ -1520,7 +1516,7 @@ def _check():
 
     # Coverage simplification is the whole partition contract in one call: two bands sharing a
     # dense chain must come back sharing the IDENTICAL chain — same vertices, in both members —
-    # while shedding vertices, holding the area, and inventing no point the raw geometry lacked
+    # while shedding vertices and inventing no point the raw geometry lacked
     # (the contour lines are pinned to those points). A per-geometry simplify is what fails this.
     import shapely
     _nc = shapely.get_num_coordinates
@@ -1541,14 +1537,30 @@ def _check():
         "simplified adjacent bands must share an identical boundary chain (no crack)"
     assert shapely.intersection(up, lo).area == 0 and up.is_valid and lo.is_valid, \
         "simplified bands must stay a partition"
-    # The result gate rejects a non-coverage rather than shipping a silent crack. Both ways in:
-    # members whose "shared" chain does not match lose area to the simplifier, and an invalid ring
-    # either loses area or raises out of it as a ZeroDivisionError, not a GEOSException.
+    # The result gate rejects a non-coverage rather than shipping a silent crack, at any tolerance.
     off = Polygon([(x, y + 1.0) for x, y in chain] + [(400.0, 0.0), (0.0, 0.0)])
-    assert all(a is b for a, b in zip(simplify_coverage([upper, off], 100.0), [upper, off])), \
-        "a broken coverage must fall back to raw geometry"
-    assert simplify_coverage([bowtie], tol_mm) == [bowtie], \
-        "a ring the simplifier cannot handle must fall back, not fail the tile"
+    for tol in (1.0, 100.0):
+        assert all(a is b for a, b in zip(simplify_coverage([upper, off], tol), [upper, off])), \
+            "a broken coverage must fall back to raw geometry"
+    # Coarse tolerance on a small jagged coverage moves far more than 0.1% of its area across the
+    # outer boundary, which is a simplification working, not a broken one.
+    edge = [(float(x), 40.0) for x in range(0, 101, 20)]
+    teeth = [(float(x), 80.0 + 8.0 * (x % 2)) for x in range(100, -1, -1)]
+    top, bottom = Polygon(edge + teeth), Polygon(edge + [(100.0, 0.0), (0.0, 0.0)])
+    coarse = simplify_coverage([top, bottom], 5.0)
+    assert abs(shapely.area(coarse).sum() / shapely.area([top, bottom]).sum() - 1) > 1e-3
+    assert _nc(coarse[0]) < _nc(top), "an overview-scale tolerance must simplify, not fall back"
+    # A result that lost a part falls back, even though every member survived valid.
+    two = shapely.MultiPolygon([Polygon([(0, 0), (1, 0), (1, 1)]), Polygon([(5, 5), (6, 5), (6, 6)])])
+    simplifier, shapely.coverage_simplify = (
+        shapely.coverage_simplify, lambda g, *a, **k: [shapely.get_parts(m)[0] for m in g])
+    try:
+        assert simplify_coverage([two], 1.0) == [two], "a lost part must fall back to raw geometry"
+    finally:
+        shapely.coverage_simplify = simplifier
+    # An invalid ring can raise out of the simplifier as a ZeroDivisionError, not a GEOSException.
+    assert len(simplify_coverage([bowtie], tol_mm)) == 1, \
+        "a ring the simplifier cannot handle must not fail the tile"
 
     # Whatever arrives invalid in 4326 — whether it was already broken in metres or reprojection
     # folded it — the write absorbs, because that is the only place the fold is visible.
