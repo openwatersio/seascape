@@ -176,7 +176,7 @@ A/B verdict **PASS**: bands bit-identical (area delta 0.0); drying symmetric dif
 Two design facts learned in implementation, recorded so nobody re-litigates them:
 
 - **The area identity alone is NOT a guard.** `coverage_union_all` returns overlapping parts *unmerged*, and `MultiPolygon.area` sums members — the identity holds exactly on broken output. `u.is_valid` on the result is what catches both failure modes (unmerged overlaps; line-touching members); it costs 119 s of the 417 s phase and is the price of not shipping a silent wrong dissolve.
-- **`coverage_is_valid` is not viable at runtime** — it did not finish in 33 minutes against the 194 s union it would have guarded. Correctness was proven offline by geometric equality against `unary_union` instead; the runtime protection is the result-gate + loud fallback (`unary_union` at 1,310 s still beats the 5,354 s it replaces).
+- **`coverage_is_valid` is not viable at runtime on a bucket's exploded parts** — it did not finish in 33 minutes against the 194 s union it would have guarded. Correctness was proven offline by geometric equality against `unary_union` instead; the runtime protection is the result-gate + loud fallback (`unary_union` at 1,310 s still beats the 5,354 s it replaces).
 
 `just test-engine` fails on `vector_join` (soundings drop) — verified pre-existing by reverting the diff: it is the unpatched local tippecanoe's minzoom issue ([[tippecanoe-variable-depth-minzoom-fix]]), unrelated.
 

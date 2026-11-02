@@ -496,7 +496,7 @@ rule depare_tile:
     output:
         tier_files("depare", ["{stem}"])
     params:
-        version=12, # increment to force a rebuild
+        version=13, # increment to force a rebuild
         levels=json.dumps({"m": pipeline_config.DEPARE_LEVELS, "ft": pipeline_config.DEPARE_LEVELS_FT}),
         tiers=json.dumps(pipeline_config.DEPARE_TIER_STARTS),
         ladders=json.dumps(pipeline_config.CONTOUR_TIERS),
