@@ -566,14 +566,14 @@ def read_bucket(raw_fgb, where):
 
 
 def _polygonal(geom):
-    """The polygonal content of a linework make_valid result. The repair can return a
-    GeometryCollection mixing polygons with line fragments; downstream, explode() unwraps only
-    one level, so a MultiPolygon nested inside the collection would survive as a MultiPolygon
-    row and be deleted by the Polygon-type filter. Merging the areal parts here keeps them."""
+    """The polygonal content of a row. A GeometryCollection can mix polygons with line fragments;
+    downstream, explode() unwraps only one level, so a MultiPolygon nested inside the collection
+    would survive as a MultiPolygon row and be deleted by the Polygon-type filter. Merging the
+    areal parts here keeps them."""
     import shapely
     if geom.geom_type != "GeometryCollection":
         return geom
-    parts = [g for g in geom.geoms if g.geom_type in ("Polygon", "MultiPolygon")]
+    parts = _polys(geom)
     return shapely.union_all(parts) if parts else shapely.Polygon()
 
 
@@ -705,6 +705,11 @@ class _RowSink:
                         f"{shapely.to_wkt(gdf.geometry.values[redo[i]], rounding_precision=9)}")
                 print(f"depare: linework repaired {len(redo)} row(s) the structure repair ate",
                       flush=True)
+        # Flatten collections before the baselines: the Polygon filter below drops what they nest.
+        mixed = np.flatnonzero(shapely.get_type_id(raw) == shapely.GeometryType.GEOMETRYCOLLECTION)
+        if len(mixed):
+            raw = raw.copy()
+            raw[mixed] = np.array([_polygonal(g) for g in raw[mixed]], dtype=object)
         # Areas and budgets come off the POST-repair geometry: it is what gets snapped, so it is
         # what the snap bound has to describe.
         before = shapely.area(raw)
@@ -1570,6 +1575,19 @@ def _check():
         "the sink must write valid geometry"
     assert set(written.geom_type) == {"Polygon"}, \
         f"the layer must stay uniformly polygon, got {set(written.geom_type)}"
+    _lobes = shapely.MultiPolygon([_box(0, 0, 2, 2), _box(3, 0, 5, 2)])
+    _lobes_deg2 = shapely.area(gpd.GeoSeries([_lobes], crs=3857).to_crs(4326).values[0])
+    _mixed = shapely.GeometryCollection([_lobes, shapely.LineString([(0, 3), (2, 3)])])
+    for _i, _row in enumerate((_mixed, shapely.GeometryCollection([_mixed]))):
+        sink = _RowSink(f"{d0}/rows.geojsons")
+        sink.write([{"geometry": _row, "drval1": 0.0, "drval2": 2.0, "sys": "m",
+                     "kind": None, "rank": BAND_RANK}])
+        n = sink.finish(f"{d0}/nested{_i}.fgb")
+        kept = gpd.read_file(f"{d0}/nested{_i}.fgb")
+        assert n == 2 and set(kept.geom_type) == {"Polygon"}, \
+            f"a collection must reach the FGB as its polygons, got {n} rows"
+        assert abs(shapely.area(kept.geometry.values).sum() - _lobes_deg2) < _lobes_deg2 * 1e-3, \
+            "a collection's nested polygons must keep their area"
 
     # ...and it must do so by CONSTRUCTION, with no repair step to go wrong. Rings at chart
     # scale, one per way the 4326 write used to fold: a pinch that snaps apart into two lobes, the
