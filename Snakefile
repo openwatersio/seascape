@@ -26,14 +26,18 @@ PROCESSED = [s for s in ALL_SOURCES if s not in RAW]
 LISTED = [s for s in ALL_SOURCES if "filter" in pipeline_config.load_metadata(s)]
 
 # ── streaming ("source access resolves per source, local wins") ──────────────────────
-# --config stream=1 (laptop preview): a source with no local prep evidence
-# (store/source/<id>/raw/) fetches its published catalog.json (the whole registration) from
-# R2 instead of prepping, and its COGs stream via SOURCE_VSI_BASE.
+# --config stream=1 (laptop preview): a source with no local prep evidence (fetched raws, a
+# prepared *.tif, or a raw source's mirror.txt; enumeration alone isn't) fetches its published
+# catalog.json (the whole registration) from R2 instead of prepping, and its COGs stream via
+# SOURCE_VSI_BASE.
 # A locally-prepped source keeps its prep rules — local wins. Off (the box, the
 # sources workflow): STREAMED is empty and nothing changes.
 STREAM_BASE = config.get("stream_base", "https://data.openwaters.io/bathymetry/source")
 _wd = Path(config.get("workdir", str(SCRIPTS)))
-STREAMED = ([s for s in ALL_SOURCES if not (_wd / "store/source" / s / "raw").is_dir()]
+def _prepped_locally(s):
+    d = _wd / "store/source" / s
+    return (d / "raw").is_dir() or any(d.rglob("*.tif")) or (d / "mirror.txt").is_file()
+STREAMED = ([s for s in ALL_SOURCES if not _prepped_locally(s)]
             if config.get("stream") else [])
 LOCAL_PROCESSED = [s for s in PROCESSED if s not in STREAMED]
 LOCAL_RAW = [s for s in RAW if s not in STREAMED]

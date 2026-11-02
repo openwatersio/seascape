@@ -41,6 +41,7 @@ export function coverageTileJSON(
           source_id: "String",
           source_name: "String",
           source_maxzoom: "Number",
+          source_priority: "Number",
         },
       },
     ],

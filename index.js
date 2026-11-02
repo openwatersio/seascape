@@ -222,8 +222,8 @@ document
   );
 
 // ─── Click to inspect ─────────────────────────────────────────────────────
-// Which sources cover a clicked point, deepest footprint first (lex-first id on
-// a tie) — the build's merge rule, so [0] names the source the depth came from
+// Which sources cover a clicked point, highest priority then deepest footprint
+// first (lex-first id on a tie) — the build's merge rule, so [0] names the source the depth came from
 // and the rest are the overlapped alternates. Deduped by id: a footprint split
 // across tile boundaries hits once per fragment.
 // undefined → coverage layer hidden (skip the line); [] → no footprint = GEBCO.
@@ -237,6 +237,7 @@ function sourcesAt(point) {
   const byId = new Map(hits.map((f) => [f.properties.source_id, f.properties]));
   return [...byId.values()].sort(
     (a, b) =>
+      (b.source_priority ?? 0) - (a.source_priority ?? 0) ||
       b.source_maxzoom - a.source_maxzoom ||
       (a.source_id < b.source_id ? -1 : 1),
   );

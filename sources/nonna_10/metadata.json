@@ -1,0 +1,10 @@
+{
+    "name": "CHS NONNA-10 Bathymetry (Canada, 10 m)",
+    "producer": "Canadian Hydrographic Service (CHS) / Fisheries and Oceans Canada",
+    "website": "https://open.canada.ca/data/en/dataset/d3881c4c-650d-4070-bf9b-1e00aabf0a1d",
+    "license": "CHS NONNA Licence (non-navigational use)",
+    "max_zoom": 13,
+    "datum": "Chart Datum (CD)",
+    "priority": 1,
+    "notice": "This product was made by Open Waters and contains intellectual property of the Canadian Hydrographic Service (CHS) of the Department of Fisheries and Oceans.\n\nThis product does not meet the requirements of the Navigation Safety Regulations, 2020 under the Canada Shipping Act, 2001. Charts and publications issued by or on the authority of CHS must be used to meet the requirements of those regulations.\n\nThe copyright in the data are and remain the property of His Majesty the King in Right of Canada and shall not be sold, licensed, leased, assigned or given to a third party.\n\nThe incorporation of CHS data in this product does not constitute an endorsement or an approval of this product by the Canadian Hydrographic Service, the Department of Fisheries and Oceans or His Majesty the King in Right of Canada."
+}

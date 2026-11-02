@@ -83,6 +83,7 @@ Coarse zooms carry fewer bands. Like an ENC compiled per usage band, the partiti
 | `source_id` | String | Stable source identifier (keys into the manifest's `source_ids`). |
 | `source_name` | String | Human-readable source name. |
 | `source_maxzoom` | Number | The zoom the source's data is built to. |
+| `source_priority` | Number | Merge precedence: where footprints overlap, the highest priority wins, then the highest `source_maxzoom`, then the lexically first `source_id`. |
 
 ## Semantics a reader cannot see
 

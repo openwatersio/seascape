@@ -67,6 +67,7 @@ test-sources:
     uv run python source_normalize.py --check
     uv run python convert_gldb.py --check
     uv run python source_polygonize.py --check
+    python3 -I ../scripts/nonna_harvest.py --check
     uv run python source_check.py --check
     uv run python source_datum.py --check
     uv run python datum_grid.py --check

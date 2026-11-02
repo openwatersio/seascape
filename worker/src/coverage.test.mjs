@@ -26,6 +26,7 @@ assert.deepEqual(Object.keys(tj.vector_layers[0].fields).sort(), [
   "source_id",
   "source_maxzoom",
   "source_name",
+  "source_priority",
 ]);
 assert.equal(tj.attribution, "credit");
 

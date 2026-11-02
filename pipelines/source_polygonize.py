@@ -2,8 +2,7 @@
 
 Vendored from mapterhorn (BSD-3). Rasterizes a 1-valued mask per file,
 polygonizes it, merges all files, and dissolves to a single union polygon. The
-covering uses these footprints; a future provenance/footprint vector layer
-(ROADMAP.md Milestone 5) can tile them straight.
+footprints feed only the coverage layer; the covering reads file bounds.
 
 Note: shells out via utils.run_command; inputs are our own source ids/filenames
 (filenames are sanitized upstream), not untrusted input.
@@ -26,6 +25,10 @@ SILENT = True
 # coastal source's speckle explodes into millions of tiny polygons, and merge_source's single
 # ST_Union over them becomes an unbounded single-threaded GEOS job (nz_coastal: 11 M features, 20 GB).
 COARSEN_TARGET_M = 100
+# Holes and islands under this many mask pixels merge into their surroundings (~0.16 km² at the
+# coarsen target; more for a source already coarser than it): a sparse survey source's (NONNA)
+# speckle is otherwise 80% of its footprint's vertices.
+SIEVE_PX = 16
 
 
 def _decimate_pct(native_m, target_m=COARSEN_TARGET_M):
@@ -51,6 +54,12 @@ def _raster_info(src):
     wkt = info.get("coordinateSystem", {}).get("wkt", "").lstrip()
     geographic = wkt.upper().startswith(("GEOGCRS", "GEOGCS"))
     return (abs(gt[1]) * 111_320 if geographic else abs(gt[1])), width, height
+
+
+def _band_max(path):
+    info = json.loads(subprocess.run(["gdalinfo", "-json", "-mm", path],
+                                     capture_output=True, text=True, check=True).stdout)
+    return info["bands"][0].get("computedMax", 0)
 
 
 def _decimated_size(width, height, pct):
@@ -79,7 +88,16 @@ def polygonize_tif(source, filename):
             f'{src} {calc_src}', silent=SILENT)
     utils.run_command(
         f'GDAL_CACHEMAX=1024 gdal_calc.py -A {calc_src} '
-        f'--outfile={mask} --calc="A*0+1" --type=Byte --overwrite', silent=SILENT)
+        f'--outfile={mask}.raw.tif --calc="A*0+1" --type=Byte --NoDataValue=0 --overwrite',
+        silent=SILENT)
+    # The sieve skips nodata pixels, so gaps must be ordinary 0s for it to fill them.
+    utils.run_command(f'gdal_edit.py -unsetnodata {mask}.raw.tif', silent=SILENT)
+    utils.run_command(f'gdal_sieve.py -q -st {SIEVE_PX} -8 {mask}.raw.tif {mask}', silent=SILENT)
+    if _band_max(mask) < 1:  # a file whose data is all sub-sieve speckle keeps it, unsieved
+        shutil.move(f"{mask}.raw.tif", mask)
+    else:
+        os.remove(f"{mask}.raw.tif")
+    utils.run_command(f'gdal_edit.py -a_nodata 0 {mask}', silent=SILENT)
     out = f"store/polygon/{source}/{filename}.gpkg"
     # A stale per-file gpkg from an interrupted run must not survive: trailing -overwrite is
     # misparsed as the layer name by current gdal_polygonize, so remove + lead with the flag.
@@ -173,6 +191,33 @@ def _check():
         # A stale gpkg from an interrupted run must be replaced, not refused.
         polygonize_tif(sid, name)
         assert os.path.isfile(out), "a pre-existing footprint must be rewritten"
+
+        # A 1-px survey gap at the coarsen target must sieve away, not punch a hole.
+        holed = np.full((20, 20), -5.0, dtype="float32")
+        holed[10, 10] = -9999.0
+        with rasterio.open(f"store/source/{sid}/holed.tif", "w", driver="GTiff", height=20,
+                           width=20, count=1, dtype="float32", nodata=-9999.0,
+                           crs="EPSG:3857", transform=from_origin(0, 2000, 100, 100)) as dst:
+            dst.write(holed, 1)
+        polygonize_tif(sid, "holed.tif")
+        info = json.loads(subprocess.run(
+            ["ogrinfo", "-json", "-features", f"store/polygon/{sid}/holed.tif.gpkg"],
+            capture_output=True, text=True, check=True).stdout)
+        rings = [len(f["geometry"]["coordinates"]) for f in info["layers"][0]["features"]]
+        assert rings == [1], f"expected one hole-free polygon, got rings per feature {rings}"
+
+        # A file whose only data is a sub-sieve island must keep it, not lose its footprint.
+        speck = np.full((20, 20), -9999.0, dtype="float32")
+        speck[5:7, 5:7] = -5.0
+        with rasterio.open(f"store/source/{sid}/speck.tif", "w", driver="GTiff", height=20,
+                           width=20, count=1, dtype="float32", nodata=-9999.0,
+                           crs="EPSG:3857", transform=from_origin(0, 2000, 100, 100)) as dst:
+            dst.write(speck, 1)
+        polygonize_tif(sid, "speck.tif")
+        info = json.loads(subprocess.run(
+            ["ogrinfo", "-json", "-features", f"store/polygon/{sid}/speck.tif.gpkg"],
+            capture_output=True, text=True, check=True).stdout)
+        assert len(info["layers"][0]["features"]) == 1, "a speck-only file lost its footprint"
     finally:
         os.chdir(cwd)
         shutil.rmtree(d, ignore_errors=True)
