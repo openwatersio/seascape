@@ -12,7 +12,9 @@ import {
   layers,
   style,
   SCHEMA,
+  VIEWS,
   type ChartMap,
+  type View,
 } from "./index";
 
 import { execFileSync } from "node:child_process";
@@ -37,6 +39,10 @@ test("generated style validates against the MapLibre style spec", () => {
       safety: 3,
     }),
     style({ tilesBase: "https://t.example", shading: "bands", safety: 5 }),
+    style({ tilesBase: "https://t.example", view: "relief" }),
+    style({ tilesBase: "https://t.example", view: "globe" }),
+    style({ tilesBase: "https://t.example", view: "hillshade" }),
+    style({ tilesBase: "https://t.example", view: "topo" }),
   ];
   for (const s of variants) expect(validateStyleMin(s)).toEqual([]);
 });
@@ -522,4 +528,35 @@ test("the ladders mirror the pipeline's at every compiled zoom", () => {
     expect(fm.length, `fathom ladder at z${z}`).toBe(ft.length);
     fm.forEach((d, i) => expect(Math.abs(d - ft[i])).toBeLessThan(DRVAL_EPS));
   }
+});
+
+test("relief views share no layer ids with the chart, so applyState leaves them alone", () => {
+  const chartIds = new Set(layers().map((l) => l.id));
+  for (const view of VIEWS.filter((v) => v !== "chart")) {
+    const s = style({ tilesBase: "https://t.example", view });
+    for (const l of s.layers) expect(chartIds.has(l.id)).toBe(false);
+  }
+});
+
+test("every view's layers reference only sources the style declares", () => {
+  for (const view of VIEWS) {
+    const s = style({ tilesBase: "https://t.example", view });
+    for (const l of s.layers)
+      if ("source" in l) expect(s.sources).toHaveProperty(l.source as string);
+  }
+});
+
+test("an unknown view throws rather than building a broken style", () => {
+  expect(() =>
+    style({ tilesBase: "https://t.example", view: "bogus" as View }),
+  ).toThrow(/unknown view/);
+});
+
+test("topo gives unknown-depth water its own knife-edge colour", () => {
+  const s = style({ tilesBase: "https://t.example", view: "topo" });
+  const tint = s.layers.find((l) => l.id === "topo-tint") as {
+    paint: Record<string, unknown>;
+  };
+  const ramp = raw(tint.paint["color-relief-color"]).slice(3);
+  expect(ramp[ramp.indexOf(0) + 1]).toBe("#ffffff");
 });

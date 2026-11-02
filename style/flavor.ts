@@ -63,7 +63,8 @@ export const day: Flavor = {
   // and uncovers with the tide. Darker than the shoalest band — charts weight
   // the foreshore as the heaviest tint in the shoaling sequence.
   drying: "#58af9c",
-  // Unknown-depth water (ENC DEPARE nodata): mapped water we hold no depth for. Painted
+  // Unknown-depth water (ENC DEPARE nodata): water we hold no depth for — mapped inland water,
+  // or a coarse source's shore clamped to datum (raster code 0). Painted
   // the hazard tint — unsurveyed water warrants the same caution as known-unsafe water
   // (ECDIS treats it as unsafe for the safety check; S-52 hatching is the eventual upgrade).
   nodata: "#1f86cb",

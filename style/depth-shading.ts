@@ -17,9 +17,9 @@ type RampStops = (number | string)[]; // alternating elevation, colour
 // categorical (0 unknown-depth water, 1 drying foreshore, 2 land — flat codes, exact at every
 // zoom): the shoal tint runs flat to -LSB, then the code tints; fractional values between codes
 // are overzoom/interpolation transitions and blend smoothly.
-const LSB = 1 / 256;
+export const LSB = 1 / 256;
 const DRYING_CODE = 1;
-const LAND_CODE = 2;
+export const LAND_CODE = 2;
 
 // Width (metres) of the normal→hazard colour transition at the safety depth.
 const EDGE = 0.01;
