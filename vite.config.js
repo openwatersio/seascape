@@ -7,7 +7,8 @@ import { defineConfig } from "vite";
 // separately (worker/) and the viewer goes to Pages as static files.
 export default defineConfig(({ command }) => ({
   plugins:
-    // vitest (style/ inherits this config) also resolves as "serve"
+    // vitest run from the repo root also resolves as "serve"; style/'s own
+    // runs don't load this config
     command === "serve" && !process.env.VITEST
       ? [
           cloudflare({
