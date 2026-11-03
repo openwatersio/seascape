@@ -288,11 +288,13 @@ def transform_file(filepath, negate, offset, clamp_positive=False, surface=None,
             crs = horizontal_crs(src.crs)
             # The owed band matters only to a file over the cells; elsewhere it is all nodata.
             owing = floor
+            # A staged tile is <url stem>_<item hash>; a bare one is just its stem.
+            stem = os.path.splitext(os.path.basename(filepath))[0]
             if owing is not None:
                 w, s, e, n = transform_bounds(crs, "EPSG:4326", *src.bounds)
                 if not (w < cells[2] and e > cells[0] and s < cells[3] and n > cells[1]):
                     owing = None
-                elif not any(t in os.path.basename(filepath) for t in measured):
+                elif not any(stem == t or stem.startswith(t + "_") for t in measured):
                     # The cells hold only for the tiles they were measured on: a republished
                     # tile may carry NOS surveys there, so it takes the full correction, which
                     # errs shallow, until the cells are re-measured.
@@ -630,10 +632,12 @@ def _check():
         assert src.read(1).tolist() == [[-7.0, 2.0, -10.0, 2.0]], src.read(1)
     assert (corrected, valid) == (4, 4), (corrected, valid)  # the deep bed is on chart datum
     # A tile the cells were not measured on takes the full correction instead of the clear.
-    path6 = cleared_file("ncei19_c_9a9a.tif", [-10.0] * 4)
-    assert transform_file(path6, False, 0.0, surface=ref2_path)[:2] == (4, 4)
-    with rasterio.open(path6) as src:
-        assert (src.read(1) == -7.0).all(), src.read(1)
+    # A longer version id is a different tile, not a measured one.
+    for name in ("ncei19_c_9a9a.tif", "ncei19_bb_9a9a.tif"):
+        path6 = cleared_file(name, [-10.0] * 4)
+        assert transform_file(path6, False, 0.0, surface=ref2_path)[:2] == (4, 4)
+        with rasterio.open(path6) as src:
+            assert (src.read(1) == -7.0).all(), (name, src.read(1))
 
     # A source whose reference does not reach it at all is reported, not corrupted.
     path4 = os.path.join(d, "t4.tif")
