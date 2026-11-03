@@ -11,7 +11,8 @@
 # NAD83 (EPSG:4269) horizontal throughout, which is what lets the whole source mosaic through
 # one VRT; vertical is NAVD88, or PRVD02/VIVD09 in PR/USVI (both ≡ LMSL, so VDatum's
 # `S = −mllw` branch corrects them with the rest). Alaska outside the southeast panhandle has
-# no VDatum grid, so those tiles stay on NAVD88. NoData varies per tile (-9999 / -99999 /
+# no VDatum grid, so those tiles stay on NAVD88. Around Grand Manan and Passamaquoddy Bay the
+# tiles carry CHS chart datum over CHS surveys, which datum_grid.CHART_DATUM_CELLS leaves alone. NoData varies per tile (-9999 / -99999 /
 # -999999) and each file's header carries it.
 # NOAA regenerates the manifests as tiles are re-surveyed, so coverage stays current without
 # re-listing here.

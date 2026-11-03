@@ -14,7 +14,10 @@ Reads the knobs from ``metadata.json``:
         elevation_re_chart_datum = bed - reference
 
     ``reference`` is negative almost everywhere the US coast is covered, so the bed rises
-    and depths get shallower — the bias-shallow-safe direction.
+    and depths get shallower — the bias-shallow-safe direction. A second band holds the
+    reference a surface cleared where the source already ships on chart datum; it still
+    applies to beds above the surface's ``CHART_DATUM_FLOOR`` tag, and in full to a file
+    over ``CHART_DATUM_BOUNDS`` that is not one of its ``CHART_DATUM_TILES``.
 
 Applied in that order, then ``clamp_positive``. Operates per file in
 ``store/source/<id>/``, in the source's native CRS (the reprojection to Web Mercator
@@ -28,8 +31,8 @@ compound CRS, whether or not a value transform applies.
 The same pass counts ``dome_candidates`` — NCEI-gridder interpolation domes, isolated at-datum
 patches standing in deep water. It rides this stripe loop because the pixels are already in
 hand; the count reaches ``datum.json`` -> ``seascape:dome_candidates`` as a source-quality
-signal. Counted only: filtering a false shoal is the one edit that charts deeper than the
-source, which the bias-shallow rule forbids.
+signal. Counted only: filtering a false shoal would chart deeper than the source on a guess,
+which the bias-shallow rule forbids.
 """
 
 import argparse
@@ -43,7 +46,7 @@ from glob import glob
 import numpy as np
 import rasterio
 from pyproj import CRS as ProjCRS
-from rasterio.warp import Resampling, reproject
+from rasterio.warp import Resampling, reproject, transform_bounds
 from rasterio.windows import Window
 from scipy.ndimage import find_objects, label
 
@@ -138,14 +141,14 @@ def assign_declared_crs(filepath, crs):
     return True
 
 
-def reference_on(ref, transform, shape, crs):
+def reference_on(ref, transform, shape, crs, band=1):
     """The reference resampled bilinearly onto a window of the file's own grid, NaN outside
     its coverage. Bilinear is a local operation on the REFERENCE grid, which is far coarser
     (0.001 deg) than any file it corrects, so striping the destination changes nothing.
     The ~1 m NAD83/WGS 84 horizontal difference is nothing against a separation field that
     changes by metres per hundred kilometres."""
     out = np.full(shape, np.nan, dtype="float32")
-    reproject(source=rasterio.band(ref, 1), destination=out,
+    reproject(source=rasterio.band(ref, band), destination=out,
               src_transform=ref.transform, src_crs=ref.crs, src_nodata=ref.nodata,
               dst_transform=transform, dst_crs=crs, dst_nodata=np.nan,
               resampling=Resampling.bilinear)
@@ -267,6 +270,14 @@ def transform_file(filepath, negate, offset, clamp_positive=False, surface=None,
         # height, so refuse it here rather than chart the coverage edge wrong.
         raise ValueError(f"{surface}: nodata {ref.nodata} is not float32-exact — "
                          "reference_on would interpolate it into the correction")
+    # A second band holds the reference a surface cleared where the source already ships on
+    # chart datum, still owed by beds above FLOOR (datum_grid.clear_chart_datum says why).
+    floor = None
+    if ref is not None and ref.count > 1:
+        tags = ref.tags()
+        floor = float(tags["CHART_DATUM_FLOOR"])
+        measured = tags["CHART_DATUM_TILES"].split()
+        cells = [float(v) for v in tags["CHART_DATUM_BOUNDS"].split()]
     corrected = valid = ranged = 0
     try:
         with rasterio.open(filepath) as src:
@@ -275,6 +286,20 @@ def transform_file(filepath, negate, offset, clamp_positive=False, surface=None,
                 raise ValueError(f"{filepath}: --offset-surface needs the file's own CRS "
                                  "(the reference is resampled onto its grid)")
             crs = horizontal_crs(src.crs)
+            # The owed band matters only to a file over the cells; elsewhere it is all nodata.
+            owing = floor
+            if owing is not None:
+                w, s, e, n = transform_bounds(crs, "EPSG:4326", *src.bounds)
+                if not (w < cells[2] and e > cells[0] and s < cells[3] and n > cells[1]):
+                    owing = None
+                elif not any(t in os.path.basename(filepath) for t in measured):
+                    # The cells hold only for the tiles they were measured on: a republished
+                    # tile may carry NOS surveys there, so it takes the full correction, which
+                    # errs shallow, until the cells are re-measured.
+                    print(f"WARNING: {filepath}: overlaps the chart-datum cells but is not a "
+                          "tile they were measured on — correcting it in full; re-run "
+                          "cudem_chart_datum.py and rebuild the surface", file=sys.stderr)
+                    owing = -np.inf
             nodata = profile.get("nodata")
             if clamp_positive and nodata is None:
                 raise ValueError(f"{filepath}: --clamp-positive needs a nodata value set")
@@ -308,6 +333,15 @@ def transform_file(filepath, negate, offset, clamp_positive=False, surface=None,
                         take = mask & np.isfinite(reference)
                         data[take] -= reference[take]
                         corrected += int(take.sum())
+                        if owing is not None:
+                            owed = reference_on(ref, src.window_transform(window),
+                                                data.shape, crs, band=2)
+                            cleared = mask & ~take & np.isfinite(owed)
+                            late = cleared & (data > owing)
+                            data[late] -= owed[late]
+                            # A deep bed left alone here is on chart datum, not missed, so it
+                            # counts toward the file's coverage like a corrected one.
+                            corrected += int(cleared.sum())
                     if clamp_positive:
                         # After the offset, 0 = water surface; anything > 0 is the surrounding
                         # terrain (a lake DEM's land fringe, or a topobathy playa) — drop it to
@@ -570,6 +604,36 @@ def _check():
     assert o3[0, 0] == -9.0 and o3[0, 1] == -19.0, o3  # bed - (-1): shallower
     assert o3[0, 2] == -30.0, o3                       # no reference coverage: unchanged
     assert o3[0, 3] == nodata, o3                      # the file's own nodata: untouched
+
+    # A chart-datum clear: band 1 cleared over the east half, band 2 holding the -3 m it owes
+    # there to beds above the -3 m floor. Deep beds there pass through; shallow ones and the
+    # whole west half are corrected.
+    ref2_path = os.path.join(d, "ref2.tif")
+    with rasterio.open(ref2_path, "w", driver="GTiff", height=1, width=4, count=2,
+                       dtype="float32", crs="EPSG:4326", nodata=-9999.0,
+                       transform=from_origin(0.0, 1.0, 1.0, 1.0)) as dst:
+        dst.write(np.array([[-3.0, -3.0, -9999.0, -9999.0]], dtype="float32"), 1)
+        dst.write(np.array([[-9999.0, -9999.0, -3.0, -3.0]], dtype="float32"), 2)
+        dst.update_tags(CHART_DATUM_FLOOR="-3.0", CHART_DATUM_TILES="ncei19_a ncei19_b",
+                        CHART_DATUM_BOUNDS="2.0 0.0 4.0 1.0")
+
+    def cleared_file(name, bed):
+        path = os.path.join(d, name)
+        with rasterio.open(path, "w", driver="GTiff", height=1, width=4, count=1,
+                           dtype="float32", crs="EPSG:4326", nodata=nodata,
+                           transform=from_origin(0.0, 1.0, 1.0, 1.0)) as dst:
+            dst.write(np.array([bed], dtype="float32"), 1)
+        return path
+    path5 = cleared_file("ncei19_b_1f2e.tif", [-10.0, -1.0, -10.0, -1.0])
+    corrected, valid, _domes = transform_file(path5, False, 0.0, surface=ref2_path)
+    with rasterio.open(path5) as src:
+        assert src.read(1).tolist() == [[-7.0, 2.0, -10.0, 2.0]], src.read(1)
+    assert (corrected, valid) == (4, 4), (corrected, valid)  # the deep bed is on chart datum
+    # A tile the cells were not measured on takes the full correction instead of the clear.
+    path6 = cleared_file("ncei19_c_9a9a.tif", [-10.0] * 4)
+    assert transform_file(path6, False, 0.0, surface=ref2_path)[:2] == (4, 4)
+    with rasterio.open(path6) as src:
+        assert (src.read(1) == -7.0).all(), src.read(1)
 
     # A source whose reference does not reach it at all is reported, not corrupted.
     path4 = os.path.join(d, "t4.tif")

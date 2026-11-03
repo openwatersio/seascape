@@ -20,15 +20,18 @@ node registration to GDAL's pixel-is-area corner convention, so no half-pixel co
 
 Stages: compose S per region on its own mllw grid -> mosaic smallest-bbox-last so the finest
 region wins where valid -> bounded nearest-fill of the interior gaps between adjacent regions
--> repaint the Columbia onto CRD -> one 4326 COG. Coverage is US coastal only: Hawaii, Guam,
-CNMI, American Samoa and Alaska outside the southeast panhandle have no VDatum grid at all, and
-outside coverage the reference is nodata, which ``source_datum --offset-surface`` treats as
-"leave the pixel alone".
+-> repaint the Columbia onto CRD -> clear where CUDEM is already on chart datum -> one 4326
+COG. Coverage is US coastal only: Hawaii, Guam, CNMI, American Samoa and Alaska outside the
+southeast panhandle have no VDatum grid at all, the measured chart-datum cells around Grand
+Manan and Passamaquoddy Bay are cleared (band 2 keeps what they owe beds above
+CHART_DATUM_FLOOR), and outside coverage the reference is nodata, which
+``source_datum --offset-surface`` treats as "leave the pixel alone".
 
 Publication is gated on two independent checks, because either alone ships a broken surface:
-the benchmark stations validate the formula and its sign at 16 points, and ``check_coverage``
-validates that all 52 regions are actually in the mosaic and that it is the size it was. The
-per-region pixel counts land in ``store/datum/navd88_chart.json`` beside the COG.
+the benchmark stations validate the formula and its sign at 17 points (and the chart-datum
+clear at nine more), and ``check_coverage`` validates that all 52 regions are actually in the mosaic
+and that it is the size it was. The per-region pixel counts land in
+``store/datum/navd88_chart.json`` beside the COG.
 
 Run from pipelines/:
     uv run python datum_grid.py --bundle <extracted-vdatum-dir>   # or omit to fetch the zip
@@ -93,6 +96,9 @@ BENCHMARKS = [
     ("8729108", "Panama City FL", -85.6644, 30.1497, +0.171, "MLLW"),
     ("8779770", "Port Isabel TX", -97.2155, 26.0612, +0.259, "MLLW"),
     ("8443970", "Boston MA", -71.0503, 42.3539, +1.676, "MLLW"),
+    # Eastport sits a few km from the chart-datum cells in Passamaquoddy Bay, so it also guards
+    # the clear against eating NAVD88 water (North Head, NO_REFERENCE, is the other side).
+    ("8410140", "Eastport ME", -66.9829, 44.9046, +3.027, "MLLW"),
     ("8665530", "Charleston SC", -79.9236, 32.7808, +0.957, "MLLW"),
     ("9410170", "San Diego CA", -117.1767, 32.7156, +0.131, "MLLW"),
     ("9414290", "San Francisco CA", -122.4659, 37.8063, -0.018, "MLLW"),
@@ -111,9 +117,28 @@ BENCHMARKS = [
 # VDatum's own stated uncertainty for NAVD88->MLLW is 9 cm; the tolerance sits inside that.
 BENCHMARK_TOL = 0.05
 
+# Water where CUDEM measures on chart datum, so the reference must be nodata.
+NO_REFERENCE = [
+    # (id, name, lon, lat)
+    ("CHS 00010", "North Head NB", -66.7536, 44.7637),
+    ("", "Seal Cove NB", -66.8350, 44.6400),
+]
+# Water beside those cells where CUDEM measures on NAVD88, so the reference must survive.
+# Bayside and the Western Passage are on the Canadian side of the seam.
+KEEP_REFERENCE = [
+    # (id, name, lon, lat)
+    ("", "Lubec Narrows ME", -66.9850, 44.8545),
+    ("", "Cobscook Bay ME", -67.1000, 44.9000),
+    ("", "St Croix Island ME", -67.1330, 45.1280),
+    ("", "Calais ME", -67.2700, 45.1800),
+    ("", "St Croix River at Bayside NB", -67.1350, 45.1500),
+    ("", "Western Passage", -66.9950, 44.9300),
+    ("", "Grand Manan Channel", -67.0050, 44.6750),
+]
+
 # The 52 tidal regions the pinned bundle ships. `regions()` skips a directory whose .met or
 # mllw grid it cannot see, so a renamed member or a half-extracted bundle drops a whole coast
-# out of the mosaic — 16 point samples never notice, this does. Re-seed with the bundle URL.
+# out of the mosaic — 17 point samples never notice, this does. Re-seed with the bundle URL.
 EXPECTED_REGIONS = frozenset({
     "AKglacier00_8301", "AKwhale00_8301", "AKyakutat00_8301", "ALFLgom02_8301",
     "ALmobile02_8301", "CAmontby13_8301", "CAoregon00_8301", "CAsfbay13_8301",
@@ -133,8 +158,11 @@ EXPECTED_REGIONS = frozenset({
 # Valid pixels in the published surface, counted over store/datum/navd88_chart.tif. Composition
 # is deterministic under the pinned bundle, so the band absorbs only resampler edge changes
 # across GDAL versions; anything that truncates or drops coverage moves it by far more.
-EXPECTED_TOTAL_PX = 351_067_891
+EXPECTED_TOTAL_PX = 350_992_391
 COVERAGE_TOL = 0.02
+# The chart-datum clear is under 0.1% of the surface, invisible inside COVERAGE_TOL, so it is
+# gated on its own count.
+EXPECTED_CLEARED_PX = 75_500
 
 
 # ── bundle ───────────────────────────────────────────────────────────────────────────
@@ -502,6 +530,165 @@ def crd_override(bnd_path, gtx_path, path, res=RES, fill_km=FILL_KM):
     return int(take.sum()), added
 
 
+# ── CUDEM on chart datum ─────────────────────────────────────────────────────────────
+
+# 0.01 deg cells where CUDEM ships on CHS chart datum despite its NAVD88 label, as
+# {south edge: [(west, east), ...]}, measured against CHS NONNA-10 by cudem_chart_datum.py
+# (which says how) on CHART_DATUM_TILES; prep corrects any other tile over them in full. The fill and
+# VDatum's own regional extent both reach these waters, and subtracting the reference there
+# charts them about 3 m too shallow.
+CHART_DATUM_CELL = 0.01
+CHART_DATUM_TILES = [
+    "ncei13_n44x25_w067x00_2021v1", "ncei13_n44x25_w067x25_2021v1",
+    "ncei19_n44x50_w067x00_2021v1", "ncei19_n44x50_w067x25_2021v1",
+    "ncei19_n44x75_w067x00_2021v1", "ncei19_n44x75_w067x25_2021v1",
+    "ncei19_n45x00_w067x00_2021v1", "ncei19_n45x00_w067x25_2021v1",
+    "ncei19_n45x25_w067x00_2021v1", "ncei19_n45x25_w067x25_2021v1",
+]
+# Beds above this (metres, as CUDEM ships them) still take the reference inside the cells.
+# The share of cleared-cell pixels reading NAVD88 against NONNA is 2-4% at every depth below
+# it (slope noise), 7.5% at -2.5..-2, then 12-62% from -2 m up: the drying fringe's NAVD88
+# lidar, which clearing would chart up to 3 m under water.
+CHART_DATUM_FLOOR = -3.0
+CHART_DATUM_CELLS = {
+    45.16: [(-66.97, -66.96)],
+    45.15: [(-67.03, -67.01), (-66.97, -66.95)],
+    45.14: [(-67.03, -67.0), (-66.99, -66.96), (-66.95, -66.94)],
+    45.13: [(-67.03, -66.97), (-66.96, -66.93)],
+    45.12: [(-67.05, -66.9)],
+    45.11: [(-67.06, -67.05), (-67.04, -67.03), (-67.0, -66.9), (-66.89, -66.88)],
+    45.1: [(-67.0, -66.98), (-66.97, -66.92), (-66.9, -66.89), (-66.79, -66.78)],
+    45.09: [(-66.99, -66.92), (-66.8, -66.79)],
+    45.08: [(-66.98, -66.91), (-66.82, -66.78)],
+    45.07: [(-66.98, -66.92), (-66.81, -66.78)],
+    45.06: [(-66.97, -66.94), (-66.84, -66.8)],
+    45.05: [(-66.96, -66.93), (-66.87, -66.85), (-66.84, -66.8)],
+    45.04: [(-66.95, -66.92), (-66.89, -66.81), (-66.8, -66.79), (-66.76, -66.74)],
+    45.03: [(-66.95, -66.91), (-66.89, -66.83), (-66.82, -66.75)],
+    45.02: [(-66.94, -66.92), (-66.88, -66.87), (-66.86, -66.85), (-66.84, -66.77)],
+    45.01: [(-66.84, -66.78), (-66.77, -66.74)],
+    45.0: [(-66.84, -66.82), (-66.81, -66.74)],
+    44.99: [(-66.81, -66.74)],
+    44.98: [(-66.82, -66.74)],
+    44.97: [(-66.82, -66.76)],
+    44.96: [(-66.84, -66.77)],
+    44.95: [(-66.84, -66.77)],
+    44.94: [(-66.82, -66.77)],
+    44.93: [(-66.82, -66.77)],
+    44.92: [(-66.82, -66.77)],
+    44.91: [(-66.85, -66.77)],
+    44.9: [(-66.96, -66.95), (-66.94, -66.93), (-66.9, -66.74)],
+    44.89: [(-66.9, -66.84), (-66.83, -66.74)],
+    44.88: [(-66.96, -66.95), (-66.91, -66.84), (-66.83, -66.74)],
+    44.87: [(-66.93, -66.85), (-66.79, -66.74)],
+    44.86: [(-66.93, -66.83), (-66.81, -66.74)],
+    44.85: [(-66.93, -66.74)],
+    44.84: [(-66.92, -66.74)],
+    44.83: [(-66.92, -66.74)],
+    44.82: [(-66.92, -66.88), (-66.86, -66.74)],
+    44.81: [(-66.92, -66.85), (-66.83, -66.77), (-66.76, -66.74)],
+    44.8: [(-66.9, -66.89), (-66.76, -66.74)],
+    44.79: [(-66.9, -66.89)],
+    44.78: [(-66.76, -66.74)],
+    44.77: [(-66.97, -66.96), (-66.76, -66.75)],
+    44.76: [(-66.99, -66.98), (-66.76, -66.75)],
+    44.75: [(-67.0, -66.99), (-66.76, -66.74)],
+    44.74: [(-67.02, -66.98), (-66.76, -66.74)],
+    44.73: [(-67.03, -67.0), (-66.76, -66.75)],
+    44.72: [(-67.06, -67.0), (-66.95, -66.94)],
+    44.71: [(-67.08, -67.07), (-67.05, -67.03), (-67.02, -67.0)],
+    44.7: [(-67.1, -67.07), (-67.06, -67.05), (-67.02, -67.01), (-66.96, -66.95)],
+    44.69: [(-67.07, -67.05), (-67.03, -67.01), (-66.98, -66.96)],
+    44.68: [(-67.1, -67.08), (-67.06, -67.04), (-66.98, -66.96), (-66.91, -66.9)],
+    44.67: [(-67.12, -67.11), (-67.08, -67.06), (-66.98, -66.96)],
+    44.66: [(-67.13, -67.07), (-67.06, -67.05), (-66.99, -66.98), (-66.76, -66.75)],
+    44.65: [(-67.14, -67.13), (-67.12, -67.1), (-67.09, -67.05), (-67.0, -66.96), (-66.81, -66.78), (-66.76, -66.75)],
+    44.64: [(-67.15, -67.13), (-67.12, -67.1), (-67.09, -67.06), (-66.97, -66.96), (-66.85, -66.75)],
+    44.63: [(-67.18, -67.17), (-67.16, -67.15), (-67.14, -67.06), (-66.85, -66.75)],
+    44.62: [(-67.18, -67.06), (-67.02, -67.01), (-66.86, -66.82), (-66.81, -66.75)],
+    44.61: [(-67.16, -67.14), (-67.13, -67.04), (-66.88, -66.75)],
+    44.6: [(-67.18, -67.17), (-67.16, -67.14), (-67.13, -67.12), (-67.11, -67.09), (-67.07, -67.02), (-67.0, -66.98), (-66.92, -66.91), (-66.88, -66.75)],
+    44.59: [(-67.15, -67.04), (-67.03, -67.01), (-67.0, -66.99), (-66.92, -66.77), (-66.76, -66.75)],
+    44.58: [(-67.15, -67.11), (-67.1, -67.04), (-67.01, -66.98), (-66.95, -66.77)],
+    44.57: [(-67.16, -67.14), (-67.13, -67.07), (-67.06, -67.0), (-66.99, -66.98), (-66.95, -66.76)],
+    44.56: [(-67.2, -67.19), (-67.17, -67.16), (-67.15, -67.11), (-67.1, -67.07), (-67.05, -67.04), (-67.03, -67.0), (-66.99, -66.98), (-66.95, -66.82), (-66.81, -66.75)],
+    44.55: [(-67.22, -67.21), (-67.16, -67.07), (-67.04, -67.03), (-67.01, -66.99), (-66.98, -66.77), (-66.76, -66.75)],
+    44.54: [(-67.15, -67.1), (-67.02, -67.01), (-67.0, -66.99), (-66.97, -66.95), (-66.93, -66.9), (-66.89, -66.75)],
+    44.53: [(-67.12, -67.1), (-66.99, -66.98), (-66.96, -66.94), (-66.9, -66.88), (-66.87, -66.84), (-66.83, -66.75)],
+    44.52: [(-67.13, -67.12), (-66.99, -66.97), (-66.91, -66.84), (-66.83, -66.82), (-66.81, -66.75)],
+    44.51: [(-66.94, -66.91), (-66.9, -66.89), (-66.88, -66.86), (-66.85, -66.84), (-66.81, -66.74)],
+    44.5: [(-67.07, -67.06), (-66.94, -66.91), (-66.9, -66.89), (-66.87, -66.85), (-66.81, -66.74)],
+    44.49: [(-67.08, -67.07), (-66.94, -66.92), (-66.91, -66.88), (-66.8, -66.74)],
+    44.48: [(-67.16, -67.15), (-67.04, -67.03), (-66.93, -66.92), (-66.83, -66.82), (-66.81, -66.74)],
+    44.47: [(-67.01, -67.0), (-66.86, -66.84), (-66.81, -66.74)],
+    44.46: [(-67.16, -67.15), (-66.94, -66.93), (-66.92, -66.91), (-66.9, -66.89), (-66.88, -66.74)],
+    44.45: [(-66.98, -66.97), (-66.92, -66.91), (-66.9, -66.74)],
+    44.44: [(-66.97, -66.95), (-66.94, -66.89), (-66.87, -66.76), (-66.75, -66.74)],
+    44.43: [(-66.97, -66.96), (-66.95, -66.94), (-66.93, -66.91), (-66.9, -66.74)],
+    44.42: [(-67.17, -67.15), (-67.14, -67.13), (-67.01, -66.99), (-66.98, -66.96), (-66.95, -66.74)],
+    44.41: [(-67.02, -66.97), (-66.96, -66.74)],
+    44.4: [(-67.16, -67.14), (-67.07, -67.05), (-67.02, -66.79), (-66.76, -66.74)],
+    44.39: [(-66.94, -66.91), (-66.9, -66.88), (-66.87, -66.84), (-66.83, -66.82), (-66.81, -66.8)],
+    44.37: [(-66.85, -66.84)],
+    44.36: [(-66.94, -66.93), (-66.85, -66.84)],
+    44.35: [(-66.94, -66.93)],
+    44.33: [(-66.82, -66.81)],
+    44.3: [(-66.9, -66.89)],
+    44.29: [(-66.93, -66.92)],
+    44.26: [(-66.76, -66.74)],
+    44.25: [(-66.8, -66.78), (-66.76, -66.74)],
+    44.24: [(-66.8, -66.74)],
+    44.23: [(-66.89, -66.87), (-66.85, -66.84), (-66.83, -66.82), (-66.8, -66.78), (-66.77, -66.75)],
+    44.22: [(-66.93, -66.92), (-66.88, -66.87), (-66.85, -66.84), (-66.83, -66.82), (-66.8, -66.79), (-66.78, -66.77), (-66.75, -66.74)],
+    44.21: [(-66.89, -66.87), (-66.85, -66.82)],
+    44.2: [(-66.9, -66.89), (-66.85, -66.84), (-66.77, -66.76)],
+    44.19: [(-66.9, -66.89), (-66.85, -66.82)],
+    44.18: [(-66.89, -66.87), (-66.85, -66.84), (-66.83, -66.81)],
+    44.17: [(-66.89, -66.87), (-66.85, -66.82)],
+    44.16: [(-66.88, -66.87)],
+    44.15: [(-66.89, -66.88)],
+    44.14: [(-66.89, -66.88)],
+    44.13: [(-66.88, -66.87)],
+    44.12: [(-66.93, -66.87)],
+    44.11: [(-66.92, -66.88), (-66.87, -66.85), (-66.8, -66.79)],
+    44.1: [(-66.9, -66.88), (-66.86, -66.81)],
+    44.09: [(-66.91, -66.88), (-66.85, -66.83)],
+    44.08: [(-66.86, -66.84)],
+    44.07: [(-66.86, -66.85)],
+    44.06: [(-66.84, -66.83)],
+}
+
+
+def clear_chart_datum(path, owed_path, cells=CHART_DATUM_CELLS, cell=CHART_DATUM_CELL):
+    """Set the reference to nodata over ``cells``, in place, and write the values cleared to
+    ``owed_path`` (a sparse raster on the same grid), which prep still applies to beds above
+    CHART_DATUM_FLOOR. Returns px cleared. The cell edges fall on the mosaic's pixel edges, so
+    a pixel clears exactly when its centre is in a cell."""
+    shapes = [({"type": "Polygon", "coordinates": [[(w, s), (e, s), (e, s + cell),
+                                                    (w, s + cell), (w, s)]]}, 1)
+              for s, spans in cells.items() for w, e in spans]
+    with rasterio.open(path, "r+") as dst:
+        window = from_bounds(*chart_datum_bounds(cells, cell), dst.transform)
+        window = window.round_offsets().round_lengths()
+        block = dst.read(1, window=window)
+        inside = rasterize(shapes, out_shape=block.shape, transform=dst.window_transform(window),
+                           fill=0, dtype="uint8").astype(bool)
+        take = inside & (block != NODATA)
+        owed = np.where(take, block, NODATA).astype(block.dtype)
+        block[take] = NODATA
+        dst.write(block, 1, window=window)
+        profile = dst.profile
+    with rasterio.open(owed_path, "w", **profile, sparse_ok=True) as out:
+        out.write(owed, 1, window=window)
+    print(f"  CUDEM on chart datum: cleared {int(take.sum())} px")
+    return int(take.sum())
+
+
+def chart_datum_bounds(cells=CHART_DATUM_CELLS, cell=CHART_DATUM_CELL):
+    return (min(w for spans in cells.values() for w, _ in spans), min(cells),
+            max(e for spans in cells.values() for _, e in spans), max(cells) + cell)
+
+
 def build(bundle, out=OUT):
     # Keyed to the output so concurrent surface builds (Phase 2 adds more grids) can't
     # share — and race on — one scratch tree.
@@ -533,19 +720,30 @@ def build(bundle, out=OUT):
     crd = os.path.join(bundle, CRD_DIR)
     crd_px, crd_added = crd_override(os.path.join(crd, "CRD.bnd"),
                                      os.path.join(crd, "crd.gtx"), merged)
-    valid = mosaic_px + filled_px + crd_added
+    # Last, so no later step can carry a value back into the cleared cells.
+    owed = os.path.join(work, "owed.tif")
+    cleared_px = clear_chart_datum(merged, owed)
+    valid = mosaic_px + filled_px + crd_added - cleared_px
     # Per-region counts are on each region's own grid, so they overlap and out-total the
     # mosaic; what they pin is that every region reached the mosaic with data.
     report = {"regions": region_px, "mosaic_px": mosaic_px, "filled_px": filled_px,
-              "crd_px": crd_px, "total_px": valid, "res": RES, "fill_km": FILL_KM,
+              "crd_px": crd_px, "cleared_px": cleared_px,
+              "total_px": valid, "res": RES, "fill_km": FILL_KM,
               "bounds": list(bounds), "size": [width, height], "bundle": BUNDLE_URL}
 
     tmp = out + ".tmp.tif"
     # OVERVIEWS=NONE: nothing reads a pyramid of the reference (reference_on and the checks
     # read full res), and COG_OPTS no longer suppresses overviews itself.
+    # Band 2 is the reference the clear still owes shallow beds; the tags tell prep where and
+    # for which tiles (source_datum.transform_file reads them).
+    stack = os.path.join(work, "surface.vrt")
+    subprocess.run(["gdalbuildvrt", "-q", "-separate", stack, merged, owed], check=True)
     subprocess.run(["gdal_translate", "-of", "COG", *COG_OPTS, "-co", "OVERVIEWS=NONE",
                     "-co", "PREDICTOR=3",
-                    merged, tmp], check=True)
+                    "-mo", f"CHART_DATUM_FLOOR={CHART_DATUM_FLOOR}",
+                    "-mo", f"CHART_DATUM_TILES={' '.join(CHART_DATUM_TILES)}",
+                    "-mo", "CHART_DATUM_BOUNDS=" + " ".join(map(str, chart_datum_bounds())),
+                    stack, tmp], check=True)
     # Gate publication on the benchmark stations AND on coverage: a formula/mosaic/input
     # regression must fail the build here, never ship a surface that silently mis-corrects
     # (or silently fails to correct) every CUDEM depth.
@@ -603,7 +801,7 @@ def check_total_px(total, tol=COVERAGE_TOL):
 def check_coverage(report, tol=COVERAGE_TOL):
     """Every bundle region reached the mosaic, and the mosaic is the size it was.
 
-    The station checks sample 16 points: a region that fell out of the bundle glob, a region
+    The station checks sample 17 points: a region that fell out of the bundle glob, a region
     that composed to nothing, or a rebuild that truncated the mosaic moves none of them, and
     the resulting hole is a coast charted on the wrong datum. Names what is missing, because
     the fix (which region, which grid) is otherwise a bundle-wide hunt."""
@@ -620,6 +818,10 @@ def check_coverage(report, tol=COVERAGE_TOL):
     if empty:
         raise AssertionError(f"region(s) composed 0 valid px: {', '.join(empty)}")
     total = check_total_px(report["total_px"], tol)
+    cleared = report.get("cleared_px", 0)  # a sidecar from before the clear fails here
+    if not EXPECTED_CLEARED_PX * (1 - tol) <= cleared <= EXPECTED_CLEARED_PX * (1 + tol):
+        raise AssertionError(f"chart-datum clear removed {cleared} px, expected "
+                             f"{EXPECTED_CLEARED_PX} +/-{tol:.0%} — the cells or the fill changed")
     print(f"coverage ok ({len(composed)} regions, {total} valid px, "
           f"{total / EXPECTED_TOTAL_PX - 1:+.2%} vs expected)")
 
@@ -641,6 +843,17 @@ def check_benchmarks(path=OUT, tol=BENCHMARK_TOL):
               f"residual={residual:+.4f}")
         assert abs(residual) <= tol, f"{name} ({datum}): |{residual:.4f}| > {tol} m"
     print(f"benchmark stations ok (worst |residual| = {worst:.4f} m)")
+    with rasterio.open(path) as src:
+        assert src.count == 2, f"{path}: one band — built before the chart-datum clear; rebuild it"
+        for station, name, lon, lat in NO_REFERENCE:
+            value, owed = next(src.sample([(lon, lat)]))
+            assert value == src.nodata, f"{name} {station}: chart-datum water holds {value:+.4f}"
+            assert owed != src.nodata, f"{name} {station}: shallow beds lost the owed reference"
+        for station, name, lon, lat in KEEP_REFERENCE:
+            value, owed = next(src.sample([(lon, lat)]))
+            assert value != src.nodata, f"{name} {station}: NAVD88 water lost its reference"
+            assert owed == src.nodata, f"{name} {station}: owes a reference it still holds"
+    print(f"chart-datum clear ok ({len(NO_REFERENCE)} points nodata, {len(KEEP_REFERENCE)} kept)")
 
 
 def _check():
@@ -675,7 +888,8 @@ def _check():
 
     # check_coverage: a full composition passes; a dropped region, a region that composed to
     # nothing, and a truncated mosaic each fail naming what went wrong.
-    full = {"regions": {r: 1_000_000 for r in EXPECTED_REGIONS}, "total_px": EXPECTED_TOTAL_PX}
+    full = {"regions": {r: 1_000_000 for r in EXPECTED_REGIONS}, "total_px": EXPECTED_TOTAL_PX,
+            "cleared_px": EXPECTED_CLEARED_PX}
     check_coverage(full)
 
     def refuse(report, expect):
@@ -691,6 +905,7 @@ def _check():
     refuse({**full, "regions": {**full["regions"], "PRVIis00_8301": 0}}, "PRVIis00_8301")
     refuse({**full, "regions": {**full["regions"], "XXnew00_8301": 5}}, "XXnew00_8301")
     refuse({**full, "total_px": int(EXPECTED_TOTAL_PX * 0.8)}, "coverage changed")
+    refuse({**full, "cleared_px": 0}, "chart-datum clear")
     check_coverage({**full, "total_px": int(EXPECTED_TOTAL_PX * 1.01)})  # inside the band
 
     # nearest_fill: a hole inside the radius takes its neighbour, one outside stays nodata.
@@ -763,6 +978,22 @@ def _check():
         assert (out[:20, :40] == -4.0).all(), out[:20, :40]
         assert (out[:20, 40:] == -1.0).all(), out[:20, 40:]
         assert (out[20:40, :40] == -2.0).all(), out[20:40, :40]
+
+        # Chart-datum cells: two spans in the row at lat 1.0..1.5 and one at 0.5..1.0, on a
+        # 0.05 deg mosaic. Exactly their pixels clear, and nothing between or around them.
+        cells = {1.0: [(2.0, 2.5), (3.0, 3.5)], 0.5: [(3.0, 4.0)]}
+        cleared = clear_chart_datum("m.tif", "owed.tif", cells=cells, cell=0.5)
+        with rasterio.open("m.tif") as src:
+            out = src.read(1)
+        with rasterio.open("owed.tif") as src:
+            owed = src.read(1)
+        assert cleared == 10 * 10 * 2 + 10 * 20, cleared
+        # What was cleared is owed, value for value, and nothing else is.
+        assert ((owed == -1.0) == (out == NODATA)).all() and (owed[out != NODATA] == NODATA).all()
+        assert (out[50:60, 40:50] == NODATA).all() and (out[50:60, 60:70] == NODATA).all()
+        assert (out[60:70, 60:80] == NODATA).all(), out[60:70, 60:80]
+        assert (out[50:60, 50:60] != NODATA).all() and (out[:50] != NODATA).all()
+        assert (out[70:] != NODATA).all() and (out[60:70, :60] != NODATA).all()
     finally:
         os.chdir(cwd)
         shutil.rmtree(tmp, ignore_errors=True)

@@ -125,7 +125,7 @@ The plan's reference-in-source-frame convention ("MLLW height expressed in NAVD8
 S = tss − mllw
 ```
 
-`tss` here is referenced to the **hybrid geoid (GEOID18/GEOID12B), which by construction *is* the NAVD88 surface**, so no geoid term is needed. Verified to ≤8 mm at 7 stations (Mayport −2 mm, Charleston SC +1 mm, Boston +2 mm, Beaufort NC +2 mm, New London +7 mm, Port Isabel −2 mm, Panama City −8 mm).
+`tss` here is referenced to the **hybrid geoid (GEOID18/GEOID12B), which by construction *is* the NAVD88 surface**, so no geoid term is needed. Verified to ≤8 mm at 8 stations (Mayport −2 mm, Charleston SC +1 mm, Boston +2 mm, Eastport +0 mm, Beaufort NC +2 mm, New London +7 mm, Port Isabel −2 mm, Panama City −8 mm).
 
 ### 3b. `horz = IGS14` / `IGS08` regions — entire West Coast, Puget Sound, SE Alaska, most of Chesapeake/Delaware
 
@@ -170,6 +170,7 @@ Coordinates: `https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations/{
 | Panama City FL | 8729108 | −85.6644 | 30.1497 | `FLandrew02_8301` | NAD83 | NAVD88 | +0.171 | +0.163 | −0.008 |
 | Port Isabel TX | 8779770 | −97.2155 | 26.0612 | `TXintra00_8301` | NAD83 | NAVD88 | +0.259 | +0.257 | −0.002 |
 | Boston MA | 8443970 | −71.0503 | 42.3539 | `MENHMAgome23_8301` | NAD83 | NAVD88 | +1.676 | +1.679 | +0.002 |
+| Eastport ME | 8410140 | −66.9829 | 44.9046 | `MENHMAgome23_8301` | NAD83 | NAVD88 | +3.027 | +3.027 | +0.000 |
 | Charleston SC | 8665530 | −79.9236 | 32.7808 | `GASCNCsab31_8301` | NAD83 | NAVD88 | +0.957 | +0.958 | +0.001 |
 | San Diego CA | 9410170 | −117.1767 | 32.7156 | `CAsouin00_8301` | IGS14 | NAVD88 | +0.131 | +0.154 | +0.023 |
 | San Francisco CA | 9414290 | −122.4659 | 37.8063 | `CAsfdel00_8301` | IGS14 | NAVD88 | **−0.018** | +0.003 | +0.021 |
