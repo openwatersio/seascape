@@ -33,10 +33,11 @@ WCS = ("https://nonna-geoserver.data.chs-shc.ca/geoserver/wcs?service=WCS&versio
        "&subset=X({1:.2f},{3:.2f})&subset=Y({2:.2f},{4:.2f})")
 SOURCES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "sources")
 R = 6378137.0
+MAX_LAT = 85.05112878  # Web Mercator's edge
 
 
 def mercator(lon, lat):
-    lat = max(-85.05112878, min(85.05112878, lat))
+    lat = max(-MAX_LAT, min(MAX_LAT, lat))
     return R * math.radians(lon), R * math.log(math.tan(math.pi / 4 + math.radians(lat) / 2))
 
 
@@ -71,9 +72,10 @@ def intersects(a, b):
 
 
 def urls(res, units):
-    # The WCS grid is fixed Web Mercator, ~2x finer than NONNA's native cells north of 68°N
+    # The WCS grid is fixed Web Mercator, ~2x finer than NONNA's native cells north of 68°N. A unit
+    # wholly past the projection's edge clamps to zero height, which the WCS answers with a 404.
     return [WCS.format(res, *mercator(w, s), *mercator(e, n)) + ("&scaleFactor=0.5" if s >= 68 else "")
-            for w, s, e, n in units]
+            for w, s, e, n in units if s < MAX_LAT]
 
 
 def write(source, lines, allow_shrink):
@@ -114,6 +116,7 @@ def _check():
     assert bins([(-133.6, 69.7, -133.4, 69.8)], 0.5) == \
         [(-134.0, 69.5, -133.5, 70.0), (-133.5, 69.5, -133.0, 70.0)]
     assert urls(10, [(-67.0, 68.0, -66.5, 68.5)])[0].endswith("&scaleFactor=0.5")
+    assert len(urls(10, [(-60.0, 85.0, -59.5, 85.5), (-60.0, 85.5, -59.5, 86.0)])) == 1, "past the edge"
     print("harvest self-check: ok")
 
 
