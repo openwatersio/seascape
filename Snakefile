@@ -2,7 +2,7 @@
 # Per-source knobs (crs/nodata/negate/datum_offset_m/offset_surface/clamp_positive/unpack)
 # live in sources/<id>/metadata.json. Run from the repo root:
 #   uv run snakemake sources [--config source=<id>] [-n]
-#   uv run snakemake catalogs                     # + masks, covering, coverage
+#   uv run snakemake catalogs [--config source=<id>]  # + masks, covering, coverage once every source has a catalog
 #   uv run snakemake check --config source=<id>
 #   uv run snakemake publish [--config source=<id>]   # per-source R2 push
 #   uv run snakemake bundles [publish_mosaic]     # stage 2/3: mosaic → forks → bundles
@@ -66,6 +66,16 @@ ONLY = config.get("source")
 if ONLY and ONLY not in PROCESSED + RAW:
     raise WorkflowError(f"unknown source {ONLY!r} — known: {PROCESSED + RAW}")
 TARGETS = [ONLY] if ONLY else PROCESSED + RAW
+# The global products (covering, coverage, masks) read every catalog, so while another source
+# has none, source=<id> leaves them out instead of pulling that source too.
+_uncataloged = [s for s in PROCESSED + RAW
+                if s != ONLY and not (_wd / f"store/source/{s}/catalog.json").exists()]
+SKIP_GLOBAL = bool(ONLY and _uncataloged) and not config.get("stream")
+if SKIP_GLOBAL:
+    print(f"source={ONLY}: skipping covering, coverage and masks, no catalog yet for: "
+          f"{' '.join(_uncataloged)}", file=sys.stderr)
+# NONNA's two sources share one CHS GeoServer, which answers 503 at 4 concurrent requests.
+workflow.global_resources.setdefault("chs_wcs", 3)
 
 include: "pipelines/publish.smk"  # needs the source lists above
 
@@ -115,6 +125,8 @@ rule fetch_item:
     wildcard_constraints:
         source=pat(LOCAL_PROCESSED), hash=r"[0-9a-f]{16}"
     retries: 2
+    resources:
+        chs_wcs=lambda wc: int(wc.source.startswith("nonna_"))
     benchmark:
         f"{TMP}/bench/fetch/{{source}}-{{hash}}.tsv"
     # stderr per job for forensics (a failed job's diagnostics stay isolated in its own log);
@@ -162,6 +174,14 @@ rule prep_source:
         "{PY}/source_catalog.py {wildcards.source} --hash-recipe ) 2> {log}"
 
 
+# The request budget as the scheduler holds it, read by test-sources.
+rule chs_budget:
+    params:
+        budget=lambda wc: workflow.global_resources["chs_wcs"].value
+    shell:
+        "echo chs_wcs={params.budget}"
+
+
 # The weekly forced source refresh — run as its OWN invocation before catalogs/publish:
 # a forced producer schedules all dependents at plan time, but across an invocation
 # boundary the engine's checksums cure unchanged registrations, so the main invocation
@@ -175,9 +195,9 @@ rule prep_source:
 # barrier. Objects stay additive and land before catalog.json, so cross-boundary atomicity holds.
 rule refresh:
     input:
-        expand("store/source/{source}/catalog.json", source=LOCAL_LISTED),
+        expand("store/source/{source}/catalog.json", source=[s for s in LOCAL_LISTED if s in TARGETS]),
         expand("store/meta/publish/{source}.objects",
-               source=[s for s in LOCAL_LISTED if s in RAW]),
+               source=[s for s in LOCAL_LISTED if s in RAW and s in TARGETS]),
 
 
 # Raw collections register objects/<key> rows off the public bucket, reading the
@@ -403,15 +423,16 @@ rule land:
         "{PY}/landmask.py tiles 2> {log}"
 
 
-# The complete stage-1 product set (what the stage-2/3 invocation parses from).
+# The complete stage-1 product set (what the stage-2/3 invocation parses from), narrowed by
+# SKIP_GLOBAL.
 rule catalogs:
     input:
-        expand("store/source/{source}/catalog.json", source=PROCESSED + RAW),
-        "store/landmask/land.fgb",
-        "store/landmask/water.fgb",
-        "store/aggregation/covering.txt",
-        "store/bundle/coverage.pmtiles",
-        "store/bundle/land.pmtiles",
+        expand("store/source/{source}/catalog.json", source=TARGETS if SKIP_GLOBAL else PROCESSED + RAW),
+        [] if SKIP_GLOBAL else ["store/landmask/land.fgb",
+                                "store/landmask/water.fgb",
+                                "store/aggregation/covering.txt",
+                                "store/bundle/coverage.pmtiles",
+                                "store/bundle/land.pmtiles"],
 
 
 # Validate one source's contract (requires --config source=<id>).

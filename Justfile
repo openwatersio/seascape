@@ -73,6 +73,17 @@ test-sources:
     uv run python datum_grid.py --check
     uv run python datum_grid_fr.py --check
     uv run snakemake -s ../Snakefile -n sources > /dev/null
+    # source= plans that one source and nothing else while another has no catalog, in both of
+    # the workflow's invocations.
+    d=$(mktemp -d) && out=$(uv run snakemake -s ../Snakefile -d "$d" -n catalogs publish --config source=nonna_100 workdir="$d") && test "$(echo "$out" | grep -o 'source=[a-z0-9_]*' | sort -u)" = source=nonna_100 && ! echo "$out" | grep -E '(rule|checkpoint) (cover|coverage|land|landmask|watermask):'
+    d=$(mktemp -d) && out=$(uv run snakemake -s ../Snakefile -d "$d" -n refresh -R enumerate --config source=nonna_100 workdir="$d") && ! echo "$out" | grep -E '(rule|checkpoint) (enumerate|prep_source|register):'
+    # Once every catalog exists, source= still rebuilds the global products a build ships.
+    d=$(mktemp -d) && for s in $(ls ../sources | grep -v '[.]'); do mkdir -p "$d/store/source/$s"; touch "$d/store/source/$s/catalog.json"; done && uv run snakemake -s ../Snakefile -d "$d" -n catalogs --config source=nonna_100 workdir="$d" | grep 'rule coverage:' > /dev/null
+    # Every source file stays under the profile's checksum limit.
+    test -z "$(find ../sources -type f -size +1900k)"
+    # NONNA fetches draw on the shared CHS budget, and the scheduler holds its cap of 3.
+    d=$(mktemp -d) && uv run snakemake -s ../Snakefile -d "$d" --cores 1 chs_budget --config workdir="$d" | grep '^chs_wcs=3$' > /dev/null
+    d=$(mktemp -d) && mkdir -p "$d/store/source/nonna_100" && touch "$d/store/source/nonna_100/items.txt" && uv run snakemake -s ../Snakefile -d "$d" -n store/source/nonna_100/raw/0000000000000000 | grep chs_wcs=1 > /dev/null
 
 # Build self-checks: the e2e (real stage-1 CLIs + the unified DAG), the `cover` checkpoint
 # seam (test_build), each module's --check, and the cross-layer agreement of the three

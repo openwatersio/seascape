@@ -224,10 +224,11 @@ def write_if_changed(path, content):
 USER_AGENT = "seascape/1.0 (+https://openwaters.io/charts/seascape)"
 
 
-def http_download(url, dest, chunk=1 << 20, retries=5):
+def http_download(url, dest, chunk=1 << 20, retries=5, busy_wait=1):
     '''Stream a URL to dest with requests (handles query-string URLs; no shell).
     Retries with backoff on transient network errors — the public data servers
-    (EMODnet, SDFE, …) reset connections under load.'''
+    (EMODnet, SDFE, …) reset connections under load. busy_wait sets the first wait after
+    a 429 or 503, for a server that needs minutes to recover.'''
     import time
     import requests
     for attempt in range(retries):
@@ -249,7 +250,8 @@ def http_download(url, dest, chunk=1 << 20, retries=5):
         except requests.exceptions.RequestException as e:
             if attempt == retries - 1:
                 raise
-            wait = 2 ** attempt
+            busy = getattr(e.response, 'status_code', None) in (429, 503)
+            wait = (busy_wait if busy else 1) * 2 ** attempt
             print(f"  download {url} failed ({e}); retry {attempt + 1}/{retries - 1} in {wait}s")
             time.sleep(wait)
 

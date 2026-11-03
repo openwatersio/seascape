@@ -24,6 +24,11 @@ import config
 import utils
 
 
+def busy_wait(source):
+    """First retry wait after a 429 or 503: the CHS GeoServer sheds load for minutes."""
+    return 30 if source.startswith("nonna_") else 1
+
+
 def fetch(source, item_hash):
     items = config.items(source)
     by_hash = {config.item_hash(u): (i, u) for i, u in enumerate(items)}
@@ -44,7 +49,7 @@ def fetch(source, item_hash):
     tmp = f"{root}/.{item_hash}.tmp"  # dotfile: invisible to raw/* globs
     print(f"{source}[{item_hash}]: {url} -> {dest}")
     try:
-        utils.http_download(url, tmp)
+        utils.http_download(url, tmp, busy_wait=busy_wait(source))
     except BaseException:
         if os.path.exists(tmp):
             os.remove(tmp)
@@ -58,12 +63,41 @@ def main():
     fetch(sys.argv[1], sys.argv[2])
 
 
+def _check_backoff():
+    """NONNA waits minutes after a 429 or 503; everything else keeps the short backoff."""
+    import time
+    from types import SimpleNamespace
+    from unittest import mock
+
+    import requests
+
+    def waits(status, source):
+        response = SimpleNamespace(status_code=status) if status else None
+        error = requests.exceptions.RequestException(response=response)
+        sleeps = []
+        with mock.patch.object(requests, "get", side_effect=error), \
+                mock.patch.object(time, "sleep", sleeps.append):
+            try:
+                utils.http_download("https://x/a.tif", os.devnull, busy_wait=busy_wait(source))
+                assert False, "expected the last attempt to raise"
+            except requests.exceptions.RequestException:
+                pass
+        return sleeps
+
+    assert waits(503, "nonna_10") == [30, 60, 120, 240], "a busy CHS waits minutes"
+    assert waits(429, "nonna_100") == [30, 60, 120, 240], "a rate limit waits like a busy server"
+    assert waits(500, "nonna_10") == waits(None, "nonna_10") == [1, 2, 4, 8], "other failures stay short"
+    assert waits(503, "cudem") == [1, 2, 4, 8], "other sources stay short"
+
+
 def _check():
     """Offline: an unknown hash exits, a failed download removes its temp file, and the
     legacy raw/<index> layout self-migrates to raw/<hash> without a download."""
     import shutil
     import tempfile
     from glob import glob
+
+    _check_backoff()
 
     d = tempfile.mkdtemp()
     cwd, saved = os.getcwd(), config.SOURCES_DIR
@@ -88,7 +122,7 @@ def _check():
             assert "no enumerated item" in str(e), e
 
         # self-migration: a legacy raw/<index> for item 1 renames to raw/<h1>, no download.
-        def forbidden_download(url, dest):
+        def forbidden_download(url, dest, **_):
             raise AssertionError(f"must not download during self-migration: {url}")
 
         utils.http_download = forbidden_download
@@ -100,7 +134,7 @@ def _check():
         assert open(f"store/source/{sid}/raw/{h1}", "rb").read() == b"legacy-bytes", "renamed in place"
 
         # a genuinely new item (no legacy file) downloads; a failure leaves nothing behind.
-        def failing_download(url, dest):
+        def failing_download(url, dest, **_):
             with open(dest, "w") as f:
                 f.write("partial")
             raise RuntimeError("simulated network failure")
