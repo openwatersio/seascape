@@ -13,7 +13,8 @@ any static URL. Re-run when CHS republishes the index (the record's "Date Modifi
   python scripts/nonna_harvest.py -67,44,-66,45         # W,S,E,N — print a regional prototype's URLs only
 
 Request units: NONNA-100 one per 1° index cell (~150 m px, small); NONNA-10 one per 0.5° bin
-that holds a 0.1° index cell (~50 MB / ~60 s each at 45°N). Stdlib + the `ogr2ogr` CLI.
+that holds a 0.1° index cell (~50 MB / ~60 s each at 45°N), or its four 0.25° quarters for the
+bins in SPLIT. Stdlib + the `ogr2ogr` CLI.
 """
 
 import csv
@@ -34,6 +35,10 @@ WCS = ("https://nonna-geoserver.data.chs-shc.ca/geoserver/wcs?service=WCS&versio
 SOURCES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "sources")
 R = 6378137.0
 MAX_LAT = 85.05112878  # Web Mercator's edge
+# NONNA-10 bins (west, south) whose 0.5° request CHS's gateway times out (504) on every attempt,
+# found by the 2026-11-03 ingest. Each is requested as its four 0.25° quarters instead.
+SPLIT = {(-129.0, 54.0), (-93.5, 59.0), (-93.5, 61.0), (-94.5, 63.5), (-94.5, 64.0),
+         (-129.5, 66.0), (-129.5, 66.5), (-113.0, 67.5), (-111.5, 67.5), (-102.0, 67.5)}
 
 
 def mercator(lon, lat):
@@ -67,6 +72,23 @@ def bins(cells, step):
     return sorted((i * step, j * step, (i + 1) * step, (j + 1) * step) for i, j in keys)
 
 
+def split(units, keys):
+    """Replace each unit whose (west, south) is in keys by its four quarters, in place, so the
+    other units keep their order. A key that matches no unit is an error: that bin's 0.5°
+    request would stay in the list and time out."""
+    missing = keys - {(w, s) for w, s, _, _ in units}
+    if missing:
+        sys.exit(f"SPLIT keys match no bin: {sorted(missing)}")
+    out = []
+    for w, s, e, n in units:
+        if (w, s) not in keys:
+            out.append((w, s, e, n))
+            continue
+        mx, my = (w + e) / 2, (s + n) / 2
+        out += [(w, s, mx, my), (w, my, mx, n), (mx, s, e, my), (mx, my, e, n)]
+    return out
+
+
 def intersects(a, b):
     return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
 
@@ -96,7 +118,7 @@ def write(source, lines, allow_shrink):
 
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    units = {100: bins(cells("NONNA100"), None), 10: bins(cells("NONNA10"), 0.5)}
+    units = {100: bins(cells("NONNA100"), None), 10: split(bins(cells("NONNA10"), 0.5), SPLIT)}
     if args:
         bbox = tuple(float(x) for x in args[0].split(","))
         for res, us in units.items():
@@ -117,6 +139,15 @@ def _check():
         [(-134.0, 69.5, -133.5, 70.0), (-133.5, 69.5, -133.0, 70.0)]
     assert urls(10, [(-67.0, 68.0, -66.5, 68.5)])[0].endswith("&scaleFactor=0.5")
     assert len(urls(10, [(-60.0, 85.0, -59.5, 85.5), (-60.0, 85.5, -59.5, 86.0)])) == 1, "past the edge"
+    a, b = (-95.0, 63.5, -94.5, 64.0), (-94.5, 63.5, -94.0, 64.0)
+    assert split([a, b], {(-94.5, 63.5)}) == \
+        [a, (-94.5, 63.5, -94.25, 63.75), (-94.5, 63.75, -94.25, 64.0),
+         (-94.25, 63.5, -94.0, 63.75), (-94.25, 63.75, -94.0, 64.0)], "quarters in place"
+    try:
+        split([a], {(-93.5, 63.5)})
+        assert False, "an unmatched key must stop the harvest"
+    except SystemExit:
+        pass
     print("harvest self-check: ok")
 
 
