@@ -250,8 +250,9 @@ jobs:
             esac
             extra+=("source=$INPUT_SOURCE")
           fi
-          # Extra args reach the command as separate words; reject anything shell-active.
-          case "$INPUT_ARGS" in *[!-A-Za-z0-9_=\ .]*) echo "invalid snakemake_args" >&2; exit 1 ;; esac
+          # Extra args reach the command as separate words; reject anything shell-active. Slashes
+          # let -R name one output file (store/polygon/<id>.gpkg) instead of every job of a rule.
+          case "$INPUT_ARGS" in *[!-A-Za-z0-9_=\ ./]*) echo "invalid snakemake_args" >&2; exit 1 ;; esac
           read -r -a xargs <<<"$INPUT_ARGS"
           extra+=("${xargs[@]}")
           # Invocations are the scoping tool: -R forces every job of a rule IN THE PLANNED DAG,

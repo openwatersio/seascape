@@ -163,7 +163,7 @@ def union_by_cell(src, out, cell=CELL_DEG):
     import shapely
 
     geoms = shapely.make_valid(pyogrio.read_dataframe(src, columns=[]).geometry.values)
-    geoms = geoms[~shapely.is_empty(geoms)]
+    geoms = geoms[~shapely.is_missing(geoms) & ~shapely.is_empty(geoms)]  # centroids skip nulls
     squares = defaultdict(list)
     for i, (x, y) in enumerate(shapely.get_coordinates(shapely.centroid(geoms)).tolist()):
         squares[(math.floor(x / cell), math.floor(y / cell))].append(i)
@@ -176,6 +176,7 @@ def union_by_cell(src, out, cell=CELL_DEG):
     print(f"union: {len(geoms):_} polygons in {len(squares):_} squares")
     pyogrio.write_dataframe(gpd.GeoDataFrame(geometry=per_square, crs="EPSG:4326"), out,
                             layer="union", driver="GPKG", geometry_type="MultiPolygon")
+
 
 def _check_union_by_cell():
     """Overlapping parts dissolve within a square; a polygon across square edges stays whole;
@@ -202,8 +203,15 @@ def _check_union_by_cell():
             f"{d}/empty.gpkg", driver="GPKG", layer="out", geometry_type="Polygon")
         union_by_cell(f"{d}/empty.gpkg", f"{d}/empty_out.gpkg")
         assert len(gpd.read_file(f"{d}/empty_out.gpkg", layer="union")) == 0
+
+        # a null geometry must not shift later polygons into the wrong square
+        gpd.GeoDataFrame(geometry=[None, a, c], crs="EPSG:4326").to_file(f"{d}/null.gpkg", driver="GPKG")
+        union_by_cell(f"{d}/null.gpkg", f"{d}/null_out.gpkg")
+        got = gpd.read_file(f"{d}/null_out.gpkg", layer="union").geometry
+        assert sorted(round(g.area, 6) for g in got) == sorted(round(g.area, 6) for g in (a, c)), list(got.area)
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
 
 def _check():
     import shutil
