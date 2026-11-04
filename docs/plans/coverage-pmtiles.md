@@ -33,8 +33,8 @@ provenance bytes leave the hot vector path entirely.
 
 ## Part 1 — get the footprints (and maxzooms) into CI
 
-The source stage builds `store/polygon/<id>.gpkg` (the per-source union footprint
-`contour_run._coverage_geojson()` reads), but the sources job syncs only
+The source stage builds `store/polygon/<id>.gpkg` (the per-source footprint, one multipolygon per 1° square,
+that `contour_run._coverage_geojson()` reads), but the sources job syncs only
 `store/source/<id>` to R2 and no later job pulls polygons — `build.yml` mentions
 "polygon" only in comments. `_coverage_geojson()` then globs an empty dir, returns
 `None`, and `_finalize_contours` takes the shard-job fallback ("coverage is dropped

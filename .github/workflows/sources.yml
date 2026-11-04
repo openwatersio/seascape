@@ -192,7 +192,7 @@ jobs:
             fi
           done
           # Swap SAFETY NET on the LOCAL root disk (never the store volume) — the ccx33 has 32 GB
-          # RAM and no swap, so a heavy single job (a source's footprint ST_Union) that over-peaks
+          # RAM and no swap, so a heavy single job (a source's footprint dissolve) that over-peaks
           # is OOM-killed and the whole run is lost. Insurance, not headroom; swappiness=10 keeps
           # the working set in RAM. Same pattern as build.yml.
           if [ ! -e /swapfile ]; then
@@ -250,8 +250,9 @@ jobs:
             esac
             extra+=("source=$INPUT_SOURCE")
           fi
-          # Extra args reach the command as separate words; reject anything shell-active.
-          case "$INPUT_ARGS" in *[!-A-Za-z0-9_=\ .]*) echo "invalid snakemake_args" >&2; exit 1 ;; esac
+          # Extra args reach the command as separate words; reject anything shell-active. Slashes
+          # let -R name one output file (store/polygon/<id>.gpkg) instead of every job of a rule.
+          case "$INPUT_ARGS" in *[!-A-Za-z0-9_=\ ./]*) echo "invalid snakemake_args" >&2; exit 1 ;; esac
           read -r -a xargs <<<"$INPUT_ARGS"
           extra+=("${xargs[@]}")
           # Invocations are the scoping tool: -R forces every job of a rule IN THE PLANNED DAG,
