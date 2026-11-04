@@ -71,6 +71,7 @@ test-sources:
     uv run python source_check.py --check
     uv run python source_datum.py --check
     uv run python datum_grid.py --check
+    uv run python cudem_chart_datum.py --check
     uv run python datum_grid_fr.py --check
     uv run snakemake -s ../Snakefile -n sources > /dev/null
     # source= plans that one source and nothing else while another has no catalog, in both of
