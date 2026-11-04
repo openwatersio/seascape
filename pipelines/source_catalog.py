@@ -212,6 +212,8 @@ def build_item(source, rows, recipe_hash=None):
             "seascape:negate": negate,  # negate at aggregation — false once baked at prep
             "seascape:clamp_positive": clamp_positive,
             "seascape:valid_range": valid_range,  # the band prep voided outside, if declared
+            # small isolated patches prep voided; absent where unset, so no other item changes
+            **({"seascape:min_patch_px": meta["min_patch_px"]} if "min_patch_px" in meta else {}),
             "seascape:file_count": file_count,
             # The per-file registration (the retired bounds.csv absorbed): compact arrays in
             # the documented [filename, left, bottom, right, top, width, height] 3857 order.
@@ -294,6 +296,18 @@ def _check():
         assert p["seascape:file_count"] == 2, p
         assert p["seascape:recipe_hash"] == "abc123", p
         assert p["providers"][0]["name"] == "Test Co", p
+        assert "seascape:min_patch_px" not in p, p  # unset: the item is byte-identical
+        meta_path = f"sources/{sid}/metadata.json"
+        with open(meta_path) as f:
+            meta = json.load(f)
+        with open(meta_path, "w") as f:
+            json.dump({**meta, "min_patch_px": 16}, f)
+        assert build_item(sid, rows)["properties"]["seascape:min_patch_px"] == 16
+        with open(meta_path, "w") as f:
+            json.dump({**meta, "min_patch_px": 0}, f)  # explicitly off is still recorded
+        assert build_item(sid, rows)["properties"]["seascape:min_patch_px"] == 0
+        with open(meta_path, "w") as f:
+            json.dump(meta, f)
 
         # A per-pixel datum correction records WHICH reference was subtracted AND how much of
         # the source it reached: a scalar offset can't describe it, the correction leaves no

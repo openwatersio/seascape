@@ -14,6 +14,9 @@ the per-source knobs that live in Justfile flags on the legacy chain:
   valid_range     [min, max] in the source's FINAL frame — values outside it are voided
                   (source_datum --valid-range); the only defence against an upstream that
                   ships impossible depths as ordinary data rather than as its nodata
+  min_patch_px    void 8-connected data patches smaller than N staged pixels that are clear
+                  of the file edge, for a grid that scatters isolated soundings outside its
+                  surveyed areas (CHS NONNA)
   unpack          how to turn each raw asset into staged raster(s); absent = a bare
                   raster (see below)
 
@@ -749,13 +752,52 @@ def _quarantine(tif, raw_index):
     return removed
 
 
+def drop_small_patches(tif, min_px, nodata):
+    """Void every 8-connected patch of valid pixels smaller than ``min_px`` that does not touch the
+    file's edge. An isolated sounding outside the source's gridded surveys is not authoritative
+    (a shoal that matters gets surveyed and gridded), and each one becomes its own footprint
+    polygon. An edge patch may continue in the neighbouring file, so it stays. Returns the number
+    of pixels voided."""
+    import numpy as np
+    import rasterio
+    from scipy import ndimage
+    with rasterio.open(tif) as src:
+        data, profile = src.read(1), src.profile
+        if nodata is None:  # the file's own nodata, through GDAL's mask like transform_file
+            nodata, valid = src.nodata, src.read_masks(1) > 0
+        else:  # declared, applied at normalize: compare at the raster's own precision
+            nodata = float(nodata)
+            valid = data != np.asarray(nodata, data.dtype)
+    if nodata is None:
+        raise ValueError(f"{os.path.basename(tif)}: min_patch_px needs a nodata value")
+    valid &= ~np.isnan(data)
+    labels, n = ndimage.label(valid, structure=np.ones((3, 3)))
+    if not n:
+        return 0
+    void = np.bincount(labels.ravel(), minlength=n + 1) < min_px
+    void[0] = False
+    void[np.unique(np.concatenate([labels[0], labels[-1], labels[:, 0], labels[:, -1]]))] = False
+    drop = void[labels]
+    dropped = int(drop.sum())
+    if dropped:
+        profile.update(driver="GTiff", compress="zstd", tiled=True, nodata=nodata,
+                       bigtiff="IF_SAFER")
+        for k in ("blockxsize", "blockysize", "photometric"):
+            profile.pop(k, None)
+        tmp = tif + ".patch.tif"
+        with rasterio.open(tmp, "w", **profile) as dst:
+            dst.write(np.where(drop, np.asarray(nodata, data.dtype), data), 1)
+        os.replace(tmp, tif)
+    return dropped
+
+
 def prep_file(tif, transform, negate, offset, clamp, surface, crs, nodata, valid_range,
-              raw_index):
+              raw_index, min_patch=0):
     """One staged raster end to end: datum transform → compound-CRS flatten → normalize to a COG.
     The unit the pool fans out over, so it touches no file but its own — every step writes a
     sibling temp and os.replaces it, and rasterio's GDAL config Env is thread-local.
     Returns (basename, reference-corrected px, valid px, whether a vertical CRS was dropped,
-    interpolation-dome candidates)."""
+    interpolation-dome candidates, px voided as small patches)."""
     import rasterio.errors
     corrected = valid = 0
     domes = None  # only the value transform streams the pixels; without it nothing is scored
@@ -769,13 +811,14 @@ def prep_file(tif, transform, negate, offset, clamp, surface, crs, nodata, valid
         # After the transform, which already reduces the CRS on the files it rewrites; this
         # catches the rest, so no staged raster reaches a warp carrying a vertical CRS.
         flattened = flatten_compound_crs(tif)
+        voided = drop_small_patches(tif, min_patch, nodata) if min_patch else 0
         normalize_file(tif, crs, nodata)
     except rasterio.errors.RasterioIOError as e:
         # ONLY this: bad bytes, never a bad recipe. A value error, a missing nodata or an
         # unbuildable COG are all reasons to stop and fix the source, not to delete a download.
         removed = _quarantine(tif, raw_index)
         raise CorruptStaged(f"{os.path.basename(tif)}: unreadable pixels ({e})", removed) from e
-    return os.path.basename(tif), corrected, valid, flattened, domes
+    return os.path.basename(tif), corrected, valid, flattened, domes, voided
 
 
 # The per-file pipeline is embarrassingly parallel, and THREADS carry it: GDAL's read/write and
@@ -864,12 +907,17 @@ def prep(source, workers=DEFAULT_WORKERS):
         print(f"{source}: datum negate={negate} offset={offset} surface={name} "
               f"clamp_positive={clamp} valid_range={band}")
     crs, nodata = meta.get("crs"), meta.get("nodata")
+    min_patch = meta.get("min_patch_px", 0)
+    if not isinstance(min_patch, int) or isinstance(min_patch, bool) or min_patch < 0:
+        sys.exit(f"{source}: min_patch_px must be a non-negative integer, got {min_patch!r}")
+    if min_patch:
+        print(f"{source}: void data patches under {min_patch} px")
     print(f"{source}: prep {len(tifs)} file(s) on {workers} worker(s) "
           f"(crs={crs} nodata={nodata})", flush=True)
 
     job = functools.partial(prep_file, transform=transform, negate=negate, offset=offset,
                             clamp=clamp, surface=surface, crs=crs, nodata=nodata,
-                            valid_range=band,
+                            valid_range=band, min_patch=min_patch,
                             raw_index=_raw_index(f"store/source/{source}", source, staged_map))
     try:
         per_file = _fan_out(source, tifs, workers, job)
@@ -890,6 +938,8 @@ def prep(source, workers=DEFAULT_WORKERS):
                       coverage_report(source, [r[:3] for r in per_file]) if surface else None,
                       dome_report(source, [(r[0], r[4]) for r in per_file]),
                       valid_range=band)
+    if min_patch:
+        print(f"{source}: voided {sum(r[5] for r in per_file):,} px in small patches")
     flattened = sum(r[3] for r in per_file)
     if flattened:
         print(f"{source}: dropped the vertical CRS from {flattened}/{len(tifs)} file(s)")
@@ -926,6 +976,43 @@ def _check():
     import numpy as np
     import rasterio
     from rasterio.transform import from_origin
+
+    # drop_small_patches (min 4) voids a lone cell at any depth, a 3-cell diagonal run
+    # (8-connected) and a lone cell inside a one-pixel void ring within a large patch; it keeps an
+    # exactly 4-cell patch, a lone cell on the file edge, the large patch and its hole, and leaves
+    # a file with nothing to void untouched. A declared
+    # nodata in its documented decimal form matches the float32 maximum CHS writes.
+    with tempfile.TemporaryDirectory() as d:
+        nd = float(np.finfo("float32").max)
+        a = np.full((12, 12), nd, "float32")
+        a[1, 1] = -900                                # deep lone cell: voided
+        a[0, 11] = -900                               # lone cell on the edge: kept
+        a[4, 3] = -5                                  # shallow lone cell: voided too
+        a[2, 8] = a[3, 9] = a[4, 10] = -900           # diagonal run of 3: voided
+        a[1, 4:6] = a[2, 4:6] = -900                  # exactly 4 cells: kept
+        a[6:11, 1:7] = -900                           # 30-cell patch ...
+        a[7:10, 2:5] = nd                             # ... with a void ring ...
+        a[8, 3] = -900                                # ... around a lone cell: voided
+        tif = f"{d}/p.tif"
+        prof = dict(driver="GTiff", width=12, height=12, count=1, dtype="float32", nodata=nd,
+                    crs="EPSG:4326", transform=from_origin(0, 12, 1, 1))
+        with rasterio.open(tif, "w", **prof) as dst:
+            dst.write(a, 1)
+        assert drop_small_patches(tif, 4, None) == 6
+        with rasterio.open(tif) as src:
+            b = src.read(1)
+        void = [(1, 1), (4, 3), (2, 8), (3, 9), (4, 10), (8, 3)]
+        assert all(b[p] == nd for p in void), b
+        assert b[0, 11] == -900 and (b[1:3, 4:6] == -900).all(), b
+        a[tuple(zip(*void))] = nd
+        assert (b == a).all(), b
+        mtime = os.stat(tif).st_mtime_ns
+        assert drop_small_patches(tif, 4, None) == 0 and os.stat(tif).st_mtime_ns == mtime
+        assert drop_small_patches(tif, 4, 3.4028235e+38) == 0
+        b[1, 1] = -900
+        with rasterio.open(tif, "r+") as dst:
+            dst.write(b, 1)
+        assert drop_small_patches(tif, 4, 3.4028235e+38) == 1
 
     # ext_for canonicalizes both GeoTIFF spellings to the staged .tif the lane globs, and
     # falls back to .tif for a non-data extension (GDAL reads by content, not name).
@@ -1032,6 +1119,29 @@ def _check():
             with rasterio.open(f"store/source/{sid}/{name}") as src:
                 assert src.crs.to_epsg() == 28992, (name, src.crs)
                 assert src.read(1)[0, 0] == want, (name, src.read(1)[0, 0])
+
+        # min_patch_px runs in prep: a lone interior cell is voided, a 2-cell patch stays; a bad
+        # value stops the source before any file.
+        pid, pu = "_prep_patch", "https://x/patch.tif"
+        seed(pid, [pu], {"name": "Patch", "negate": True, "min_patch_px": 2})
+        g = np.full((6, 6), -9999.0, "float32")
+        g[2, 2], g[2, 4], g[3, 4] = 300.0, 5.0, 6.0
+        with rasterio.open(raw_of(pid, pu), "w", driver="GTiff", height=6, width=6, count=1,
+                           dtype="float32", nodata=-9999.0, crs="EPSG:4326",
+                           transform=from_origin(0, 6, 1, 1)) as dst:
+            dst.write(g, 1)
+        prep(pid)
+        (pt,) = glob(f"store/source/{pid}/*.tif")
+        with rasterio.open(pt) as src:
+            got = src.read(1)
+        assert got[2, 2] == -9999.0 and got[2, 4] == -5.0 and got[3, 4] == -6.0, got
+        for bad in (True, -1, 16.0, "16"):
+            seed(pid, [pu], {"name": "Patch", "min_patch_px": bad})
+            try:
+                prep(pid)
+                assert False, f"expected min_patch_px={bad!r} to exit"
+            except SystemExit as e:
+                assert "min_patch_px must be a non-negative integer" in str(e), e
 
         os.remove(raw_of(sid, u1))
         try:
