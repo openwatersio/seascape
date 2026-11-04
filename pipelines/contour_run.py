@@ -288,7 +288,7 @@ def vector_covering_cells(stems):
 
 
 # ── source coverage (provenance) layer ───────────────────────────────────────
-# Tile each source's union footprint (store/polygon/<id>.gpkg, from the source stage)
+# Tile each source's footprint (store/polygon/<id>.gpkg, from the source stage)
 # into its own store/bundle/coverage.pmtiles, so the viewer can show which source
 # covers a clicked point. Its own tileset, NOT a layer in vector.pmtiles: a joined
 # archive shares one zoom range, and sea-sized fill polygons tiled to the contours'
@@ -318,7 +318,7 @@ def _coverage_geojson():
 
     BBOX (W,S,E,N lon/lat, the same regional-build env the covering uses) pushes a -spat
     filter onto each footprint read, so a preview builds only the region's coverage instead of
-    tippecanoeing every footprint whole (the large intertidal-survey unions — uk_surfzone,
+    tippecanoeing every footprint whole (the large intertidal-survey footprints — uk_surfzone,
     infomar — dominate that cost). Footprints are EPSG:4326, so BBOX maps straight to -spat.
     Unset (a planet/CI build) → the whole world."""
     valid = set(config.sources())

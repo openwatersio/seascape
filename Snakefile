@@ -243,6 +243,8 @@ rule polygon:
     wildcard_constraints:
         source=pat(LOCAL_PROCESSED)
     threads: 4
+    resources:
+        mem_gb=4  # the dissolve holds a source's footprints in memory: 2.4 GB for NONNA-10
     log:
         f"{TMP}/logs/polygon/{{source}}.log"
     shell:

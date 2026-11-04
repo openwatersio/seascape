@@ -1,7 +1,7 @@
 """Build store/polygon/<id>.gpkg — the source's coverage footprint.
 
 Vendored from mapterhorn (BSD-3). Rasterizes a 1-valued mask per file,
-polygonizes it, merges all files, and dissolves to a single union polygon. The
+polygonizes it, merges all files, and dissolves them one CELL_DEG square at a time. The
 footprints feed only the coverage layer; the covering reads file bounds.
 
 Note: shells out via utils.run_command; inputs are our own source ids/filenames
@@ -22,9 +22,13 @@ SILENT = True
 
 # The footprint feeds ONLY the coverage layer, which reads it with -simplify 0.001 (~100 m) and
 # tiles to z8. So polygonize a mask decimated to ~this resolution: at native resolution a dense
-# coastal source's speckle explodes into millions of tiny polygons, and merge_source's single
-# ST_Union over them becomes an unbounded single-threaded GEOS job (nz_coastal: 11 M features, 20 GB).
+# coastal source's speckle explodes into millions of tiny polygons (nz_coastal: 11 M features).
 COARSEN_TARGET_M = 100
+# The dissolve's grid square. A sparse survey source stays millions of disjoint polygons even
+# coarsened (NONNA-10: 2.3 M); one union over them ran 3 h, and the coverage layer's -simplify of
+# that single multi-part feature grows faster than quadratically. Per square the union is local
+# (NONNA-10: about 3 min), and one feature per square keeps each simplify small.
+CELL_DEG = 1.0
 # Holes and islands under this many mask pixels merge into their surroundings (~0.16 km² at the
 # coarsen target; more for a source already coarser than it): a sparse survey source's (NONNA)
 # speckle is otherwise 80% of its footprint's vertices.
@@ -142,9 +146,71 @@ def merge_source(source):
     union = f"store/polygon/{source}.gpkg"
     if os.path.isfile(union):
         os.remove(union)
-    utils.run_command(
-        f'ogr2ogr -f GPKG {union} {merged} -nln union -dialect sqlite '
-        f'-sql "SELECT ST_Union(ST_MakeValid(geom)) AS geom FROM out"', silent=False)
+    union_by_cell(merged, union)
+
+
+def union_by_cell(src, out, cell=CELL_DEG):
+    """Dissolve src's polygons within each cell-degree square and write one multipolygon per
+    square to out. A polygon belongs to the square holding its centroid and is never clipped, so
+    the footprint keeps all its area. Polygons in neighbouring squares are not dissolved together:
+    they may overlap or share an edge, which a single source's footprint tolerates. One feature
+    per square, not per polygon, keeps the coverage tiles under tippecanoe's feature limit."""
+    import math
+    from collections import defaultdict
+
+    import geopandas as gpd
+    import pyogrio
+    import shapely
+
+    geoms = shapely.make_valid(pyogrio.read_dataframe(src, columns=[]).geometry.values)
+    geoms = geoms[~shapely.is_missing(geoms) & ~shapely.is_empty(geoms)]  # centroids skip nulls
+    squares = defaultdict(list)
+    for i, (x, y) in enumerate(shapely.get_coordinates(shapely.centroid(geoms)).tolist()):
+        squares[(math.floor(x / cell), math.floor(y / cell))].append(i)
+    per_square = []
+    for idx in squares.values():
+        polys = [p for p in shapely.get_parts(shapely.unary_union(geoms[idx]))
+                 if p.geom_type == "Polygon"]
+        if polys:
+            per_square.append(shapely.multipolygons(polys))
+    print(f"union: {len(geoms):_} polygons in {len(squares):_} squares")
+    pyogrio.write_dataframe(gpd.GeoDataFrame(geometry=per_square, crs="EPSG:4326"), out,
+                            layer="union", driver="GPKG", geometry_type="MultiPolygon")
+
+
+def _check_union_by_cell():
+    """Overlapping parts dissolve within a square; a polygon across square edges stays whole;
+    each square is one feature; an empty footprint still writes a layer."""
+    import shutil
+    import tempfile
+
+    import geopandas as gpd
+    import shapely
+
+    d = tempfile.mkdtemp()
+    try:
+        a, b = shapely.box(0.1, 0.1, 0.5, 0.5), shapely.box(0.3, 0.3, 0.6, 0.6)  # overlap
+        c = shapely.box(0.8, -1.4, 2.6, -0.2)  # crosses three squares and the equator
+        gpd.GeoDataFrame(geometry=[a, b, c], crs="EPSG:4326").to_file(f"{d}/in.gpkg", driver="GPKG")
+        union_by_cell(f"{d}/in.gpkg", f"{d}/out.gpkg")
+        got = gpd.read_file(f"{d}/out.gpkg", layer="union").geometry
+        assert len(got) == 2, f"expected one feature per occupied square, got {len(got)}"
+        assert abs(got.area.sum() - shapely.union_all([a, b, c]).area) < 1e-9, "area lost or doubled"
+        assert any(g.equals(shapely.multipolygons([c])) for g in got), "a crossing polygon stays whole"
+        assert set(got.geom_type) == {"MultiPolygon"}, set(got.geom_type)
+
+        gpd.GeoDataFrame(geometry=gpd.GeoSeries([], crs="EPSG:4326")).to_file(
+            f"{d}/empty.gpkg", driver="GPKG", layer="out", geometry_type="Polygon")
+        union_by_cell(f"{d}/empty.gpkg", f"{d}/empty_out.gpkg")
+        assert len(gpd.read_file(f"{d}/empty_out.gpkg", layer="union")) == 0
+
+        # a null geometry must not shift later polygons into the wrong square
+        gpd.GeoDataFrame(geometry=[None, a, c], crs="EPSG:4326").to_file(f"{d}/null.gpkg", driver="GPKG")
+        union_by_cell(f"{d}/null.gpkg", f"{d}/null_out.gpkg")
+        got = gpd.read_file(f"{d}/null_out.gpkg", layer="union").geometry
+        assert sorted(round(g.area, 6) for g in got) == sorted(round(g.area, 6) for g in (a, c)), list(got.area)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def _check():
@@ -162,6 +228,8 @@ def _check():
     assert _decimated_size(1, 1, 1) == (1, 1)
     assert _decimated_size(4000, 2000, 2) == (80, 40)  # the ordinary case is unchanged
     assert _decimated_size(150, 30, 2) == (3, 1), "each axis floors independently"
+
+    _check_union_by_cell()
 
     if not (shutil.which("gdal_translate") and shutil.which("gdal_polygonize.py")):
         print("source_polygonize.py ok (tiny-raster path skipped — no GDAL CLI)")
