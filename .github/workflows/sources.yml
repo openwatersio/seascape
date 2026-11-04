@@ -192,7 +192,7 @@ jobs:
             fi
           done
           # Swap SAFETY NET on the LOCAL root disk (never the store volume) — the ccx33 has 32 GB
-          # RAM and no swap, so a heavy single job (a source's footprint ST_Union) that over-peaks
+          # RAM and no swap, so a heavy single job (a source's footprint dissolve) that over-peaks
           # is OOM-killed and the whole run is lost. Insurance, not headroom; swappiness=10 keeps
           # the working set in RAM. Same pattern as build.yml.
           if [ ! -e /swapfile ]; then
