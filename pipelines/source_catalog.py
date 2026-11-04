@@ -213,7 +213,7 @@ def build_item(source, rows, recipe_hash=None):
             "seascape:clamp_positive": clamp_positive,
             "seascape:valid_range": valid_range,  # the band prep voided outside, if declared
             # small isolated patches prep voided; absent where unset, so no other item changes
-            **({"seascape:min_patch_px": meta["min_patch_px"]} if meta.get("min_patch_px") else {}),
+            **({"seascape:min_patch_px": meta["min_patch_px"]} if "min_patch_px" in meta else {}),
             "seascape:file_count": file_count,
             # The per-file registration (the retired bounds.csv absorbed): compact arrays in
             # the documented [filename, left, bottom, right, top, width, height] 3857 order.
@@ -303,6 +303,9 @@ def _check():
         with open(meta_path, "w") as f:
             json.dump({**meta, "min_patch_px": 16}, f)
         assert build_item(sid, rows)["properties"]["seascape:min_patch_px"] == 16
+        with open(meta_path, "w") as f:
+            json.dump({**meta, "min_patch_px": 0}, f)  # explicitly off is still recorded
+        assert build_item(sid, rows)["properties"]["seascape:min_patch_px"] == 0
         with open(meta_path, "w") as f:
             json.dump(meta, f)
 
