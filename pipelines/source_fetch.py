@@ -112,6 +112,7 @@ def _check_backoff():
             yield self.body
 
     import shutil
+    import struct
     import tempfile
     d = tempfile.mkdtemp()
     out = os.path.join(d, "raw")
@@ -135,8 +136,11 @@ def _check_backoff():
             sleeps, err = outcome(body, "nonna_10")
             assert err and "unexpected body" in err and sleeps == [30, 60, 120, 240], (body, sleeps, err)
             assert outcome(body, "cudem") == ([], None), "other sources take the body as sent"
-        for body in (b"II*\x00tiff", b"MM\x00*tiff"):
-            assert outcome(body, "nonna_10") == ([], None), body
+        # byte-order mark then version: 42 is classic TIFF, 43 is BigTIFF
+        for order, fmt in ((b"II", "<H"), (b"MM", ">H")):
+            for version in (42, 43):
+                header = order + struct.pack(fmt, version)
+                assert outcome(header + b"tiff", "nonna_10") == ([], None), header
         sleeps = []
         with mock.patch.object(requests, "get", side_effect=[Ok(bad[0]), Ok(b"II*\x00tiff")]), \
                 mock.patch.object(time, "sleep", sleeps.append):
