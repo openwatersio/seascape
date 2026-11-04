@@ -224,11 +224,13 @@ def write_if_changed(path, content):
 USER_AGENT = "seascape/1.0 (+https://openwaters.io/charts/seascape)"
 
 
-def http_download(url, dest, chunk=1 << 20, retries=5, busy_wait=1):
+def http_download(url, dest, chunk=1 << 20, retries=5, busy_wait=1, magic=None):
     '''Stream a URL to dest with requests (handles query-string URLs; no shell).
     Retries with backoff on transient network errors — the public data servers
     (EMODnet, SDFE, …) reset connections under load. busy_wait sets the first wait after
-    a 429 or 503, for a server that needs minutes to recover.'''
+    a 429, a 503 or a rejected body, for a server that needs minutes to recover. magic lists
+    the byte prefixes a good body starts with; any other body counts as a busy server, for
+    one that answers overload with a 200 error report.'''
     import time
     import requests
     for attempt in range(retries):
@@ -246,11 +248,18 @@ def http_download(url, dest, chunk=1 << 20, retries=5, busy_wait=1):
                         and written != int(expected):
                     raise requests.exceptions.RequestException(
                         f"truncated body: {written} of {expected} bytes")
+            if magic:
+                with open(dest, 'rb') as f:
+                    head = f.read(200)
+                if not head.startswith(tuple(magic)):
+                    err = requests.exceptions.RequestException(f"unexpected body: {head!r}")
+                    err.busy = True
+                    raise err
             return
         except requests.exceptions.RequestException as e:
             if attempt == retries - 1:
                 raise
-            busy = getattr(e.response, 'status_code', None) in (429, 503)
+            busy = getattr(e, 'busy', False) or getattr(e.response, 'status_code', None) in (429, 503)
             wait = (busy_wait if busy else 1) * 2 ** attempt
             print(f"  download {url} failed ({e}); retry {attempt + 1}/{retries - 1} in {wait}s")
             time.sleep(wait)

@@ -24,9 +24,18 @@ import config
 import utils
 
 
+TIFF = (b"II*\x00", b"MM\x00*", b"II+\x00", b"MM\x00+")  # classic and BigTIFF headers
+
+
+def chs(source):
+    """NONNA's CHS GeoServer sheds load for minutes, and under load can answer 200 with an XML
+    error report instead of a GeoTIFF."""
+    return source.startswith("nonna_")
+
+
 def busy_wait(source):
-    """First retry wait after a 429 or 503: the CHS GeoServer sheds load for minutes."""
-    return 30 if source.startswith("nonna_") else 1
+    """First retry wait after a 429, a 503 or a rejected body."""
+    return 30 if chs(source) else 1
 
 
 def fetch(source, item_hash):
@@ -49,7 +58,7 @@ def fetch(source, item_hash):
     tmp = f"{root}/.{item_hash}.tmp"  # dotfile: invisible to raw/* globs
     print(f"{source}[{item_hash}]: {url} -> {dest}")
     try:
-        utils.http_download(url, tmp, busy_wait=busy_wait(source))
+        utils.http_download(url, tmp, busy_wait=busy_wait(source), magic=TIFF if chs(source) else None)
     except BaseException:
         if os.path.exists(tmp):
             os.remove(tmp)
@@ -64,7 +73,8 @@ def main():
 
 
 def _check_backoff():
-    """NONNA waits minutes after a 429 or 503; everything else keeps the short backoff."""
+    """NONNA waits minutes after a 429, a 503 or a body that isn't a TIFF; everything else keeps
+    the short backoff and takes the body as sent."""
     import time
     from types import SimpleNamespace
     from unittest import mock
@@ -88,6 +98,52 @@ def _check_backoff():
     assert waits(429, "nonna_100") == [30, 60, 120, 240], "a rate limit waits like a busy server"
     assert waits(500, "nonna_10") == waits(None, "nonna_10") == [1, 2, 4, 8], "other failures stay short"
     assert waits(503, "cudem") == [1, 2, 4, 8], "other sources stay short"
+
+    class Ok:  # a 200 whose body is whatever the server sent
+        def __init__(self, body):
+            self.body, self.headers = body, {}
+        def __enter__(self):
+            return self
+        def __exit__(self, *_):
+            return False
+        def raise_for_status(self):
+            pass
+        def iter_content(self, _):
+            yield self.body
+
+    import shutil
+    import tempfile
+    d = tempfile.mkdtemp()
+    out = os.path.join(d, "raw")
+
+    def outcome(body, source):
+        """(sleeps, error) for a 200 carrying body."""
+        sleeps = []
+        with mock.patch.object(requests, "get", return_value=Ok(body)), \
+                mock.patch.object(time, "sleep", sleeps.append):
+            try:
+                utils.http_download("https://x/a.tif", out, busy_wait=busy_wait(source),
+                                    magic=TIFF if chs(source) else None)
+                return sleeps, None
+            except requests.exceptions.RequestException as e:
+                return sleeps, str(e)
+
+    try:
+        bad = [b'<?xml version="1.0"?><ows:ExceptionReport/>', b'\xef\xbb\xbf<?xml version="1.0"?>',
+               "<?xml?>".encode("utf-16"), b'{"error": "busy"}', b""]
+        for body in bad:
+            sleeps, err = outcome(body, "nonna_10")
+            assert err and "unexpected body" in err and sleeps == [30, 60, 120, 240], (body, sleeps, err)
+            assert outcome(body, "cudem") == ([], None), "other sources take the body as sent"
+        for body in (b"II*\x00tiff", b"MM\x00*tiff"):
+            assert outcome(body, "nonna_10") == ([], None), body
+        sleeps = []
+        with mock.patch.object(requests, "get", side_effect=[Ok(bad[0]), Ok(b"II*\x00tiff")]), \
+                mock.patch.object(time, "sleep", sleeps.append):
+            utils.http_download("https://x/a.tif", out, busy_wait=30, magic=TIFF)
+        assert sleeps == [30] and open(out, "rb").read() == b"II*\x00tiff", "a retry replaces the report"
+    finally:
+        shutil.rmtree(d)
 
 
 def _check():
