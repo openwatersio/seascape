@@ -1,5 +1,5 @@
 # The Snakemake build — ONE DAG, ONE entry (this file). See docs/plans/2026-07-14-snakemake-build.md.
-# Per-source knobs (crs/nodata/negate/datum_offset_m/offset_surface/clamp_positive/unpack)
+# Per-source knobs (crs/nodata/negate/datum_offset_m/offset_surface/clamp_positive/min_patch_px/unpack)
 # live in sources/<id>/metadata.json. Run from the repo root:
 #   uv run snakemake sources [--config source=<id>] [-n]
 #   uv run snakemake catalogs [--config source=<id>]  # + masks, covering, coverage once every source has a catalog
@@ -164,6 +164,7 @@ rule prep_source:
         # Staging still bounds this: a zip member is read whole into memory, and asc-mosaic
         # holds a raster. The fan-out fits inside it — 4 workers measured 2.5 GB peak RSS on
         # 1/9" CUDEM (both transforms stripe, so a worker scales with raster WIDTH, not size).
+        # min_patch_px labels a whole file: 0.78 GB peak measured on a 25 M px half-scattered bin.
         mem_gb=8
     benchmark:
         f"{TMP}/bench/prep/{{source}}.tsv"
