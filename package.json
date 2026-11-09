@@ -13,10 +13,10 @@
     "test": "npm test --workspaces --if-present"
   },
   "devDependencies": {
-    "@cloudflare/vite-plugin": "^1.66.0",
+    "@cloudflare/vite-plugin": "^1.67.0",
     "@openwaters/seascape": "*",
-    "maplibre-gl": "^6.14.0",
+    "maplibre-gl": "^6.16.0",
     "pmtiles": "^4.5.0",
-    "vite": "^8.3.5"
+    "vite": "^8.3.6"
   }
 }
