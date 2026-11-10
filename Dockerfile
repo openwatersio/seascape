@@ -5,7 +5,7 @@
 # Digest-pinned because the tag floats with master.
 # Bumping it (GDAL/GEOS/PROJ) must bump `version` on mosaic_tile, the fork rules, and
 # terrain_render (build.smk) — tools are not rule inputs.
-FROM ghcr.io/osgeo/gdal:ubuntu-full-latest@sha256:05c65b38a829ae31bf227845168211c23086184f9928e0a9347305868ca7a27f
+FROM ghcr.io/osgeo/gdal:ubuntu-full-latest@sha256:ff044cd73f35c343beb9eced20203bdb9c07802403a50118198e0a2ed7223f23
 
 LABEL org.opencontainers.image.source="https://github.com/openwatersio/seascape"
 LABEL org.opencontainers.image.description="Bathymetry → tile pipeline)"
