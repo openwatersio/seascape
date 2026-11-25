@@ -2,6 +2,8 @@
 
 The goal of this project is to create a **planet-scale bathymetry product good enough to use in a nautical chart**, not just a bathymetry visualizer. It is a **derived, supplementary** layer for situational awareness and passage planning, not an official Electronic Navigational Chart and never a replacement for one.
 
+Every change follows the org-wide [rigor rules](https://github.com/openwatersio/.github/blob/main/docs/agents/rigor.md). The first of them: when something fails or looks wrong, find the cause and fix it there instead of working around it.
+
 ## Principles
 
 A chart is a safety instrument: where this layer can't be authoritative, it must be _conservative_ and _honest about its own quality_. Two rules separate "looks like a chart" from "safe to glance at on the water":
