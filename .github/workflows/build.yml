@@ -80,7 +80,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions: { contents: read, packages: write }
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
       - uses: ./.github/actions/ghcr-login
       - name: Already in GHCR?
         id: have
@@ -90,9 +90,9 @@ jobs:
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@v4.4.1
         if: steps.have.outputs.exists != 'true'
-      - uses: docker/build-push-action@v7
+      - uses: docker/build-push-action@v7.4.0
         if: steps.have.outputs.exists != 'true'
         with:
           context: .
@@ -188,7 +188,7 @@ jobs:
       # to release.yml (which promotes the bare sha), so a regional stage can never ship.
       SHA: ${{ github.event.inputs.bbox && format('{0}-bbox', github.sha) || github.sha }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
       # Idempotent box setup — docker + the store volume mount. STATE is the volume root
       # (contains store/ and .snakemake/), mounted whole so both persist. A build assumes a
       # warm volume — refuse to run against a blank one (that's sources.yml's job).
@@ -544,7 +544,7 @@ jobs:
       # both live in the box's local-disk scratch (TMP), the durable home is this artifact.
       - name: Upload snakemake benchmarks + logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: snakemake-bench-${{ github.run_id }}
           path: |
@@ -560,7 +560,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
       - name: Fetch Hetzner host metrics
         continue-on-error: true
         env:
@@ -569,7 +569,7 @@ jobs:
         run: scripts/collect-hcloud-metrics "$SERVER_ID"
       - name: Upload Hetzner host metrics
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: hcloud-metrics-${{ github.run_id }}-${{ needs.create-runner.outputs.server_id }}
           path: hcloud-metrics/

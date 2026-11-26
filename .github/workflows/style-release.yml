@@ -22,7 +22,7 @@ jobs:
     env:
       TAG: ${{ github.event.release.tag_name }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with: { fetch-depth: 0 }
       - name: Tag matches the package version
         run: |
@@ -64,7 +64,7 @@ jobs:
           schema=$(jq -r '.schema // 1' <<<"$live")
           [ "$style" = "$schema" ] ||
             { echo "::error::the style is schema $style but the released tiles are schema $schema"; exit 1; }
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7.1.0
         with: { node-version-file: mise.toml, cache: npm, registry-url: "https://registry.npmjs.org" }
       - name: Test
         run: |
