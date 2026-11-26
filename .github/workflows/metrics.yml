@@ -12,13 +12,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
       - name: Fetch Hetzner host metrics
         env:
           HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
           SERVER_ID: ${{ inputs.server_id }}
         run: scripts/collect-hcloud-metrics "$SERVER_ID"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: hcloud-metrics-${{ github.run_id }}-${{ inputs.server_id }}
           path: hcloud-metrics/
